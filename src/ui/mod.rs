@@ -14,3 +14,4 @@ pub mod settings;
 pub(crate) mod text;
 pub(crate) mod theme;
 pub mod tray;
+pub(crate) mod tray_menu;

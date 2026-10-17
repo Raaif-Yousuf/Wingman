@@ -57,13 +57,23 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    GetIconInfo, GetSystemMetrics, LoadIconW, LoadImageW, PostMessageW, RegisterWindowMessageW,
+    CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetIconInfo,
+    GetSystemMetrics, InsertMenuItemW, LoadIconW, LoadImageW, PostMessageW, RegisterWindowMessageW,
     SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION,
-    IMAGE_ICON, LR_DEFAULTCOLOR, MENUITEMINFOW, MFS_CHECKED, MFT_RADIOCHECK, MF_DISABLED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_FTYPE, MIIM_STATE, SM_CXSMICON, SM_CYSMICON,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
+    IMAGE_ICON, LR_DEFAULTCOLOR, MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFS_ENABLED, MFS_GRAYED,
+    MFT_OWNERDRAW, MFT_RADIOCHECK, MFT_SEPARATOR, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    MIIM_STRING, MIIM_SUBMENU, SM_CXSMICON, SM_CYSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
+    WM_CONTEXTMENU, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
 };
+
+use crate::ui::theme::{SysColors, Theme};
+use crate::ui::tray_menu::{self, ItemRecord, Kind};
+
+/// Segoe Fluent Icons code points for the menu's gutter (#825).
+const GLYPH_SETTINGS: char = '\u{E713}';
+const GLYPH_COPY: char = '\u{E8C8}';
+const GLYPH_PLAY: char = '\u{E768}';
+const GLYPH_QUIT: char = '\u{E7E8}';
 
 /// What a tray message asks for. See [`Tray::on_tray_message`].
 pub enum TrayEvent {
@@ -81,6 +91,8 @@ pub struct PreparedMenu {
     hmenu: HMENU,
     pt: POINT,
     hwnd: HWND,
+    /// Keeps the menu's fonts and brush alive while it is on screen (#825).
+    _look: tray_menu::TrackScope,
 }
 
 impl PreparedMenu {
@@ -407,8 +419,11 @@ impl Tray {
     /// [`EMBEDDED_ICON_ID`]).
     pub fn new(hwnd: HWND, instance: HINSTANCE) -> Result<Self> {
         let base_icon = add_icon(hwnd, instance)?;
+        Ok(Self::with_icon(hwnd, instance, base_icon))
+    }
 
-        Ok(Self {
+    fn with_icon(hwnd: HWND, instance: HINSTANCE, base_icon: HICON) -> Self {
+        Self {
             hwnd,
             instance,
             primary_label: String::new(),
@@ -434,7 +449,25 @@ impl Tray {
             failed: false,
             working_icon: None,
             failed_icon: None,
-        })
+        }
+    }
+
+    /// A tray with no shell icon, for the UI gallery's menu pictures: it can
+    /// build and show the menu, and touches nothing of the real tray.
+    #[cfg(debug_assertions)]
+    pub(crate) fn for_gallery(hwnd: HWND, instance: HINSTANCE) -> Self {
+        let mut tray = Self::with_icon(hwnd, instance, HICON::default());
+        tray.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K");
+        tray.set_pause_binding("Not set");
+        tray.set_models(
+            &["gpt-5".to_string(), "gpt-5-mini".to_string()],
+            "gpt-5",
+            &["claude-sonnet-5-5".to_string()],
+            "claude-sonnet-5-5",
+        );
+        tray.mode = crate::mode::Mode::Local;
+        tray.set_active_provider(Some(ActiveProvider::Anthropic));
+        tray
     }
 
     /// Re-add the icon after the shell's `TaskbarCreated` broadcast (see the
@@ -563,7 +596,7 @@ impl Tray {
         let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
     }
 
-    /// Set the display strings shown in the "Set Copilot key..." / "Set
+    /// Set the display strings shown in the "Set Copilot key…" / "Set
     /// secondary key..." menu labels, e.g. `chord_to_string(&primary)`.
     /// Does not touch the shell icon; only affects the next menu built by
     /// [`Tray::on_tray_message`].
@@ -718,16 +751,37 @@ impl Tray {
         if unsafe { GetCursorPos(&mut pt) }.is_err() {
             return None;
         }
+        self.prepare_menu_at(
+            pt,
+            crate::ui::theme::detect_theme(),
+            SysColors::read(),
+            None,
+        )
+    }
 
+    /// Builds the menu for `pt` in `theme`. The theme is read when the menu
+    /// opens, so a change of Windows' app mode shows on the next right-click.
+    /// `sys` is the system palette high contrast draws with. `dpi` replaces
+    /// the monitor's DPI (the UI gallery draws the menu at other scales).
+    pub(crate) fn prepare_menu_at(
+        &self,
+        pt: POINT,
+        theme: Theme,
+        sys: SysColors,
+        dpi: Option<u32>,
+    ) -> Option<PreparedMenu> {
+        let look = tray_menu::begin_track(theme, dpi.unwrap_or_else(|| tray_menu::dpi_at(pt)), sys);
         let hmenu = unsafe { CreatePopupMenu() }.ok()?;
         if self.build_menu(hmenu).is_err() {
             let _ = unsafe { DestroyMenu(hmenu) };
             return None;
         }
+        tray_menu::apply_background(hmenu);
         Some(PreparedMenu {
             hmenu,
             pt,
             hwnd: self.hwnd,
+            _look: look,
         })
     }
 
@@ -735,13 +789,23 @@ impl Tray {
         // #317: a disabled, greyed first line showing the running version --
         // no `WM_COMMAND` arm needed since it's never enabled and thus never
         // clickable (see `append_item_state`'s doc comment on #185).
+        tray_menu::begin_build();
         append_item_state(hmenu, cmd::VERSION_LABEL, &version_label(), false)?;
         append_separator(hmenu)?;
-        append_item(hmenu, cmd::ASK_NOW, "Ask now (same as the key)")?;
+        // The key is shown as a right-aligned hint, the way Windows 11 shows
+        // a shortcut (#825).
+        append_item_with(
+            hmenu,
+            cmd::ASK_NOW,
+            "Ask &now",
+            &self.primary_label,
+            None,
+            true,
+        )?;
 
         // #348: every action lives in one submenu. Quick Ask is first
         // because it is the palette that lists the rest.
-        let actions = append_group(hmenu, "Actions")?;
+        let actions = append_group(hmenu, "&Actions")?;
         // #307: the options card, offered first: it picks the action for you.
         // Honors Pause like the other pickers.
         append_item_state(
@@ -777,17 +841,24 @@ impl Tray {
         append_item(actions, cmd::FILL_FORM, "Fill this form")?;
         append_item(actions, cmd::RESTORE_LAST_FORM, "Restore last form")?;
 
-        append_item(hmenu, cmd::COPY_LAST, "Copy last answer")?;
+        append_item_with(
+            hmenu,
+            cmd::COPY_LAST,
+            "&Copy last answer",
+            "",
+            Some(GLYPH_COPY),
+            true,
+        )?;
         append_separator(hmenu)?;
         if self.paused {
-            append_item(hmenu, cmd::RESUME, "Resume")?;
+            append_item_with(hmenu, cmd::RESUME, "&Resume", "", Some(GLYPH_PLAY), true)?;
         } else {
             append_pause_submenu(hmenu)?;
         }
         append_mode_submenu(hmenu, self.mode)?;
 
         // #348: providers, models and the key-learning items in one place.
-        let setup = append_group(hmenu, "Providers and keys")?;
+        let setup = append_group(hmenu, "Pro&viders and keys")?;
         append_provider_submenu(setup, self.active_provider)?;
         append_model_submenu(
             setup,
@@ -828,28 +899,41 @@ impl Tray {
         // offering it would show a "press now" prompt that can never
         // succeed and leaves a stale armed deadline behind. Mirrors the
         // Pause/Resume item swap above.
-        append_item_state(
+        append_item_with(
             setup,
             cmd::SET_PRIMARY,
-            &key_label("Set Copilot key", &self.primary_label),
+            "Set Copilot key…",
+            &self.primary_label,
+            None,
             !self.paused,
         )?;
-        append_item_state(
+        append_item_with(
             setup,
             cmd::SET_SECONDARY,
-            &key_label("Set secondary key", &self.secondary_label),
+            "Set secondary key…",
+            &self.secondary_label,
+            None,
             !self.paused,
         )?;
-        append_item_state(
+        append_item_with(
             setup,
             cmd::SET_PAUSE,
-            &key_label("Set pause key", &self.pause_label),
+            "Set pause key…",
+            &self.pause_label,
+            None,
             !self.paused,
         )?;
 
         append_separator(hmenu)?;
-        append_item(hmenu, cmd::OPEN_SETTINGS, "Settings...")?;
-        let help = append_group(hmenu, "Help and diagnostics")?;
+        append_item_with(
+            hmenu,
+            cmd::OPEN_SETTINGS,
+            "&Settings...",
+            "",
+            Some(GLYPH_SETTINGS),
+            true,
+        )?;
+        let help = append_group(hmenu, "&Help and diagnostics")?;
         append_item(help, cmd::EDIT_SETTINGS, "Open config.toml")?;
         append_item(help, cmd::IMPORT_ACTION, "Import action from file...")?;
         let export_labels: Vec<String> =
@@ -868,7 +952,9 @@ impl Tray {
         append_item(help, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
         append_item(help, cmd::CHECK_MACHINE, "Check this PC for local models")?;
         append_separator(hmenu)?;
-        append_item(hmenu, cmd::QUIT, "Quit")?;
+        append_item_with(hmenu, cmd::QUIT, "&Quit", "", Some(GLYPH_QUIT), true)?;
+        // Letters for every row, and the padding at each menu's ends.
+        tray_menu::finalize(hmenu);
         Ok(())
     }
 }
@@ -909,29 +995,66 @@ fn version_label() -> String {
     format!("Wingman {}", env!("CARGO_PKG_VERSION"))
 }
 
-fn key_label(base: &str, binding: &str) -> String {
-    if binding.is_empty() {
-        format!("{base}…")
-    } else {
-        format!("{base}…  ({binding})")
-    }
-}
-
-fn to_wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 fn append_item(hmenu: HMENU, id: u32, text: &str) -> Result<()> {
-    let wide = to_wide(text);
-    unsafe {
-        AppendMenuW(
-            hmenu,
-            MF_STRING,
-            id as usize,
-            PCWSTR::from_raw(wide.as_ptr()),
-        )
+    append_row(hmenu, id, ItemRecord::new(text, Kind::Item), true)
+}
+
+/// Appends an owner-drawn row (#825). The row's text, hint and icon live in
+/// the [`tray_menu`] table; its item data is the key to that record.
+fn append_row(hmenu: HMENU, id: u32, rec: ItemRecord, enabled: bool) -> Result<()> {
+    insert_row(hmenu, Some(id), None, rec, enabled)
+}
+
+/// Inserts one owner-drawn row at the end of `hmenu`: a command (`id`) or a
+/// submenu. The menu is told the row's plain text as well as its item data,
+/// so Narrator and other screen readers can name it: an owner-drawn row
+/// otherwise has no name at all (checked with UI Automation, #825).
+fn insert_row(
+    hmenu: HMENU,
+    id: Option<u32>,
+    submenu: Option<HMENU>,
+    rec: ItemRecord,
+    enabled: bool,
+) -> Result<()> {
+    let (data, name) = tray_menu::add_record(rec);
+    let mut mask = MIIM_FTYPE | MIIM_STATE | MIIM_DATA | MIIM_STRING;
+    if id.is_some() {
+        mask |= MIIM_ID;
     }
-    .context("AppendMenuW failed")
+    if submenu.is_some() {
+        mask |= MIIM_SUBMENU;
+    }
+    let info = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: mask,
+        fType: MFT_OWNERDRAW,
+        fState: if enabled {
+            MFS_ENABLED
+        } else {
+            MFS_DISABLED | MFS_GRAYED
+        },
+        wID: id.unwrap_or(0),
+        hSubMenu: submenu.unwrap_or_default(),
+        dwItemData: data,
+        dwTypeData: windows::core::PWSTR(name as *mut u16),
+        ..Default::default()
+    };
+    unsafe { InsertMenuItemW(hmenu, u32::MAX, true, &info) }.context("InsertMenuItemW failed")
+}
+
+/// A row with a right-aligned hint, and optionally a gutter icon.
+fn append_item_with(
+    hmenu: HMENU,
+    id: u32,
+    text: &str,
+    hint: &str,
+    glyph: Option<char>,
+    enabled: bool,
+) -> Result<()> {
+    let mut rec = ItemRecord::new(text, Kind::Item);
+    rec.hint = hint.to_string();
+    rec.glyph = glyph;
+    append_row(hmenu, id, rec, enabled)
 }
 
 /// Same as [`append_item`], but greyed out and disabled when `enabled` is
@@ -942,19 +1065,20 @@ fn append_item(hmenu: HMENU, id: u32, text: &str) -> Result<()> {
 /// `GetMenuItemInfoW` readback (this module's own test) found the
 /// `MFS_DISABLED` bit is not set by `MF_GRAYED` alone.
 fn append_item_state(hmenu: HMENU, id: u32, text: &str, enabled: bool) -> Result<()> {
-    let wide = to_wide(text);
-    let flags = if enabled {
-        MF_STRING
-    } else {
-        MF_STRING | MF_GRAYED | MF_DISABLED
-    };
-    unsafe { AppendMenuW(hmenu, flags, id as usize, PCWSTR::from_raw(wide.as_ptr())) }
-        .context("AppendMenuW failed")
+    append_row(hmenu, id, ItemRecord::new(text, Kind::Item), enabled)
 }
 
 fn append_separator(hmenu: HMENU) -> Result<()> {
-    unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) }
-        .context("AppendMenuW(separator) failed")
+    let (data, _) = tray_menu::add_record(ItemRecord::new("", Kind::Separator));
+    let info = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_FTYPE | MIIM_DATA,
+        fType: MFT_SEPARATOR | MFT_OWNERDRAW,
+        dwItemData: data,
+        ..Default::default()
+    };
+    unsafe { InsertMenuItemW(hmenu, u32::MAX, true, &info) }
+        .context("InsertMenuItemW(separator) failed")
 }
 
 /// Attach `submenu` to `parent` as a `MF_POPUP` item labeled `text`. Per
@@ -967,17 +1091,10 @@ fn append_separator(hmenu: HMENU) -> Result<()> {
 /// Ownership: once attached this way, `submenu` becomes a child of `parent`
 /// and is destroyed along with it by `DestroyMenu(parent)` -- callers must
 /// NOT call `DestroyMenu` on `submenu` themselves (double-free/UAF).
-fn append_submenu(parent: HMENU, submenu: HMENU, text: &str) -> Result<()> {
-    let wide = to_wide(text);
-    unsafe {
-        AppendMenuW(
-            parent,
-            MF_POPUP | MF_STRING,
-            submenu.0 as usize,
-            PCWSTR::from_raw(wide.as_ptr()),
-        )
-    }
-    .context("AppendMenuW(popup) failed")
+fn append_submenu(parent: HMENU, submenu: HMENU, text: &str, hint: &str) -> Result<()> {
+    let mut rec = ItemRecord::new(text, Kind::Submenu);
+    rec.hint = hint.to_string();
+    insert_row(parent, None, Some(submenu), rec, true)
 }
 
 /// Create an empty submenu labeled `text`, attached to `parent` before it is
@@ -986,7 +1103,7 @@ fn append_submenu(parent: HMENU, submenu: HMENU, text: &str) -> Result<()> {
 /// for the #348 groups.
 fn append_group(parent: HMENU, text: &str) -> Result<HMENU> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    attach_submenu_or_destroy(parent, sub, text)?;
+    attach_submenu_or_destroy(parent, sub, text, "")?;
     Ok(sub)
 }
 
@@ -999,7 +1116,8 @@ fn mark_radio_checked(hmenu: HMENU, id: u32) {
     let info = MENUITEMINFOW {
         cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
         fMask: MIIM_STATE | MIIM_FTYPE,
-        fType: MFT_RADIOCHECK,
+        // Keeps the row owner-drawn: setting the type replaces the old one.
+        fType: MFT_RADIOCHECK | MFT_OWNERDRAW,
         fState: MFS_CHECKED,
         ..Default::default()
     };
@@ -1009,8 +1127,8 @@ fn mark_radio_checked(hmenu: HMENU, id: u32) {
 /// Attach `submenu` to `parent` (see [`append_submenu`]). If the attach
 /// itself fails, `submenu` was never reachable from `parent`, so nothing
 /// else will ever free it -- destroy it here before propagating the error.
-fn attach_submenu_or_destroy(parent: HMENU, submenu: HMENU, text: &str) -> Result<()> {
-    if let Err(e) = append_submenu(parent, submenu, text) {
+fn attach_submenu_or_destroy(parent: HMENU, submenu: HMENU, text: &str, hint: &str) -> Result<()> {
+    if let Err(e) = append_submenu(parent, submenu, text, hint) {
         let _ = unsafe { DestroyMenu(submenu) };
         return Err(e);
     }
@@ -1022,7 +1140,7 @@ fn attach_submenu_or_destroy(parent: HMENU, submenu: HMENU, text: &str) -> Resul
 /// single "Resume" item while already paused -- see [`Tray::build_menu`].
 fn append_pause_submenu(parent: HMENU) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    attach_submenu_or_destroy(parent, sub, "Pause")?;
+    attach_submenu_or_destroy(parent, sub, "&Pause", "")?;
     append_item(sub, cmd::PAUSE_1H, "1 hour")?;
     append_item(sub, cmd::PAUSE_UNTIL_TOMORROW, "Until tomorrow")?;
     append_item(sub, cmd::PAUSE_UNTIL_RESUMED, "Until resumed")?;
@@ -1036,7 +1154,7 @@ fn append_mode_submenu(parent: HMENU, current: crate::mode::Mode) -> Result<()> 
     use crate::mode::Mode;
 
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    attach_submenu_or_destroy(parent, sub, "Mode")?;
+    attach_submenu_or_destroy(parent, sub, "&Mode", current.label())?;
 
     let items = [
         (cmd::MODE_CLOUD, Mode::Cloud),
@@ -1067,7 +1185,12 @@ fn append_mode_submenu(parent: HMENU, current: crate::mode::Mode) -> Result<()> 
 /// `sub` -- see #147.
 fn append_provider_submenu(parent: HMENU, active: Option<ActiveProvider>) -> Result<()> {
     let sub = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    attach_submenu_or_destroy(parent, sub, "Provider")?;
+    attach_submenu_or_destroy(
+        parent,
+        sub,
+        "Provider",
+        active.map_or("", provider_menu_label),
+    )?;
     for provider in ActiveProvider::ALL {
         append_item(sub, provider_cmd(provider), provider_menu_label(provider))?;
     }
@@ -1119,19 +1242,10 @@ fn append_model_submenu(
     current: Option<usize>,
 ) -> Result<()> {
     let submenu = unsafe { CreatePopupMenu() }.context("CreatePopupMenu failed")?;
-    attach_submenu_or_destroy(parent, submenu, label)?;
+    attach_submenu_or_destroy(parent, submenu, label, "")?;
 
     if models.is_empty() {
-        let wide = to_wide("(none configured)");
-        unsafe {
-            AppendMenuW(
-                submenu,
-                MF_STRING | MF_GRAYED,
-                base_id as usize,
-                PCWSTR::from_raw(wide.as_ptr()),
-            )
-        }
-        .context("AppendMenuW(none configured) failed")?;
+        append_item_state(submenu, base_id, "(none configured)", false)?;
         return Ok(());
     }
 
@@ -1776,26 +1890,28 @@ mod tests {
 
     fn read_menu(hmenu: HMENU) -> Vec<Node> {
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetMenuItemCount, GetMenuItemInfoW, MFS_GRAYED, MIIM_ID, MIIM_STRING, MIIM_SUBMENU,
+            GetMenuItemCount, GetMenuItemInfoW, MFS_GRAYED, MIIM_ID, MIIM_SUBMENU,
         };
         let n = unsafe { GetMenuItemCount(Some(hmenu)) };
         assert!(n >= 0, "GetMenuItemCount failed");
         let mut out = Vec::new();
         for pos in 0..n as u32 {
-            let mut buf = [0u16; 128];
             let mut info = MENUITEMINFOW {
                 cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_ID | MIIM_FTYPE | MIIM_STATE | MIIM_STRING | MIIM_SUBMENU,
-                dwTypeData: windows::core::PWSTR(buf.as_mut_ptr()),
-                cch: buf.len() as u32 - 1,
+                fMask: MIIM_ID | MIIM_FTYPE | MIIM_STATE | MIIM_DATA | MIIM_SUBMENU,
                 ..Default::default()
             };
             unsafe { GetMenuItemInfoW(hmenu, pos, true, &mut info) }.expect("GetMenuItemInfoW");
-            if info.fType.0 & MF_SEPARATOR.0 != 0 {
+            assert!(
+                info.fType.0 & MFT_OWNERDRAW.0 != 0,
+                "every row is owner-drawn (#825)"
+            );
+            if info.fType.0 & MFT_SEPARATOR.0 != 0 {
                 out.push(Node::Sep);
                 continue;
             }
-            let text = String::from_utf16_lossy(&buf[..info.cch as usize]);
+            // The label lives in the owner-draw table, without its `&` marks.
+            let text = tray_menu::plain_label(info.dwItemData).expect("a row with no record");
             if info.hSubMenu.0.is_null() {
                 out.push(Node::Item(
                     info.wID,
@@ -1902,7 +2018,7 @@ mod tests {
         );
         let expect = [
             format!("Wingman {}", env!("CARGO_PKG_VERSION")),
-            "Ask now (same as the key)".to_string(),
+            "Ask now".to_string(),
             "Actions".to_string(),
             "Copy last answer".to_string(),
             "Pause".to_string(),
@@ -2027,6 +2143,171 @@ mod tests {
                 _ => panic!("id {id} missing"),
             }
         }
+    }
+
+    /// Every record of one built menu: `(depth, label with marks, hint)`,
+    /// read back from the real `HMENU` through each row's item data.
+    fn rows_with_marks(hmenu: HMENU, depth: usize, out: &mut Vec<(usize, String, String)>) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuItemInfoW, GetSubMenu,
+        };
+        let n = unsafe { GetMenuItemCount(Some(hmenu)) };
+        for pos in 0..n.max(0) {
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_DATA,
+                ..Default::default()
+            };
+            unsafe { GetMenuItemInfoW(hmenu, pos as u32, true, &mut info) }.expect("item info");
+            let rec = tray_menu::record(info.dwItemData).expect("a row with no record");
+            if rec.kind != Kind::Separator {
+                out.push((depth, rec.label, rec.hint));
+            }
+            let sub = unsafe { GetSubMenu(hmenu, pos) };
+            if !sub.0.is_null() {
+                rows_with_marks(sub, depth + 1, out);
+            }
+        }
+    }
+
+    fn built_rows(configure: impl FnOnce(&mut Tray)) -> Vec<(usize, String, String)> {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray menu marks test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new");
+        configure(&mut tray);
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+        let mut rows = Vec::new();
+        rows_with_marks(hmenu, 0, &mut rows);
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+        rows
+    }
+
+    /// #825: letter keys work. Every top-level row that can be used has a
+    /// mnemonic, and no two rows of one menu share one.
+    #[test]
+    fn the_menu_has_a_unique_letter_per_usable_row() {
+        let rows = built_rows(|t| t.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K"));
+        let top: Vec<&(usize, String, String)> = rows.iter().filter(|r| r.0 == 0).collect();
+        // Everything but the greyed version line has a letter.
+        for (_, label, _) in &top[1..] {
+            assert!(
+                tray_menu::mnemonic_of(label).is_some(),
+                "{label:?} has no mnemonic"
+            );
+        }
+    }
+
+    /// #825: no two rows of the same menu share a mnemonic, in every menu of
+    /// the tree (checked on the real `HMENU`, not on the label list).
+    #[test]
+    fn no_two_rows_of_one_menu_share_a_mnemonic() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetMenuItemCount, GetMenuItemInfoW, GetSubMenu,
+        };
+        fn check(hmenu: HMENU, seen_menus: &mut usize) {
+            let n = unsafe { GetMenuItemCount(Some(hmenu)) };
+            let mut letters = Vec::new();
+            for pos in 0..n.max(0) {
+                let mut info = MENUITEMINFOW {
+                    cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                    fMask: MIIM_DATA,
+                    ..Default::default()
+                };
+                unsafe { GetMenuItemInfoW(hmenu, pos as u32, true, &mut info) }.expect("info");
+                let rec = tray_menu::record(info.dwItemData).expect("record");
+                if let Some(m) = tray_menu::mnemonic_of(&rec.label) {
+                    assert!(!letters.contains(&m), "{m:?} twice in one menu");
+                    letters.push(m);
+                }
+                let sub = unsafe { GetSubMenu(hmenu, pos) };
+                if !sub.0.is_null() {
+                    check(sub, seen_menus);
+                }
+            }
+            *seen_menus += 1;
+        }
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, CW_USEDEFAULT, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Wingman tray menu letters test"),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+        .expect("CreateWindowExW");
+        let mut tray = Tray::new(hwnd, instance).expect("Tray::new");
+        tray.set_models(
+            &["gpt-5".to_string(), "gpt-5-mini".to_string()],
+            "gpt-5",
+            &["claude-sonnet-5-5".to_string()],
+            "claude-sonnet-5-5",
+        );
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        tray.build_menu(hmenu).expect("build_menu");
+        let mut seen = 0;
+        check(hmenu, &mut seen);
+        assert!(seen >= 8, "walker saw only {seen} menus");
+        let _ = unsafe { DestroyMenu(hmenu) };
+        drop(tray);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    /// #825: the current mode and provider are visible without opening the
+    /// submenu, as a right-aligned hint, and the key shows beside "Ask now".
+    #[test]
+    fn current_mode_provider_and_key_show_as_hints() {
+        let rows = built_rows(|t| {
+            t.set_mode(crate::mode::Mode::Local);
+            t.set_active_provider(Some(ActiveProvider::Anthropic));
+            t.set_key_bindings("Win+Shift+F23", "");
+        });
+        let hint = |label: &str| {
+            rows.iter()
+                .find(|(_, l, _)| tray_menu::strip_mnemonics(l) == label)
+                .map(|(_, _, h)| h.clone())
+                .unwrap_or_else(|| panic!("no row {label:?}"))
+        };
+        assert_eq!(hint("Mode"), crate::mode::Mode::Local.label());
+        assert_eq!(hint("Provider"), "Claude");
+        assert_eq!(hint("Ask now"), "Win+Shift+F23");
     }
 
     /// Wired-to-nothing guard for dynamic state that now sits inside
@@ -2374,7 +2655,7 @@ mod tests {
         // exhaust real USER objects to hit the same error path.
         let invalid_parent = HMENU(std::ptr::null_mut());
 
-        let result = attach_submenu_or_destroy(invalid_parent, sub, "Provider");
+        let result = attach_submenu_or_destroy(invalid_parent, sub, "Provider", "");
 
         assert!(result.is_err(), "attaching to a null HMENU should fail");
         assert!(
@@ -2391,7 +2672,7 @@ mod tests {
         let parent = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
         let sub = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
 
-        let result = attach_submenu_or_destroy(parent, sub, "Provider");
+        let result = attach_submenu_or_destroy(parent, sub, "Provider", "");
 
         assert!(result.is_ok());
         assert_eq!(unsafe { GetMenuItemCount(Some(parent)) }, 1);

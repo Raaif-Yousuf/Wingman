@@ -24,6 +24,10 @@ pub struct GalleryArgs {
     /// `--matrix`: with `--screenshot <dir>`, render every state under every
     /// theme and scale in [`MATRIX_THEMES`] and [`MATRIX_SCALES`].
     pub matrix: bool,
+    /// `--only <prefix>`: draw only the states whose name starts with this
+    /// (`tray-menu`, `card-options`), so one surface can be looked at without
+    /// rendering the whole gallery.
+    pub only: Option<String>,
 }
 
 /// The themes `--matrix` renders, by their `--theme` names.
@@ -60,7 +64,7 @@ pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> Stri
 }
 
 /// Whether a state can be drawn under a simulated theme and DPI. The card
-/// states and the region overlay can. The palette follows the theme only (see
+/// states, the region overlay and the tray menu can. The palette follows the theme only (see
 /// [`follows_theme_only`]) and Settings the DPI only (see [`follows_dpi_only`]).
 #[cfg(any(test, debug_assertions))]
 pub fn follows_variants(state: GalleryState) -> bool {
@@ -136,6 +140,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
     let mut theme = None;
     let mut dpi = None;
     let mut matrix = false;
+    let mut only = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a == "--screenshot" {
@@ -152,6 +157,10 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
             }
         } else if a == "--matrix" {
             matrix = true;
+        } else if a == "--only" {
+            if let Some(prefix) = iter.next() {
+                only = Some(prefix.clone());
+            }
         }
     }
     Some(GalleryArgs {
@@ -159,6 +168,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
         theme,
         dpi,
         matrix,
+        only,
     })
 }
 
@@ -225,6 +235,10 @@ pub enum GalleryState {
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
+    /// #825: the real tray menu, drawn from fixture data.
+    TrayMenu,
+    /// #825: the same with a row selected and its submenu open.
+    TrayMenuSubmenu,
 }
 
 /// The full ordered list of states the gallery steps through. Order is the
@@ -263,6 +277,8 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsAdvancedTop,
         SettingsAdvancedBottom,
         RegionOverlay,
+        TrayMenu,
+        TrayMenuSubmenu,
     ]
 }
 
@@ -303,6 +319,8 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsAdvancedTop => "settings-advanced-top",
         SettingsAdvancedBottom => "settings-advanced-bottom",
         RegionOverlay => "region-overlay",
+        TrayMenu => "tray-menu",
+        TrayMenuSubmenu => "tray-menu-submenu",
     }
 }
 
@@ -324,9 +342,10 @@ pub fn screenshot_filename(state_name: &str) -> String {
 // named in the PR: `wingman --ui-gallery --screenshot <dir>` must produce
 // one non-trivial PNG per state in `gallery_states()`, with no hotkey
 // registered, no tray icon created and no `single_instance` mutex touched
-// (verified by code inspection: this module never imports `hotkey`, `tray`
-// or `single_instance`, and never constructs anything from `provider::`
-// that would make a real HTTP call -- every value handed to `show_answer`/
+// (verified by code inspection: this module never imports `hotkey` or
+// `single_instance`, and it uses `tray` only through `Tray::for_gallery`,
+// which builds the menu on a tray that never adds a shell icon), and never
+// constructs anything from `provider::` that would make a real HTTP call -- every value handed to `show_answer`/
 // `show_error`/`show_preview` below is a literal or a fixture
 // `serde_json::Value`).
 #[cfg(debug_assertions)]
@@ -345,7 +364,7 @@ mod driver {
         SelectObject, HBITMAP, HDC,
     };
     use windows::Win32::Storage::Xps::{PrintWindow, PW_CLIENTONLY};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetClientRect, GetMessageW, PeekMessageW, SendMessageW, TranslateMessage,
         MSG, PM_REMOVE, WM_KEYDOWN, WM_PRINT,
@@ -371,7 +390,11 @@ mod driver {
         palette.keep_open_for_gallery();
         let mut settings: Option<GalleryWindow> = None;
         let mut region: Option<Overlay> = None;
-        let states = gallery_states();
+        let mut states = gallery_states();
+        if let Some(prefix) = &args.only {
+            states.retain(|s| state_name(*s).starts_with(prefix.as_str()));
+            anyhow::ensure!(!states.is_empty(), "--only {prefix:?} matches no state");
+        }
 
         if args.matrix {
             if args.theme.is_some() || args.dpi.is_some() {
@@ -570,6 +593,17 @@ mod driver {
         path: &std::path::Path,
     ) -> anyhow::Result<HWND> {
         apply_variant(card, palette, variant);
+        if matches!(
+            state,
+            GalleryState::TrayMenu | GalleryState::TrayMenuSubmenu
+        ) {
+            // A real menu in its own modal loop, captured from the screen.
+            // The card window only names the DPI the picture was drawn at.
+            card.hide();
+            palette.hide();
+            tray_menu_shot(variant, state, Some(path))?;
+            return Ok(card.hwnd());
+        }
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
         print_window_png(hwnd, path, prints_with_wm_print(state))?;
@@ -928,6 +962,12 @@ mod driver {
                 let dpi = variant.dpi.unwrap_or(96);
                 *region = Some(Overlay::open_for_gallery(instance, theme, dpi)?);
             }
+            TrayMenu | TrayMenuSubmenu => {
+                card.hide();
+                palette.hide();
+                // Interactive: the menu opens and stays until it is closed.
+                tray_menu_shot(variant, state, None)?;
+            }
             SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
                 card.hide();
                 palette.hide();
@@ -953,6 +993,265 @@ mod driver {
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
             _ => card.hwnd(),
         })
+    }
+
+    /// Shows the real tray menu, built from fixture data on a tray with no
+    /// shell icon, and, with `path`, saves a picture of it and closes it
+    /// (#825). The menu runs its own modal loop, so a timer on the host
+    /// window drives it: it presses the keys the state needs, then captures
+    /// the menu windows from the screen. The process DPI is the monitor's, so
+    /// the file is named for that scale.
+    fn tray_menu_shot(
+        variant: Variant,
+        state: GalleryState,
+        path: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        use windows::core::w;
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_POPUP,
+        };
+        let instance = unsafe {
+            windows::Win32::Foundation::HINSTANCE(
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?.0,
+            )
+        };
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(menu_host_proc),
+            hInstance: instance,
+            lpszClassName: w!("WingmanGalleryMenuHost"),
+            ..Default::default()
+        };
+        // Registering twice (a matrix run) fails harmlessly with "exists".
+        unsafe { RegisterClassW(&wc) };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("WingmanGalleryMenuHost"),
+                w!("Wingman gallery menu host"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }?;
+        let tray = crate::ui::tray::Tray::for_gallery(hwnd, instance);
+        let theme = variant.theme.unwrap_or_else(crate::ui::theme::detect_theme);
+        let sys = if theme == crate::ui::theme::Theme::HighContrast {
+            crate::ui::theme::HC_BLACK
+        } else {
+            crate::ui::theme::SysColors::read()
+        };
+        let menu = tray
+            .prepare_menu_at(POINT { x: 80, y: 80 }, theme, sys, variant.dpi)
+            .ok_or_else(|| anyhow::anyhow!("could not build the tray menu"))?;
+        MENU_SHOT.with(|s| {
+            *s.borrow_mut() = Some(MenuShot {
+                path: path.map(|p| p.to_path_buf()),
+                keys: if state == GalleryState::TrayMenuSubmenu {
+                    // Down to "Mode" (the first press lands on the version line), then Right.
+                    vec![VK_DOWN.0; 6].into_iter().chain([VK_RIGHT.0]).collect()
+                } else {
+                    Vec::new()
+                },
+                step: 0,
+                error: None,
+            })
+        });
+        if path.is_some() {
+            unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 400, None) };
+        }
+        let _ = menu.track();
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        drop(tray);
+        let shot = MENU_SHOT.with(|s| s.borrow_mut().take());
+        match shot.and_then(|s| s.error) {
+            Some(e) => Err(anyhow::anyhow!(e)),
+            None => Ok(()),
+        }
+    }
+
+    struct MenuShot {
+        path: Option<std::path::PathBuf>,
+        keys: Vec<u16>,
+        step: u32,
+        error: Option<String>,
+    }
+
+    thread_local! {
+        static MENU_SHOT: std::cell::RefCell<Option<MenuShot>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The owner of the gallery's menu: answers the menu's owner-draw messages
+    /// and runs the capture timer.
+    unsafe extern "system" fn menu_host_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DefWindowProcW, EndMenu, KillTimer, SetTimer, WM_TIMER,
+        };
+        if let Some(answer) = crate::ui::tray_menu::handle_message(msg, wparam, lparam) {
+            return answer;
+        }
+        if msg == WM_TIMER {
+            let _ = KillTimer(Some(hwnd), 1);
+            let (step, keys, path) = MENU_SHOT.with(|s| {
+                let mut s = s.borrow_mut();
+                match s.as_mut() {
+                    Some(shot) => {
+                        shot.step += 1;
+                        (shot.step, shot.keys.clone(), shot.path.clone())
+                    }
+                    None => (0, Vec::new(), None),
+                }
+            });
+            if step == 1 && !keys.is_empty() {
+                for vk in keys {
+                    press_key(vk);
+                }
+                SetTimer(Some(hwnd), 1, 400, None);
+            } else {
+                if let Some(path) = path {
+                    if let Err(e) = capture_menus_png(&path) {
+                        MENU_SHOT.with(|s| {
+                            if let Some(shot) = s.borrow_mut().as_mut() {
+                                shot.error = Some(e.to_string());
+                            }
+                        });
+                    }
+                }
+                let _ = EndMenu();
+            }
+            return windows::Win32::Foundation::LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    fn press_key(vk: u16) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        };
+        let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            SendInput(
+                &[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)],
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    /// Saves the screen area every open menu window covers as a PNG.
+    fn capture_menus_png(path: &std::path::Path) -> anyhow::Result<()> {
+        use windows::core::w;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, SRCCOPY};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowExW, GetWindowRect, IsWindowVisible,
+        };
+        let mut union: Option<RECT> = None;
+        let mut prev: Option<HWND> = None;
+        unsafe {
+            while let Ok(menu) = FindWindowExW(None, prev, w!("#32768"), None) {
+                prev = Some(menu);
+                if !IsWindowVisible(menu).as_bool() {
+                    continue;
+                }
+                let mut r = RECT::default();
+                if GetWindowRect(menu, &mut r).is_err() {
+                    continue;
+                }
+                union = Some(match union {
+                    None => r,
+                    Some(u) => RECT {
+                        left: u.left.min(r.left),
+                        top: u.top.min(r.top),
+                        right: u.right.max(r.right),
+                        bottom: u.bottom.max(r.bottom),
+                    },
+                });
+            }
+        }
+        let r = union.ok_or_else(|| anyhow::anyhow!("no menu window was on screen"))?;
+        // A little margin so the shadow edge and corners can be seen.
+        let (x, y) = (r.left - 8, r.top - 8);
+        let (width, height) = (r.right - r.left + 16, r.bottom - r.top + 16);
+        unsafe {
+            let screen_dc: HDC = GetDC(None);
+            let mem_dc = CreateCompatibleDC(Some(screen_dc));
+            let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
+            let old = SelectObject(mem_dc, bitmap.into());
+            let blit = BitBlt(
+                mem_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                x,
+                y,
+                SRCCOPY | CAPTUREBLT,
+            );
+            let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
+            let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
+                bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>()
+                        as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            windows::Win32::Graphics::Gdi::GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                height as u32,
+                Some(buf.as_mut_ptr().cast()),
+                &mut bmi,
+                windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+            );
+            SelectObject(mem_dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
+            blit?;
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+                px[3] = 255;
+            }
+            let img: image::RgbaImage =
+                image::ImageBuffer::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("bad capture buffer for {path:?}"))?;
+            img.save(path)
+                .map_err(|e| anyhow::anyhow!("failed to save {path:?}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Captures `hwnd`'s client area and saves it as a PNG at `path`, with
@@ -1070,6 +1369,22 @@ mod tests {
     }
 
     #[test]
+    fn only_names_a_state_prefix() {
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only", "tray-menu"]))
+            .expect("--ui-gallery is present");
+        assert_eq!(parsed.only.as_deref(), Some("tray-menu"));
+        let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("tray-menu")).count(),
+            2,
+            "the prefix finds the two tray menu states"
+        );
+        // A dangling --only is ignored, like a dangling --screenshot.
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only"])).unwrap();
+        assert_eq!(parsed.only, None);
+    }
+
+    #[test]
     fn ui_gallery_with_a_dpi_override_and_the_matrix_flag() {
         let parsed = parse_gallery_args(&args(&["--ui-gallery", "--dpi", "150", "--matrix"]))
             .expect("--ui-gallery is present");
@@ -1131,6 +1446,8 @@ mod tests {
     fn only_the_palette_and_settings_states_ignore_variants() {
         assert!(follows_variants(GalleryState::CardError));
         assert!(follows_variants(GalleryState::RegionOverlay));
+        assert!(follows_variants(GalleryState::TrayMenu));
+        assert!(follows_variants(GalleryState::TrayMenuSubmenu));
         assert!(!follows_variants(GalleryState::PaletteDefault));
         assert!(!follows_variants(GalleryState::SettingsTop));
         for state in gallery_states() {
@@ -1248,8 +1565,9 @@ mod tests {
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 options card states (#307) + 3 palette
         // states + 4 settings states (#560) + the region overlay (#580) + the
-        // welcome card (#831) = 28, + the two setup cards (#885) = 30.
-        assert_eq!(states.len(), 30);
+        // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
+        // tray menu with and without an open submenu (#825) = 32.
+        assert_eq!(states.len(), 32);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

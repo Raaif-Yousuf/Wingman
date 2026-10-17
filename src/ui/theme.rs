@@ -475,6 +475,81 @@ pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
 #[allow(dead_code)] // ramp token for surfaces not yet moved onto it
 pub(crate) const WINDOW_RADIUS_DP: i32 = 8;
 
+// ---------------------------------------------------------------------------
+// Menus (the tray menu, #825)
+// ---------------------------------------------------------------------------
+
+/// Height of one menu row, in dp. Windows 11's own flyout menus use 32.
+pub(crate) const MENU_ITEM_HEIGHT_DP: i32 = 32;
+/// Height of a separator row, in dp: a hairline with 4 dp above and below.
+pub(crate) const MENU_SEPARATOR_HEIGHT_DP: i32 = 9;
+/// Padding above the first row and below the last, and the inset of the
+/// hover pill from the menu's sides, in dp.
+pub(crate) const MENU_EDGE_PAD_DP: i32 = SPACE_XS_DP;
+/// Gap between the hover pill and the row's top and bottom, in dp.
+pub(crate) const MENU_PILL_INSET_Y_DP: i32 = 2;
+/// Width of the left gutter (icon, radio dot) measured from the pill's left
+/// edge to where the text starts, in dp.
+pub(crate) const MENU_GUTTER_DP: i32 = 36;
+/// Space reserved at the right of a row for the submenu chevron, in dp.
+pub(crate) const MENU_CHEVRON_AREA_DP: i32 = 28;
+/// Right padding of a row without a chevron, in dp.
+pub(crate) const MENU_RIGHT_PAD_DP: i32 = SPACE_LG_DP;
+/// Minimum gap between a label and its right-aligned hint, in dp.
+pub(crate) const MENU_HINT_GAP_DP: i32 = SPACE_XL_DP;
+/// Narrowest and widest a menu is allowed to be, in dp.
+pub(crate) const MENU_MIN_WIDTH_DP: i32 = 200;
+pub(crate) const MENU_MAX_WIDTH_DP: i32 = 420;
+/// Glyph size of the icon column, in px at 96 DPI.
+pub(crate) const MENU_ICON_PX: i32 = 16;
+/// How far the hover pill is moved from the surface toward the text colour,
+/// in percent. Windows 11 uses a 6% white (dark) or black (light) overlay.
+const MENU_HOVER_PCT: u32 = 6;
+/// How far disabled text is moved from the text colour toward the surface,
+/// in percent.
+const MENU_DISABLED_PCT: u32 = 55;
+
+/// The fill of the hovered or keyboard-selected row. High contrast uses the
+/// system highlight, as every native menu does.
+pub(crate) fn menu_hover_fill(theme: Theme, tokens: &Tokens, sys: &SysColors) -> u32 {
+    match theme {
+        Theme::HighContrast => sys.highlight,
+        Theme::Light | Theme::Dark => {
+            crate::ui::card_buttons::blend(tokens.surface, tokens.text, MENU_HOVER_PCT)
+        }
+    }
+}
+
+/// The text colour of a row, by whether it is hovered and whether it can be
+/// used. High contrast uses `HighlightText` on the highlight and `GrayText`
+/// for a disabled row.
+pub(crate) fn menu_text_color(
+    theme: Theme,
+    tokens: &Tokens,
+    sys: &SysColors,
+    hot: bool,
+    disabled: bool,
+) -> u32 {
+    match theme {
+        Theme::HighContrast => {
+            if hot {
+                sys.highlight_text
+            } else if disabled {
+                sys.gray_text
+            } else {
+                sys.window_text
+            }
+        }
+        Theme::Light | Theme::Dark => {
+            if disabled {
+                crate::ui::card_buttons::blend(tokens.text, tokens.surface, MENU_DISABLED_PCT)
+            } else {
+                tokens.text
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
