@@ -371,6 +371,24 @@ fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) 
     }
 }
 
+/// #42: moves the pending action to the last-run slot. Pure.
+fn remember_started(pending: &mut Option<String>, last: &mut Option<String>) {
+    if let Some(id) = pending.take() {
+        *last = Some(id);
+    }
+}
+
+/// #42: the action a double press repeats: the last one the user ran, if the
+/// catalogue still knows it and its effect lets a bare key run it (never one
+/// that writes the clipboard, #859). Pure.
+fn repeat_target(last: Option<&str>, catalogue: &[palette_model::PaletteAction]) -> Option<String> {
+    let last = last?;
+    catalogue
+        .iter()
+        .find(|a| a.id == last && palette_model::key_pickable(a.effect))
+        .map(|a| a.id.clone())
+}
+
 /// #393: `phase` with what only the card and the clock know filled in. A
 /// press inside the window of the one that started a Look is the second tap
 /// of a double (`early`), and an answer, error or info card is `Answer`.
@@ -380,12 +398,20 @@ fn refine_key_phase(
     card_state: crate::ui::card::CardState,
     since_look_press: Option<Duration>,
     window: Option<Duration>,
+    can_repeat: bool,
 ) -> keypress::Phase {
     use crate::ui::card::CardState;
     match phase {
-        keypress::Phase::Looking { .. } => keypress::Phase::Looking {
-            early: matches!((since_look_press, window), (Some(d), Some(w)) if d < w),
-        },
+        keypress::Phase::Looking { .. } => {
+            let early = matches!((since_look_press, window), (Some(d), Some(w)) if d < w);
+            // #42: the second tap of a double repeats the last action when
+            // there is one; with none it is absorbed, as before.
+            if early && can_repeat {
+                keypress::Phase::Repeat
+            } else {
+                keypress::Phase::Looking { early }
+            }
+        }
         keypress::Phase::Other
             if matches!(card_state, CardState::Collapsed | CardState::Expanded) =>
         {
@@ -620,6 +646,13 @@ struct App {
     key_quiet_until: Option<Instant>,
     /// #393: when the press that started the current Look was made.
     look_pressed_at: Option<Instant>,
+    /// #42: the id of the last action whose run started, kept for this run
+    /// only (a double press repeats it). Not saved: an id from an earlier
+    /// session could name an action that has since changed.
+    last_action: Option<String>,
+    /// #42: the action being dispatched right now. It becomes `last_action`
+    /// only when its run starts ([`App::note_run_started`]), not on a refusal.
+    pending_action: Option<String>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -939,6 +972,8 @@ pub fn run() -> Result<()> {
         key_pending: None,
         key_quiet_until: None,
         look_pressed_at: None,
+        last_action: None,
+        pending_action: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1473,6 +1508,23 @@ fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
     }
 }
 
+/// #845: what a machine-check verdict may do to the card on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineCheckCard {
+    /// Nothing else is on screen but the check's own working card.
+    Show,
+    /// A preview, an options card or a run in flight owns the card.
+    Hold,
+}
+
+fn machine_check_card(card: crate::ui::card::CardState, busy: bool) -> MachineCheckCard {
+    use crate::ui::card::CardState;
+    if busy || matches!(card, CardState::Preview | CardState::Options) {
+        MachineCheckCard::Hold
+    } else {
+        MachineCheckCard::Show
+    }
+}
 /// #723: whether a press still finds the app busy. A run flagged stuck is
 /// abandoned by the press, so the press can start a new one.
 fn busy_after_press(busy: bool, stuck: bool) -> bool {
@@ -1976,6 +2028,7 @@ impl App {
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
+        self.note_run_started();
         self.set_busy(true);
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
@@ -2014,6 +2067,24 @@ impl App {
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
     fn ask(&mut self, trigger: Trigger) {
+        // #42: Check my work from the key or the tray has no dispatch id.
+        let own = self.pending_action.is_none();
+        if own {
+            self.pending_action = Some(actions::DEFAULT_ACTION_ID.to_string());
+        }
+        self.ask_inner(trigger);
+        if own {
+            self.pending_action = None;
+        }
+    }
+
+    /// #42: called where a run actually starts, after every gate and just
+    /// before the app goes busy: the pending action becomes the last one.
+    fn note_run_started(&mut self) {
+        remember_started(&mut self.pending_action, &mut self.last_action);
+    }
+
+    fn ask_inner(&mut self, trigger: Trigger) {
         let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
@@ -2547,6 +2618,7 @@ impl App {
             self.card.state(),
             self.look_pressed_at.map(|t| now.duration_since(t)),
             window,
+            self.last_action.is_some(),
         )
     }
 
@@ -2570,10 +2642,31 @@ impl App {
                 }
             }
             keypress::KeyAction::Absorb => {}
+            keypress::KeyAction::Repeat => {
+                self.repeat_last_action();
+                // Like every immediate action: a third tap during the settle
+                // must not reach the busy card.
+                self.key_quiet_until = window.map(|w| Instant::now() + w);
+            }
             keypress::KeyAction::Proceed => {
                 self.look_pressed_at = Some(now);
                 self.run_primary_action(trigger);
             }
+        }
+    }
+
+    /// #42: a double press with no card up runs the last action again on a
+    /// fresh look at the screen. The first tap's Look is closed (and settled)
+    /// first, so no card is in the screenshot. Only an action the key may run
+    /// ([`repeat_target`]) repeats: with none, or a clipboard one, the first
+    /// tap's options card simply stays, which is what a single press does.
+    /// Settings in front is refused by the dispatch, as for any run.
+    fn repeat_last_action(&mut self) {
+        let Some(catalogue) = self.load_catalogue(false) else {
+            return;
+        };
+        if let Some(id) = repeat_target(self.last_action.as_deref(), &catalogue) {
+            self.run_option(&id);
         }
     }
 
@@ -2670,7 +2763,9 @@ impl App {
         // sees whatever Windows re-activated. Honour what was in front when
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
+        self.pending_action = Some(action_id.to_string());
         self.dispatch_palette_target(action_id);
+        self.pending_action = None;
         self.password_manager_hint = false;
     }
 
@@ -2781,6 +2876,7 @@ impl App {
             }
         };
 
+        self.note_run_started();
         self.set_busy(true);
         self.set_watch(false);
         // No model in this flow (see the doc comment above): `Working` is
@@ -4758,6 +4854,11 @@ impl App {
     }
 
     fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        // #845: never cover a preview, an options card or a working card of a
+        // run in flight. The check is on demand and cheap, so it is run again.
+        if machine_check_card(self.card.state(), self.busy) == MachineCheckCard::Hold {
+            return;
+        }
         let verdict = crate::machine::verdict(facts);
         self.card
             .show_answer(&verdict.headline, &verdict.detail(), 20, None);
@@ -4787,6 +4888,7 @@ impl App {
             return;
         }
 
+        self.note_run_started();
         self.set_busy(true);
         self.set_watch(false);
         // Issue #354 follow-up review, finding 3: this reads the current
@@ -7994,7 +8096,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_CONFIG_WRITTEN
         | WM_APP_SETTINGS_LEFT
         | WM_APP_SETTINGS_SAVE
-        | WM_APP_SETTINGS_COMMAND => SettingsReentrancy::Defer,
+        | WM_APP_SETTINGS_COMMAND
+        // #845: the verdict the user asked for is shown once Settings is gone,
+        // not dropped (#328 ignored it, which left no card at all).
+        | WM_APP_MACHINE_CHECK_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -8039,10 +8144,6 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
-        // #328: an on-demand card; Settings hides every card when it
-        // opens, so a result arriving then has nothing to show on. The
-        // boxed facts are freed below.
-        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -8349,7 +8450,8 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_EXECUTOR_DONE
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_SEND_PREVIEW
-        | WM_APP_PAUSE_TOGGLE => ForegroundPolicy::Hold,
+        | WM_APP_PAUSE_TOGGLE
+        | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
         WM_APP_PENDING_STAGE
@@ -8357,7 +8459,6 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_ROUTER_RESULT
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
-        | WM_APP_MACHINE_CHECK_RESULT
         | WM_APP_OPTIONS_CHOICE => ForegroundPolicy::Drop,
         // Settings takes a chord itself while its own Change is pending; one
         // that reaches here is from a Change that ended (Esc, timeout), and
@@ -9260,6 +9361,8 @@ mod tests {
             WM_APP_PREVIEW_DECIDED,
             WM_APP_SEND_PREVIEW,
             WM_APP_PAUSE_TOGGLE,
+            // #845: an on-demand verdict is still owed a card.
+            WM_APP_MACHINE_CHECK_RESULT,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Hold, "{id}");
         }
@@ -9269,7 +9372,6 @@ mod tests {
             WM_APP_ROUTER_RESULT,
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
-            WM_APP_MACHINE_CHECK_RESULT,
             WM_APP_OPTIONS_CHOICE,
             // Settings takes a captured chord itself while a Change is
             // pending; one that reaches the main window is from a Change that
@@ -9901,6 +10003,31 @@ mod tests {
         }
     }
 
+    /// #845: a machine-check verdict never covers a card the user is
+    /// reading or answering, or one for a run in flight. Only its own
+    /// working card (or nothing) is replaced.
+    #[test]
+    fn machine_check_card_never_covers_another_card() {
+        use super::MachineCheckCard::{Hold, Show};
+        use crate::ui::card::CardState;
+        for (state, busy, expected) in [
+            (CardState::Pending, false, Show),
+            (CardState::Hidden, false, Show),
+            (CardState::Collapsed, false, Show),
+            (CardState::Expanded, false, Show),
+            (CardState::Preview, false, Hold),
+            (CardState::Options, false, Hold),
+            (CardState::Pending, true, Hold),
+            (CardState::Hidden, true, Hold),
+            (CardState::Preview, true, Hold),
+        ] {
+            assert_eq!(
+                super::machine_check_card(state, busy),
+                expected,
+                "{state:?} busy={busy}"
+            );
+        }
+    }
     // -- #307: the options card's choices ---------------------------------
 
     fn session(generation: u32, ids: &[&str]) -> super::OptionsSession {
@@ -10290,6 +10417,155 @@ mod tests {
         assert_eq!(super::key_phase_of(None, Some(4)), Phase::Other);
     }
 
+    /// #42: the second tap repeats only when there is something to repeat.
+    #[test]
+    fn a_second_tap_repeats_only_with_a_last_action() {
+        use crate::keypress::Phase;
+        use crate::ui::card::CardState;
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        let looking = Phase::Looking { early: false };
+        assert_eq!(
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300), true),
+            Phase::Repeat
+        );
+        // Too late, or double press off: a cancel, never a repeat.
+        for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
+            assert_eq!(
+                super::refine_key_phase(looking, CardState::Options, since, win, true),
+                Phase::Looking { early: false }
+            );
+        }
+        // No card is not a Look: nothing becomes a repeat.
+        assert_eq!(
+            super::refine_key_phase(Phase::Other, CardState::Hidden, None, ms(300), true),
+            Phase::Other
+        );
+    }
+
+    /// #42: the repeated action is the last one run, and never a clipboard one.
+    #[test]
+    fn the_repeat_target_is_the_last_action_and_never_a_clipboard_one() {
+        use crate::ui::palette_model::{Effect, PaletteAction};
+        let act = |id: &str, effect| PaletteAction {
+            id: id.to_string(),
+            name: id.to_string(),
+            group: None,
+            requires_model: false,
+            effect,
+        };
+        let cat = [
+            act("a", Effect::None),
+            act("b", Effect::Preview),
+            act("c", Effect::Clipboard),
+        ];
+        assert_eq!(super::repeat_target(Some("a"), &cat).as_deref(), Some("a"));
+        assert_eq!(super::repeat_target(Some("b"), &cat).as_deref(), Some("b"));
+        assert_eq!(super::repeat_target(Some("c"), &cat), None, "clipboard");
+        assert_eq!(super::repeat_target(Some("gone"), &cat), None);
+        assert_eq!(super::repeat_target(None, &cat), None);
+    }
+
+    /// #42: an action is remembered only once its run starts, never on a
+    /// refusal. The pure part.
+    #[test]
+    fn an_action_is_remembered_only_when_its_run_starts() {
+        let mut pending = Some("a".to_string());
+        let mut last = Some("old".to_string());
+        // A refusal never reaches `remember_started`: the old one stays.
+        assert_eq!(last.as_deref(), Some("old"));
+        super::remember_started(&mut pending, &mut last);
+        assert_eq!(last.as_deref(), Some("a"));
+        assert_eq!(pending, None, "consumed, so a later run cannot reuse it");
+        // Nothing pending: what was remembered is kept.
+        super::remember_started(&mut pending, &mut last);
+        assert_eq!(last.as_deref(), Some("a"));
+    }
+
+    /// #42: `note_run_started` sits after every gate and just before the run
+    /// goes busy, in each path that starts a run. Fails if it moves above a
+    /// gate (a refusal would then be remembered) or the paths change.
+    #[test]
+    fn the_run_is_noted_after_the_gates_and_just_before_it_goes_busy() {
+        let src = lf(include_str!("app.rs"));
+        let paths: [(&str, &[&str]); 3] = [
+            (
+                "    fn begin_action<",
+                &[
+                    "refuse_for_settings()",
+                    "model_action_gate(",
+                    "refuse_if_password_manager()",
+                    "grab_raw_for(",
+                ],
+            ),
+            (
+                "    fn run_model_free_screen_action(",
+                &[
+                    "busy_now()",
+                    "gate(pause::is_paused_now())",
+                    "refuse_if_password_manager()",
+                    "capture_screen()",
+                ],
+            ),
+            (
+                "    fn calculate_selection(",
+                &[
+                    "busy_now()",
+                    "is_paused_now()",
+                    "refuse_if_password_manager()",
+                ],
+            ),
+        ];
+        let mut checked = 0;
+        for (sig, gates) in paths {
+            let body = body_between(&src, sig, "\n    }\n");
+            let note = body.find("self.note_run_started();").expect(sig);
+            for g in gates {
+                let at = body.find(g).unwrap_or_else(|| panic!("{sig} lost `{g}`"));
+                assert!(at < note, "{sig}: `{g}` must come before the note");
+            }
+            let busy = body.find("self.set_busy(true);").expect(sig);
+            assert!(note < busy, "{sig}");
+            assert!(body[note..busy].lines().count() <= 3, "{sig}");
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
+    }
+
+    /// #42: Check my work from the key or the tray is remembered too, and the
+    /// dispatch's pending id is cleared when the dispatch returns.
+    #[test]
+    fn check_my_work_from_the_key_or_tray_is_remembered_and_nothing_goes_stale() {
+        let src = lf(include_str!("app.rs"));
+        let ask = body_between(
+            &src,
+            "    fn ask(&mut self, trigger: Trigger) {",
+            "\n    }\n",
+        );
+        assert!(
+            ask.contains("DEFAULT_ACTION_ID") && ask.contains("ask_inner("),
+            "{ask}"
+        );
+        let dispatch = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
+        let set = dispatch.find("self.pending_action = Some(").expect("set");
+        let run = dispatch.find("self.dispatch_palette_target(").expect("run");
+        let clear = dispatch.find("self.pending_action = None").expect("clear");
+        assert!(set < run && run < clear, "{dispatch}");
+    }
+
+    /// #42: a Repeat reaches `repeat_last_action`, and the key goes quiet
+    /// after it so a third tap during the settle does not hit the busy card.
+    #[test]
+    fn the_repeat_key_action_is_handled_and_quiets_the_key() {
+        let src = lf(include_str!("app.rs"));
+        let apply = body_between(&src, "    fn apply_key_action(", "\n    }\n");
+        let arm = apply.find("KeyAction::Repeat =>").expect("arm");
+        let tail = &apply[arm..];
+        assert!(tail.contains("self.repeat_last_action()"), "{apply}");
+        assert!(tail.contains("self.key_quiet_until"), "{apply}");
+        let rep = body_between(&src, "    fn repeat_last_action(", "\n    }\n");
+        assert!(rep.contains("run_option("), "{rep}");
+    }
+
     /// #393: what only the card and the clock know.
     #[test]
     fn the_key_phase_is_refined_by_the_card_state_and_the_clock() {
@@ -10299,26 +10575,26 @@ mod tests {
         let looking = Phase::Looking { early: false };
         // Inside the window of the press that started the Look: a second tap.
         assert_eq!(
-            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300)),
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300), false),
             Phase::Looking { early: true }
         );
         // Outside it, or with double press off, or no press recorded: a cancel.
         for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
             assert_eq!(
-                super::refine_key_phase(looking, CardState::Options, since, win),
+                super::refine_key_phase(looking, CardState::Options, since, win, false),
                 Phase::Looking { early: false }
             );
         }
         // An answer, error or info card is an Answer; nothing else is.
         for st in [CardState::Collapsed, CardState::Expanded] {
             assert_eq!(
-                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Answer
             );
         }
         for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
             assert_eq!(
-                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Other
             );
         }
@@ -10327,7 +10603,7 @@ mod tests {
             pickable: [true, true],
         };
         assert_eq!(
-            super::refine_key_phase(opts, CardState::Options, None, ms(300)),
+            super::refine_key_phase(opts, CardState::Options, None, ms(300), false),
             opts
         );
     }
@@ -12918,7 +13194,7 @@ mod tests {
         (
             "WM_APP_MACHINE_CHECK_RESULT",
             WM_APP_MACHINE_CHECK_RESULT,
-            SettingsReentrancy::Ignore,
+            SettingsReentrancy::Defer,
         ),
         (
             "WM_APP_FIRST_RUN",

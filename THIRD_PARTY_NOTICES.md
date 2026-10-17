@@ -214,6 +214,7 @@ state, not a pending action.
 | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
 | trybuild | 1.0.121 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
 | untrusted | 0.9.0 | ISC |
 | ureq | 3.4.2 | MIT OR Apache-2.0 |
 | ureq-proto | 0.6.3 | MIT OR Apache-2.0 |

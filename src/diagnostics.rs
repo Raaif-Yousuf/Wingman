@@ -495,9 +495,12 @@ pub fn egress_report() -> String {
 pub fn collect(config: &Config, last_error: Option<LastError>) -> DiagnosticsInput {
     let ollama_port =
         ollama_admin::port_from_base_url(&config.providers.ollama.base_url).unwrap_or(11434);
-    let mut ollama_health = ollama_admin::query_ollama_health(ollama_port).message();
-    // #382: Wingman exited in the middle of the Intel GPU fix.
-    if crate::provider::ollama_gpu_fix::interrupted() {
+    let health = ollama_admin::query_ollama_health(ollama_port);
+    let listening = matches!(health, ollama_admin::OllamaHealth::Listening { .. });
+    let mut ollama_health = health.message();
+    // #382: Wingman exited in the middle of the Intel GPU fix. #846: not once
+    // Ollama is answering again.
+    if crate::provider::ollama_gpu_fix::interrupted(listening) {
         ollama_health.push_str(" The last Fix it did not finish, so Ollama may be stopped.");
     }
 
