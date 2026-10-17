@@ -551,6 +551,13 @@ impl Palette {
         self.inner.set_query(query);
     }
 
+    /// The UI gallery's hovered row, as if the mouse were over it.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn set_hover_for_test(&mut self, row: Option<usize>) {
+        self.inner.hover = row;
+        self.inner.invalidate();
+    }
+
     #[cfg(test)]
     pub(crate) fn state_offset(&self) -> usize {
         self.inner.state.offset
@@ -932,7 +939,12 @@ struct PaletteColors {
     footer: u32,
     /// The router's suggestion line.
     summary: u32,
-    /// The fill of the selected and the hovered row.
+    /// The fill of a row the mouse is over: quieter than the selection's.
+    /// High contrast has no tints, so there it is the background and the row
+    /// gets `hover_outline` instead.
+    hover_fill: u32,
+    hover_outline: Option<u32>,
+    /// The fill of the selected row.
     selected_fill: u32,
     selected_text: u32,
     /// The 3 px bar on the selected row.
@@ -959,6 +971,8 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
             hint: t.text,
             footer: t.text,
             summary: t.text,
+            hover_fill: t.surface,
+            hover_outline: Some(t.text),
             selected_fill: sys.highlight,
             selected_text: sys.highlight_text,
             // The whole row is the highlight, so the bar is the same colour.
@@ -976,6 +990,8 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
         hint: t.text_faint,
         footer: t.text_faint,
         summary: t.text_dim,
+        hover_fill: blend(t.surface, bar, 8),
+        hover_outline: None,
         selected_fill: blend(t.surface, bar, 16),
         selected_text: t.text,
         bar,
@@ -1575,9 +1591,9 @@ impl PaletteInner {
                     draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    // The selected row has the fill and the bar; a row only
-                    // hovered gets an outline in the bar colour (3:1 on the
-                    // background), so the two never look alike.
+                    // The selected row has the strong fill and the bar; a row
+                    // only hovered gets a quiet fill (an outline in high
+                    // contrast), so the two never look alike.
                     if i == self.state.selected {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
@@ -1590,20 +1606,32 @@ impl PaletteInner {
                             }
                         }
                     } else if self.hover == Some(i) {
-                        if let Ok(outline) = unsafe {
+                        if let Ok(fill) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.hover_fill)) as *const _,
                                 None,
                             )
                         } {
-                            let inset = D2D_RECT_F {
-                                left: row_rect.left + 0.5,
-                                top: row_rect.top + 0.5,
-                                right: row_rect.right - 0.5,
-                                bottom: row_rect.bottom - 0.5,
-                            };
                             unsafe {
-                                target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
+                                target.FillRectangle(&row_rect as *const _, &fill);
+                            }
+                        }
+                        if let Some(ink) = colors.hover_outline {
+                            if let Ok(outline) = unsafe {
+                                target.CreateSolidColorBrush(
+                                    &colorref_to_d2d(COLORREF(ink)) as *const _,
+                                    None,
+                                )
+                            } {
+                                let inset = D2D_RECT_F {
+                                    left: row_rect.left + 0.5,
+                                    top: row_rect.top + 0.5,
+                                    right: row_rect.right - 0.5,
+                                    bottom: row_rect.bottom - 0.5,
+                                };
+                                unsafe {
+                                    target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
+                                }
                             }
                         }
                     }
@@ -1807,29 +1835,34 @@ impl PaletteInner {
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
                         } else if self.hover == Some(i) {
-                            let outline = CreateSolidBrush(COLORREF(colors.bar));
-                            let line = scale(1, self.dpi).max(1);
-                            for edge in [
-                                RECT {
-                                    bottom: row_rect.top + line,
-                                    ..row_rect
-                                },
-                                RECT {
-                                    top: row_rect.bottom - line,
-                                    ..row_rect
-                                },
-                                RECT {
-                                    right: row_rect.left + line,
-                                    ..row_rect
-                                },
-                                RECT {
-                                    left: row_rect.right - line,
-                                    ..row_rect
-                                },
-                            ] {
-                                FillRect(hdc, &edge, outline);
+                            let fill = CreateSolidBrush(COLORREF(colors.hover_fill));
+                            FillRect(hdc, &row_rect, fill);
+                            let _ = DeleteObject(fill.into());
+                            if let Some(ink) = colors.hover_outline {
+                                let outline = CreateSolidBrush(COLORREF(ink));
+                                let line = scale(1, self.dpi).max(1);
+                                for edge in [
+                                    RECT {
+                                        bottom: row_rect.top + line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        top: row_rect.bottom - line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        right: row_rect.left + line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        left: row_rect.right - line,
+                                        ..row_rect
+                                    },
+                                ] {
+                                    FillRect(hdc, &edge, outline);
+                                }
+                                let _ = DeleteObject(outline.into());
                             }
-                            let _ = DeleteObject(outline.into());
                         }
                         if i == self.state.selected {
                             let accent = CreateSolidBrush(COLORREF(colors.bar));
@@ -2245,8 +2278,32 @@ mod tests {
         }
 
         #[test]
-        fn the_bar_and_the_hover_outline_have_at_least_3_to_1_on_the_background() {
-            // The hover outline is drawn in the bar colour, so this holds both.
+        fn the_hovered_row_differs_from_the_selected_row_and_keeps_readable_text() {
+            for (name, theme, c) in cases() {
+                let r = ratio(c.text, c.hover_fill);
+                assert!(r >= 4.5, "{name}: text is {r:.2}:1 on a hovered row");
+                assert_ne!(c.hover_fill, c.selected_fill, "{name}");
+                if theme == Theme::HighContrast {
+                    // No fill in high contrast: an outline in the text colour.
+                    assert_eq!(c.hover_fill, c.background, "{name}");
+                    let o = c
+                        .hover_outline
+                        .expect("high contrast hovers with an outline");
+                    assert!(ratio(o, c.background) >= 3.0, "{name}: outline");
+                } else {
+                    // A quiet fill, lighter than the selection's.
+                    assert_ne!(c.hover_fill, c.background, "{name}");
+                    assert_eq!(c.hover_outline, None, "{name}");
+                    assert!(
+                        ratio(c.hover_fill, c.background) < ratio(c.selected_fill, c.background),
+                        "{name}: the hover fill is not quieter than the selection"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_bar_has_at_least_3_to_1_on_the_background() {
             for (name, theme, c) in cases() {
                 // In high contrast the whole row is the system highlight and
                 // the bar is that colour: the row itself must stand out.
@@ -2484,6 +2541,56 @@ mod tests {
         );
         assert_eq!(empty.0, p.inner.colors.background, "the palette background");
     }
+    /// #882: a row the mouse is over is filled lighter than the selected row,
+    /// so two rows never look selected. Prints the window and reads the
+    /// pixels of the hovered row and of the selected one.
+    #[test]
+    fn a_hovered_row_is_filled_lighter_than_the_selected_row() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject, HDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.force_theme_for_gallery(Theme::Dark);
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        // Rows: header, action (selected), header, action.
+        p.inner.hover = Some(3);
+        let dpi = p.inner.dpi;
+        let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+        let (screen, mem, bmp);
+        unsafe {
+            screen = GetDC(None);
+            mem = CreateCompatibleDC(Some(screen));
+            bmp = CreateCompatibleBitmap(screen, w, h);
+            SelectObject(mem, bmp.into());
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+        }
+        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT, dpi);
+        let row_y = |pos: i32| list_top + scale(ROW_HEIGHT, dpi) * pos + scale(ROW_HEIGHT, dpi) / 2;
+        let x = w - scale(PADDING, dpi) - 4;
+        let (selected, hovered) = unsafe {
+            (
+                GetPixel(mem as HDC, x, row_y(1)).0,
+                GetPixel(mem as HDC, x, row_y(3)).0,
+            )
+        };
+        unsafe {
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+        let c = p.inner.colors;
+        assert_eq!(selected, c.selected_fill);
+        assert_eq!(hovered, c.hover_fill, "the hovered row fill");
+        assert_ne!(hovered, selected);
+        assert_ne!(hovered, c.background);
+    }
+
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
