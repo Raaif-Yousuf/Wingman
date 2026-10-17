@@ -517,8 +517,17 @@ fn labelled_digit_spans(
 ) {
     let mut from = 0;
     while let Some(found) = lower.get(from..).and_then(|rest| rest.find(label)) {
-        let after = from + found + label.len();
+        let label_at = from + found;
+        let after = label_at + label.len();
         from = after;
+        // A label inside a longer word ("syntax id") is not a label.
+        if label_at > 0
+            && bytes
+                .get(label_at - 1)
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            continue;
+        }
         let mut i = after;
         // At most a few separator characters: "SSN: ", "tax id #".
         let limit = after + 8;
@@ -594,6 +603,13 @@ mod national_id_tests {
         for ok in ["+1 555-123-4567", "94103-1234", "SW1A 1AA", "07700 900123"] {
             assert!(found(ok).is_empty(), "{ok}");
         }
+    }
+
+    #[test]
+    fn a_label_inside_a_longer_word_is_not_a_label() {
+        assert!(found("syntax id 123456").is_empty());
+        assert!(found("pretax id 123456").is_empty());
+        assert_eq!(found("(tax id 123456)"), ["123456"]);
     }
 
     #[test]

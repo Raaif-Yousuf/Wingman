@@ -46,32 +46,76 @@ pub struct ScanSummary {
     pub incomplete: bool,
 }
 
-/// Starts the scan on a background thread, or does nothing at all: an empty
-/// folder setting starts no thread and reads nothing. Returns the thread so a
-/// test can wait for it; the app drops it.
-pub fn start_scan(folder: &str) -> Option<std::thread::JoinHandle<()>> {
+/// What the `[knowledge] folder` setting asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Setting {
+    Off,
+    Invalid(&'static str),
+    Folder(PathBuf),
+}
+
+fn read_setting(folder: &str) -> Setting {
     let folder = folder.trim();
     if folder.is_empty() {
-        return None;
+        return Setting::Off;
     }
-    let folder = PathBuf::from(folder);
+    let path = PathBuf::from(folder);
+    if !path.is_absolute() {
+        return Setting::Invalid(
+            "The knowledge folder must be a full path, such as C:\\Notes. Nothing was indexed.",
+        );
+    }
+    if path.parent().is_none() {
+        return Setting::Invalid(
+            "The knowledge folder must be a folder, not a whole drive. Nothing was indexed.",
+        );
+    }
+    Setting::Folder(path)
+}
+
+/// Starts the start-up pass on a background thread that ends with it. With a
+/// folder set it indexes that folder. With the setting empty or invalid it
+/// reads no folder at all and only retires a folder indexed earlier (a cheap
+/// store check), so clearing the setting also clears the stored text.
+/// Returns the thread so a test can wait for it; the app drops it.
+///
+/// Until Settings can add folders, `[knowledge] folder` is the whole
+/// configuration. When Settings lands, this value is imported into
+/// `knowledge_root` once and this function goes away.
+pub fn start_scan(folder: &str) -> Option<std::thread::JoinHandle<()>> {
+    let setting = read_setting(folder);
     std::thread::Builder::new()
         .name("knowledge-scan".into())
-        .spawn(move || run_scan(&folder))
+        .spawn(move || run_scan(setting))
         .ok()
 }
 
-fn run_scan(folder: &Path) {
+fn run_scan(setting: Setting) {
     lower_thread_priority();
-    let root = match canonical_root(folder) {
-        Ok(root) => root,
-        Err(why) => {
-            store::report_text(&why);
-            return;
+    let wanted = match setting {
+        Setting::Off => None,
+        Setting::Invalid(why) => {
+            store::report_text(why);
+            None
         }
+        Setting::Folder(folder) => match canonical_root(&folder) {
+            Ok(root) => Some(root),
+            Err(why) => {
+                // The folder may be on a drive that is not connected right
+                // now: keep what was indexed, say so, and try next start.
+                store::report_text(&why);
+                return;
+            }
+        },
     };
     // A store that cannot open has already reported itself.
     let Ok(store) = store::global() else { return };
+    let keep = wanted.as_ref().map(|r| r.to_string_lossy().into_owned());
+    if let Err(e) = store.retire_default_roots_except(keep.as_deref()) {
+        store::report(&e);
+        return;
+    }
+    let Some(root) = wanted else { return };
     match scan_folder(&store, &root, now_unix()) {
         Ok(summary) => {
             let unreadable = summary.failed + summary.pending;
@@ -147,10 +191,12 @@ pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, 
     let root_id = store.ensure_root(&root_key, now)?;
     let (files, mut incomplete) = walk(root);
     let known = store.documents_in_root(root_id)?;
+    let by_path: std::collections::HashMap<&str, &DocumentRow> =
+        known.iter().map(|d| (d.rel_path.as_str(), d)).collect();
     let mut summary = ScanSummary::default();
 
     for file in &files {
-        let existing = known.iter().find(|d| d.rel_path == file.rel);
+        let existing = by_path.get(file.rel.as_str()).copied();
         match index_file(store, root_id, file, existing, now)? {
             Outcome::Indexed => summary.indexed += 1,
             Outcome::Unchanged => summary.unchanged += 1,
@@ -354,6 +400,9 @@ fn index_file(
     };
     // Mask before chunking, so no chunk and no overlap can hold a number.
     let masked = mask_sensitive(&parsed.text);
+    // The title is text from the file too (a front-matter title or the first
+    // heading), and goes into the store, so it is masked the same way.
+    let title = parsed.title.as_deref().map(mask_sensitive);
     let mut chunks = Vec::new();
     for chunk in chunk_text(&masked) {
         let Ok(text_hash) = sha256_hex(chunk.text.as_bytes()) else {
@@ -384,7 +433,7 @@ fn index_file(
         "indexed",
         None,
         &DocumentUpdate {
-            title: parsed.title.as_deref(),
+            title: title.as_deref(),
             content_hash: Some(&hash),
             parser: Some(file.parser.name()),
             parser_ver: Some(PARSER_VERSION),
@@ -434,6 +483,10 @@ mod tests {
 
     /// A scan time later than any file in a test, so a file counts as settled.
     const FUT: i64 = 4_000_000_000;
+
+    /// `start_scan` works on the one process-wide store and retires the roots
+    /// it was not given, so the tests that go through it take turns.
+    static GLOBAL_STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -667,13 +720,93 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_folder_starts_no_thread_and_reads_nothing() {
-        assert!(start_scan("").is_none());
-        assert!(start_scan("   ").is_none());
+    fn an_unset_folder_reads_no_folder() {
+        assert_eq!(read_setting(""), Setting::Off);
+        assert_eq!(read_setting("   "), Setting::Off);
+    }
+
+    #[test]
+    fn a_relative_path_and_a_drive_root_are_refused() {
+        for bad in ["Notes", r"..\Notes", "C:", r"C:\", "/", r"\\server\share"] {
+            assert!(
+                matches!(read_setting(bad), Setting::Invalid(_)),
+                "{bad} must be refused"
+            );
+        }
+        assert!(!matches!(read_setting(r"C:\Notes"), Setting::Invalid(_)));
+        for why in [read_setting("Notes"), read_setting(r"C:\")] {
+            if let Setting::Invalid(text) = why {
+                assert!(!text.contains('\u{2014}'));
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_or_changing_the_folder_retires_the_old_root() {
+        let a = scratch("retire-a");
+        let b = scratch("retire-b");
+        fs::write(a.join("a.md"), "# A\noldfolderword\n").unwrap();
+        fs::write(b.join("b.md"), "# B\nnewfolderword\n").unwrap();
+        let store = Store::in_memory();
+        scan_folder(&store, &a, FUT).unwrap();
+        assert_eq!(store.fts_hits("oldfolderword").unwrap(), 1);
+
+        // The same folder: nothing is retired.
+        let a_key = a.to_string_lossy().into_owned();
+        assert_eq!(store.retire_default_roots_except(Some(&a_key)).unwrap(), 0);
+        assert_eq!(store.fts_hits("oldfolderword").unwrap(), 1);
+
+        // A different folder: the old text goes, the new one is scanned.
+        let b_key = b.to_string_lossy().into_owned();
+        assert_eq!(store.retire_default_roots_except(Some(&b_key)).unwrap(), 1);
+        scan_folder(&store, &b, FUT).unwrap();
+        assert_eq!(store.fts_hits("oldfolderword").unwrap(), 0);
+        assert_eq!(store.fts_hits("newfolderword").unwrap(), 1);
+
+        // Cleared: everything goes, and a second call finds nothing to do.
+        assert_eq!(store.retire_default_roots_except(None).unwrap(), 1);
+        assert_eq!(store.knowledge_counts().unwrap(), (0, 0, 0));
+        assert_eq!(store.fts_hits("newfolderword").unwrap(), 0);
+        assert_eq!(store.retire_default_roots_except(None).unwrap(), 0);
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+    }
+
+    #[test]
+    fn an_empty_setting_still_clears_a_folder_indexed_earlier() {
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
+        // The wiring: start_scan("") runs on a thread and retires the root in
+        // the process-wide store.
+        let dir = scratch("clear-wired");
+        fs::write(dir.join("n.md"), "# N\nclearedwiredword\n").unwrap();
+        start_scan(&dir.to_string_lossy()).unwrap().join().unwrap();
+        let store = store::global().unwrap();
+        assert_eq!(store.fts_hits("clearedwiredword").unwrap(), 1);
+        start_scan("").unwrap().join().unwrap();
+        assert_eq!(store.fts_hits("clearedwiredword").unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_title_with_a_card_number_is_masked_in_the_store() {
+        let dir = scratch("title");
+        fs::write(
+            dir.join("t.md"),
+            "---\ntitle: 4111 1111 1111 1111\n---\nbody words\n",
+        )
+        .unwrap();
+        let store = Store::in_memory();
+        scan_folder(&store, &dir, FUT).unwrap();
+        let root = store.ensure_root(&dir.to_string_lossy(), 0).unwrap();
+        let title = store.document_title(root, "t.md").unwrap().unwrap();
+        assert!(!title.contains("4111"), "title was {title}");
+        assert_eq!(title, "[card number]");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_set_folder_is_indexed_through_the_global_store() {
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
         // The wiring test: the entry point `app.rs` calls, a real thread, and
         // the process-wide store (a per-process temp directory under test).
         let dir = scratch("wired");

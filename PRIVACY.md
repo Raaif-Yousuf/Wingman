@@ -132,7 +132,9 @@ packet capture, is in [`docs/offline.md`](docs/offline.md).
   text is saved as plain text in the store folder, which only your Windows
   account can open, like the files themselves. Nothing is sent anywhere: this
   makes no network request. Delete a file and its text is removed at the next
-  start. Leave the setting empty and Wingman reads nothing.
+  start. Change the setting to another folder, or clear it, and the saved text
+  of the old folder is deleted at the next start. Leave the setting empty and
+  Wingman reads no folder and keeps no text from one.
 - Nothing else. No screenshot is written to disk. No history, log or cache of
   past answers persists across a restart.
 

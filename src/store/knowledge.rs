@@ -48,6 +48,24 @@ impl Store {
         )?)
     }
 
+    /// Removes every `default` root except the one at `keep` (none: all of
+    /// them), with its documents, chunks and full-text rows, then checkpoints
+    /// the log so the text does not linger in it. Touches nothing when there
+    /// is nothing to remove. Returns how many roots were removed.
+    pub fn retire_default_roots_except(&self, keep: Option<&str>) -> Result<usize, StoreError> {
+        let conn = self.lock();
+        let removed = conn.execute(
+            "DELETE FROM knowledge_root
+             WHERE kind = 'default' AND (?1 IS NULL OR path <> ?1)",
+            params![keep],
+        )?;
+        if removed > 0 {
+            // Best effort: a busy checkpoint is not a failed delete.
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
+        Ok(removed)
+    }
+
     /// Every document of a root.
     pub fn documents_in_root(&self, root_id: i64) -> Result<Vec<DocumentRow>, StoreError> {
         let conn = self.lock();
@@ -169,6 +187,28 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
+    }
+
+    /// The stored title of one document.
+    #[cfg(test)]
+    pub(crate) fn document_title(
+        &self,
+        root_id: i64,
+        rel_path: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self.lock().query_row(
+            "SELECT title FROM document WHERE root_id = ?1 AND rel_path = ?2",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// How many roots, documents and chunks the store holds.
+    #[cfg(test)]
+    pub(crate) fn knowledge_counts(&self) -> Result<(i64, i64, i64), StoreError> {
+        let conn = self.lock();
+        let n = |t: &str| conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0));
+        Ok((n("knowledge_root")?, n("document")?, n("chunk")?))
     }
 
     /// How many `chunk_fts` rows match `term`: the full-text index followed
