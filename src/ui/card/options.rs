@@ -1189,6 +1189,12 @@ mod tests {
             for bg in [t.surface, hover] {
                 assert!(ratio(t.text, bg) >= 4.5, "{theme:?} label on {bg:#08x}");
                 assert!(ratio(t.text_dim, bg) >= 4.5, "{theme:?} digit on {bg:#08x}");
+                // The digit sits on its chip, which is a step off the row.
+                let cap = crate::ui::theme::keycap_fill(theme, bg, t.text);
+                assert!(
+                    ratio(t.text_dim, cap) >= 4.5,
+                    "{theme:?} digit on a keycap over {bg:#08x}"
+                );
             }
             assert!(ratio(t.text_faint, t.surface) >= 4.5, "{theme:?} hint");
         }

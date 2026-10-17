@@ -1986,6 +1986,9 @@ impl CardInner {
         self.stop_reading();
         self.kill_timers();
         self.set_noactivate(true);
+        // #973: the error glyph belongs to the card it was shown for; a
+        // pending, preview or options card never inherits it.
+        self.error_mark = false;
     }
 
     fn kill_timers(&self) {
@@ -5729,6 +5732,16 @@ mod tests {
         assert_eq!(footer_glyph("Stop reading"), '\u{E71A}');
         assert_eq!(footer_glyph("Report a problem"), '\u{E939}');
         assert_eq!(footer_glyph("Copied"), '\u{E73E}');
+    }
+
+    #[test]
+    fn a_pending_card_after_an_error_card_drops_the_error_mark() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_error("Couldn't read the screen", "detail");
+        assert!(card.inner.error_mark);
+        card.show_pending(PendingStage::Working);
+        assert!(!card.inner.error_mark);
+        assert_eq!(card.inner.headline_indent(), 0);
     }
 
     #[test]
