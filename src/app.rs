@@ -1161,8 +1161,9 @@ fn degraded_start_card(
             "Tray icon not added yet".to_string(),
             format!(
                 "Windows did not accept the tray icon ({e}). This can happen right after \
-                 sign-in. Wingman keeps running and adds the icon as soon as the taskbar is \
-                 ready. The Copilot key works meanwhile."
+                 sign-in. Wingman keeps running and tries again the next time you press the \
+                 Copilot key or open Quick Ask, or when the taskbar restarts. The Copilot key \
+                 works meanwhile."
             ),
         )
     });
@@ -1259,11 +1260,17 @@ fn setup_gate(
 /// #711: config.toml exists but did not parse. Names the line and column
 /// (`problem` already carries them), never file text. No em dash (rule 11).
 fn config_problem_card(problem: &str) -> (String, String) {
+    // #1037: a failed copy has nothing in the file to fix; the cause is the folder.
+    let last = if problem.starts_with(crate::config::COPY_FAILED_PREFIX) {
+        "Check that the Wingman settings folder can be written to, then choose Reload settings"
+    } else {
+        "Fix it, then choose Reload settings"
+    };
     (
         "Settings file not read".to_string(),
         format!(
             "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
-             computer) and will not save over your file. Fix it, then choose Reload settings \
+             computer) and will not save over your file. {last} \
              (tray menu, Help and diagnostics)."
         ),
     )
@@ -2127,6 +2134,7 @@ impl App {
     /// the screen is read only after the user picks an action or types
     /// something, by that action's own flow.
     fn toggle_palette(&mut self) {
+        self.retry_missing_tray_icon();
         let Some(palette) = self.palette.as_mut() else {
             self.card.show_error(
                 "Quick Ask unavailable",
@@ -2499,6 +2507,7 @@ impl App {
     /// press inside the window is a double, the timer firing is a single.
     /// Everywhere else the press acts at once.
     fn on_primary_key(&mut self, trigger: Trigger) {
+        self.retry_missing_tray_icon();
         let now = Instant::now();
         if self.key_quiet_until.is_some_and(|t| now < t) {
             return;
@@ -5830,6 +5839,17 @@ impl App {
     fn on_taskbar_created(&mut self) {
         if let Some(e) = self.try_restore_tray_icon() {
             self.card.show_error("Couldn't restore the tray icon", &e);
+        }
+    }
+
+    /// #1037: when the start-up `NIM_ADD` was refused, try again on the next
+    /// Wingman key press or Quick Ask open. Event-driven (no timer) and one
+    /// cheap check when the icon is there. A failed retry is silent here: the
+    /// start-up card already said the icon is missing, and the error is kept
+    /// for "Copy diagnostics" by `try_restore_tray_icon`.
+    fn retry_missing_tray_icon(&mut self) {
+        if !self.tray.has_icon() {
+            let _ = self.try_restore_tray_icon();
         }
     }
 
@@ -12449,6 +12469,48 @@ mod tests {
         assert_eq!(super::merge_cards(tray.clone(), None), tray);
         assert_eq!(super::merge_cards(None, know.clone()), know);
         assert_eq!(super::merge_cards(None, None), None);
+    }
+
+    // #1037: the card says what really happens: a retry on the next key press
+    // or Quick Ask open (and on TaskbarCreated), not "as soon as the taskbar is ready".
+    #[test]
+    fn the_tray_card_promises_only_the_real_retry() {
+        let (_, d) = super::degraded_start_card(Some("x"), None).unwrap();
+        assert!(!d.contains("as soon as the taskbar"), "{d}");
+        assert!(d.contains("next time you press the Copilot key"), "{d}");
+        assert!(!d.contains('\u{2014}'));
+    }
+
+    // #1037: a copy failure has nothing in the file to fix.
+    #[test]
+    fn a_copy_failure_card_does_not_say_fix_the_file() {
+        let problem = format!("{} (Access is denied)", crate::config::COPY_FAILED_PREFIX);
+        let (_, copy) = super::config_problem_card(&problem);
+        assert!(!copy.contains("Fix it"), "{copy}");
+        assert!(
+            copy.contains("folder") && copy.contains("Reload settings"),
+            "{copy}"
+        );
+        assert!(!copy.contains('\u{2014}'));
+        let (_, parse) = super::config_problem_card("config.toml has an error at line 1");
+        assert!(
+            parse.contains("Fix it, then choose Reload settings"),
+            "{parse}"
+        );
+    }
+
+    // #1037: the key press and the palette open retry a missing tray icon.
+    #[test]
+    fn a_key_press_and_a_palette_open_retry_a_missing_tray_icon() {
+        let src = lf(include_str!("app.rs"));
+        for sig in ["    fn on_primary_key(", "    fn toggle_palette("] {
+            let body = src.split(sig).nth(1).expect("function exists");
+            let body = &body[..body.find("\n    }\n").unwrap()];
+            assert!(
+                body.contains("retry_missing_tray_icon()"),
+                "{sig} does not retry"
+            );
+        }
     }
 
     #[test]
