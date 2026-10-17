@@ -31,7 +31,7 @@ use crate::ui::palette_model::PaletteAction;
 /// (1568) and the per-provider vision tiers in `capture.rs`: this call only
 /// needs to recognize the GENRE of what's on screen (an email compose
 /// window, a calendar, a physics problem), not read every character of it,
-/// and it runs on every palette open rather than only on a confirmed press.
+/// and it runs on every options card rather than only on a confirmed press.
 ///
 /// THEORY (unverified): 512 is a conservative starting point, not a measured
 /// legibility/token sweep -- reasoned from `capture.rs`'s own tables (a
@@ -62,17 +62,16 @@ pub const ROUTER_IMAGE_MAX_PIXELS: u64 =
 /// a reply cut off with no text is the "ran out of room" error (#155). THEORY
 /// (unverified, no OpenAI or Gemini key to measure): at `Effort::Low` a small
 /// reasoning model can spend more than the old 200 on thinking and return
-/// nothing, so the palette hint would silently never appear and the chain
+/// nothing, so the options card would silently get no suggestion and the chain
 /// would bill a second provider. MEASURED 2026-10-16 (Anthropic
 /// `claude-haiku-5-5`, low effort, a structured calendar reply): 39 to 42
 /// output tokens, no thinking. Raising the cap costs nothing when the model
 /// does not think, since only generated tokens are billed.
 pub const ROUTER_MAX_TOKENS: u32 = 1000;
 
-/// How long the palette waits for the router before it gives up and clears
-/// its "Looking at your screen..." line. The hint is a bonus, so a slow
-/// local model that talks on for the whole token budget must not keep the
-/// line up for minutes. The call itself still ends on its own HTTP timeout;
+/// How long the options card waits for the router before it gives up and shows
+/// its fallback options. A slow local model that talks on for the whole token
+/// budget must not keep the card on "Looking at your screen" for minutes. The call itself still ends on its own HTTP timeout;
 /// only the wait is capped.
 pub const ROUTER_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -556,7 +555,7 @@ pub struct RouterTarget {
 /// `ready_provider_names` is the Mode-and-readiness-filtered, ordered list a
 /// caller already has from `Providers::build_chain_for_mode(mode,
 /// ollama_ready).ready_provider_names()` -- the SAME selection `App::ask`
-/// and `App::toggle_palette` already build for the real action chain, so
+/// and `App::show_options_card` already build for the real action chain, so
 /// Mode (Cloud/Local/Auto/Offline) and "is this provider actually ready"
 /// (has a key, or Ollama probed reachable) are both already folded in by the
 /// time this function runs; it does no Mode logic of its own. An empty list

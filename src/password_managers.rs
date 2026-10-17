@@ -723,7 +723,7 @@ mod tests {
         // The palette sets the hint for its dispatch, then clears it.
         let dispatch = body_of("dispatch_palette_action");
         let set = dispatch
-            .find("self.password_manager_hint = self.picker_password_manager;")
+            .find("self.password_manager_hint = self.palette_password_manager;")
             .expect("the palette dispatch never sets the hint");
         let run = dispatch
             .find("self.dispatch_palette_target(")
@@ -758,12 +758,11 @@ mod tests {
             .find("self.palette.show(")
             .expect("no palette.show call");
         assert!(ask < show, "the palette steals the foreground when shown");
-        // #805: the palette reads nothing when it opens, so there is no
-        // capture to hand the answer to. It keeps the answer for the action
-        // the user runs from it.
+        // #805: opening the palette starts no router request, so the answer
+        // is kept for the action the user picks.
         assert!(
-            body.contains("self.picker_password_manager = self.password_manager_now()"),
-            "toggle_palette must keep its answer for the dispatch"
+            body.contains("self.palette_password_manager = self.password_manager_now();"),
+            "toggle_palette must keep its answer for the action the palette runs"
         );
     }
 

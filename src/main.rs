@@ -35,6 +35,7 @@ mod portable;
 mod profile;
 mod provider;
 mod redact;
+mod remote_ollama;
 mod router;
 mod secrets;
 mod single_instance;

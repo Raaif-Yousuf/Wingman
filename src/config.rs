@@ -1229,11 +1229,30 @@ impl Config {
     ///
     /// `env_is_set` is injected (rather than calling `std::env::var`
     /// directly) so tests exercise this without touching real process env.
+    #[cfg(test)]
     fn push_secrets_to_store(
         &mut self,
         store: &dyn SecretStore,
         env_is_set: &dyn Fn(&str) -> bool,
     ) -> Result<()> {
+        self.push_secrets_logged(store, env_is_set, &mut Vec::new())
+    }
+
+    /// [`Config::push_secrets_to_store`] that also records each credential's
+    /// previous value before touching it (#890), so a failed save can put the
+    /// store back. A credential that cannot be read is not recorded: it is
+    /// overwritten as before rather than blocking a retyped key.
+    fn push_secrets_logged(
+        &mut self,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+        undo: &mut Vec<(String, Option<String>)>,
+    ) -> Result<()> {
+        let mut remember = |target: &str| {
+            if let Ok(previous) = store.get(target) {
+                undo.push((target.to_string(), previous));
+            }
+        };
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
@@ -1252,10 +1271,12 @@ impl Config {
                 continue;
             }
             if key.is_empty() {
+                remember(&target);
                 store
                     .delete(&target)
                     .with_context(|| format!("failed to delete {target} from the secret store"))?;
             } else {
+                remember(&target);
                 store
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
@@ -1273,10 +1294,12 @@ impl Config {
                 continue;
             }
             if entry.api_key.is_empty() {
+                remember(&target);
                 store
                     .delete(&target)
                     .with_context(|| format!("failed to delete {target} from the secret store"))?;
             } else {
+                remember(&target);
                 store
                     .set(&target, &entry.api_key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
@@ -1498,12 +1521,39 @@ impl Config {
     /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        self.save_with_store(&path, &CredManagerStore, &|name| {
+            std::env::var(name).is_ok()
+        })
+    }
+
+    /// [`Config::save`] with the path and secret store injected. The store is
+    /// written before the file (the file must not hold a key the store never
+    /// got), so when the file write fails the store is put back: a failed
+    /// save changes neither (#890).
+    fn save_with_store(
+        &self,
+        path: &Path,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
         // #711: checked before the secret store is touched, so a refused save
         // writes nothing anywhere.
-        self.check_save_allowed(&path)?;
+        self.check_save_allowed(path)?;
         let mut on_disk = self.clone();
-        on_disk.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())?;
-        on_disk.save_to(&path)
+        let mut undo = Vec::new();
+        let result = on_disk
+            .push_secrets_logged(store, env_is_set, &mut undo)
+            .and_then(|()| on_disk.save_to(path));
+        if result.is_err() {
+            for (target, previous) in undo.into_iter().rev() {
+                // Best effort: the save error is the one worth reporting.
+                let _ = match previous {
+                    Some(secret) => store.set(&target, &secret),
+                    None => store.delete(&target),
+                };
+            }
+        }
+        result
     }
 
     /// #711: refuses a save that would clobber the user's file.
@@ -3218,6 +3268,52 @@ structured = "prompt"
         assert!(config
             .unreadable_secrets
             .contains(&"compat:openrouter".to_string()));
+    }
+
+    /// #890: a save that fails after the secret store was written puts the
+    /// store back, so nothing is half-applied.
+    #[test]
+    fn a_save_that_fails_on_the_file_leaves_the_secret_store_as_it_was() {
+        let blocker = std::env::temp_dir().join(format!(
+            "wingman-test-890-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&blocker, "not a directory").unwrap();
+        // A parent that is a file: create_dir_all, so save_to, must fail.
+        let path = blocker.join("config.toml");
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-new".into();
+        config.providers.anthropic.api_key = String::new();
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-old").unwrap();
+        store.set("Wingman/anthropic", "sk-ant-old").unwrap();
+
+        let err = config.save_with_store(&path, &store, &|_| false);
+        let _ = std::fs::remove_file(&blocker);
+        assert!(err.is_err());
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-old")
+        );
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-ant-old"),
+            "a delete must be undone too"
+        );
+        // A key that was new is removed again.
+        let fresh = crate::secrets::InMemoryStore::default();
+        let blocker2 = std::env::temp_dir().join(format!(
+            "wingman-test-890b-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&blocker2, "x").unwrap();
+        let err = config.save_with_store(&blocker2.join("config.toml"), &fresh, &|_| false);
+        let _ = std::fs::remove_file(&blocker2);
+        assert!(err.is_err());
+        assert_eq!(fresh.get("Wingman/openai").unwrap(), None);
     }
 
     #[test]
