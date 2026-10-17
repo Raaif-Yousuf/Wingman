@@ -1305,11 +1305,14 @@ mod tests {
             return; // 8.3 names are switched off on this volume
         }
         let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
-        let short_rel = short
-            .strip_prefix(&root)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
+        // The short form shortens the whole path (the temp dir too), so take
+        // only the two components under the root.
+        let parts: Vec<_> = short.components().collect();
+        let short_rel = parts[parts.len() - 2..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         if short_rel == "a long folder/long notes file.md" {
             // THEORY (unverified): 8.3 name creation is off for this volume.
             let _ = fs::remove_dir_all(&dir);
