@@ -36,10 +36,11 @@ folder = 'C:\Notes'
   cells than the first line gets "column 3" style names. Only the first 256
   cells of a row are kept.
 - `.json` files: one line per value, as `address.city: Paris` or `skills[0]:
-  rust`. Empty values and `null` are left out. A file that is not valid JSON
-  is read as plain text instead.
-- A heading line is never made from a cell or a key: a line that would start
-  with `#` gets a backslash.
+  rust`. Empty values and `null` are left out. A file that is not valid JSON,
+  or is over 1 MB, is read as plain text instead.
+- A heading line is never made from a cell, a key or a web page line: a line
+  that would start with `#` gets a backslash. (A `.txt` file is kept as it is,
+  so a `#` line in one still reads as a heading.)
 - Other file types are ignored for now: PDF, Word, images and the rest are not
   read.
 - Left out on purpose: folders whose name starts with a dot (such as
@@ -125,6 +126,11 @@ Sensitive numbers are removed twice.
 
 A masked number cannot be found or quoted: ask for it and the answer says the
 documents have none.
+
+Not masked: a password or other secret written as ordinary words next to a label,
+such as `password: hunter2` or `"pin": "1234"` in a `.json` or `.csv` file. If an
+excerpt holding one is chosen for a question, it is sent. Keep files like that
+out of the documents folder (issue #1112).
 
 ## Limits worth knowing
 

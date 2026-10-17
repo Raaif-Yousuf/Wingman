@@ -16,6 +16,9 @@ use serde_json::Value;
 
 /// Longest column name or key kept, in characters.
 const MAX_NAME_CHARS: usize = 80;
+/// Largest JSON text that is parsed. Past it the file is read as plain text,
+/// which bounds the memory the parsed tree can take.
+const MAX_JSON_BYTES: usize = 1024 * 1024;
 /// Most cells kept per CSV row. The rest of a wider row is ignored.
 const MAX_CELLS: usize = 256;
 
@@ -71,6 +74,22 @@ fn tidy(s: &str) -> String {
 
 fn short(s: &str) -> String {
     tidy(s).chars().take(MAX_NAME_CHARS).collect()
+}
+
+/// The text with a backslash before every line that starts with `#`, so the
+/// chunker reads no line of it as a heading.
+pub fn escape_headings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.starts_with('#') {
+            out.push('\\');
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 // -- CSV --------------------------------------------------------------------
@@ -198,6 +217,11 @@ pub fn csv_to_text(text: &str, cap: usize) -> (String, bool) {
 /// caller then reads the file as plain text). Nesting past the parser's own
 /// depth limit is an error, not a stack overflow.
 pub fn json_to_text(text: &str, cap: usize) -> Option<(String, bool)> {
+    // The parsed tree is several times the size of the text, so a bigger file
+    // is read as plain text instead.
+    if text.len() > MAX_JSON_BYTES {
+        return None;
+    }
     let value: Value = serde_json::from_str(text).ok()?;
     let mut lines = Lines::new(cap);
     let mut path = String::new();

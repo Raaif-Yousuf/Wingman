@@ -93,7 +93,8 @@ pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
         Parser::Html => {
             // Only the first 2 MB of the file was decoded above, so the markup
             // is bounded before it is stripped.
-            let text = crate::inputs::html_text::html_to_text(&normalized);
+            let text =
+                flatten::escape_headings(&crate::inputs::html_text::html_to_text(&normalized));
             let (text, cut) = truncate(text, MAX_TEXT_BYTES);
             Ok(Parsed {
                 title: None,
@@ -914,6 +915,42 @@ mod tests {
     }
 
     #[test]
+    fn html_never_makes_a_heading_for_the_chunker() {
+        let p = read(Parser::Html, "<p># not a heading</p><p>ok</p><p>a # b</p>");
+        assert!(p.text.lines().all(|l| !l.starts_with('#')), "{}", p.text);
+        assert!(p.text.contains("# not a heading"), "{}", p.text);
+    }
+
+    #[test]
+    fn json_over_a_megabyte_or_cut_short_is_indexed_as_plain_text() {
+        // Valid, but past the 1 MB the JSON reader will parse.
+        let mut big = String::from("[");
+        while big.len() < 1_200_000 {
+            big.push_str("{\"k\":\"word\"},");
+        }
+        big.push_str("{\"k\":\"end\"}]");
+        let p = parse(Parser::Json, big.as_bytes()).unwrap();
+        assert!(
+            p.text.starts_with("[{\"k\":\"word\"}"),
+            "kept as the raw text"
+        );
+        assert!(!p.text.contains("[0].k:"), "not flattened");
+        // Over 2 MB the file is cut, which is no longer valid JSON: also text.
+        let mut huge = String::from("[");
+        while huge.len() < 2_300_000 {
+            huge.push_str("{\"k\":\"word\"},");
+        }
+        huge.push_str("{\"k\":\"end\"}]");
+        let p = parse(Parser::Json, huge.as_bytes()).unwrap();
+        assert!(p.truncated);
+        assert!(
+            p.text.starts_with("[{\"k\":\"word\"}"),
+            "kept as the raw text"
+        );
+        assert!(!p.text.contains("[0].k:"), "not flattened");
+    }
+
+    #[test]
     fn html_goes_through_the_same_byte_checks() {
         assert_eq!(
             parse(Parser::Html, b"<p>a\0b</p>"),
@@ -1045,7 +1082,7 @@ mod tests {
         big.push_str("{\"k\":1}]");
         let p = parse(Parser::Json, big.as_bytes()).unwrap();
         assert!(p.text.len() <= MAX_TEXT_BYTES);
-        let small = format!("[{}0]", "\"x\",".repeat(300_000));
+        let small = format!("[{}0]", "\"x\",".repeat(220_000));
         let p = parse(Parser::Json, small.as_bytes()).unwrap();
         assert!(p.text.len() <= MAX_TEXT_BYTES);
         assert!(p.truncated);
