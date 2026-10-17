@@ -13892,7 +13892,7 @@ mod tests {
     /// HighlightText on it, whatever the tokens say.
     #[test]
     fn high_contrast_list_rows_use_the_system_highlight() {
-        use crate::ui::theme::{HC_BLACK, HC_WHITE};
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
         for sys in [HC_BLACK, HC_WHITE] {
             let c = edit_colors(true, &sys, rgb(0, 103, 192), sys.window);
             assert_eq!(c.item_hover, sys.highlight);
