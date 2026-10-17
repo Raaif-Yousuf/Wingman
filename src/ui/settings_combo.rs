@@ -3,6 +3,9 @@
 //! only the field and the list rows, so the button is painted over after the
 //! system's paint. Only a window that paints its own face calls this; light and
 //! the system's high contrast keep the system's button.
+//!
+//! Every Settings combo is `CBS_DROPDOWNLIST`. An editable `CBS_DROPDOWN` would
+//! also have an edit child that needs its own background.
 
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -59,12 +62,10 @@ pub(crate) unsafe fn paint_arrow(
     let _ = DeleteObject(HGDIOBJ(brush.0));
     let pen = CreatePen(PS_SOLID, stroke_px(dpi), COLORREF(ink));
     let old = SelectObject(hdc, HGDIOBJ(pen.0));
-    let points: Vec<windows::Win32::Foundation::POINT> = chevron_points(button, dpi)
-        .iter()
-        .map(|&(x, y)| windows::Win32::Foundation::POINT { x, y })
-        .collect();
-    let _ = MoveToEx(hdc, points[0].x, points[0].y, None);
-    let _ = Polyline(hdc, &points);
+    let [a, b, c] =
+        chevron_points(button, dpi).map(|(x, y)| windows::Win32::Foundation::POINT { x, y });
+    let _ = MoveToEx(hdc, a.x, a.y, None);
+    let _ = Polyline(hdc, &[a, b, c]);
     SelectObject(hdc, old);
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }

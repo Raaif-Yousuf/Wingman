@@ -8950,11 +8950,16 @@ unsafe extern "system" fn combo_subclass(
         // A print of the client area (`PrintWindow`, the gallery) carries its
         // own DC; the arrow goes onto it the same way.
         windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT => {
+            use windows::Win32::Graphics::Gdi::{RestoreDC, SaveDC, HDC};
+            let dc = HDC(wparam.0 as *mut c_void);
+            // The system's own print leaves the clip cut to its field, so it is
+            // put back before the arrow goes on.
+            let saved = SaveDC(dc);
             let result = DefSubclassProc(hwnd, msg, wparam, lparam);
-            paint_combo_arrow(
-                hwnd,
-                Some(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void)),
-            );
+            if saved != 0 {
+                let _ = RestoreDC(dc, saved);
+            }
+            paint_combo_arrow(hwnd, Some(dc));
             result
         }
         // #1109: the mouse over the field hovers it; Windows says when it leaves.
@@ -13239,9 +13244,11 @@ mod tests {
         unsafe {
             let screen = GetDC(None);
             let dc = CreateCompatibleDC(Some(screen));
-            let bitmap = CreateCompatibleBitmap(screen, 1000, 700);
+            // The bitmap is the size of the window, so a print never clips.
+            let mut wr = windows::Win32::Foundation::RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let bitmap = CreateCompatibleBitmap(screen, wr.right - wr.left, wr.bottom - wr.top);
             let old = SelectObject(dc, bitmap.into());
-            // PW_RENDERFULLCONTENT
             assert!(PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(flags)).as_bool());
             let pixel = GetPixel(dc, x, y).0;
             SelectObject(dc, old);
@@ -13420,8 +13427,7 @@ mod tests {
                 let mid = (info.rcButton.top + info.rcButton.bottom) / 2;
                 let field = printed_pixel_with(hwnd, info.rcItem.right - 4 + dx, mid + dy, 1);
                 // The arrow is painted over the system's after its own paint, so
-                // it is drawn here onto a memory DC the size of the combo, which
-                // is how a print of the combo reaches the same code.
+                // it is read from a client print of the combo onto a memory DC.
                 let (button, chevron, gap) = unsafe {
                     use windows::Win32::Graphics::Gdi::{
                         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel,
@@ -13431,7 +13437,15 @@ mod tests {
                     let dc = CreateCompatibleDC(Some(screen));
                     let bmp = CreateCompatibleBitmap(screen, 400, 80);
                     let old = SelectObject(dc, HGDIOBJ(bmp.0));
-                    paint_combo_arrow(combo, Some(dc));
+                    // The real route: a client print of the combo goes through
+                    // `combo_subclass`, which paints the arrow after the system.
+                    const PRF_CLIENT: isize = 0x4;
+                    SendMessageW(
+                        combo,
+                        windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT,
+                        Some(WPARAM(dc.0 as usize)),
+                        Some(LPARAM(PRF_CLIENT)),
+                    );
                     let [_, vertex, _] =
                         crate::ui::settings_combo::chevron_points(&info.rcButton, dpi_for(combo));
                     let seen = (
