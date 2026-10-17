@@ -13,10 +13,11 @@ tagged release.
   what is on screen) instead of running Check my work. This costs one small
   model call for the card, then one more for the choice you pick. To keep the
   old one-press flow, set `primary_action = "check-my-work"` under `[hotkeys]`
-  in `config.toml`. Pressing the key again while the card is up runs the first
-  choice (never one that writes the clipboard) or closes the card. A press
-  while an answer or error card is showing starts a new options card (and so
-  makes a new model call).
+  in `config.toml`. Pressing the key once while the card is up runs the first
+  choice, and twice quickly runs the second (never one that writes the
+  clipboard: the key closes the card instead). A press while an answer or
+  error card is showing closes it. `key_mode` and `double_press_ms` under
+  `[hotkeys]` change this (#393).
 - Starting Wingman a second time (the Start menu, the Copilot-key picker) shows
   the same card with only the choices that need no model, and sends nothing.
 

@@ -2,6 +2,8 @@ mode = "auto"
 
 [hotkeys]
 primary_action = "options"
+key_mode = "dynamic"
+double_press_ms = 300
 
 [hotkeys.primary]
 vk = 134

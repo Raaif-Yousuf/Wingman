@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -311,6 +311,10 @@ const PAUSE_TIMER_ID: usize = 1;
 /// #723: one-shot, armed only while a run is in flight (rule 5), fires when
 /// the run has outlasted `provider::worst_case_run_secs` for its chain.
 const STUCK_TIMER_ID: usize = 4;
+/// #393: one-shot, armed only by a first press that has to wait to tell a
+/// single press from a double (rule 5: never while idle), killed when it
+/// fires or a second press arrives.
+const KEY_WINDOW_TIMER_ID: usize = 5;
 
 /// #307: the options card on screen, as the app side knows it. The card holds
 /// the buttons; this holds what each one runs. Its `generation` must equal the
@@ -335,14 +339,40 @@ fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) 
     match (session, card_generation) {
         (Some(s), Some(g)) if s.generation == g => {
             if s.ids.is_empty() {
-                keypress::Phase::Looking
+                keypress::Phase::Looking { early: false }
             } else {
+                let pick = |i: usize| i < s.ids.len() && s.key_pickable.get(i) == Some(&true);
                 keypress::Phase::Options {
-                    first_key_pickable: s.key_pickable.first().copied().unwrap_or(false),
+                    count: s.ids.len(),
+                    pickable: [pick(0), pick(1)],
                 }
             }
         }
         _ => keypress::Phase::Other,
+    }
+}
+
+/// #393: `phase` with what only the card and the clock know filled in. A
+/// press inside the window of the one that started a Look is the second tap
+/// of a double (`early`), and an answer, error or info card is `Answer`.
+/// Pure, so the table over every state is tested.
+fn refine_key_phase(
+    phase: keypress::Phase,
+    card_state: crate::ui::card::CardState,
+    since_look_press: Option<Duration>,
+    window: Option<Duration>,
+) -> keypress::Phase {
+    use crate::ui::card::CardState;
+    match phase {
+        keypress::Phase::Looking { .. } => keypress::Phase::Looking {
+            early: matches!((since_look_press, window), (Some(d), Some(w)) if d < w),
+        },
+        keypress::Phase::Other
+            if matches!(card_state, CardState::Collapsed | CardState::Expanded) =>
+        {
+            keypress::Phase::Answer
+        }
+        other => other,
     }
 }
 
@@ -552,6 +582,16 @@ struct App {
     /// #308: the bad `hotkeys.primary_action` id already shown on a card, so
     /// the mistake is shown once and later presses fall back to the options card.
     primary_action_reported: Option<String>,
+    /// #393: a first press waiting out the double-press window: the options
+    /// card it was made on and when. Only an options card with two buttons
+    /// the key may run ever waits (`keypress::needs_window`).
+    key_pending: Option<(u32, Instant)>,
+    /// #393: presses are ignored until then. Set when the key closes or
+    /// cancels something, so the second tap of a double does not start a new
+    /// Look on the card the first tap just closed.
+    key_quiet_until: Option<Instant>,
+    /// #393: when the press that started the current Look was made.
+    look_pressed_at: Option<Instant>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -833,6 +873,9 @@ pub fn run() -> Result<()> {
         options: None,
         options_generation: 0,
         primary_action_reported: None,
+        key_pending: None,
+        key_quiet_until: None,
+        look_pressed_at: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -2231,24 +2274,117 @@ impl App {
         self.dispatch_palette_action(id);
     }
 
-    /// #308: one press of the Wingman key. What it does follows the options
-    /// card ([`keypress::on_key`]): while the router works it cancels, on the
-    /// card it runs option 1 when the key may, otherwise it closes the card.
-    /// With no options card it does the primary action: show the options card
-    /// (the default), or run the action `hotkeys.primary_action` names, with
-    /// no router call (`"check-my-work"` is the old one-press flow).
+    /// #308, #393: one press of the Wingman key. What it does follows what is
+    /// on screen and `hotkeys.key_mode` ([`keypress::on_key`]): while the
+    /// router works it cancels, on the options card it runs option 1 (a
+    /// double press option 2) when the key may, otherwise it closes the card,
+    /// and an answer card is dismissed. With no card up it does the primary
+    /// action: show the options card (the default), or run the action
+    /// `hotkeys.primary_action` names, with no router call.
+    ///
+    /// The hook stays dumb; the timing lives here. Where a single and a
+    /// double would differ (an options card with two buttons) the first press
+    /// arms a one-shot timer ([`KEY_WINDOW_TIMER_ID`]) and waits: a second
+    /// press inside the window is a double, the timer firing is a single.
+    /// Everywhere else the press acts at once.
     fn on_primary_key(&mut self, trigger: Trigger) {
-        let phase = key_phase_of(self.options.as_ref(), self.card.options_generation());
-        match keypress::on_key(phase) {
-            keypress::KeyAction::Close => self.close_options_card(),
-            keypress::KeyAction::RunFirst => {
-                let first = self.options.as_ref().and_then(|s| s.ids.first().cloned());
-                match first {
+        let now = Instant::now();
+        if self.key_quiet_until.is_some_and(|t| now < t) {
+            return;
+        }
+        let window = self.key_window();
+        let mode = self.config.hotkeys.key_mode_value();
+        let phase = self.current_key_phase(now, window);
+        if let Some((generation, at)) = self.key_pending.take() {
+            self.kill_key_window();
+            let inside = window.is_some_and(|w| now.duration_since(at) < w);
+            if inside && self.card.options_generation() == Some(generation) {
+                let action = keypress::on_key(phase, mode, keypress::Press::Double);
+                self.apply_key_action(action, trigger, window, now);
+                return;
+            }
+            // A stale wait (its card is gone): this is a fresh press.
+        }
+        if let (Some(w), true) = (window, keypress::needs_window(phase, mode)) {
+            if let Some(generation) = self.card.options_generation() {
+                self.key_pending = Some((generation, now));
+                let hwnd = self.hwnd();
+                unsafe {
+                    let _ = SetTimer(Some(hwnd), KEY_WINDOW_TIMER_ID, w.as_millis() as u32, None);
+                }
+                return;
+            }
+        }
+        let action = keypress::on_key(phase, mode, keypress::Press::Single);
+        self.apply_key_action(action, trigger, window, now);
+    }
+
+    /// The double-press window from the config, or `None` when it is off.
+    fn key_window(&self) -> Option<Duration> {
+        self.config
+            .hotkeys
+            .double_press_window_ms()
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+    }
+
+    /// #393: the double-press window ran out with no second press: the first
+    /// press was a single. Dropped when its card is gone.
+    fn on_key_window_expired(&mut self) {
+        self.kill_key_window();
+        let Some((generation, _)) = self.key_pending.take() else {
+            return;
+        };
+        if self.card.options_generation() != Some(generation) {
+            return;
+        }
+        let now = Instant::now();
+        let window = self.key_window();
+        let phase = self.current_key_phase(now, window);
+        let mode = self.config.hotkeys.key_mode_value();
+        let action = keypress::on_key(phase, mode, keypress::Press::Single);
+        self.apply_key_action(action, Trigger::Hotkey, window, now);
+    }
+
+    fn kill_key_window(&mut self) {
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
+        }
+    }
+
+    fn current_key_phase(&self, now: Instant, window: Option<Duration>) -> keypress::Phase {
+        refine_key_phase(
+            key_phase_of(self.options.as_ref(), self.card.options_generation()),
+            self.card.state(),
+            self.look_pressed_at.map(|t| now.duration_since(t)),
+            window,
+        )
+    }
+
+    fn apply_key_action(
+        &mut self,
+        action: keypress::KeyAction,
+        trigger: Trigger,
+        window: Option<Duration>,
+        now: Instant,
+    ) {
+        match action {
+            keypress::KeyAction::Close => {
+                self.close_options_card();
+                self.key_quiet_until = window.map(|w| now + w);
+            }
+            keypress::KeyAction::RunOption(i) => {
+                let id = self.options.as_ref().and_then(|s| s.ids.get(i).cloned());
+                match id {
                     Some(id) => self.run_option(&id),
                     None => self.close_options_card(),
                 }
             }
-            keypress::KeyAction::Proceed => self.run_primary_action(trigger),
+            keypress::KeyAction::Absorb => {}
+            keypress::KeyAction::Proceed => {
+                self.look_pressed_at = Some(now);
+                self.run_primary_action(trigger);
+            }
         }
     }
 
@@ -2289,6 +2425,8 @@ impl App {
     /// Hides the options card and forgets it. The card's own `hide` stops the
     /// key claim and the auto-dismiss.
     fn close_options_card(&mut self) {
+        self.key_pending = None;
+        self.kill_key_window();
         self.options = None;
         self.card.hide();
         self.set_watch(false);
@@ -7716,6 +7854,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
             return LRESULT(0);
         }
+        if msg == WM_TIMER && wparam.0 == KEY_WINDOW_TIMER_ID {
+            // A one-shot: killed at once so it cannot repeat behind the modal.
+            // Its wait is stale by the time Settings closes; the next press
+            // checks the clock and starts fresh.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
+            }
+            return LRESULT(0);
+        }
         if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
             unsafe {
                 let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
@@ -8036,6 +8183,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 app.on_pause_timer(hwnd);
             } else if wparam.0 == STUCK_TIMER_ID {
                 app.on_busy_stuck();
+            } else if wparam.0 == KEY_WINDOW_TIMER_ID {
+                app.on_key_window_expired();
             }
             LRESULT(0)
         }
@@ -8752,26 +8901,114 @@ mod tests {
         use crate::keypress::Phase;
         let mut s = session(4, &[]);
         // Looking: a shell with no buttons.
-        assert_eq!(super::key_phase_of(Some(&s), Some(4)), Phase::Looking);
+        assert_eq!(
+            super::key_phase_of(Some(&s), Some(4)),
+            Phase::Looking { early: false }
+        );
         s = session(4, &["a", "b"]);
         s.key_pickable = vec![true, false];
         assert_eq!(
             super::key_phase_of(Some(&s), Some(4)),
             Phase::Options {
-                first_key_pickable: true
+                count: 2,
+                pickable: [true, false]
             }
         );
         s.key_pickable = vec![false, true];
         assert_eq!(
             super::key_phase_of(Some(&s), Some(4)),
             Phase::Options {
-                first_key_pickable: false
+                count: 2,
+                pickable: [false, true]
+            }
+        );
+        // A flag past the last button never counts.
+        s = session(4, &["a"]);
+        s.key_pickable = vec![true, true];
+        assert_eq!(
+            super::key_phase_of(Some(&s), Some(4)),
+            Phase::Options {
+                count: 1,
+                pickable: [true, false]
             }
         );
         // A card that is not this session's, or no card: not an options card.
         assert_eq!(super::key_phase_of(Some(&s), Some(5)), Phase::Other);
         assert_eq!(super::key_phase_of(Some(&s), None), Phase::Other);
         assert_eq!(super::key_phase_of(None, Some(4)), Phase::Other);
+    }
+
+    /// #393: what only the card and the clock know.
+    #[test]
+    fn the_key_phase_is_refined_by_the_card_state_and_the_clock() {
+        use crate::keypress::Phase;
+        use crate::ui::card::CardState;
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        let looking = Phase::Looking { early: false };
+        // Inside the window of the press that started the Look: a second tap.
+        assert_eq!(
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300)),
+            Phase::Looking { early: true }
+        );
+        // Outside it, or with double press off, or no press recorded: a cancel.
+        for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
+            assert_eq!(
+                super::refine_key_phase(looking, CardState::Options, since, win),
+                Phase::Looking { early: false }
+            );
+        }
+        // An answer, error or info card is an Answer; nothing else is.
+        for st in [CardState::Collapsed, CardState::Expanded] {
+            assert_eq!(
+                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                Phase::Answer
+            );
+        }
+        for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
+            assert_eq!(
+                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                Phase::Other
+            );
+        }
+        let opts = Phase::Options {
+            count: 2,
+            pickable: [true, true],
+        };
+        assert_eq!(
+            super::refine_key_phase(opts, CardState::Options, None, ms(300)),
+            opts
+        );
+    }
+
+    /// Wired-to-nothing guard (#393): the window timer is armed by the press
+    /// and its `WM_TIMER` reaches the handler, both in the live window
+    /// procedure and in the Settings-open branch that must kill it.
+    #[test]
+    fn the_double_press_window_is_a_one_shot_that_is_armed_and_handled() {
+        let src = lf(include_str!("app.rs"));
+        let key = src
+            .split("fn on_primary_key(")
+            .nth(1)
+            .expect("no on_primary_key");
+        let key = &key[..key.find("\n    }\n").unwrap()];
+        assert!(key.contains("SetTimer("), "{key}");
+        assert!(key.contains("KEY_WINDOW_TIMER_ID"), "{key}");
+        assert!(key.contains("needs_window("), "{key}");
+        let proc_src = wnd_proc_body(&src);
+        assert!(
+            proc_src.contains("app.on_key_window_expired()"),
+            "WM_TIMER must reach the window-expiry handler"
+        );
+        let kills = proc_src
+            .matches("KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID)")
+            .count();
+        assert!(kills >= 1, "the Settings branch must kill the one-shot");
+        // Armed in exactly one place, after a press, never at startup.
+        let live = src.split("\n#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            live.matches("KEY_WINDOW_TIMER_ID, w.as_millis()").count(),
+            1
+        );
     }
 
     /// Wired-to-nothing guard: the hook's message reaches the key table, and a
@@ -8806,7 +9043,12 @@ mod tests {
             .expect("no on_primary_key");
         let key = &key[..key.find("\n    }\n").unwrap()];
         assert!(key.contains("keypress::on_key("), "{key}");
-        assert!(key.contains("self.run_primary_action("), "{key}");
+        let apply = src
+            .split("fn apply_key_action(")
+            .nth(1)
+            .expect("no apply_key_action");
+        let apply = &apply[..apply.find("\n    }\n").unwrap()];
+        assert!(apply.contains("self.run_primary_action("), "{apply}");
         // The decision itself is unit tested (`primary_dispatch`); this only
         // checks the method acts on it.
         let run = src
