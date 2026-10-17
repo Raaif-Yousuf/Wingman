@@ -142,13 +142,21 @@ struct HealState {
     /// Set once the damaged file was moved here but no fresh database is open
     /// yet: the next try only has to open one.
     kept: Option<PathBuf>,
+    /// Set once the connection was swapped for the empty in-memory stand-in
+    /// and no file connection has been installed since (#1165). A check on
+    /// that stand-in always passes, so while this is set the next try goes
+    /// straight to opening the file instead of checking.
+    detached: bool,
 }
 
 /// How a heal ended.
 enum Heal {
     /// Nothing to do: not this store's file, or a check that could not run.
     Fine,
-    /// A fresh database replaced the damaged one; the notice for the user.
+    /// The file was never moved and is open again as it was.
+    Reopened,
+    /// A fresh database replaced the damaged (or missing) one; the notice for
+    /// the user.
     Replaced(String),
     /// Could not finish. The text says why. Tried again after [`RETRY_GAP`].
     Stuck(String),
@@ -223,6 +231,12 @@ impl Store {
                 self.seen
                     .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
             }
+            Heal::Reopened => {
+                *state = HealState::default();
+                self.seen
+                    .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
+                note_recovery(reopened_notice());
+            }
             Heal::Replaced(notice) => {
                 *state = HealState::default();
                 self.seen
@@ -249,18 +263,38 @@ impl Store {
             return Heal::Fine;
         };
         if state.kept.is_none() {
-            if !file_is_damaged(conn) {
-                return Heal::Fine;
+            if state.detached {
+                // `conn` is the empty stand-in, so a check would pass. Open
+                // the file as it is; only a damaged one is moved aside.
+                let existed = path.exists();
+                match Store::open_at(path) {
+                    Ok(fresh) => {
+                        *conn = fresh.conn.into_inner().unwrap_or_else(|e| e.into_inner());
+                        // A missing file was created empty: not the old data.
+                        return if existed {
+                            Heal::Reopened
+                        } else {
+                            Heal::Replaced(missing_file_notice())
+                        };
+                    }
+                    Err(StoreError::Corrupt(_)) => {}
+                    Err(e) => return Heal::Stuck(e.to_string()),
+                }
+            } else {
+                if !file_is_damaged(conn) {
+                    return Heal::Fine;
+                }
+                // Closing the old connection first: Windows will not rename an open file.
+                let Ok(empty) = Connection::open_in_memory() else {
+                    return Heal::Fine;
+                };
+                drop(std::mem::replace(conn, empty));
+                state.detached = true;
             }
-            // Closing the old connection first: Windows will not rename an open file.
-            let Ok(empty) = Connection::open_in_memory() else {
-                return Heal::Fine;
-            };
-            drop(std::mem::replace(conn, empty));
             match quarantine(path) {
                 Ok(kept) => state.kept = Some(kept),
                 Err(e) => {
-                    reopen_original(conn, path);
+                    state.detached = !reopen_original(conn, path);
                     return Heal::Stuck(e.to_string());
                 }
             }
@@ -298,15 +332,32 @@ fn file_is_damaged(conn: &Connection) -> bool {
 }
 
 /// Puts the original file back under `conn` after it could not be moved. Its
-/// errors keep surfacing; nothing is created if the file is gone.
-fn reopen_original(conn: &mut Connection, path: &Path) {
+/// errors keep surfacing; nothing is created if the file is gone. `true` when
+/// a connection to the file is installed.
+fn reopen_original(conn: &mut Connection, path: &Path) -> bool {
     if !path.exists() {
-        return;
+        return false;
     }
-    if let Ok(c) = Connection::open(path) {
-        let _ = configure(&c);
-        *conn = c;
+    match Connection::open(path) {
+        Ok(c) => {
+            let _ = configure(&c);
+            *conn = c;
+            true
+        }
+        Err(_) => false,
     }
+}
+
+/// The card text after a store lost its file connection for a while and got it
+/// back without moving anything.
+fn reopened_notice() -> String {
+    "Wingman's saved data could not be opened for a while and is open again. Usage and request history from that time may be missing.".into()
+}
+
+/// The card text after a store lost its file connection and the file was gone
+/// when it came back, so a new one was started.
+fn missing_file_notice() -> String {
+    "Wingman's saved data file was missing, so a new one was started. Usage and request history are lost, and your saved profile and indexed documents start empty.".into()
 }
 
 /// True if a `-wal` or `-shm` sits next to `path`.
@@ -1122,6 +1173,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store whose connection was swapped for the empty in-memory stand-in
+    /// and never got a file connection back (#1165): what a failed undo leaves.
+    fn detached_store(s: &Store) {
+        let empty = Connection::open_in_memory().unwrap();
+        drop(std::mem::replace(
+            &mut *s.conn.lock().unwrap_or_else(|e| e.into_inner()),
+            empty,
+        ));
+        s.heal_state.lock().unwrap().detached = true;
+        // Any corrupt-class error in the process makes every store check itself.
+        let _ = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+    }
+
+    /// The undo worked but reopening failed once: the next lock must reopen
+    /// the file, not pass a check on the empty in-memory database.
+    #[test]
+    fn a_detached_store_reopens_its_untouched_file_on_the_next_lock() {
+        let dir = scratch("detached-healthy");
+        let s = Store::open_at(&dir.join("wingman.db")).unwrap();
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        detached_store(&s);
+
+        assert!(s.day_total("2026-10-15").unwrap().is_some());
+        assert_eq!(damaged_copies(&dir), 0, "a healthy file is not moved");
+        assert!(!s.heal_state.lock().unwrap().detached);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Detached and the file really is damaged: it goes aside and a fresh one
+    /// opens, so the store is not left empty until restart.
+    #[test]
+    fn a_detached_store_over_a_damaged_file_gets_a_fresh_one() {
+        let dir = scratch("detached-damaged");
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        s.lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .unwrap();
+        std::fs::write(&path, vec![b'x'; 8192]).unwrap();
+        detached_store(&s);
+
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None);
+        s.record_usage("2026-10-16", "a", "m", Some(0.2), None)
+            .unwrap();
+        assert_eq!(damaged_copies(&dir), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file is gone: opening it creates a new one, and the notice must say
+    /// so rather than claim the old data is back.
+    #[test]
+    fn a_detached_store_whose_file_is_gone_says_it_started_a_new_one() {
+        let dir = scratch("detached-gone");
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        detached_store(&s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("wingman.db{suffix}")));
+        }
+
+        let mut conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = s.heal_state.lock().unwrap_or_else(|e| e.into_inner());
+        match s.heal(&mut conn, &mut state) {
+            Heal::Replaced(text) => {
+                assert!(text.contains("missing"), "{text}");
+                assert!(!text.contains("open again"), "{text}");
+                assert!(!text.contains('\u{2014}'), "{text}");
+            }
+            Heal::Reopened => panic!("a new file is not a reopen"),
+            _ => panic!("expected a replaced store"),
+        }
+        assert!(path.exists());
+        drop(state);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the file cannot be opened, a detached store tries once per gap,
+    /// not on every lock.
+    #[test]
+    fn a_detached_store_opens_the_file_once_per_retry_gap() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = scratch("detached-gap");
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        s.lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .unwrap();
+        detached_store(&s);
+        // No sharing at all: opening the file fails until the hold is dropped.
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        drop(s.lock());
+        assert!(s.heal_state.lock().unwrap().detached);
+        assert!(s.heal_state.lock().unwrap().not_before.is_some());
+        drop(hold);
+        // The file is free now, but the gap has not passed: no attempt.
+        drop(s.lock());
+        drop(s.lock());
+        assert!(s.heal_state.lock().unwrap().detached, "the gap was ignored");
+        expire_retry_wait(&s);
+        drop(s.lock());
+        assert!(!s.heal_state.lock().unwrap().detached);
+        assert!(s.day_total("2026-10-15").unwrap().is_some());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo after a failed move reports whether a file connection is back.
+    #[test]
+    fn reopen_original_reports_whether_it_got_the_file_back() {
+        let dir = scratch("reopen-original");
+        let path = dir.join("wingman.db");
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(
+            !reopen_original(&mut conn, &path),
+            "no file, nothing created"
+        );
+        assert!(!path.exists());
+        // A directory where the file should be cannot be opened as a database.
+        std::fs::create_dir(&path).unwrap();
+        assert!(!reopen_original(&mut conn, &path));
+        std::fs::remove_dir(&path).unwrap();
+        drop(Store::open_at(&path).unwrap());
+        assert!(reopen_original(&mut conn, &path));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_reopened_notice_is_plain() {
+        let text = reopened_notice();
+        assert!(!text.contains('\u{2014}'), "{text}");
+        assert!(!text.contains("copy was kept"), "no file was moved: {text}");
+    }
+
     #[test]
     fn a_healthy_store_is_never_moved_aside_after_a_corrupt_error_elsewhere() {
         let dir = scratch("runtime-healthy");
@@ -1155,6 +1357,8 @@ mod tests {
         assert!(s.day_total("2026-10-15").is_err());
         assert!(s.record_usage("2026-10-16", "a", "m", None, None).is_err());
         assert_eq!(damaged_copies(&dir), 0);
+        // The failed move was undone: the file is open again, not detached.
+        assert!(!s.heal_state.lock().unwrap().detached);
         drop(_hold);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
