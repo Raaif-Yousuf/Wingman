@@ -24,7 +24,7 @@ pub use ics::{parse_event_time, IcsConnector, Opener};
 // same shell open, same text escaping and line folding.
 pub(crate) use ics::{
     cleanup_stale_ics_files, escape_text, fold_line, generate_uid, is_hidden_format,
-    sanitize_filename, temp_dir_for, ShellOpener,
+    sanitize_filename, strip_unsafe_text, temp_dir_for, ShellOpener,
 };
 
 use civil_time::{CivilDate, CivilDateTime};

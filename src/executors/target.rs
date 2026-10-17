@@ -316,10 +316,11 @@ pub fn plan_typed_fallback(control_type: &str, new_text: &str) -> Result<TypedRe
     // #1214: any other control character (Backspace, Escape, DEL, C1) or
     // Unicode line separator would reach the control as a key event or a
     // line break, so the field would not hold what the preview showed.
-    if new_text
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
-    {
+    if new_text.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}')
+            || crate::connectors::is_hidden_format(c)
+    }) {
         return Err(anyhow!(
             "the value has a control character, which Wingman cannot type into this field without changing it. Nothing was written. Click the field and type the value yourself."
         ));
@@ -1256,7 +1257,19 @@ mod tests {
     #[test]
     fn plan_typed_fallback_refuses_other_control_characters() {
         for c in [
-            '\u{8}', '\u{1b}', '\u{7f}', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
+            '\u{8}',
+            '\u{1b}',
+            '\u{7f}',
+            '\u{b}',
+            '\u{c}',
+            '\u{85}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202e}',
+            '\u{200b}',
+            '\u{2066}',
+            '\u{e0041}',
+            '\u{ad}',
         ] {
             let v = format!("a{c}b");
             let msg = plan_typed_fallback("Edit", &v).unwrap_err().to_string();
