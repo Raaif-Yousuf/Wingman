@@ -325,12 +325,18 @@ pub(crate) unsafe fn draw(
             ring_rect,
             corner.max(2) / 2,
             None,
-            Some((look.focus, ring.max(1))),
+            Some((look.focus, focus_ring_thickness(ring))),
             look.smooth,
         );
     }
 
     SelectObject(hdc, old_font);
+}
+
+/// The focus ring is 2 px at 100% like Windows 11's, twice the border width at
+/// any scale (#817). Never thinner than the border, so a zero never vanishes.
+fn focus_ring_thickness(ring: i32) -> i32 {
+    (ring * 2).max(2)
 }
 
 /// Maps a `DRAWITEMSTRUCT` to the state to draw, given the hover flag.
@@ -346,6 +352,13 @@ pub(crate) fn state_of(dis: &DRAWITEMSTRUCT, hovered: bool) -> State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_focus_ring_is_twice_the_border_width() {
+        assert_eq!(super::focus_ring_thickness(1), 2);
+        assert_eq!(super::focus_ring_thickness(2), 4);
+        assert_eq!(super::focus_ring_thickness(0), 2);
+    }
+
     use super::*;
 
     #[test]
