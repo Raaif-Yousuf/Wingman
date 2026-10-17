@@ -443,9 +443,12 @@ unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
     // anywhere in the window; F6 swaps focus between the rail and the page;
     // Enter on the rail goes into the page instead of saving.
     {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_F6};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyState, VK_CONTROL, VK_F6, VK_MENU,
+        };
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-        let request = match page_key(vk, ctrl) {
+        let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+        let request = match page_key(vk, ctrl, alt) {
             Some(PageKey::Pick(page)) => Some((PAGE_PICK, page.index() as isize)),
             Some(PageKey::Step(by)) => Some((PAGE_STEP, by)),
             None if vk == VK_F6.0 as u32 => Some((PAGE_SWAP_FOCUS, 0)),
@@ -976,7 +979,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
                     set_text(msg, invalid.message());
                 }
-                focus_and_select_field(inner.hwnd, invalid.control_id());
+                focus_and_select_field(inner, invalid.control_id());
                 return;
             }
             if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
@@ -1095,11 +1098,20 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
 /// from a direct unit-test call) -- `EM_SETSEL` on a `CBS_DROPDOWNLIST`
 /// combo with no editable text portion is simply a no-op, so no special case
 /// is needed here any more.
-fn focus_and_select_field(hwnd: HWND, id: i32) {
-    let Some(ctrl) = get_dlg_item(hwnd, id) else {
+fn focus_and_select_field(inner: &mut SettingsInner, id: i32) {
+    let Some(ctrl) = get_dlg_item(inner.hwnd, id) else {
         return;
     };
     unsafe {
+        // A control on a hidden page cannot take focus: show its page first.
+        if let Some(page) = inner
+            .children
+            .iter()
+            .find(|c| c.hwnd == ctrl)
+            .and_then(|c| c.page)
+        {
+            show_page(inner, page);
+        }
         let _ = SetFocus(Some(ctrl));
         SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
     }
@@ -5348,7 +5360,7 @@ fn build_ui_recorded(
     let actions_bottom = y + 4;
     ctx.create(
         WC_BUTTON,
-        "Actions",
+        "Your actions",
         BS_GROUPBOX as u32,
         0,
         content_x,
@@ -5611,10 +5623,11 @@ enum PageKey {
 
 /// The page command for a key press: Ctrl+1 to Ctrl+5 pick a page, Ctrl+PageDown
 /// and Ctrl+PageUp move to the next and the previous. Nothing without Ctrl, so
-/// typing in a box is never taken.
-fn page_key(vk: u32, ctrl: bool) -> Option<PageKey> {
+/// typing in a box is never taken. AltGr reads as Ctrl+Alt, so with Alt down
+/// the key is left alone: AltGr+2 and AltGr+3 type @ and # on some layouts.
+fn page_key(vk: u32, ctrl: bool, alt: bool) -> Option<PageKey> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NEXT, VK_PRIOR};
-    if !ctrl {
+    if !ctrl || alt {
         return None;
     }
     if vk == VK_NEXT.0 as u32 {
@@ -7388,27 +7401,71 @@ mod tests {
     #[test]
     fn page_keys_are_ctrl_only() {
         assert_eq!(
-            page_key('1' as u32, true),
+            page_key('1' as u32, true, false),
             Some(PageKey::Pick(Page::General))
         );
         assert_eq!(
-            page_key('3' as u32, true),
+            page_key('3' as u32, true, false),
             Some(PageKey::Pick(Page::Privacy))
         );
         assert_eq!(
-            page_key('5' as u32, true),
+            page_key('5' as u32, true, false),
             Some(PageKey::Pick(Page::Advanced))
         );
-        assert_eq!(page_key('6' as u32, true), None);
-        assert_eq!(page_key('0' as u32, true), None);
+        assert_eq!(page_key('6' as u32, true, false), None);
+        assert_eq!(page_key('0' as u32, true, false), None);
         assert_eq!(
-            page_key('3' as u32, false),
+            page_key('3' as u32, false, false),
             None,
             "typing a 3 is not a command"
         );
-        assert_eq!(page_key(0x22, true), Some(PageKey::Step(1)), "PageDown");
-        assert_eq!(page_key(0x21, true), Some(PageKey::Step(-1)), "PageUp");
-        assert_eq!(page_key(0x22, false), None);
+        assert_eq!(
+            page_key(0x22, true, false),
+            Some(PageKey::Step(1)),
+            "PageDown"
+        );
+        assert_eq!(
+            page_key(0x21, true, false),
+            Some(PageKey::Step(-1)),
+            "PageUp"
+        );
+        assert_eq!(page_key(0x22, false, false), None);
+        // AltGr is Ctrl+Alt: AltGr+3 and AltGr+PageDown are not commands.
+        assert_eq!(page_key('3' as u32, true, true), None);
+        assert_eq!(page_key(0x22, true, true), None);
+        assert_eq!(page_key(0x21, true, true), None);
+    }
+
+    /// Save on a bad field shows the page the field is on, then focuses it:
+    /// SetFocus on a hidden page's control does nothing.
+    #[test]
+    fn save_rejecting_a_field_shows_its_page_and_focuses_it() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "abc");
+            unsafe { show_page(inner, Page::Privacy) };
+            assert!(!is_shown(hwnd, ID_CARD_SECONDS));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_eq!(inner.page, Page::General);
+            assert!(is_shown(hwnd, ID_CARD_SECONDS));
+            assert!(
+                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "Save was rejected"
+            );
+            assert_eq!(
+                unsafe { GetFocus() },
+                get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()
+            );
+        });
     }
 
     #[test]
@@ -7559,7 +7616,7 @@ mod tests {
         let body = &src[start..end];
         assert!(!body.is_empty());
         for needle in [
-            "page_key(vk, ctrl)",
+            "page_key(vk, ctrl, alt)",
             "VK_F6",
             "PAGE_ENTER",
             "WM_SETTINGS_PAGE",
