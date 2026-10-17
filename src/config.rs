@@ -1739,6 +1739,75 @@ impl Config {
         result
     }
 
+    /// Stores the keys the user changed between `original` (what the Settings
+    /// window opened with) and `edited` (what it saved) in Credential Manager,
+    /// and removes the credential of a key that was cleared. A key that is the
+    /// same in both is left alone, so a stale copy held by an open window can
+    /// never overwrite a key changed elsewhere meanwhile. It never writes a file:
+    /// the field-level writer (`config_writer`, #870) keeps keys out of
+    /// `config.toml`, and runs this only after the file write has succeeded.
+    pub(crate) fn push_changed_secrets(original: &Config, edited: &Config) -> Result<()> {
+        Self::push_changed_secrets_with(original, edited, &CredManagerStore, &|name| {
+            std::env::var(name).is_ok()
+        })
+    }
+
+    fn push_changed_secrets_with(
+        original: &Config,
+        edited: &Config,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        let mut changed = Self::only_changed_secrets(original, edited);
+        let mut undo = Vec::new();
+        let result = changed.push_secrets_logged(store, env_is_set, &mut undo);
+        if result.is_err() {
+            // Best effort: the store error is the one worth reporting.
+            for (target, previous) in undo.into_iter().rev() {
+                let _ = match previous {
+                    Some(secret) => store.set(&target, &secret),
+                    None => store.delete(&target),
+                };
+            }
+        }
+        result
+    }
+
+    /// `edited` with every key that did not change marked as "leave the store
+    /// alone" (the same marker an unreadable credential carries, which
+    /// `push_secrets_logged` skips).
+    fn only_changed_secrets(original: &Config, edited: &Config) -> Config {
+        let mut out = edited.clone();
+        let keep = |was: &str, now: &mut String| {
+            if was == now.as_str() {
+                *now = UNREADABLE_KEY_MARKER.to_string();
+            }
+        };
+        keep(
+            &original.providers.openai.api_key,
+            &mut out.providers.openai.api_key,
+        );
+        keep(
+            &original.providers.anthropic.api_key,
+            &mut out.providers.anthropic.api_key,
+        );
+        keep(
+            &original.providers.gemini.api_key,
+            &mut out.providers.gemini.api_key,
+        );
+        for entry in &mut out.providers.compat {
+            if let Some(was) = original
+                .providers
+                .compat
+                .iter()
+                .find(|o| o.name == entry.name)
+            {
+                keep(&was.api_key, &mut entry.api_key);
+            }
+        }
+        out
+    }
+
     /// #711: refuses a save that would clobber the user's file.
     fn check_save_allowed(&self, path: &Path) -> Result<()> {
         // Defaults standing in for an unreadable file must never replace it.
@@ -3699,6 +3768,98 @@ structured = "prompt"
 
         config.push_secrets_to_store(&store, &|_| false).unwrap();
         assert_eq!(store.get("Wingman/compat:openrouter").unwrap(), None);
+    }
+
+    // -- the keys a Settings save changed (#871) ------------------------------
+
+    fn with_keys(openai: &str, anthropic: &str) -> Config {
+        let mut c = Config::default();
+        c.providers.openai.api_key = openai.into();
+        c.providers.anthropic.api_key = anthropic.into();
+        c
+    }
+
+    #[test]
+    fn a_changed_key_is_stored_and_an_unchanged_one_is_left_alone() {
+        // The window opened with both keys. Meanwhile the Anthropic key was
+        // changed elsewhere (the store holds a newer one). Saving the window must
+        // store the OpenAI key it changed and must not put the stale Anthropic
+        // key back.
+        let store = crate::secrets::InMemoryStore::default();
+        store
+            .set("Wingman/anthropic", "sk-newer-elsewhere")
+            .unwrap();
+        let original = with_keys("sk-old-openai", "sk-old-anthropic");
+        let edited = with_keys("sk-typed", "sk-old-anthropic");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-typed")
+        );
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-newer-elsewhere"),
+            "an unchanged key must not be written back"
+        );
+    }
+
+    #[test]
+    fn a_cleared_key_is_removed_and_one_never_set_stays_absent() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-old-openai").unwrap();
+        let original = with_keys("sk-old-openai", "");
+        let edited = with_keys("", "");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(store.get("Wingman/openai").unwrap(), None);
+        assert_eq!(store.get("Wingman/anthropic").unwrap(), None);
+    }
+
+    #[test]
+    fn an_untouched_save_changes_nothing_in_the_store() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-newer").unwrap();
+        let same = with_keys("sk-old", "");
+        Config::push_changed_secrets_with(&same, &same, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-newer")
+        );
+    }
+
+    #[test]
+    fn a_compat_key_is_matched_by_name_and_only_a_changed_one_is_stored() {
+        let store = crate::secrets::InMemoryStore::default();
+        let mut original = Config::default();
+        original.providers.compat = vec![
+            compat_entry("kept", "https://a.example/v1"),
+            compat_entry("changed", "https://b.example/v1"),
+        ];
+        let mut edited = original.clone();
+        edited.providers.compat[1].api_key = "sk-new-compat".into();
+        store
+            .set("Wingman/compat:kept", "sk-newer-elsewhere")
+            .unwrap();
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/compat:changed").unwrap().as_deref(),
+            Some("sk-new-compat")
+        );
+        assert_eq!(
+            store.get("Wingman/compat:kept").unwrap().as_deref(),
+            Some("sk-newer-elsewhere")
+        );
+    }
+
+    #[test]
+    fn a_key_set_by_an_env_var_is_not_stored_from_a_save() {
+        let store = crate::secrets::InMemoryStore::default();
+        let original = with_keys("", "");
+        let edited = with_keys("sk-from-env", "");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|name| {
+            name == "OPENAI_API_KEY"
+        })
+        .unwrap();
+        assert_eq!(store.get("Wingman/openai").unwrap(), None);
     }
 
     #[test]

@@ -32,7 +32,7 @@ touches a `HWND` beyond posting to it.
 | `src/provider/anthropic.rs` | Anthropic Messages API impl | — |
 | `src/hotkey.rs` | `WH_KEYBOARD_LL` hook, chord matching, learn mode | know about providers |
 | `src/ui/tray.rs` | `Shell_NotifyIconW` icon + context menu | know about providers |
-| `src/ui/settings.rs` | the GUI settings window (modal) | persist anything itself |
+| `src/ui/settings.rs` | the GUI settings window (modeless since #871) | persist anything itself |
 | `src/dismiss.rs` | `WH_MOUSE_LL` click-anywhere-to-close watcher | know about the card |
 | `src/single_instance.rs` | named-mutex guard; a duplicate exits | own any UI |
 | `src/autostart.rs` | the `Run` key entry behind "Start with Windows" | mirror state into `Config` |
@@ -118,6 +118,15 @@ pub const WM_APP_LEARNED: u32 = WM_APP + 4; // lparam = *mut Chord (learn mode c
 ```
 
 ### Settings modal re-entrancy (issue #152)
+
+> **Changed by #871:** Settings is no longer modal. `settings::open` creates the
+> window and returns; the app's own pump hands every message to
+> `settings::pre_dispatch`, and nothing holds `&mut App` while it is open. The
+> policy described here still governs the other nested loops, the tray menu and
+> the file dialogs (`SETTINGS_OPEN` now means "a nested loop is running"). With
+> Settings open, Quit, the tray and config changes are handled on arrival; a card
+> that would land on the window waits until Settings loses the foreground
+> (`WM_APP_SETTINGS_LEFT`). The text below describes the original modal design.
 
 `ui::settings::show_modal` runs its own `GetMessageW` loop so its child
 controls receive input; that loop pumps *every* thread message, not just the
