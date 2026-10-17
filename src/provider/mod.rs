@@ -306,6 +306,15 @@ pub(crate) fn declined_error(tag: &str, reason: &str) -> anyhow::Error {
     )))
 }
 
+/// The error for a prompt the vendor blocked before generating anything
+/// (#767): a decline too, so it stops the chain.
+pub(crate) fn blocked_error(tag: &str, reason: &str) -> anyhow::Error {
+    anyhow::Error::new(Declined(format!(
+        "{tag}: the prompt was blocked ({})",
+        safe_reason(reason)
+    )))
+}
+
 /// The error for a model that refused to answer (#767), with the same
 /// stop-the-chain meaning as [`declined_error`].
 pub(crate) fn refused_error(tag: &str) -> anyhow::Error {
