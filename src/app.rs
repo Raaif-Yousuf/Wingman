@@ -1550,11 +1550,20 @@ fn plaintext_keys_card(providers: &[String]) -> Option<(String, String)> {
     if providers.is_empty() {
         return None;
     }
+    // #1225: for a name that is empty or shared, retyping in Settings would
+    // hit the same shared slot, so the advice is to fix the name first.
+    let advice = if providers
+        .iter()
+        .any(|p| crate::config::is_shared_name_label(p))
+    {
+        "Give each endpoint its own name in config.toml, then choose Reload settings (tray menu, Help and diagnostics)."
+    } else {
+        "Choose Reload settings (tray menu, Help and diagnostics) to try again, or retype it in Settings."
+    };
     Some((
         "API key still in config.toml".to_string(),
         format!(
-            "Wingman could not move the key for {} out of config.toml, so it is still there as plain text. \
-             Choose Reload settings (tray menu, Help and diagnostics) to try again, or retype it in Settings.",
+            "Wingman could not move the key for {} out of config.toml, so it is still there as plain text. {advice}",
             providers.join(", ")
         ),
     ))
@@ -11340,6 +11349,17 @@ mod tests {
             plaintext_keys_card(&["openai".to_string(), "lab".to_string()]).unwrap();
         assert!(detail.contains("openai, lab"), "{detail}");
         assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn plaintext_keys_card_says_to_rename_for_a_shared_compat_name() {
+        use super::plaintext_keys_card;
+        let (_, detail) =
+            plaintext_keys_card(&["lab (name used more than once, rename one)".to_string()])
+                .unwrap();
+        assert!(detail.contains("its own name"), "{detail}");
+        assert!(!detail.contains("retype"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
     }
 
     #[test]
