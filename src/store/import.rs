@@ -551,9 +551,7 @@ mod tests {
 
     /// The store the connection belongs to, for reading the profile back.
     fn store_over(conn: Connection) -> crate::store::Store {
-        crate::store::Store {
-            conn: std::sync::Mutex::new(conn),
-        }
+        crate::store::Store::over(conn, None)
     }
 
     #[test]
