@@ -37,6 +37,7 @@ mod profile;
 mod provider;
 mod redact;
 mod remote_ollama;
+mod report_problem;
 mod router;
 mod secrets;
 mod single_instance;

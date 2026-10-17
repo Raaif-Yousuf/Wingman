@@ -20,6 +20,10 @@ tagged release.
 - Starting Wingman a second time (the Start menu, the Copilot-key picker) shows
   the same card with only the choices that need no model, and sends nothing.
 
+### Added
+
+- An error card has a "Report a problem" link. It opens a new GitHub issue in your browser with the version, mode, provider kinds and error class filled in. Nothing is sent by Wingman, and no error text, screen text, keys or paths are in the link (#373).
+
 ## [0.2.0] - 2026-10-16
 
 Changes since 0.1.0, grouped by what you notice. The release page has the download and its checksums.
