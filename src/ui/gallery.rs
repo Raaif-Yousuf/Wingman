@@ -231,6 +231,12 @@ pub enum GalleryState {
     /// Issue #354.
     CardPendingStillWorking,
     CardPreviewCalendar,
+    /// #818: the preview's "Do it" button as with the pointer over it, held
+    /// down, and with keyboard focus; and the Edit outline button hovered.
+    CardPreviewDoItHover,
+    CardPreviewDoItPressed,
+    CardPreviewDoItFocused,
+    CardPreviewEditHover,
     CardPreviewFormLongLabels,
     /// The preview's title line replaced by an error message, drawn in the
     /// error colour (a number field holding text).
@@ -306,6 +312,10 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardPendingAskingModelLong,
         CardPendingStillWorking,
         CardPreviewCalendar,
+        CardPreviewDoItHover,
+        CardPreviewDoItPressed,
+        CardPreviewDoItFocused,
+        CardPreviewEditHover,
         CardPreviewFormLongLabels,
         CardPreviewError,
         CardOptionsLooking,
@@ -358,6 +368,10 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardPendingAskingModelLong => "card-pending-asking-model-long",
         CardPendingStillWorking => "card-pending-still-working",
         CardPreviewCalendar => "card-preview-calendar",
+        CardPreviewDoItHover => "card-preview-doit-hover",
+        CardPreviewDoItPressed => "card-preview-doit-pressed",
+        CardPreviewDoItFocused => "card-preview-doit-focused",
+        CardPreviewEditHover => "card-preview-edit-hover",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
         CardPreviewError => "card-preview-error",
         CardOptionsLooking => "card-options-looking",
@@ -1010,6 +1024,28 @@ mod driver {
                 palette.hide();
                 let (schema, value) = calendar_fixture();
                 let _ = card.show_preview("Add to calendar", &schema, &value, false);
+            }
+            CardPreviewDoItHover
+            | CardPreviewDoItPressed
+            | CardPreviewDoItFocused
+            | CardPreviewEditHover => {
+                use crate::ui::card::{ButtonDemo, ID_PREVIEW_DO_IT, ID_PREVIEW_EDIT};
+                card.hide();
+                palette.hide();
+                let (schema, value) = calendar_fixture();
+                // The Edit button only exists when the main window does.
+                let _ = card.show_preview(
+                    "Add to calendar",
+                    &schema,
+                    &value,
+                    state == CardPreviewEditHover,
+                );
+                card.set_button_demo_for_gallery(Some(match state {
+                    CardPreviewDoItHover => (ID_PREVIEW_DO_IT, ButtonDemo::Hover),
+                    CardPreviewDoItPressed => (ID_PREVIEW_DO_IT, ButtonDemo::Pressed),
+                    CardPreviewDoItFocused => (ID_PREVIEW_DO_IT, ButtonDemo::Focus),
+                    _ => (ID_PREVIEW_EDIT, ButtonDemo::Hover),
+                }));
             }
             CardPreviewFormLongLabels => {
                 card.hide();
@@ -1827,8 +1863,8 @@ mod tests {
         // key-rejected setup card (#1020) = 37, + the Settings states going
         // from four to one per page and the prompt open (#872) = 39, + the
         // Models page with Claude active and with every provider shown (#874)
-        // = 41, + the palette with a widened thumb (#988) = 42.
-        assert_eq!(states.len(), 42);
+        // = 41, + the palette with a widened thumb (#988) = 42, + the preview's button states (#818) = 46.
+        assert_eq!(states.len(), 46);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

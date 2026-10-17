@@ -334,6 +334,10 @@ const STUCK_TIMER_ID: usize = 4;
 /// single press from a double (rule 5: never while idle), killed when it
 /// fires or a second press arrives.
 const KEY_WINDOW_TIMER_ID: usize = 5;
+/// #901: one-shot, armed only while a Reload settings is in flight (rule 5),
+/// killed when its answer arrives. If the writer never answers it fires once
+/// and the Working card becomes an error card.
+const RELOAD_TIMER_ID: usize = 6;
 
 /// #307: the options card on screen, as the app side knows it. The card holds
 /// the buttons; this holds what each one runs. Its `generation` must equal the
@@ -600,6 +604,13 @@ struct App {
     /// are live until quit; a reload after a later successful write puts them
     /// back on the loaded config instead of silently reverting them.
     unsaved: Vec<crate::config_writer::FieldChange>,
+    /// #901: the finished read of a Reload that was not the last reply. If the
+    /// write that superseded it fails, this is the config that gets applied.
+    carried_reload: Option<Box<Config>>,
+    /// #901: a Reload put its Working card up and has not taken it down. Only
+    /// then (and not while a model run is busy, whose cards are its own) is a
+    /// Pending card the reload's to hide or replace; see `reload_owns_card`.
+    reload_card: Option<u64>,
     /// #870: writes handed to the writer thread whose reply has not come back.
     /// Only the last reply swaps in the loaded config; an earlier one was read
     /// before a later choice was made.
@@ -980,6 +991,8 @@ pub fn run() -> Result<()> {
         knowledge_folder,
         config,
         unsaved: Vec::new(),
+        carried_reload: None,
+        reload_card: None,
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
         settings_save_starts: VecDeque::new(),
@@ -4755,6 +4768,10 @@ impl App {
     /// run's failure badge ("until the next press").
     fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
+        if busy {
+            // A run's cards replace the reload's Working card.
+            self.reload_card = None;
+        }
         BUSY_STUCK.with(|c| c.set(false));
         let hwnd = self.hwnd();
         unsafe {
@@ -5178,39 +5195,54 @@ impl App {
         self.persist_diff(&before, outcome);
     }
 
+    /// "Reload settings". The read, the secret store and any repair run on the
+    /// writer thread (#901): the keyboard hook shares this thread, and a slow
+    /// store or disk must not stall the key. The finished `Config` comes back
+    /// as `WM_APP_CONFIG_WRITTEN` and `on_config_written` applies it, or says
+    /// why it could not.
     fn reload(&mut self) {
-        match Config::load() {
-            // #711: a file that does not parse must not replace the settings
-            // already running; keep them and say what is wrong.
-            Ok(config) if config.load_problem.is_some() => {
-                let (headline, detail) =
-                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
-                self.card.show_error(&headline, &detail);
-            }
-            Ok(config) => {
-                // #175: report before self.config is overwritten, since the
-                // freshly loaded config is the one whose hydrate ran.
-                let unreadable = config.unreadable_secrets.clone();
-                self.config = config;
-                // The file is the truth again; an old failed write must not be
-                // re-applied over it later.
-                self.unsaved.clear();
-                self.apply_config();
-                if unreadable.is_empty() {
-                    self.card.show_answer("Settings reloaded", "", 3, None);
-                } else {
-                    let (headline, detail) = unreadable_secrets_card(&unreadable);
-                    self.card.show_error(&headline, &detail);
-                }
-            }
-            Err(e) => {
-                let detail = self.track_error("Couldn't reload settings", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't reload settings", &detail);
-            }
+        RELOAD_STUCK.with(|c| c.set(false));
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        self.reload_card = Some(self.card.show_serial());
+        // The writer answers in well under a second when it is alive; if it
+        // never does, the Working card must not stay forever.
+        unsafe {
+            let _ = SetTimer(
+                Some(self.hwnd()),
+                RELOAD_TIMER_ID,
+                SAVE_STUCK_AFTER.as_millis() as u32,
+                None,
+            );
         }
-        // Every card above but "Settings reloaded" persists.
-        self.set_watch(true);
+        self.persist_changes_with(crate::config_writer::Outcome::reload(), Vec::new(), None);
+    }
+
+    /// #901: the one-shot timer of `reload` fired. When the Working card is
+    /// still up and a write is still unanswered, the writer is stuck: say so.
+    fn on_reload_stuck(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID);
+        }
+        let in_flight = self
+            .pending_writes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if reload_is_stuck(self.reload_owns_card(), in_flight) {
+            self.reload_card = None;
+            let (headline, detail) = reload_stuck_card();
+            self.card.show_error(headline, detail);
+            self.set_watch(true);
+        }
+    }
+
+    /// Whether the Pending card on screen is the Working card a Reload put up.
+    fn reload_owns_card(&self) -> bool {
+        reload_owns_card_rule(
+            self.reload_card,
+            self.card.show_serial(),
+            self.busy,
+            matches!(self.card.state(), crate::ui::card::CardState::Pending),
+        )
     }
 
     /// Opens the Settings window (or brings the open one to the front).
@@ -5432,6 +5464,10 @@ impl App {
                     }
                 }
             }
+        }
+        // #901: after the replies above, so one that arrived meanwhile counts.
+        if RELOAD_STUCK.with(|c| c.replace(false)) {
+            self.on_reload_stuck();
         }
     }
 
@@ -5902,6 +5938,23 @@ impl App {
             key_error,
         } = written;
         let last = crate::config_writer::finish(&self.pending_writes);
+        // Only the last reply: an earlier one must not disarm the timer that
+        // guards a newer reload still in flight.
+        let carried = if last {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID);
+            }
+            RELOAD_STUCK.with(|c| c.set(false));
+            // The reload's own Working card goes now; whatever card this reply
+            // has to show replaces nothing of a model run's.
+            if self.reload_owns_card() {
+                self.hide_card();
+            }
+            self.reload_card = None;
+            self.carried_reload.take()
+        } else {
+            None
+        };
         if outcome.from_settings {
             crate::config_writer::finish(&self.settings_saves);
         }
@@ -5929,17 +5982,54 @@ impl App {
                 Some(crate::config_writer::Loaded {
                     config: Ok(config), ..
                 }) if config.load_problem.is_none() => {
+                    if reload_reply(outcome.from_reload, last) == ReloadReply::Superseded {
+                        // A write sent after the reload is still in flight and
+                        // its reply reads the file later, so it is the one to
+                        // swap the config in. Changes that failed to save before
+                        // this read are dropped now; the read itself is kept
+                        // for the last reply, which applies it if its own write
+                        // fails. The Working card stays: the last reply takes
+                        // it down (a newer reload may own it).
+                        self.unsaved.clear();
+                        self.carried_reload = Some(config);
+                        return;
+                    }
                     if last {
-                        self.config = crate::config_writer::reapply(&config, &self.unsaved)
-                            .unwrap_or(*config);
+                        if outcome.from_reload {
+                            // The file is the truth again; an old failed write
+                            // must not be re-applied over it later.
+                            self.unsaved.clear();
+                        }
+                        // #175: read before the config is moved. A reload that
+                        // was superseded hands its card on to this reply.
+                        let unreadable = secrets_to_announce(
+                            outcome.from_reload || carried.is_some(),
+                            &config.unreadable_secrets,
+                            carried.as_deref().map(|c| c.unreadable_secrets.as_slice()),
+                        )
+                        .to_vec();
+                        if let Some(config) = final_config(Some(config), carried, &self.unsaved) {
+                            self.config = config;
+                        }
                         self.apply_config();
+                        if !unreadable.is_empty() {
+                            let (headline, mut detail) = unreadable_secrets_card(&unreadable);
+                            if let Some(why) = &key_error {
+                                // The key note must not be lost behind this card.
+                                let human = self.track_error(KEY_NOT_STORED_HEADLINE, why);
+                                detail = with_key_failure_note(&detail, &human);
+                            }
+                            self.card.show_error(&headline, &detail);
+                            self.set_watch(true);
+                            return;
+                        }
                     }
                     let card_idle = matches!(self.card.state(), crate::ui::card::CardState::Hidden);
                     let shown = saved_card(outcome.from_settings, key_error.is_some(), card_idle);
                     if shown == SavedCard::KeyFailed {
                         // The other changes are saved; only the key is not.
                         let why = key_error.unwrap_or_default();
-                        let headline = "Settings saved, but the key was not stored";
+                        let headline = KEY_NOT_STORED_HEADLINE;
                         let human = self.track_error(headline, &why);
                         self.card.show_error_with_details(
                             headline,
@@ -5984,14 +6074,30 @@ impl App {
             Err(reason) => {
                 // A refused Settings save changed nothing in memory, so there is
                 // nothing for a later reload to put back.
+                let kept = !outcome.from_settings && !changes.is_empty();
                 if !outcome.from_settings {
                     self.unsaved.extend(changes);
                 }
                 let human = self.track_error(&outcome.fail_headline, &reason);
-                self.card.show_error_with_details(
-                    &outcome.fail_headline,
-                    &format!("{}\n\n{human}", outcome.fail_note),
-                );
+                // #901: a reload that was superseded by this failed write still
+                // applies, with this write's change live on top; its key notice
+                // rides along on the card.
+                let mut note = format!("{}\n\n{human}", outcome.fail_note);
+                if let Some(carried) = &carried {
+                    // The reloaded values are live now, so the note must not
+                    // say the old settings are still in use.
+                    note = format!("{}\n\n{human}", carried_fail_note(kept));
+                    if !carried.unreadable_secrets.is_empty() {
+                        let (_, detail) = unreadable_secrets_card(&carried.unreadable_secrets);
+                        note = format!("{note}\n\n{detail}");
+                    }
+                }
+                if let Some(config) = final_config(None, carried, &self.unsaved) {
+                    self.config = config;
+                    self.apply_config();
+                }
+                self.card
+                    .show_error_with_details(&outcome.fail_headline, &note);
             }
         }
         self.set_watch(true);
@@ -7993,6 +8099,10 @@ thread_local! {
     /// it. Thread-local for the same reason as `SETTINGS_OPEN`.
     static BUSY_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// #901: the reload timer fired while a menu or dialog was open. Killed
+    /// there; the stuck check is made once the modal is over.
+    static RELOAD_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// #393: the double-press timer fired while Settings was open. `App`
     /// cannot be touched there (see `SETTINGS_OPEN`), so the wait is
     /// forgotten by the next press, through `disarm_key_window`.
@@ -8975,6 +9085,101 @@ const SAVE_STUCK_AFTER: Duration = Duration::from_secs(30);
 
 /// Whether the oldest save still in flight has gone unanswered for too long
 /// (`since` is when the count last rose from zero).
+/// What `on_config_written` does with a reload's reply (#901). A reload that
+/// is not the last reply to arrive is `Superseded`: a write sent after it will
+/// read the file later, so only that reply swaps the config, and the reload
+/// neither clears `unsaved` nor says "Settings reloaded" over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadReply {
+    NotAReload,
+    Apply,
+    Superseded,
+}
+
+fn reload_reply(from_reload: bool, last: bool) -> ReloadReply {
+    match (from_reload, last) {
+        (false, _) => ReloadReply::NotAReload,
+        (true, true) => ReloadReply::Apply,
+        (true, false) => ReloadReply::Superseded,
+    }
+}
+
+/// The config to run once the last reply is in (#901). The last reply's own read
+/// is the newest; when its write failed there is none, and the config of an
+/// earlier reload that was superseded is used so its read is not lost. Changes
+/// that could not be saved are put back on top either way.
+fn final_config(
+    own: Option<Box<Config>>,
+    carried: Option<Box<Config>>,
+    unsaved: &[crate::config_writer::FieldChange],
+) -> Option<Config> {
+    let config = own.or(carried)?;
+    Some(crate::config_writer::reapply(&config, unsaved).unwrap_or(*config))
+}
+
+/// The providers whose stored key could not be read, to say on a card (#175).
+/// Only a reload says it, including one that was superseded and whose card is
+/// carried to the last reply; the last read's own list wins when it has one.
+fn secrets_to_announce<'a>(
+    reload_involved: bool,
+    own: &'a [String],
+    carried: Option<&'a [String]>,
+) -> &'a [String] {
+    if !reload_involved {
+        return &[];
+    }
+    if own.is_empty() {
+        carried.unwrap_or(&[])
+    } else {
+        own
+    }
+}
+
+const KEY_NOT_STORED_HEADLINE: &str = "Settings saved, but the key was not stored";
+
+/// A Pending card is the reload's own only when the reload put it up, no model
+/// run has taken the card over, and it is still a Pending card (#901).
+fn reload_owns_card_rule(
+    reload_card: Option<u64>,
+    card_serial: u64,
+    run_busy: bool,
+    card_pending: bool,
+) -> bool {
+    reload_card == Some(card_serial) && !run_busy && card_pending
+}
+
+/// The note when a write that followed a reload failed: the reload's values
+/// are live, so "still using the settings it had" would be untrue. `kept` is
+/// whether the failed change itself is kept until quit.
+fn carried_fail_note(kept: bool) -> String {
+    if kept {
+        "Settings were reloaded from the file, but this change was not saved. It stays until you quit.".to_string()
+    } else {
+        "Settings were reloaded from the file, but a later change was not saved.".to_string()
+    }
+}
+
+/// The unreadable-key card with the "key not stored" note kept on it.
+fn with_key_failure_note(detail: &str, human: &str) -> String {
+    format!(
+        "{detail}\n\n{KEY_NOT_STORED_HEADLINE}. Enter the key again in Settings after fixing this.\n\n{human}"
+    )
+}
+
+/// The reload's timer fired: stuck when the Working card is still up and a
+/// write is still unanswered.
+fn reload_is_stuck(working_card_up: bool, writes_in_flight: u32) -> bool {
+    working_card_up && writes_in_flight > 0
+}
+
+/// No em dash (rule 11).
+fn reload_stuck_card() -> (&'static str, &'static str) {
+    (
+        "Couldn't reload settings",
+        "Wingman did not get an answer in time. If it keeps happening, quit Wingman from the tray and start it again.",
+    )
+}
+
 fn save_is_stuck(saves_in_flight: u32, since: Option<Instant>, now: Instant) -> bool {
     saves_in_flight > 0
         && since.is_some_and(|s| now.saturating_duration_since(s) >= SAVE_STUCK_AFTER)
@@ -9114,6 +9319,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
             }
             KEY_WINDOW_STALE.with(|c| c.set(true));
+            return LRESULT(0);
+        }
+        if msg == WM_TIMER && wparam.0 == RELOAD_TIMER_ID {
+            // Killed at once so it cannot repeat behind the modal (rule 5);
+            // the stuck check is made when the modal is over.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), RELOAD_TIMER_ID);
+            }
+            RELOAD_STUCK.with(|c| c.set(true));
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
@@ -9438,6 +9652,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 app.on_busy_stuck();
             } else if wparam.0 == KEY_WINDOW_TIMER_ID {
                 app.on_key_window_expired();
+            } else if wparam.0 == RELOAD_TIMER_ID {
+                app.on_reload_stuck();
             }
             LRESULT(0)
         }
@@ -10017,6 +10233,42 @@ mod tests {
         }
     }
 
+    /// #901: Reload settings reads the file, the secret store and any repair on
+    /// the writer thread; the UI thread only takes the finished `Config`.
+    #[test]
+    fn a_reload_that_is_not_the_last_reply_is_superseded() {
+        use super::{reload_is_stuck, reload_reply, reload_stuck_card, ReloadReply};
+        assert_eq!(reload_reply(false, true), ReloadReply::NotAReload);
+        assert_eq!(reload_reply(false, false), ReloadReply::NotAReload);
+        assert_eq!(reload_reply(true, true), ReloadReply::Apply);
+        assert_eq!(reload_reply(true, false), ReloadReply::Superseded);
+        assert!(reload_is_stuck(true, 1));
+        assert!(!reload_is_stuck(false, 1), "the card moved on");
+        assert!(!reload_is_stuck(true, 0), "the answer arrived");
+        let (h, d) = reload_stuck_card();
+        assert!(!h.contains('\u{2014}') && !d.contains('\u{2014}'));
+        // Wired: the handler consults the rule, kills the timer, and the timer
+        // reaches the stuck handler.
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        assert!(handler.contains("reload_reply(outcome.from_reload, last)"));
+        assert!(handler.contains("KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID)"));
+        let wnd = body_between(&src, "extern \"system\" fn wnd_proc(", "\n}\n");
+        assert!(wnd.contains("app.on_reload_stuck()"), "not in wnd_proc");
+        let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(reload.contains("RELOAD_TIMER_ID"));
+    }
+
+    #[test]
+    fn reload_does_its_load_off_the_ui_thread() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(!body.is_empty());
+        assert!(!body.contains("Config::load"), "{body}");
+        assert!(body.contains("persist_changes_with("), "{body}");
+        assert!(body.contains("Outcome::reload()"), "{body}");
+    }
+
     /// #900: a key press or second launch during a file dialog gets the same
     /// deferred card the tray menu gives it, not a silent drop.
     #[test]
@@ -10075,6 +10327,196 @@ mod tests {
             );
         }
         assert!(checked > 10, "the registry scan found {checked} ids");
+    }
+
+    /// #901 review: while a menu or dialog is open the reload timer is killed
+    /// at once (rule 5: a SetTimer without a callback repeats until killed)
+    /// and the stuck check is made when the modal ends.
+    #[test]
+    fn the_reload_timer_is_killed_behind_a_modal_and_checked_after_it() {
+        let src = lf(include_str!("app.rs"));
+        let arm = body_between(
+            &src,
+            "        if msg == WM_TIMER && wparam.0 == RELOAD_TIMER_ID {",
+            "\n        }\n",
+        );
+        assert!(
+            arm.contains("KillTimer(Some(hwnd), RELOAD_TIMER_ID)"),
+            "{arm}"
+        );
+        assert!(arm.contains("RELOAD_STUCK.with(|c| c.set(true))"), "{arm}");
+        let deliver = body_between(&src, "    fn deliver_deferred(", "\n    }\n");
+        let flag = deliver
+            .find("RELOAD_STUCK.with(|c| c.replace(false))")
+            .expect("the deferred stuck flag is never read");
+        let after_messages = deliver.find("for message in order_deferred").unwrap();
+        assert!(flag > after_messages, "a deferred reply must land first");
+        assert!(
+            deliver[flag..].contains("self.on_reload_stuck()"),
+            "{deliver}"
+        );
+        // A new reload forgets an old flag.
+        let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(
+            reload.contains("RELOAD_STUCK.with(|c| c.set(false))"),
+            "{reload}"
+        );
+    }
+
+    /// #901 review: a superseded reload's reply must not kill the timer that
+    /// guards the newer reload still in flight; only the last reply does.
+    #[test]
+    fn only_the_last_reply_kills_the_reload_timer() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let kill = handler
+            .find("KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID)")
+            .expect("the timer is never killed");
+        let guard = handler[..kill].rfind("if last {").expect("no guard");
+        assert!(
+            !handler[guard..kill].contains("}\n"),
+            "the kill must sit directly inside `if last`: {handler}"
+        );
+    }
+
+    /// #901 review: the outcome of a reload that was not the last reply.
+    #[test]
+    fn a_failed_superseding_write_still_gets_the_reloaded_config() {
+        use crate::config_writer::FieldChange;
+        let carried = crate::config::Config {
+            unreadable_secrets: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let unsaved = [FieldChange::mode(crate::mode::Mode::Offline)];
+        // The newer write failed: no config of its own, the reload's is used,
+        // with the failed change still live on top.
+        let out = super::final_config(None, Some(Box::new(carried.clone())), &unsaved)
+            .expect("the reload's config was dropped");
+        assert_eq!(out.mode, crate::mode::Mode::Offline);
+        assert_eq!(out.unreadable_secrets, vec!["openai".to_string()]);
+        // The newer write worked: its later read wins over the carried one.
+        let mut own = crate::config::Config::default();
+        own.providers.openai.model = "newer".to_string();
+        let out = super::final_config(Some(Box::new(own)), Some(Box::new(carried)), &[])
+            .expect("own config");
+        assert_eq!(out.providers.openai.model, "newer");
+        assert!(super::final_config(None, None, &[]).is_none());
+    }
+
+    #[test]
+    fn a_reload_that_was_superseded_still_announces_unreadable_keys() {
+        let own: Vec<String> = vec![];
+        let carried = vec!["openai".to_string()];
+        let none: &[String] = &[];
+        assert_eq!(
+            super::secrets_to_announce(true, &own, Some(&carried)),
+            carried.as_slice()
+        );
+        // The last read's own list wins when it has one.
+        let mine = vec!["anthropic".to_string()];
+        assert_eq!(
+            super::secrets_to_announce(true, &mine, Some(&carried)),
+            mine.as_slice()
+        );
+        // A plain save with nothing carried says nothing.
+        assert_eq!(super::secrets_to_announce(false, &mine, None), none);
+        assert_eq!(super::secrets_to_announce(true, &own, None), none);
+    }
+
+    #[test]
+    fn the_write_handler_carries_a_superseded_reload_forward() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        // Stored on a superseded reply (and the old unsaved list dropped then).
+        let store = handler
+            .find("self.carried_reload = Some(config)")
+            .expect("a superseded reload's config is thrown away");
+        assert!(
+            handler[..store].contains("self.unsaved.clear()"),
+            "{handler}"
+        );
+        // Taken on the last reply, used on both the success and failure paths.
+        assert!(handler.contains("self.carried_reload.take()"), "{handler}");
+        let err = handler.find("Err(reason) =>").expect("no failure arm");
+        assert!(
+            handler[err..].contains("final_config(None, carried"),
+            "{handler}"
+        );
+        assert!(
+            handler[..err].contains("final_config(Some(config), carried"),
+            "{handler}"
+        );
+        assert!(handler.contains("secrets_to_announce("), "{handler}");
+    }
+
+    /// #901 review: only the reload's own Working card is hidden or replaced.
+    #[test]
+    fn a_model_pending_card_is_not_the_reloads_to_touch() {
+        use super::{reload_is_stuck, reload_owns_card_rule};
+        assert!(reload_owns_card_rule(Some(4), 4, false, true));
+        assert!(!reload_owns_card_rule(None, 4, false, true), "a model card");
+        assert!(
+            !reload_owns_card_rule(Some(4), 4, true, true),
+            "a run is busy"
+        );
+        assert!(!reload_owns_card_rule(Some(4), 4, false, false), "moved on");
+        // Any other card shown since (an options card, an error) disowns it,
+        // even when it is Pending again and no run is busy.
+        assert!(!reload_owns_card_rule(Some(4), 5, false, true));
+        // The stuck timer replaces nothing it does not own.
+        assert!(!reload_is_stuck(
+            reload_owns_card_rule(None, 4, false, true),
+            1
+        ));
+        let src = lf(include_str!("app.rs"));
+        let stuck = body_between(&src, "    fn on_reload_stuck(", "\n    }\n");
+        assert!(stuck.contains("self.reload_owns_card()"), "{stuck}");
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        assert!(handler.contains("self.reload_owns_card()"), "{handler}");
+        // A superseded reply hides nothing.
+        let at = handler.find("self.carried_reload = Some(config)").unwrap();
+        let end = handler[at..].find("return;").unwrap();
+        assert!(!handler[at..at + end].contains("hide_card"), "{handler}");
+        let busy = body_between(&src, "    fn set_busy(", "\n    }\n");
+        assert!(busy.contains("self.reload_card = None"), "{busy}");
+        let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(
+            reload.contains("self.reload_card = Some(self.card.show_serial())"),
+            "{reload}"
+        );
+    }
+
+    #[test]
+    fn the_unreadable_key_card_keeps_the_key_not_stored_note() {
+        let text = super::with_key_failure_note("Could not read the saved key.", "disk full");
+        assert!(text.contains("Could not read the saved key."), "{text}");
+        assert!(text.contains("the key was not stored"), "{text}");
+        assert!(text.contains("disk full"), "{text}");
+        assert!(!text.contains('\u{2014}'));
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let at = handler
+            .find("unreadable_secrets_card(&unreadable)")
+            .unwrap();
+        let show = handler[at..].find("return;").unwrap();
+        assert!(
+            handler[at..at + show].contains("with_key_failure_note("),
+            "{handler}"
+        );
+    }
+
+    #[test]
+    fn the_failure_note_after_a_reload_says_the_settings_were_reloaded() {
+        for kept in [true, false] {
+            let note = super::carried_fail_note(kept);
+            assert!(note.contains("reloaded from the file"), "{note}");
+            assert!(!note.contains("still using"), "{note}");
+            assert!(!note.contains('\u{2014}'));
+        }
+        assert!(super::carried_fail_note(true).contains("stays until you quit"));
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        assert!(handler.contains("carried_fail_note(kept)"), "{handler}");
     }
 
     /// The gate is in the one place every model action starts, before the
@@ -15186,7 +15628,10 @@ mod tests {
         // The helper itself and the startup welcome card.
         assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
         assert!(body_of("show_setup_card").contains("set_watch(true)"));
-        assert!(body_of("reload").contains("set_watch(true)"));
+        // #901: reload only shows the Working card; the cards that follow it
+        // are shown by the write handler and the stuck handler, which arm it.
+        assert!(body_of("on_config_written").contains("set_watch(true)"));
+        assert!(body_of("on_reload_stuck").contains("set_watch(true)"));
         // Every early return in edit_settings that follows a card arms it.
         let edit = body_of("edit_settings");
         let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
