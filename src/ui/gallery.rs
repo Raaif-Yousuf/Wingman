@@ -70,6 +70,8 @@ pub fn follows_variants(state: GalleryState) -> bool {
         PaletteDefault
             | PaletteNoMatches
             | PaletteNoModel
+            | PaletteLong
+            | PaletteLongScrolled
             | PaletteHover
             | SettingsTop
             | SettingsBottom
@@ -87,7 +89,12 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
-        PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover
+        PaletteDefault
+            | PaletteNoMatches
+            | PaletteNoModel
+            | PaletteHover
+            | PaletteLong
+            | PaletteLongScrolled
     )
 }
 
@@ -100,7 +107,12 @@ pub fn follows_theme_only(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
-        PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover
+        PaletteDefault
+            | PaletteNoMatches
+            | PaletteNoModel
+            | PaletteHover
+            | PaletteLong
+            | PaletteLongScrolled
     )
 }
 
@@ -222,6 +234,10 @@ pub enum GalleryState {
     PaletteDefault,
     PaletteNoMatches,
     PaletteNoModel,
+    /// #883: more actions than fit, at the top: a scroll thumb at the top.
+    PaletteLong,
+    /// #883: the same list scrolled to the end: the thumb at the bottom.
+    PaletteLongScrolled,
     /// #882: the mouse over a row other than the selected one.
     PaletteHover,
     /// Issue #560: the Settings window from a default config, Advanced
@@ -267,6 +283,8 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteDefault,
         PaletteNoMatches,
         PaletteNoModel,
+        PaletteLong,
+        PaletteLongScrolled,
         PaletteHover,
         SettingsTop,
         SettingsBottom,
@@ -308,6 +326,8 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteDefault => "palette-default",
         PaletteNoMatches => "palette-no-matches",
         PaletteNoModel => "palette-no-model",
+        PaletteLong => "palette-long",
+        PaletteLongScrolled => "palette-long-scrolled",
         PaletteHover => "palette-hover",
         SettingsTop => "settings-top",
         SettingsBottom => "settings-bottom",
@@ -644,6 +664,38 @@ mod driver {
         crate::actions::fill_form::build_preview_schema_and_value(&proposal)
     }
 
+    /// More actions than the palette shows at once, so it draws a scroll thumb.
+    fn long_palette_catalogue() -> Vec<PaletteAction> {
+        [
+            "Check my work",
+            "Summarize this",
+            "Explain this",
+            "Translate this",
+            "Rewrite more simply",
+            "Fix the grammar",
+            "Copy text from screen",
+            "Copy region to clipboard",
+            "Calculate selection",
+            "Convert units",
+            "Convert times",
+            "Add to calendar",
+            "Fill this form",
+            "Read a QR code",
+            "Define this word",
+            "Find similar images",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| PaletteAction {
+            id: format!("long-{i}"),
+            name: (*name).to_string(),
+            group: None,
+            requires_model: false,
+            effect: crate::ui::palette_model::Effect::None,
+        })
+        .collect()
+    }
+
     /// The options card's rows from `(id, label)` pairs.
     fn option_rows(rows: &[(&str, &str)]) -> Vec<crate::ui::card::OptionRow> {
         rows.iter()
@@ -933,6 +985,14 @@ mod driver {
                 palette.hide();
                 palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
             }
+            PaletteLong | PaletteLongScrolled => {
+                card.hide();
+                palette.hide();
+                palette.show(long_palette_catalogue(), true, "mode: Auto".to_string());
+                if state == PaletteLongScrolled {
+                    palette.scroll_for_test(i32::MAX);
+                }
+            }
             PaletteHover => {
                 card.hide();
                 palette.hide();
@@ -964,7 +1024,8 @@ mod driver {
             }
         }
         Ok(match state {
-            PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover => palette.hwnd(),
+            PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover | PaletteLong
+            | PaletteLongScrolled => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
                 .map(|o| o.hwnd())
@@ -1176,7 +1237,7 @@ mod tests {
                 palette_states += 1;
             }
         }
-        assert_eq!(palette_states, 4, "the test must see every palette state");
+        assert_eq!(palette_states, 6, "the test must see every palette state");
     }
 
     #[test]
@@ -1191,7 +1252,7 @@ mod tests {
             );
             palette_states += usize::from(n.starts_with("palette-"));
         }
-        assert_eq!(palette_states, 4, "the test must see every palette state");
+        assert_eq!(palette_states, 6, "the test must see every palette state");
     }
 
     #[test]
@@ -1271,8 +1332,8 @@ mod tests {
         // focus = 15 card states, + 4 options card states (#307) + 3 palette
         // states + 4 settings states (#560) + the region overlay (#580) + the
         // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
-        // hovered palette (#882) = 31.
-        assert_eq!(states.len(), 31);
+        // two long palettes (#883) = 33.
+        assert_eq!(states.len(), 33);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

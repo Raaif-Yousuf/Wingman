@@ -342,6 +342,29 @@ pub fn scroll_by(offset: usize, delta_rows: i32, total_rows: usize, visible_rows
     (offset as i32 + delta_rows).clamp(0, max_offset) as usize
 }
 
+/// The scroll thumb for a list scrolled to `offset` (#883), in the pixels of a
+/// track `track_len` long: `(top, length)`, or `None` when every row fits and
+/// there is nothing to say. The thumb is the visible share of the track, never
+/// shorter than `min_len` (or the track, when that is shorter), and slides
+/// from the top at offset 0 to the bottom at the last page.
+pub fn scroll_thumb(
+    offset: usize,
+    total_rows: usize,
+    visible_rows: usize,
+    track_len: i32,
+    min_len: i32,
+) -> Option<(i32, i32)> {
+    if visible_rows == 0 || total_rows <= visible_rows || track_len <= 0 {
+        return None;
+    }
+    let max_offset = total_rows - visible_rows;
+    let offset = offset.min(max_offset);
+    let share = (track_len as i64 * visible_rows as i64 / total_rows as i64) as i32;
+    let len = share.max(min_len).min(track_len);
+    let top = ((track_len - len) as i64 * offset as i64 / max_offset as i64) as i32;
+    Some((top, len))
+}
+
 /// The palette's selection state over a built row list. Rebuilt (via
 /// [`PaletteState::new`]) every time the query changes; selection resets to
 /// the first selectable (non-header, non-hint) row.
@@ -685,6 +708,57 @@ mod tests {
             requires_model,
             effect: Effect::None,
         }
+    }
+
+    // -- scroll_thumb (#883) ---------------------------------------------
+
+    #[test]
+    fn no_thumb_when_every_row_fits() {
+        assert_eq!(scroll_thumb(0, 12, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 3, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 0, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 20, 0, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 20, 12, 0, 24), None);
+    }
+
+    #[test]
+    fn the_thumb_is_the_visible_share_of_the_track() {
+        // 24 rows, 12 visible: half the track.
+        assert_eq!(scroll_thumb(0, 24, 12, 312, 24), Some((0, 156)));
+    }
+
+    #[test]
+    fn the_thumb_touches_the_top_at_offset_zero_and_the_bottom_at_the_end() {
+        let (top, len) = scroll_thumb(0, 30, 12, 312, 24).unwrap();
+        assert_eq!(top, 0);
+        let (top, len2) = scroll_thumb(18, 30, 12, 312, 24).unwrap();
+        assert_eq!(len, len2);
+        assert_eq!(top + len2, 312);
+        // Past the end is the end.
+        assert_eq!(
+            scroll_thumb(99, 30, 12, 312, 24),
+            scroll_thumb(18, 30, 12, 312, 24)
+        );
+    }
+
+    #[test]
+    fn the_thumb_moves_down_with_the_offset_and_stays_in_the_track() {
+        let mut last = 0;
+        for offset in 0..=88 {
+            let (top, len) = scroll_thumb(offset, 100, 12, 312, 24).unwrap();
+            assert!(top >= last, "offset {offset}");
+            assert!(top >= 0 && top + len <= 312, "offset {offset}");
+            last = top;
+        }
+    }
+
+    #[test]
+    fn a_very_long_list_still_gets_a_thumb_you_can_see() {
+        let (_, len) = scroll_thumb(0, 5000, 12, 312, 24).unwrap();
+        assert_eq!(len, 24);
+        // A track shorter than the minimum: the thumb is the whole track.
+        let (top, len) = scroll_thumb(0, 5000, 12, 10, 24).unwrap();
+        assert_eq!((top, len), (0, 10));
     }
 
     // -- fuzzy_score ---------------------------------------------------
