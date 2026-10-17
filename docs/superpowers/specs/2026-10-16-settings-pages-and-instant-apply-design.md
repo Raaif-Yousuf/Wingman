@@ -283,7 +283,7 @@ That spec changes how controls are *painted*; this one changes where they *are*.
   the one resolve in the top-level proc.
 - **Order.** Slices 0 and 1 are independent of the dark slices. From slice 2 the
   dark work lands on the new layout; the dark spec's plumbing slice is
-  layout-independent and can ship first. `SETTINGS_DARK_ENABLED` stays false
+  layout-independent and can ship first. `SETTINGS_DARK_ENABLED` stayed false
   until that spec's last slice.
 
 ## DPI and size

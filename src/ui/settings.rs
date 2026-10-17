@@ -13483,6 +13483,17 @@ mod tests {
         }
     }
 
+    /// #582 slice 6: with nothing forced (a real window) the look is the
+    /// system's detected theme, not light. The gate that used to turn dark
+    /// into light is gone. Runs on a thread where no theme is forced.
+    #[test]
+    fn an_unforced_window_follows_the_detected_theme() {
+        force_theme(None);
+        let look = current_look();
+        assert!(!look.forced);
+        assert_eq!(look.theme, crate::ui::theme::detect_theme());
+    }
+
     /// The Start with Windows checkbox, on the page Settings opens on.
     fn autostart_checkbox(hwnd: HWND) -> HWND {
         get_dlg_item(hwnd, ID_AUTOSTART).expect("the Start with Windows checkbox")
