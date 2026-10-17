@@ -1245,6 +1245,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // The one owner of the theme resolves it again here; the title
             // bar follows.
             apply_title_bar(hwnd);
+            if let Ok(body) = GetDlgItem(Some(hwnd), ID_BODY) {
+                apply_body_scrollbar_theme(body);
+            }
             let erase = if was_painted || edit_style().paints_face {
                 windows::Win32::Graphics::Gdi::RDW_ERASE
             } else {
@@ -3666,6 +3669,34 @@ unsafe fn apply_title_bar(hwnd: HWND) {
             std::mem::size_of::<BOOL>() as u32,
         );
     }
+}
+
+/// Gives the body's own scrollbar the dark visual style in dark (#582), and
+/// takes it back when the theme leaves dark while Settings is open. Only the
+/// body: the spec measured the style to do nothing for edits, combos and the
+/// trackbar. The style is set on change only (creation, a theme message), never
+/// per paint. A failure leaves the stock bar, which is accessible. Light is
+/// only written back after a dark one was applied, so a light-only run never
+/// touches the window's theme.
+unsafe fn apply_body_scrollbar_theme(body: HWND) {
+    use windows::Win32::UI::Controls::SetWindowTheme;
+    thread_local! {
+        static DARK_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if body.0.is_null() {
+        return;
+    }
+    let dark = crate::ui::settings_theme::scrollbar_is_dark(edit_style().look.theme);
+    if !dark && !DARK_APPLIED.get() {
+        return;
+    }
+    DARK_APPLIED.set(dark);
+    let class = wide_z(crate::ui::settings_theme::DARK_SCROLLBAR_CLASS);
+    let _ = if dark {
+        SetWindowTheme(body, PCWSTR(class.as_ptr()), PCWSTR::null())
+    } else {
+        SetWindowTheme(body, PCWSTR::null(), PCWSTR::null())
+    };
 }
 
 /// Below this the prompt box stops being usable; scroll rather than shrink
@@ -7586,6 +7617,7 @@ fn build_ui_recorded(
     // controls made last are the last stops.
     let rail = create_rail(hwnd, instance, dpi, font);
     let body = create_body(hwnd, instance, dpi);
+    unsafe { apply_body_scrollbar_theme(body) };
     let ctx = Ctx {
         parent: std::cell::Cell::new(if body.0.is_null() { hwnd } else { body }),
         page: std::cell::Cell::new(None),
@@ -13358,6 +13390,56 @@ mod tests {
             with_window(Config::default(), |hwnd, _raw| {
                 assert_eq!(erased_face_pixel(hwnd), HC_BLACK.window);
                 assert_eq!(label_answer(hwnd), (HC_BLACK.window, HC_BLACK.window_text));
+            });
+        }
+    }
+
+    /// The brightness (0 to 255) of the body's scrollbar track, as a real
+    /// `PrintWindow` of the body captures it. The body is given a range far
+    /// taller than its view, so the bar is live; the pixel sits in the track
+    /// below the thumb, clear of the arrows.
+    fn body_scrollbar_brightness(hwnd: HWND) -> u32 {
+        let body = get_dlg_item_body(hwnd);
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            let _ = GetWindowRect(body, &mut wr);
+            set_body_scroll(body, 20_000, 400, 0);
+        }
+        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+        let sb = scrollbar_width_px(96);
+        let px = printed_pixel(body, w - sb / 2, h - sb * 2);
+        let (r, g, b) = (px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF);
+        (r + g + b) / 3
+    }
+
+    /// #582 slice 5, wired-to-nothing check: with nothing wired, the body's
+    /// scrollbar track of a dark window would be the stock near-white strip
+    /// (MEASURED 2026-10-16: 240 stock, 29 themed). It must be dark in dark,
+    /// stock in light and in high contrast, and follow a theme change while
+    /// the window is open, both ways.
+    #[test]
+    fn a_dark_body_scrollbar_is_dark_and_light_and_high_contrast_stay_stock() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED;
+        {
+            let _forced = Forced::new(Theme::Dark);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert!(body_scrollbar_brightness(hwnd) < 100, "dark track");
+                force_theme(Some(Theme::Light));
+                unsafe { SendMessageW(hwnd, WM_THEMECHANGED, None, None) };
+                assert!(body_scrollbar_brightness(hwnd) > 200, "back to stock");
+                force_theme(Some(Theme::Dark));
+                unsafe { SendMessageW(hwnd, WM_THEMECHANGED, None, None) };
+                assert!(body_scrollbar_brightness(hwnd) < 100, "dark again");
+            });
+        }
+        for theme in [Theme::Light, Theme::HighContrast] {
+            let _forced = Forced::new(theme);
+            with_window(Config::default(), |hwnd, _raw| {
+                // High contrast black's own track is whatever the system
+                // draws; the claim is only that the dark theme was not applied.
+                if theme == Theme::Light {
+                    assert!(body_scrollbar_brightness(hwnd) > 200, "stock in light");
+                }
             });
         }
     }
