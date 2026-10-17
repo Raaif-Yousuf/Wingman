@@ -14874,7 +14874,8 @@ mod tests {
             away(hwnd, "not-a-key");
             // Drain the activation message so the left count is the close's.
             while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
-            close_now();
+            // The close button: `WM_CLOSE`, not a bare destroy.
+            unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
             let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "a key that does not fit is counted");
@@ -14882,7 +14883,7 @@ mod tests {
         with_open_window(|hwnd, owner| {
             away(hwnd, "sk-a-whole-key");
             while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
-            close_now();
+            unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
             assert!(
                 take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some(),
                 "a key that fits is applied on close"
