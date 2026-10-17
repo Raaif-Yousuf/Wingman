@@ -63,8 +63,9 @@
 //!   a correct light window beats a half-dark one. So far the title bar, the
 //!   window face, the labels, the text boxes, the rail, the footer divider,
 //!   the push buttons and the checkboxes (`settings_buttons`, drawn from
-//!   `NM_CUSTOMDRAW`) follow the theme; combos, the trackbar and the
-//!   scrollbar are still stock. `edit_style` resolves the theme once per change
+//!   `NM_CUSTOMDRAW`), the combo boxes (`settings_combo`) and the trackbar
+//!   (`settings_trackbar`, also `NM_CUSTOMDRAW`) follow the theme; the
+//!   scrollbar is still stock. `edit_style` resolves the theme once per change
 //!   and everything else reads it. The UI gallery forces a theme
 //!   (`--ui-gallery --theme`), which bypasses the gate.
 //!
@@ -4653,7 +4654,7 @@ unsafe fn answer_label_colors(hdc: windows::Win32::Graphics::Gdi::HDC) -> LRESUL
 }
 
 /// `WM_NOTIFY` from a child when Settings paints its own look (#582): a push
-/// button or checkbox asks before painting (`NM_CUSTOMDRAW`, common controls
+/// button, checkbox or the trackbar asks before painting (`NM_CUSTOMDRAW`, common controls
 /// v6) and is drawn from the tokens. Everything else, and every notification
 /// while the system draws (light, real high contrast), gets `None` and the
 /// default answer, exactly as before. The brush and colours are the cached
@@ -4669,6 +4670,12 @@ unsafe fn answer_button_draw(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
         return None;
     }
     let palette = Palette::new(style.look.theme, &style.look.sys, style.colors.focus_line);
+    // #582 slice 4: the trackbar answers for itself; anything else is a button.
+    if let Some(answer) =
+        crate::ui::settings_trackbar::handle_custom_draw(lparam, dpi_for(hwnd), &palette)
+    {
+        return Some(LRESULT(answer));
+    }
     Some(LRESULT(handle_custom_draw(
         lparam,
         dpi_for(hwnd),
@@ -13474,6 +13481,93 @@ mod tests {
         assert_ne!(
             light_button, DARK.control_fill,
             "light keeps the system button"
+        );
+    }
+
+    /// #582 slice 4, wired-to-nothing check: with nothing wired, a dark
+    /// window's trackbar would be the stock one (a grey rail and a grey
+    /// thumb). The pixels come from a real `WM_PRINTCLIENT` of the trackbar,
+    /// which paints through its own `NM_CUSTOMDRAW` route to the body: the
+    /// filled rail and the thumb's dot are the accent, the rest of the rail is
+    /// the control border token and the thumb is the text token. Light keeps
+    /// the stock trackbar.
+    #[test]
+    fn a_dark_trackbar_is_drawn_from_the_tokens_and_light_stays_stock() {
+        use crate::ui::theme::DARK;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetPixel, ReleaseDC, SelectObject,
+        };
+        const TBM_GETTHUMBRECT: u32 = 0x0419;
+        const PRF_CLIENT: isize = 0x4;
+        let probe = |theme: Theme| {
+            let _forced = Forced::new(theme);
+            let mut seen = (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+            with_window(Config::default(), |hwnd, _raw| {
+                let track = get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK).expect("the trackbar");
+                let mut rc = windows::Win32::Foundation::RECT::default();
+                let mut thumb = windows::Win32::Foundation::RECT::default();
+                unsafe {
+                    let _ = GetClientRect(track, &mut rc);
+                    SendMessageW(
+                        track,
+                        TBM_GETTHUMBRECT,
+                        None,
+                        Some(LPARAM(&mut thumb as *mut _ as isize)),
+                    );
+                }
+                let (disc, dot) = crate::ui::settings_trackbar::thumb_rects(
+                    &thumb,
+                    dpi_for(track),
+                    crate::ui::settings_trackbar::ThumbState::Normal,
+                );
+                let cy = (thumb.top + thumb.bottom) / 2;
+                seen = unsafe {
+                    let screen = GetDC(None);
+                    let dc = CreateCompatibleDC(Some(screen));
+                    let bmp = CreateCompatibleBitmap(screen, rc.right.max(400), rc.bottom.max(80));
+                    let old = SelectObject(dc, HGDIOBJ(bmp.0));
+                    SendMessageW(
+                        track,
+                        windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT,
+                        Some(WPARAM(dc.0 as usize)),
+                        Some(LPARAM(PRF_CLIENT)),
+                    );
+                    let seen = (
+                        GetPixel(dc, thumb.left - 12, cy).0,
+                        GetPixel(dc, rc.right - 12, cy).0,
+                        GetPixel(dc, (dot.left + dot.right) / 2, cy).0,
+                        GetPixel(dc, disc.left + 1, cy).0,
+                        GetPixel(dc, rc.right - 12, 1).0,
+                        // The end mark the system draws under the rail's left end.
+                        (cy + 6..rc.bottom)
+                            .flat_map(|y| (rc.left..rc.left + 12).map(move |x| (x, y)))
+                            .filter(|&(x, y)| GetPixel(dc, x, y).0 != DARK.surface)
+                            .count() as u32,
+                    );
+                    SelectObject(dc, old);
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    let _ = DeleteDC(dc);
+                    ReleaseDC(None, screen);
+                    seen
+                };
+            });
+            seen
+        };
+        let accent = {
+            let _forced = Forced::new(Theme::Dark);
+            unsafe { edit_style() }.colors.focus_line
+        };
+        let (filled, rail, dot, disc, face, marks) = probe(Theme::Dark);
+        assert_eq!(filled, accent, "the rail before the thumb");
+        assert_eq!(rail, DARK.control_border, "the rail after the thumb");
+        assert_eq!(dot, accent, "the dot in the thumb");
+        assert_eq!(disc, DARK.text, "the thumb");
+        assert_eq!(face, DARK.surface, "the background behind the rail");
+        assert_eq!(marks, 0, "no stock end mark under the rail");
+        let (_, light_rail, ..) = probe(Theme::Light);
+        assert_ne!(
+            light_rail, DARK.control_border,
+            "light keeps the stock rail"
         );
     }
 

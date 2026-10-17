@@ -20,6 +20,7 @@ mod settings_combo;
 mod settings_commit;
 mod settings_models;
 mod settings_theme;
+mod settings_trackbar;
 pub(crate) mod text;
 pub(crate) mod theme;
 pub mod tray;

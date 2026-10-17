@@ -509,6 +509,10 @@ pub(crate) const FOCUS_LINE_DP: i32 = 2;
 /// Side of a checkbox's box, in dp. Smaller than the Windows 11 20 so the label
 /// starts where the stock one does and the rows keep their layout (#582).
 pub(crate) const CHECK_BOX_DP: i32 = 16;
+/// Thickness of a trackbar's channel, in dp (Windows 11 draws a 4 dp rail).
+pub(crate) const TRACK_CHANNEL_DP: i32 = 4;
+/// Largest diameter of a trackbar's thumb, in dp.
+pub(crate) const TRACK_THUMB_DP: i32 = 16;
 /// Gap between a checkbox's box and its label, in dp.
 pub(crate) const CHECK_TEXT_GAP_DP: i32 = 4;
 /// Height of a button, in dp (Windows 11 controls are 32 tall).
