@@ -827,6 +827,9 @@ pub fn run() -> Result<()> {
     crate::usage::set_daily_budget(config.budget.daily_usd, config.budget.warn_percent);
     // #111: `ocr::recognize` runs on worker threads with no Config in reach.
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
+    // #81: index the knowledge folder once, on a background thread that ends
+    // with the scan. An empty setting starts nothing.
+    let _ = crate::knowledge::ingest::start_scan(&config.knowledge.folder);
     let chain = Arc::new(config.build_chain());
 
     // #105: every `Chain` built from here on asks the owner window to show

@@ -21,6 +21,7 @@ mod acl;
 pub mod chunks;
 mod egress;
 mod import;
+pub mod knowledge;
 mod migrate;
 mod profile_field;
 mod usage_day;
@@ -529,6 +530,12 @@ fn global_with(
 /// kept, so a broken store cannot flood the user with cards.
 pub fn report(e: &StoreError) {
     note(e.to_string());
+}
+
+/// Records a plain-words notice that is not a store failure (the knowledge
+/// scan could not read some files). Same rule as [`report`]: one per run.
+pub fn report_text(text: &str) {
+    note(text.to_string());
 }
 
 fn note(text: String) {
