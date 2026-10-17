@@ -993,9 +993,23 @@ pub(crate) fn describe_error_span(contents: &str, span: Option<std::ops::Range<u
 /// a whole-file save in between is refused instead of overwriting a hand edit
 /// that the patch carried along.
 pub(crate) fn write_file_atomically(path: &Path, text: &str, note_new_mtime: bool) -> Result<()> {
-    // The UI thread's whole-file save and the writer thread share one temp file
-    // name; two writes at once would trip over it.
-    let _one_writer = lock_ignoring_poison(&WRITE_LOCK);
+    let _one_writer = lock_writes();
+    write_file_atomically_held(path, text, note_new_mtime)
+}
+
+/// The UI thread's whole-file save and the writer thread share one temp file
+/// name; two writes at once would trip over it. The field writer holds this
+/// across its "did the file change" check and its write.
+pub(crate) fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+    lock_ignoring_poison(&WRITE_LOCK)
+}
+
+/// [`write_file_atomically`] for a caller that already holds [`lock_writes`].
+pub(crate) fn write_file_atomically_held(
+    path: &Path,
+    text: &str,
+    note_new_mtime: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("failed to create config directory")?;
     }

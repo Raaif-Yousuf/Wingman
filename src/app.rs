@@ -432,7 +432,9 @@ struct App {
     /// #870: writes handed to the writer thread whose reply has not come back.
     /// Only the last reply swaps in the loaded config; an earlier one was read
     /// before a later choice was made.
-    pending_writes: u32,
+    pending_writes: Arc<std::sync::atomic::AtomicU32>,
+    /// #870: the newest good load an earlier (not last) reply left unadopted.
+    skipped_mtime: Option<Option<std::time::SystemTime>>,
     /// #339: whether a password manager was in front before Wingman's own UI
     /// (the tray menu, the palette) took the foreground. Set only around a
     /// dispatch from that UI and cleared right after, so it never leaks into
@@ -699,7 +701,8 @@ pub fn run() -> Result<()> {
         taskbar_created_msg,
         config,
         unsaved: Vec::new(),
-        pending_writes: 0,
+        pending_writes: Arc::default(),
+        skipped_mtime: None,
         chain,
         card,
         palette,
@@ -4306,6 +4309,9 @@ impl App {
                 // freshly loaded config is the one whose hydrate ran.
                 let unreadable = config.unreadable_secrets.clone();
                 self.config = config;
+                // The file is the truth again; an old failed write must not be
+                // re-applied over it later.
+                self.unsaved.clear();
                 self.apply_config();
                 if unreadable.is_empty() {
                     self.card.show_answer("Settings reloaded", "", 3, None);
@@ -4429,6 +4435,8 @@ impl App {
             self.show_tray_restore_error(tray_restore_error);
             return;
         }
+        // The saved config replaces everything, failed tray writes included.
+        self.unsaved.clear();
         self.apply_config();
 
         if pending.is_empty() {
@@ -4760,7 +4768,9 @@ impl App {
         changes: Vec<crate::config_writer::FieldChange>,
     ) {
         use crate::config_writer::{WriteReply, Written};
-        self.pending_writes += 1;
+        self.pending_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pending = Arc::clone(&self.pending_writes);
         let target = self.hwnd_isize();
         let label = outcome.ok_headline.clone();
         let sent = changes.clone();
@@ -4785,8 +4795,10 @@ impl App {
                 )
                 .is_err()
                 {
-                    // Window gone: nobody will take the box, so free it here.
+                    // Window gone: nobody will take the box, so free it here, and
+                    // settle the count its reply would have settled.
                     free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
+                    crate::config_writer::finish(&pending);
                 }
             }
         };
@@ -4812,19 +4824,32 @@ impl App {
             outcome,
             loaded,
         } = written;
-        let (pending, last) = crate::config_writer::settle(self.pending_writes);
-        self.pending_writes = pending;
+        let last = crate::config_writer::finish(&self.pending_writes);
+        let this_ok = match (&reply.result, &loaded) {
+            (
+                Ok(()),
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config),
+                    mtime,
+                }),
+            ) if config.load_problem.is_none() => Some(*mtime),
+            _ => None,
+        };
+        let (adopt, skipped) =
+            crate::config_writer::track_mtime(last, this_ok, self.skipped_mtime.take());
+        self.skipped_mtime = skipped;
+        if let Some(mtime) = adopt {
+            crate::config_writer::adopt_mtime(mtime);
+        }
         let rewritten =
             |c: &crate::config_writer::FieldChange| changes.iter().any(|n| n.path() == c.path());
         self.unsaved.retain(|c| !rewritten(c));
         match reply.result {
             Ok(()) => match loaded {
                 Some(crate::config_writer::Loaded {
-                    config: Ok(config),
-                    mtime,
+                    config: Ok(config), ..
                 }) if config.load_problem.is_none() => {
                     if last {
-                        crate::config_writer::adopt_mtime(mtime);
                         self.config = crate::config_writer::reapply(&config, &self.unsaved)
                             .unwrap_or(*config);
                         self.apply_config();

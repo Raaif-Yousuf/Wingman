@@ -146,7 +146,22 @@ impl FieldChange {
                             }
                             _ => {}
                         }
+                        let comment = match (&*slot, &item) {
+                            (Item::ArrayOfTables(old), Item::Value(_)) => {
+                                old.get(0).and_then(|t| t.decor().prefix().cloned())
+                            }
+                            _ => None,
+                        };
                         *slot = item;
+                        // A list of tables replaced by an empty list becomes a
+                        // plain `key = []`; the comment that stood above the
+                        // first table moves to the key.
+                        if let Some(prefix) = comment {
+                            if let Some(mut k) = table.key_mut(key) {
+                                k.leaf_decor_mut().set_prefix(prefix);
+                                k.leaf_decor_mut().set_suffix(" ");
+                            }
+                        }
                     }
                     None => {
                         table.insert(key, item);
@@ -425,13 +440,16 @@ fn write_changes_with(
             );
         }
         between_read_and_write(attempt);
+        // The check and the write happen under one hold of the write lock, so
+        // another writer cannot slip a write in between them.
+        let _one_writer = crate::config::lock_writes();
         if crate::config::file_mtime(path) != seen {
             continue;
         }
         if out == text {
             return Ok(());
         }
-        return crate::config::write_file_atomically(path, &out, false);
+        return crate::config::write_file_atomically_held(path, &out, false);
     }
     bail!("config.toml changed while Wingman was saving it, so nothing was written. Try again")
 }
@@ -540,12 +558,39 @@ pub struct Written {
     pub loaded: Option<Loaded>,
 }
 
-/// After one write's reply: the writes still in flight, and whether this was the
-/// last. Only the last reply may swap in a loaded config; an earlier one was read
-/// before a later choice was made and would overwrite it.
-pub fn settle(pending: u32) -> (u32, bool) {
-    let left = pending.saturating_sub(1);
-    (left, left == 0)
+/// One write's reply has been dealt with (or could not be posted): takes it off
+/// the count of writes in flight and says whether it was the last. Only the last
+/// reply may swap in a loaded config; an earlier one was read before a later
+/// choice was made and would overwrite it.
+pub fn finish(pending: &std::sync::atomic::AtomicU32) -> bool {
+    use std::sync::atomic::Ordering;
+    let before = pending
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .unwrap_or(0);
+    before <= 1
+}
+
+type Seen = Option<std::time::SystemTime>;
+
+/// Which file mtime the UI thread should adopt after a reply, and which good one
+/// to remember for later. `this_ok` is the mtime of this reply's load if it
+/// succeeded; `skipped` the newest good one an earlier reply left unadopted
+/// (not the last). The last reply adopts its own, or, if it failed, the newest
+/// good earlier one: a failed write leaves the file as that load saw it, so
+/// Settings saves are not refused for good.
+pub fn track_mtime(
+    last: bool,
+    this_ok: Option<Seen>,
+    skipped: Option<Seen>,
+) -> (Option<Seen>, Option<Seen>) {
+    let newest = this_ok.or(skipped);
+    if last {
+        (newest, None)
+    } else {
+        (None, newest)
+    }
 }
 
 /// `Config::load` for the handler of [`Written`], with the error as a sentence.
@@ -1767,18 +1812,6 @@ x = 1
         cleanup(&path);
     }
 
-    #[test]
-    fn only_the_last_reply_in_a_run_of_writes_swaps_the_config() {
-        // Mode toggled twice quickly: the first reply's file read predates the
-        // second choice and must not overwrite it.
-        let (pending, last) = settle(2);
-        assert_eq!((pending, last), (1, false));
-        let (pending, last) = settle(pending);
-        assert_eq!((pending, last), (0, true));
-        // A stray extra reply never underflows.
-        assert_eq!(settle(0), (0, true));
-    }
-
     fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
         let start = src.find(signature).unwrap_or_else(|| {
             panic!("{signature} moved: this scan is no longer looking at anything")
@@ -1812,7 +1845,7 @@ x = 1
     fn the_handler_swaps_only_when_no_other_write_is_in_flight() {
         let app = include_str!("app.rs").replace('\r', "");
         let body = body_of(&app, "    fn on_config_written(");
-        assert!(body.contains("settle("), "{body}");
+        assert!(body.contains("finish("), "{body}");
     }
 
     /// The low-level keyboard hook must be gone before Quit waits on the writer,
@@ -1833,6 +1866,112 @@ x = 1
             .expect("the hook must be dropped in WM_DESTROY");
         let flush = arm.find("flush_global(").expect("flush");
         assert!(unhook < flush, "{arm}");
+    }
+
+    // -- round 3 review fixes (#889) --------------------------------------------
+
+    #[test]
+    fn a_pending_count_that_lost_its_reply_still_settles() {
+        use std::sync::atomic::AtomicU32;
+        let pending = AtomicU32::new(0);
+        pending.fetch_add(2, Ordering::SeqCst);
+        // The first write's reply could not be posted (window gone): the poster
+        // settles it itself, and it must not count as the last.
+        assert!(!finish(&pending));
+        // The second reply then is the last.
+        assert!(finish(&pending));
+        // A stray extra never underflows.
+        assert!(finish(&pending));
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_last_reply_still_adopts_the_newest_good_load() {
+        let t = |s: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        // Not the last: remember it, adopt nothing yet.
+        assert_eq!(track_mtime(false, Some(t(1)), None), (None, Some(t(1))));
+        assert_eq!(
+            track_mtime(false, Some(t(2)), Some(t(1))),
+            (None, Some(t(2)))
+        );
+        assert_eq!(track_mtime(false, None, Some(t(1))), (None, Some(t(1))));
+        // Last and good: adopt its own, forget the rest.
+        assert_eq!(
+            track_mtime(true, Some(t(3)), Some(t(1))),
+            (Some(t(3)), None)
+        );
+        // Last but failed: adopt the newest earlier good one.
+        assert_eq!(track_mtime(true, None, Some(t(2))), (Some(t(2)), None));
+        // Nothing good at all.
+        assert_eq!(track_mtime(true, None, None), (None, None));
+    }
+
+    #[test]
+    fn the_changed_since_read_check_happens_while_the_write_lock_is_held() {
+        let path = scratch("lock-check");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let guard = crate::config::lock_writes();
+        let worker = {
+            let path = path.clone();
+            std::thread::spawn(move || write_changes(&path, &[FieldChange::mode(Mode::Offline)]))
+        };
+        // Let the worker read the file and reach the lock.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let during = replaced(HAND_EDITED, "card_seconds = 12", "card_seconds = 77");
+        edit_file(&path, &during, 5);
+        drop(guard);
+        worker.join().unwrap().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("card_seconds = 77"),
+            "the hand edit was lost:\n{out}"
+        );
+        assert!(out.contains(r#"mode = "offline""#), "{out}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_empty_list_replacing_a_list_of_tables_keeps_the_comment() {
+        let text = "[providers]\norder = [\"openai\"]\n\n# my endpoints\n[[providers.compat]]\nname = \"a\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n[ui]\ncard_seconds = 7 # keep\n";
+        let out = patched(
+            "aot-empty",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: toml::Value::Array(Vec::new()),
+            }],
+        );
+        assert!(out.contains("# my endpoints"), "{out}");
+        assert!(
+            out.find("# my endpoints").unwrap() < out.find("compat = []").unwrap(),
+            "{out}"
+        );
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert!(loaded.providers.compat.is_empty());
+        assert!(out.contains("card_seconds = 7 # keep"), "{out}");
+    }
+
+    #[test]
+    fn a_reload_or_a_settings_save_forgets_the_unsaved_changes() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let reload = body_of(&app, "    fn reload(&mut self) {");
+        assert!(reload.contains("unsaved.clear()"), "{reload}");
+        let settings = body_of(&app, "    fn open_settings_inner(&mut self) {");
+        let saved = settings
+            .find("commit_edited_config(")
+            .expect("the Settings commit moved");
+        let clear = settings
+            .find("unsaved.clear()")
+            .expect("unsaved must be cleared");
+        let apply = settings.find("self.apply_config()").expect("apply_config");
+        assert!(saved < clear && clear < apply, "{settings}");
+    }
+
+    #[test]
+    fn a_reply_that_cannot_be_posted_settles_its_own_count() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let body = body_of(&app, "    fn persist_changes(");
+        assert!(body.contains("finish("), "{body}");
     }
 
     // -- guards ----------------------------------------------------------------
