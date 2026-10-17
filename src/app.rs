@@ -14872,7 +14872,10 @@ mod tests {
         // The helper itself and the startup welcome card.
         assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
         assert!(body_of("show_setup_card").contains("set_watch(true)"));
-        assert!(body_of("reload").contains("set_watch(true)"));
+        // #901: reload only shows the Working card; the cards that follow it
+        // are shown by the write handler and the stuck handler, which arm it.
+        assert!(body_of("on_config_written").contains("set_watch(true)"));
+        assert!(body_of("on_reload_stuck").contains("set_watch(true)"));
         // Every early return in edit_settings that follows a card arms it.
         let edit = body_of("edit_settings");
         let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
