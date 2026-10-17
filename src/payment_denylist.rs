@@ -403,6 +403,234 @@ pub fn is_payment_shaped_value(text: &str) -> bool {
     contains_card_number(text) || contains_iban(text)
 }
 
+// ---------------------------------------------------------------------------
+// National-id shapes (knowledge spec, K1): masked in indexed chunks so the
+// store never holds one. A pure string scan. Where a bare digit run would also
+// match a phone number or a postcode (which documents are full of and which are
+// allowed), a label must come first; only the US social security shape
+// `ddd-dd-dddd` is caught without one.
+// ---------------------------------------------------------------------------
+
+/// Labels after which a nine-digit number is a US social security number.
+const SSN_LABELS: &[&str] = &["ssn", "social security"];
+/// Labels after which a run of six or more digits is an identity number.
+const ID_LABELS: &[&str] = &["national id", "passport number", "tax id"];
+
+/// Byte ranges of every national-id shaped value in `text`, merged and sorted:
+/// a US social security shape (`ddd-dd-dddd`, or nine digits after "ssn" or
+/// "social security"), a UK National Insurance number (`AB 12 34 56 C`), and a
+/// run of six or more digits after "national id", "passport number" or
+/// "tax id". Never panics on any input.
+pub fn national_id_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let lower = text.to_ascii_lowercase();
+    let mut spans = Vec::new();
+    ssn_shape_spans(bytes, &mut spans);
+    uk_ni_spans(bytes, &mut spans);
+    for label in SSN_LABELS {
+        labelled_digit_spans(&lower, bytes, label, 9, Some(9), &mut spans);
+    }
+    for label in ID_LABELS {
+        labelled_digit_spans(&lower, bytes, label, 6, None, &mut spans);
+    }
+    merge_overlapping(spans)
+}
+
+fn is_digit_at(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i).is_some_and(u8::is_ascii_digit)
+}
+
+/// `ddd-dd-dddd` with no digit touching either end.
+fn ssn_shape_spans(bytes: &[u8], out: &mut Vec<std::ops::Range<usize>>) {
+    const LEN: usize = 11;
+    for start in 0..bytes.len() {
+        let Some(win) = bytes.get(start..start + LEN) else {
+            break;
+        };
+        let shaped = win.iter().enumerate().all(|(i, b)| match i {
+            3 | 6 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        });
+        let before = start > 0 && is_digit_at(bytes, start - 1);
+        if shaped && !before && !is_digit_at(bytes, start + LEN) {
+            out.push(start..start + LEN);
+        }
+    }
+}
+
+/// Two letters, six digits (optionally in pairs split by single spaces), then
+/// A to D, as a whole word. The first letter is never D, F, I, Q, U or V and
+/// the second is never those or O, which is how a real number is told from
+/// an arbitrary code.
+fn uk_ni_spans(bytes: &[u8], out: &mut Vec<std::ops::Range<usize>>) {
+    let word_byte = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_alphanumeric);
+    for start in 0..bytes.len() {
+        if start > 0 && word_byte(start - 1) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (bytes.get(start), bytes.get(start + 1)) else {
+            break;
+        };
+        let (a, b) = (a.to_ascii_uppercase(), b.to_ascii_uppercase());
+        let bad_letter = |c: u8| !c.is_ascii_uppercase() || b"DFIQUV".contains(&c);
+        if bad_letter(a) || bad_letter(b) || b == b'O' {
+            continue;
+        }
+        let mut i = start + 2;
+        if bytes.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        let mut digits = 0;
+        while digits < 6 {
+            if digits > 0 && digits % 2 == 0 && bytes.get(i) == Some(&b' ') {
+                i += 1;
+            }
+            if !is_digit_at(bytes, i) {
+                break;
+            }
+            digits += 1;
+            i += 1;
+        }
+        if digits != 6 {
+            continue;
+        }
+        if bytes.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        let suffix = bytes.get(i).map(u8::to_ascii_uppercase);
+        if matches!(suffix, Some(b'A'..=b'D')) && !word_byte(i + 1) {
+            out.push(start..i + 1);
+        }
+    }
+}
+
+/// After each occurrence of `label`, skips a few separators and takes a run of
+/// digits (single spaces or hyphens allowed between digits). It counts when it
+/// has at least `min` digits, and exactly `exact` if given.
+fn labelled_digit_spans(
+    lower: &str,
+    bytes: &[u8],
+    label: &str,
+    min: usize,
+    exact: Option<usize>,
+    out: &mut Vec<std::ops::Range<usize>>,
+) {
+    let mut from = 0;
+    while let Some(found) = lower.get(from..).and_then(|rest| rest.find(label)) {
+        let label_at = from + found;
+        let after = label_at + label.len();
+        from = after;
+        // A label inside a longer word ("syntax id") is not a label.
+        if label_at > 0
+            && bytes
+                .get(label_at - 1)
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            continue;
+        }
+        let mut i = after;
+        // At most a few separator characters: "SSN: ", "tax id #".
+        let limit = after + 8;
+        while i < limit && matches!(bytes.get(i), Some(b' ' | b':' | b'#' | b'=' | b'-' | b'\t')) {
+            i += 1;
+        }
+        let start = i;
+        let (mut end, mut digits) = (i, 0usize);
+        loop {
+            if is_digit_at(bytes, end) {
+                digits += 1;
+                end += 1;
+            } else if matches!(bytes.get(end), Some(b' ' | b'-')) && is_digit_at(bytes, end + 1) {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if digits >= min && exact.map_or(true, |n| digits == n) {
+            out.push(start..end);
+        }
+    }
+}
+
+#[cfg(test)]
+mod national_id_tests {
+    use super::national_id_spans;
+
+    fn found(text: &str) -> Vec<&str> {
+        national_id_spans(text)
+            .into_iter()
+            .map(|r| &text[r])
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_social_security_shape_without_a_label() {
+        assert_eq!(found("id 123-45-6789 here"), ["123-45-6789"]);
+        assert!(found("1123-45-67890").is_empty(), "digits touch both ends");
+    }
+
+    #[test]
+    fn nine_digits_need_the_label() {
+        assert_eq!(found("SSN: 123456789."), ["123456789"]);
+        assert_eq!(found("Social Security 123 45 6789"), ["123 45 6789"]);
+        assert!(found("zip 123456789").is_empty());
+        assert!(found("SSN 1234567890").is_empty(), "ten digits is not one");
+    }
+
+    #[test]
+    fn finds_uk_national_insurance_numbers() {
+        assert_eq!(found("NI: AB 12 34 56 C ok"), ["AB 12 34 56 C"]);
+        assert_eq!(found("ab123456c"), ["ab123456c"]);
+        assert!(
+            found("QQ 12 34 56 C").is_empty(),
+            "Q is never a first letter"
+        );
+        assert!(found("AB 12 34 56 E").is_empty(), "suffix is A to D");
+        assert!(found("XAB123456C").is_empty(), "must start a word");
+    }
+
+    #[test]
+    fn labelled_runs_of_six_or_more_digits() {
+        assert_eq!(found("Passport number: 5512 3456"), ["5512 3456"]);
+        assert_eq!(found("national id 123456"), ["123456"]);
+        assert_eq!(found("Tax ID #98765432"), ["98765432"]);
+        assert!(found("tax id 12345").is_empty());
+        assert!(found("call 555 123456").is_empty());
+    }
+
+    #[test]
+    fn phone_numbers_and_postcodes_are_allowed() {
+        for ok in ["+1 555-123-4567", "94103-1234", "SW1A 1AA", "07700 900123"] {
+            assert!(found(ok).is_empty(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_label_inside_a_longer_word_is_not_a_label() {
+        assert!(found("syntax id 123456").is_empty());
+        assert!(found("pretax id 123456").is_empty());
+        assert_eq!(found("(tax id 123456)"), ["123456"]);
+    }
+
+    #[test]
+    fn odd_input_never_panics() {
+        for text in [
+            "",
+            "é",
+            "ssn",
+            "ssn:",
+            "tax id é123456",
+            "AB",
+            "ab 12 3",
+            "\u{1F600}ssn 1",
+        ] {
+            let _ = national_id_spans(text);
+        }
+        let long = "ssn ".repeat(5000) + &"1".repeat(40);
+        let _ = national_id_spans(&long);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
