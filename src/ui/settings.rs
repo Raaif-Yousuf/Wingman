@@ -145,13 +145,27 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     inner.owner = owner;
     inner.owns_itself = true;
     let owner_raw = owner.0 as isize;
+    // What the FILE held when the window opened, defaults for keys it does not
+    // spell out. The running config is not that (a tray change not yet written,
+    // a default never written), and comparing with it refuses a save that
+    // touched nothing by hand. Tests do not read the real file (rule 9).
+    let file_baseline = if live {
+        crate::config::Config::path()
+            .ok()
+            .and_then(|p| crate::config_writer::file_baseline(&p))
+    } else {
+        None
+    };
     inner.save_sink = Some(Box::new(move |original: &Config, edited: &Config| {
         let changes = crate::config_writer::diff(original, edited).map_err(|e| format!("{e:#}"))?;
         // A list changed here replaces the whole list in the file, so it is
         // written only if the file's list is still the one this window opened
         // with; a hand edit of a sibling entry is not silently dropped.
-        let changes = crate::config_writer::guard_whole_values(changes, original)
-            .map_err(|e| format!("{e:#}"))?;
+        let changes = crate::config_writer::guard_whole_values(
+            changes,
+            file_baseline.as_ref().unwrap_or(original),
+        )
+        .map_err(|e| format!("{e:#}"))?;
         crate::app::post_settings_save(
             owner_raw,
             crate::app::SettingsSave {

@@ -1983,6 +1983,12 @@ impl App {
     /// Copilot-key picker): that shows the static card, the model-free options
     /// only, and sends nothing, so it can never cost money (#308).
     fn show_options_card(&mut self, trigger: Trigger, use_router: bool) {
+        // The Wingman key, the tray and the palette all arrive here: with
+        // Settings in front, or a save still being applied, nothing is captured
+        // and no request is billed on settings that are about to change.
+        if self.refuse_for_settings() {
+            return;
+        }
         if self.busy_now() {
             self.show_busy_card();
             return;
@@ -2329,6 +2335,10 @@ impl App {
     /// palette-only code path. A `None` target (an id the palette itself
     /// never produces) is a no-op, not a panic (rule 7).
     fn dispatch_palette_action(&mut self, action_id: &str) {
+        // A run posted before Settings opened, or while a save is applied.
+        if self.refuse_for_settings() {
+            return;
+        }
         // #339: the palette hid itself before this runs, so the live check
         // sees whatever Windows re-activated. Honour what was in front when
         // it opened as well, for the length of this one dispatch.
@@ -4605,6 +4615,9 @@ impl App {
         // that window would dismiss it anyway.
         self.card.hide();
         self.set_watch(false);
+        // The options card went with it; an answer for it is dropped while
+        // Settings is in front, so its session must not wait for one.
+        self.options = None;
         if !settings::open(self.instance, self.hwnd(), &self.config) {
             // Rule 7: never a silent no-op.
             self.card.show_error(
@@ -4626,7 +4639,11 @@ impl App {
         let pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         self.deliver_deferred(pending);
-        self.set_watch(true);
+        // Click-away dismissal needs the global mouse hook, which is armed only
+        // while a card is showing (nothing runs while idle).
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.set_watch(true);
+        }
     }
 
     /// The Settings window's Save (#871): only the fields the user changed, the
@@ -7660,6 +7677,10 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_PALETTE_RUN
         | WM_APP_MACHINE_CHECK_RESULT
         | WM_APP_OPTIONS_CHOICE => ForegroundPolicy::Drop,
+        // Settings takes a chord itself while its own Change is pending; one
+        // that reaches here is from a Change that ended (Esc, timeout), and
+        // applying it would rebind a hotkey the user cancelled.
+        WM_APP_LEARNED => ForegroundPolicy::Drop,
         // The writer's answer and the save apply the setting at once; the Wingman
         // key and activation are refused with a card (`settings_hold_card`);
         // Quit, the tray and the card's own clicks work as always.
@@ -7955,7 +7976,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     match msg {
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
-            if !app.cancel_pending_send_preview() {
+                                   // Before any dispatch: the key's press captures the screen and
+                                   // asks the router, so with Settings in front (or a save still
+                                   // being applied) it is refused with a card, never kept.
+            if app.refuse_for_settings() {
+                // The card says why.
+            } else if !app.cancel_pending_send_preview() {
                 app.on_primary_key(Trigger::Hotkey);
             }
             LRESULT(0)
@@ -8432,6 +8458,10 @@ mod tests {
             WM_APP_PALETTE_RUN,
             WM_APP_MACHINE_CHECK_RESULT,
             WM_APP_OPTIONS_CHOICE,
+            // Settings takes a captured chord itself while a Change is
+            // pending; one that reaches the main window is from a Change that
+            // was cancelled or timed out, and must not rebind a hotkey.
+            WM_APP_LEARNED,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Drop, "{id}");
         }
@@ -8442,7 +8472,6 @@ mod tests {
             WM_APP_TRAY,
             WM_CLOSE,
             WM_DESTROY,
-            WM_APP_LEARNED,
             WM_APP_HOTKEY,
             WM_APP_ACTIVATE,
             WM_APP_DISMISS,
@@ -8569,6 +8598,66 @@ mod tests {
             .expect("activation ungated");
         let limiter = tail.find("check_activation_now").expect("limiter moved");
         assert!(refuse < limiter, "refuse before spending an allowance");
+
+        // The Wingman key reaches `show_options_card(Hotkey, true)` (a capture
+        // and a billed router call) without going through `begin_action`, so
+        // its own arm asks before any dispatch.
+        let hot = proc_src
+            .find("WM_APP_HOTKEY => {")
+            .expect("no WM_APP_HOTKEY arm");
+        let hot_end = proc_src[hot..]
+            .find("WM_APP_ACTIVATE => {")
+            .expect("the arm order moved");
+        let arm = &proc_src[hot..hot + hot_end];
+        let refuse = arm
+            .find("app.refuse_for_settings()")
+            .expect("the Wingman key bypasses the Settings gate");
+        let dispatch = arm
+            .find("on_primary_key(")
+            .expect("the arm lost its dispatch");
+        let cancel = arm
+            .find("cancel_pending_send_preview")
+            .expect("the arm lost its preview cancel");
+        assert!(refuse < dispatch && refuse < cancel, "{arm}");
+        // The options card and the palette's dispatch are model entry points
+        // of their own (the palette run can arrive while a save is applied).
+        let options = body_between(&src, "    fn show_options_card(", "\n    }\n");
+        let ask = options.find("self.refuse_for_settings()").expect("ungated");
+        assert!(
+            ask < options.find("self.busy_now()").expect("busy moved"),
+            "{options}"
+        );
+        let palette = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
+        let ask = palette.find("self.refuse_for_settings()").expect("ungated");
+        assert!(
+            ask < palette.find("dispatch_palette_target").expect("moved"),
+            "{palette}"
+        );
+    }
+
+    /// #871: leaving Settings re-arms the click-away hook only when a card is
+    /// showing. With none, the global mouse hook would sit idle (rule 5).
+    #[test]
+    fn leaving_settings_arms_the_click_watch_only_for_a_visible_card() {
+        let src = lf(include_str!("app.rs"));
+        let left = body_between(&src, "    fn on_settings_left(&mut self) {", "\n    }\n");
+        let deliver = left
+            .find("self.deliver_deferred(pending)")
+            .expect("deliver moved");
+        let watch = left.find("self.set_watch(true)").expect("no re-arm at all");
+        let hidden = left.find("CardState::Hidden").expect("arms with no card");
+        assert!(deliver < hidden && hidden < watch, "{left}");
+    }
+
+    /// A router answer that arrives while Settings is in front is dropped, so
+    /// the options session it was for must not outlive the card Settings hid.
+    #[test]
+    fn opening_settings_forgets_the_options_session_with_its_card() {
+        let src = lf(include_str!("app.rs"));
+        let open = body_between(&src, "    fn open_settings(&mut self) {", "\n    }\n");
+        let hide = open.find("self.card.hide()").expect("card not hidden");
+        let forget = open.find("self.options = None").expect("session kept");
+        assert!(hide < forget, "{open}");
     }
 
     /// #213: the "Settings saved" card gives way to an answer on screen, a failed

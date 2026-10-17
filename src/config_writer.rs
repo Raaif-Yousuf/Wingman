@@ -444,6 +444,27 @@ pub fn guard_whole_values(changes: Vec<FieldChange>, before: &Config) -> Result<
         .collect())
 }
 
+/// The settings as `text` (the file's contents) holds them, defaults for every key
+/// it does not spell out: what [`guard_whole_values`] must compare against, since
+/// the writer compares with the file read the same way. The running config is not
+/// that: a tray change not yet written, or a default the file never carried, would
+/// make an untouched list look hand-edited.
+pub fn baseline_from_text(text: &str) -> Config {
+    Config::parse_or_default(text)
+}
+
+/// [`baseline_from_text`] for the file at `path`, read once when Settings opens.
+/// A missing file is all defaults, as the writer treats it. `None` when it cannot
+/// be read: the caller falls back to the running config, and a whole-value change
+/// the file then disagrees with is refused (the safe outcome).
+pub fn file_baseline(path: &Path) -> Option<Config> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(baseline_from_text(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(baseline_from_text("")),
+        Err(_) => None,
+    }
+}
+
 fn value_at<'a>(root: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
     path.iter().try_fold(root, |at, key| at.get(key.as_str()))
 }
@@ -2103,6 +2124,10 @@ x = 1
             code.contains("crate::config_writer::guard_whole_values("),
             "a changed list must not replace a hand edit of the same list"
         );
+        assert!(
+            code.contains("crate::config_writer::file_baseline("),
+            "the guard must compare with the file as read when the window opened"
+        );
         assert!(code.contains("crate::app::post_settings_save("));
         assert!(
             !code.contains(".save("),
@@ -2175,6 +2200,45 @@ x = 1
         assert!(after.contains("order = [\"gemini\"]"), "{after}");
         assert!(after.contains("mode = \"auto\""), "{after}");
         cleanup(&path);
+    }
+
+    /// The running config has a list the file never spelled out (a tray change
+    /// not yet written): guarding against the running config refuses a save that
+    /// touched nothing in the file; guarding against the file as read does not.
+    #[test]
+    fn a_pending_tray_change_does_not_make_an_untouched_list_look_hand_edited() {
+        let path = scratch("guard-baseline");
+        let text = "mode = \"auto\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut running = Config::default();
+        running.providers.order = vec!["ollama".into()];
+        let mut edited = running.clone();
+        edited.providers.order = vec!["gemini".into()];
+        let changes = diff(&running, &edited).unwrap();
+
+        let wrong = guard_whole_values(changes.clone(), &running).unwrap();
+        assert!(write_changes(&path, &wrong).is_err(), "the old baseline");
+
+        let baseline = file_baseline(&path).expect("the file reads");
+        assert_eq!(baseline.providers.order, Config::default().providers.order);
+        let right = guard_whole_values(changes, &baseline).unwrap();
+        write_changes(&path, &right).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("order = [\"gemini\"]"), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_missing_file_is_all_defaults_and_an_unreadable_one_has_no_baseline() {
+        let missing = scratch("guard-missing");
+        cleanup(&missing);
+        let baseline = file_baseline(&missing).expect("a missing file is defaults");
+        assert_eq!(baseline.providers.order, Config::default().providers.order);
+        // Bytes that are not text cannot be read as a config.
+        let junk = scratch("guard-junk");
+        std::fs::write(&junk, [0xffu8, 0xfe, 0xfd]).unwrap();
+        assert!(file_baseline(&junk).is_none());
+        cleanup(&junk);
     }
 
     #[test]
