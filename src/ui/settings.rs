@@ -1998,6 +1998,13 @@ unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPAR
 /// window's current client size: the footer is pinned to the bottom, the body
 /// fills the rest, and its scroll range follows the content (#481).
 unsafe fn apply_dpi(inner: &mut SettingsInner) {
+    apply_layout(inner, true);
+}
+
+/// [`apply_dpi`], optionally keeping the current font. A layout change that
+/// is not a DPI or font change (a provider switch, #874) passes `false`, so no
+/// new `HFONT` is made for it.
+unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
     let dpi = inner.dpi;
     let mut rc = windows::Win32::Foundation::RECT::default();
     let (client_w_px, client_h_px) = if GetClientRect(inner.hwnd, &mut rc).is_ok() {
@@ -2028,7 +2035,11 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     );
     inner.body_dpi = dpi;
 
-    let new_font = build_font(dpi);
+    let new_font = if rebuild_font || inner.font.0.is_null() {
+        build_font(dpi)
+    } else {
+        inner.font
+    };
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
@@ -2067,7 +2078,7 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         set_body_scroll(inner.body, content_px, view_px, pos);
     }
     // Every child now uses the new font, so the old one can go.
-    if !inner.font.0.is_null() {
+    if new_font != inner.font && !inner.font.0.is_null() {
         let _ = DeleteObject(HGDIOBJ(inner.font.0));
     }
     inner.font = new_font;
@@ -2156,12 +2167,13 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
         get_dlg_item(hwnd, id)
             .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(h) > 0)
     };
-    let has_key = [
+    let configured = [
         typed(ID_OPENAI_KEY),
         typed(ID_ANTHROPIC_KEY),
         typed(ID_GEMINI_KEY),
+        inner.original.providers.order.iter().any(|p| p == "ollama"),
     ];
-    let shown = settings_models::shown_providers(active, has_key, inner.models_revealed);
+    let shown = settings_models::shown_providers(active, configured, inner.models_revealed);
     let add = settings_models::add_button_shown(shown, inner.models_revealed);
     inner.models_shown = shown;
     inner.models_add_shown = add;
@@ -2176,10 +2188,25 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
             }
         }
     }
-    inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch);
+    // A hidden Ollama card also takes its own height off the page. Its group
+    // frame is the tallest control made under the slot.
+    let card_h = inner
+        .models_flow
+        .iter()
+        .filter(|f| f.slot == Slot::OllamaCard)
+        .map(|f| f.h)
+        .max()
+        .unwrap_or(0);
+    let card_gone = if shown[3] { 0 } else { card_h + GROUP_GAP };
+    inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch) + card_gone;
+    if !inner.hwnd.0.is_null() {
+        // One repaint for the whole change, as `show_page` does: the layout
+        // pass below turns redraw back on and repaints.
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+    }
     sync_visibility(inner);
     if !inner.hwnd.0.is_null() {
-        apply_dpi(inner);
+        apply_layout(inner, false);
         // Focus never stays on a control that just went away.
         let focus = GetFocus();
         if !focus.0.is_null()
@@ -2193,21 +2220,27 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
     }
 }
 
+/// The control that takes focus when "Add another provider" shows the blocks
+/// that were hidden `before`: the first field of the first one that appeared.
+fn reveal_focus_id(before: [bool; 4], after: [bool; 4]) -> i32 {
+    const FIRST_FIELD: [i32; 4] = [
+        ID_OPENAI_KEY,
+        ID_ANTHROPIC_KEY,
+        ID_GEMINI_KEY,
+        ID_OLLAMA_MODEL,
+    ];
+    settings_models::first_revealed(before, after)
+        .map(|i| FIRST_FIELD[i])
+        .unwrap_or(ID_ACTIVE_PROVIDER)
+}
+
 /// "Add another provider": shows every vendor and puts focus on the first one
 /// that was hidden, since the button that had focus is gone.
 unsafe fn reveal_providers(inner: &mut SettingsInner) {
     let before = inner.models_shown;
     inner.models_revealed = true;
     sync_models_flow(inner);
-    let first_field = [
-        ID_OPENAI_KEY,
-        ID_ANTHROPIC_KEY,
-        ID_GEMINI_KEY,
-        ID_OLLAMA_MODEL,
-    ];
-    let target = settings_models::first_revealed(before, inner.models_shown)
-        .map(|i| first_field[i])
-        .unwrap_or(ID_ACTIVE_PROVIDER);
+    let target = reveal_focus_id(before, inner.models_shown);
     if let Some(h) = get_dlg_item(inner.hwnd, target) {
         let _ = SetFocus(Some(h));
     }
@@ -4988,8 +5021,9 @@ fn build_ui_recorded(
         providers_bottom - providers_top,
         0,
     );
-    // Everything under the frame moves up with it (#874).
-    ctx.slot.set(Some(Slot::Below));
+    // The Ollama card under the frame shows with the Ollama block and moves
+    // up with the frame (#874).
+    ctx.slot.set(Some(Slot::OllamaCard));
 
     y = providers_bottom + GROUP_GAP;
     page_y[Page::Models.index()] = y;
@@ -7602,6 +7636,8 @@ mod tests {
 
             // The Ollama button is on Models and only when it has an offer.
             unsafe { handle_page_request(inner, PAGE_PICK, 1) };
+            // The card is under the Ollama block, which shows on request.
+            unsafe { reveal_providers(inner) };
             assert!(!is_shown(hwnd, ID_OLLAMA_LINK), "nothing to offer yet");
             inner.ollama_link_shown = true;
             unsafe { sync_visibility(inner) };
@@ -8195,30 +8231,94 @@ mod tests {
     }
 
     /// The button that had focus is gone after "Add another provider", so
-    /// focus must land on a control that shows, never on the hidden button.
+    /// focus goes to the first row that appeared, never to the hidden button.
     #[test]
-    fn focus_moves_off_the_add_button_when_it_goes() {
+    fn focus_after_add_another_provider_goes_to_the_first_new_row() {
+        let one = [true, false, false, false];
+        assert_eq!(reveal_focus_id(one, [true; 4]), ID_ANTHROPIC_KEY);
+        assert_eq!(
+            reveal_focus_id([false, true, false, false], [true; 4]),
+            ID_OPENAI_KEY
+        );
+        assert_eq!(
+            reveal_focus_id([true, true, true, false], [true; 4]),
+            ID_OLLAMA_MODEL
+        );
+        // Nothing new appeared: the always-present provider combo.
+        assert_eq!(reveal_focus_id([true; 4], [true; 4]), ID_ACTIVE_PROVIDER);
+        // And the real window really uses it: the pick is a visible control.
         with_window(Config::default(), |hwnd, raw| {
             let inner = unsafe { &mut *raw };
-            unsafe {
-                show_page(inner, Page::Models);
-                let _ = ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE,
-                );
-                let add = get_dlg_item(hwnd, ID_ADD_PROVIDER).unwrap();
-                let _ = SetFocus(Some(add));
-                if GetFocus() != add {
-                    return; // no desktop to hold focus (headless run)
-                }
-                handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
-                let now = GetFocus();
-                assert_eq!(now, get_dlg_item(hwnd, ID_ANTHROPIC_KEY).unwrap());
-                assert!(IsWindowVisible(now).as_bool());
-            }
+            unsafe { show_page(inner, Page::Models) };
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            assert!(shows(hwnd, reveal_focus_id(one, inner.models_shown)));
         });
     }
 
+    #[test]
+    fn the_ollama_card_hides_with_the_ollama_block() {
+        let card = [
+            ID_OLLAMA_MODEL,
+            ID_OLLAMA_STATUS,
+            ID_PULL_NAME,
+            ID_PULL_BUTTON,
+        ];
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                card.iter().all(|id| !shows(hwnd, *id)),
+                "default order has no ollama"
+            );
+            let short = inner.models_shrink_dp;
+            pick_provider(inner, ActiveProvider::Ollama.index() as i32);
+            assert!(card.iter().all(|id| shows(hwnd, *id)));
+            assert!(
+                inner.models_shrink_dp < short,
+                "the card brings its height back"
+            );
+        });
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["openai".to_string(), "ollama".to_string()];
+        with_window(cfg, |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                card.iter().all(|id| shows(hwnd, *id)),
+                "ollama is in the order"
+            );
+        });
+    }
+
+    /// A hidden vendor's hand-edited model, and a stored key on a vendor that
+    /// stays shown, both come back unchanged from the Save path (`read_form`).
+    #[test]
+    fn hidden_vendors_survive_the_save_path_unchanged() {
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["anthropic".to_string()];
+        cfg.providers.openai.model = "gpt-hand-edited".to_string();
+        cfg.providers.openai.models = vec!["gpt-hand-edited".to_string(), "gpt-other".to_string()];
+        cfg.providers.gemini.api_key = "AIza-stored-gemini-key".to_string();
+        cfg.providers.gemini.model = "gemini-hand-edited".to_string();
+        with_window(cfg.clone(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                !shows(hwnd, ID_OPENAI_MODEL),
+                "OpenAI has no key and is not active"
+            );
+            assert!(
+                shows(hwnd, ID_GEMINI_KEY),
+                "a stored key keeps its vendor shown"
+            );
+            let saved = read_form(inner);
+            assert_eq!(saved.providers.openai.model, "gpt-hand-edited");
+            assert_eq!(saved.providers.openai.models, cfg.providers.openai.models);
+            assert_eq!(saved.providers.gemini.api_key, cfg.providers.gemini.api_key);
+            assert_eq!(saved.providers.gemini.model, "gemini-hand-edited");
+            assert_eq!(saved.providers.order, cfg.providers.order);
+        });
+    }
     #[test]
     fn a_hidden_block_leaves_no_gap_and_the_page_gets_shorter() {
         with_window(Config::default(), |hwnd, raw| {
@@ -8880,6 +8980,8 @@ mod tests {
                 ("Capture", Page::Privacy),
             ] {
                 unsafe { show_page(&mut *raw, page) };
+                // Every provider shows, so both groups are at full height.
+                unsafe { reveal_providers(&mut *raw) };
                 // The group's rect is read with its page showing.
                 let groups: Vec<(String, RECT)> = inner
                     .children

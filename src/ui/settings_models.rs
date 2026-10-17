@@ -22,8 +22,9 @@ pub(crate) enum Slot {
     Hint,
     /// The Providers group frame: only its height changes.
     Frame,
-    /// Everything under the frame (the Ollama card): only its top changes.
-    Below,
+    /// The Ollama card under the frame (status, Pull, link): shows with the
+    /// Ollama block, and its top moves with the frame's height.
+    OllamaCard,
 }
 
 /// How many rows each flowing slot takes.
@@ -31,7 +32,7 @@ fn rows(slot: Slot) -> i32 {
     match slot {
         Slot::OpenAi | Slot::Anthropic | Slot::Gemini => 3,
         Slot::Ollama | Slot::AddButton | Slot::Hint => 1,
-        Slot::Frame | Slot::Below => 0,
+        Slot::Frame | Slot::OllamaCard => 0,
     }
 }
 
@@ -46,11 +47,12 @@ const FLOW: [Slot; 6] = [
 ];
 
 /// Which provider blocks show, as `[OpenAI, Anthropic, Gemini, Ollama]`.
-/// `has_key` is whether each cloud vendor has a key (stored or typed).
+/// `configured` is whether each already has something of the user's: a key
+/// stored or typed for a cloud vendor, a place in `providers.order` for Ollama.
 /// With no recognisable active provider nothing can be picked out, so all show.
 pub(crate) fn shown_providers(
     active: Option<ActiveProvider>,
-    has_key: [bool; 3],
+    configured: [bool; 4],
     revealed: bool,
 ) -> [bool; 4] {
     let Some(active) = active else {
@@ -60,10 +62,10 @@ pub(crate) fn shown_providers(
         return [true; 4];
     }
     [
-        active == ActiveProvider::OpenAi || has_key[0],
-        active == ActiveProvider::Anthropic || has_key[1],
-        active == ActiveProvider::Gemini || has_key[2],
-        active == ActiveProvider::Ollama,
+        active == ActiveProvider::OpenAi || configured[0],
+        active == ActiveProvider::Anthropic || configured[1],
+        active == ActiveProvider::Gemini || configured[2],
+        active == ActiveProvider::Ollama || configured[3],
     ]
 }
 
@@ -86,9 +88,9 @@ pub(crate) fn slot_shown(slot: Slot, shown: [bool; 4], add: bool) -> bool {
         Slot::OpenAi => shown[0],
         Slot::Anthropic => shown[1],
         Slot::Gemini => shown[2],
-        Slot::Ollama => shown[3],
+        Slot::Ollama | Slot::OllamaCard => shown[3],
         Slot::AddButton => add,
-        Slot::Hint | Slot::Frame | Slot::Below => true,
+        Slot::Hint | Slot::Frame => true,
     }
 }
 
@@ -102,7 +104,7 @@ pub(crate) fn slot_dy(slot: Slot, shown: [bool; 4], add: bool, pitch: i32) -> i3
         .filter(|s| !slot_shown(**s, shown, add))
         .map(|s| rows(*s))
         .sum();
-    let hidden_rows = if matches!(slot, Slot::Frame | Slot::Below) {
+    let hidden_rows = if matches!(slot, Slot::Frame | Slot::OllamaCard) {
         FLOW.iter()
             .filter(|s| !slot_shown(**s, shown, add))
             .map(|s| rows(*s))
@@ -121,35 +123,53 @@ mod tests {
     #[test]
     fn only_the_active_provider_shows_with_no_keys() {
         assert_eq!(
-            shown_providers(Some(OpenAi), [false; 3], false),
+            shown_providers(Some(OpenAi), [false; 4], false),
             [true, false, false, false]
         );
         assert_eq!(
-            shown_providers(Some(Anthropic), [false; 3], false),
+            shown_providers(Some(Anthropic), [false; 4], false),
             [false, true, false, false]
         );
         assert_eq!(
-            shown_providers(Some(Gemini), [false; 3], false),
+            shown_providers(Some(Gemini), [false; 4], false),
             [false, false, true, false]
         );
         assert_eq!(
-            shown_providers(Some(Ollama), [false; 3], false),
+            shown_providers(Some(Ollama), [false; 4], false),
             [false, false, false, true]
         );
     }
 
     #[test]
+    fn ollama_in_the_order_keeps_its_block_and_card() {
+        assert_eq!(
+            shown_providers(Some(OpenAi), [false, false, false, true], false),
+            [true, false, false, true]
+        );
+        assert!(slot_shown(
+            Slot::OllamaCard,
+            [true, false, false, true],
+            true
+        ));
+        assert!(!slot_shown(
+            Slot::OllamaCard,
+            [true, false, false, false],
+            true
+        ));
+    }
+
+    #[test]
     fn a_vendor_with_a_key_always_shows() {
         assert_eq!(
-            shown_providers(Some(Anthropic), [true, false, true], false),
+            shown_providers(Some(Anthropic), [true, false, true, false], false),
             [true, true, true, false]
         );
     }
 
     #[test]
     fn revealing_or_an_unknown_active_provider_shows_everything() {
-        assert_eq!(shown_providers(Some(OpenAi), [false; 3], true), [true; 4]);
-        assert_eq!(shown_providers(None, [false; 3], false), [true; 4]);
+        assert_eq!(shown_providers(Some(OpenAi), [false; 4], true), [true; 4]);
+        assert_eq!(shown_providers(None, [false; 4], false), [true; 4]);
     }
 
     #[test]
@@ -168,7 +188,7 @@ mod tests {
         assert_eq!(slot_dy(Slot::AddButton, shown, true, pitch), -7 * pitch);
         assert_eq!(slot_dy(Slot::Hint, shown, true, pitch), -7 * pitch);
         assert_eq!(slot_dy(Slot::Frame, shown, true, pitch), -7 * pitch);
-        assert_eq!(slot_dy(Slot::Below, shown, true, pitch), -7 * pitch);
+        assert_eq!(slot_dy(Slot::OllamaCard, shown, true, pitch), -7 * pitch);
     }
 
     #[test]
