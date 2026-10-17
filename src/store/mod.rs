@@ -384,7 +384,10 @@ fn open_default() -> Result<Store, StoreError> {
 }
 
 /// Written into the store folder once its owner-only restriction succeeded.
-const ACL_MARKER: &str = ".owner-only";
+/// The `-2` is #995: folders restricted before it still carry SYSTEM and
+/// Administrators entries, so the old marker no longer counts and the next
+/// launch restricts them again (one `icacls` call, once).
+const ACL_MARKER: &str = ".owner-only-2";
 
 /// Owner-only directory, recovery, migrations, imports.
 ///

@@ -59,7 +59,7 @@ pub fn card_text(address: &str) -> (String, String) {
         format!(
             "Your Ollama address points to {address}. Your screenshot and any selected text \
              will be sent there. This message shows once for this address. Press the key \
-             again to go on, or click here to open Settings and change it."
+             again to go on, or open Settings to change it."
         ),
     )
 }
