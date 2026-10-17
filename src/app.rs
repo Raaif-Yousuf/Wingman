@@ -4796,8 +4796,16 @@ impl App {
         if settings::is_foreground() {
             return;
         }
-        let pending: VecDeque<DeferredMessage> =
+        let mut pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        // "The tray menu was open" is only true right after the menu; by now
+        // it would be a stale card (#1011).
+        pending.retain(|m| {
+            !matches!(
+                m,
+                DeferredMessage::KeyDuringMenu | DeferredMessage::ActivateDuringMenu
+            )
+        });
         self.deliver_deferred(pending);
         // Click-away dismissal needs the global mouse hook, which is armed only
         // while a card is showing (nothing runs while idle).
