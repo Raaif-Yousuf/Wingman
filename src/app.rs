@@ -5259,10 +5259,10 @@ impl App {
     }
 
     /// #1011: the card for a key press or a second launch that arrived while
-    /// the tray menu was open.
+    /// the tray menu or a file dialog was open (#900).
     fn show_menu_was_open_card(&mut self) {
         self.card
-            .show_answer("The tray menu was open", "Try again.", 3, None);
+            .show_answer("A menu or dialog was open", "Try again.", 3, None);
     }
 
     /// #722: the tray menu runs with the same reentrancy policy as Settings,
@@ -5994,7 +5994,11 @@ impl App {
         self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
+        // #900: the menu's policy, so a press or a second launch meanwhile is
+        // held and answered with a card afterwards, not dropped.
+        TRAY_MENU_OPEN.with(|c| c.set(true));
         let out = dialog();
+        TRAY_MENU_OPEN.with(|c| c.set(false));
         SETTINGS_OPEN.with(|c| c.set(false));
         let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -9485,6 +9489,30 @@ mod tests {
             let body = body_between(&src, head, "\n    }\n");
             assert!(body.contains("take_pending_messages(settings::is_foreground())"));
             assert!(!body.contains("std::mem::take"), "{head}");
+        }
+    }
+
+    /// #900: a key press or second launch during a file dialog gets the same
+    /// deferred card the tray menu gives it, not a silent drop.
+    #[test]
+    fn a_file_dialog_defers_a_press_and_a_second_launch_like_the_menu() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn run_os_dialog<T>(", "\n    }\n");
+        assert!(!body.is_empty());
+        let on = body
+            .find("TRAY_MENU_OPEN.with(|c| c.set(true))")
+            .expect("run_os_dialog never selects the menu policy");
+        let run = body.find("dialog()").expect("no dialog call");
+        let off = body
+            .find("TRAY_MENU_OPEN.with(|c| c.set(false))")
+            .expect("run_os_dialog never clears the menu policy");
+        assert!(
+            on < run && run < off,
+            "set before the dialog, cleared after"
+        );
+        // And the policy it selects defers both, never ignores them.
+        for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE] {
+            assert_eq!(super::tray_menu_policy(id, 0), SettingsReentrancy::Defer);
         }
     }
 
