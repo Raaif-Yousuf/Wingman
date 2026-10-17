@@ -10506,9 +10506,7 @@ mod tests {
         assert!(!text.contains('\u{2014}'));
         let src = lf(include_str!("app.rs"));
         let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
-        let at = handler
-            .find("unreadable_secrets_card(&unreadable)")
-            .unwrap();
+        let at = handler.find("= notice {").unwrap();
         let show = handler[at..].find("return;").unwrap();
         assert!(
             handler[at..at + show].contains("with_key_failure_note("),
