@@ -161,6 +161,12 @@ pub struct Config {
     /// the file name and the line and column only, never file contents.
     #[serde(skip)]
     pub load_problem: Option<String>,
+    /// #899: providers (compat entries by name) whose plaintext key is still in
+    /// config.toml after the load: the store refused it, or the file could not
+    /// be rewritten. Load-time diagnostic only, never persisted, so `app.rs`
+    /// can end in a card (rule 7). Names only, never key material.
+    #[serde(skip)]
+    pub keys_left_in_file: Vec<String>,
     /// Issue #19: `Cloud | Local | Auto | Offline`. Defaults to `Auto` per
     /// the expansion plan's Modes table. `App::run` publishes this to
     /// `mode::set_current` at startup, and `App::set_mode` keeps the
@@ -1069,6 +1075,29 @@ fn write_back_fields(path: &Path, changes: &[crate::config_writer::FieldChange])
     Ok(())
 }
 
+/// Names of the providers whose key `before` (as the file read it) held and the
+/// file still holds after an import: every one when the file could not be
+/// rewritten, else those the store refused (`after` still has them).
+fn keys_still_in_file(before: &Config, after: &Config, write_failed: bool) -> Vec<String> {
+    let left = |was: &str, now: &str| !was.is_empty() && (write_failed || !now.is_empty());
+    let (b, a) = (&before.providers, &after.providers);
+    let mut out: Vec<String> = [
+        ("openai", &b.openai.api_key, &a.openai.api_key),
+        ("anthropic", &b.anthropic.api_key, &a.anthropic.api_key),
+        ("gemini", &b.gemini.api_key, &a.gemini.api_key),
+    ]
+    .into_iter()
+    .filter(|(_, was, now)| left(was, now))
+    .map(|(name, ..)| name.to_string())
+    .collect();
+    for (was, now) in b.compat.iter().zip(&a.compat) {
+        if left(&was.api_key, &now.api_key) {
+            out.push(was.name.clone());
+        }
+    }
+    out
+}
+
 /// The one atomic write of `config.toml`, shared by [`Config::save_to`] and the
 /// field-level writer (`config_writer`, #870): temp file, owner-only ACL on the
 /// temp file, one-generation backup, rename, then note the new mtime.
@@ -1385,8 +1414,12 @@ impl Config {
     /// Best effort, same as the repair write-back in `load_from_file`: the
     /// in-memory value is already correct even if the write fails, and the next
     /// load imports again.
+    ///
+    /// A key still in the file afterwards (the store refused it, or neither
+    /// write could blank it) is named in [`Config::keys_left_in_file`].
     fn import_keys_and_write_back(&mut self, path: &Path, store: &dyn SecretStore) {
         let before = self.clone();
+        let mut write_failed = false;
         if self.import_secrets_and_blank(store) {
             // #899: blank only the keys, so comments and hand edits stay. If
             // that cannot be done, the whole-file save still must not leave a
@@ -1394,9 +1427,10 @@ impl Config {
             let wrote = crate::config_writer::blanked_key_changes(&before, self)
                 .and_then(|changes| write_back_fields(path, &changes));
             if wrote.is_err() {
-                let _ = self.save_to(path);
+                write_failed = self.save_to(path).is_err();
             }
         }
+        self.keys_left_in_file = keys_still_in_file(&before, self, write_failed);
     }
     /// Fills any still-empty `api_key` field from `store`. Called after
     /// [`Config::import_secrets_and_blank`] so a freshly imported key
@@ -4919,6 +4953,105 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         assert_eq!(again.providers.openai.api_key, "sk-in-file");
         cleanup(&path);
     }
+
+    /// A store that refuses one target and keeps the rest.
+    struct FailsFor {
+        target: String,
+        inner: InMemoryStore,
+    }
+    impl SecretStore for FailsFor {
+        fn get(&self, target: &str) -> Result<Option<String>> {
+            self.inner.get(target)
+        }
+        fn set(&self, target: &str, secret: &str) -> Result<()> {
+            if target == self.target {
+                anyhow::bail!("simulated failure writing {target}");
+            }
+            self.inner.set(target, secret)
+        }
+        fn delete(&self, target: &str) -> Result<()> {
+            self.inner.delete(target)
+        }
+    }
+
+    const TWO_COMPAT_KEYS: &str = "[[providers.compat]]\n# lab\nname = \"lab\"\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\napi_key = \"k-lab\"\n\n[[providers.compat]]\nname = \"home\"\nbase_url = \"http://127.0.0.1:2/v1\"\nmodel = \"m\"\napi_key = \"k-home\"\n";
+
+    #[test]
+    fn a_key_that_fails_to_store_stays_in_the_file_and_is_reported() {
+        // #899: the one that failed is the only one left in the file; the
+        // stored one is blanked, and the load says which key is still there.
+        let path = scratch_path("import-one-fails");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, TWO_COMPAT_KEYS).unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        let store = FailsFor {
+            target: target_name(&compat_order_name("home")),
+            inner: InMemoryStore::default(),
+        };
+        config.import_keys_and_write_back(&path, &store);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("k-lab"), "{on_disk}");
+        assert!(on_disk.contains("k-home"), "{on_disk}");
+        assert!(on_disk.contains("# lab"), "{on_disk}");
+        assert_eq!(config.keys_left_in_file, vec!["home".to_string()]);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn nothing_is_reported_when_every_key_was_stored_and_blanked() {
+        let path = scratch_path("import-all-ok");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, TWO_COMPAT_KEYS).unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        config.import_keys_and_write_back(&path, &InMemoryStore::default());
+        assert!(config.keys_left_in_file.is_empty());
+        assert!(!fs::read_to_string(&path).unwrap().contains("k-"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_refused_fallback_save_leaves_the_key_and_says_so() {
+        // #899: the file changed after the load, so neither the field write
+        // nor the whole-file fallback may touch it. The key stays; the load
+        // reports it instead of staying silent (rule 7).
+        let path = scratch_path("import-write-refused");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, TWO_COMPAT_KEYS).unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let edited = format!("{TWO_COMPAT_KEYS}\n# edited by hand\nnot valid toml =\n");
+        fs::write(&path, &edited).unwrap();
+        config.import_keys_and_write_back(&path, &InMemoryStore::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(
+            config.keys_left_in_file,
+            vec!["lab".to_string(), "home".to_string()]
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn the_fallback_save_blanks_the_keys_when_the_field_write_cannot() {
+        // The guarded field write refuses (the entry at that place is another
+        // one now), but the file is the one this load read, so the whole-file
+        // fallback runs and nothing is left behind.
+        let path = scratch_path("import-fallback-ok");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, TWO_COMPAT_KEYS).unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        // The list is in another order in memory than in the file, so the
+        // position guard refuses the field write.
+        config.providers.compat.reverse();
+        config.import_keys_and_write_back(&path, &InMemoryStore::default());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(
+            !on_disk.contains("k-lab") && !on_disk.contains("k-home"),
+            "{on_disk}"
+        );
+        assert!(config.keys_left_in_file.is_empty());
+        cleanup(&path);
+    }
+
     #[test]
     fn import_and_blank_is_a_no_op_once_the_field_is_already_blank() {
         let mut config = Config::default(); // api_key fields start empty

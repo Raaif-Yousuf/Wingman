@@ -945,10 +945,13 @@ pub fn run() -> Result<()> {
             .as_ref()
             .map(|(folder, error)| (folder.as_str(), error.as_str())),
         merge_cards(
-            degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
-            knowledge_start_card(
-                knowledge_setting_problem.as_deref(),
-                knowledge_spawn_problem.as_deref(),
+            plaintext_keys_card(&config.keys_left_in_file),
+            merge_cards(
+                degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
+                knowledge_start_card(
+                    knowledge_setting_problem.as_deref(),
+                    knowledge_spawn_problem.as_deref(),
+                ),
             ),
         ),
     ) {
@@ -1117,6 +1120,24 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
             "Could not read the saved key for: {list}. It was not deleted. Retype it in Settings to replace it."
         ),
     )
+}
+
+/// #899: the card for API keys that are still written in config.toml after a
+/// load, because Credential Manager refused them or the file could not be
+/// rewritten. The keys still work; the card says where they are and what to do.
+/// `None` when there are none. Names only, never a key. No em dash (rule 11).
+fn plaintext_keys_card(providers: &[String]) -> Option<(String, String)> {
+    if providers.is_empty() {
+        return None;
+    }
+    Some((
+        "API key still in config.toml".to_string(),
+        format!(
+            "Wingman could not move the key for {} out of config.toml, so it is still there as plain text. \
+             Choose Reload settings (tray menu, Help and diagnostics) to try again, or retype it in Settings.",
+            providers.join(", ")
+        ),
+    ))
 }
 
 /// The one card shown at startup, or `None`. Both startup problems (#175
@@ -5073,16 +5094,17 @@ impl App {
                 // #175: report before self.config is overwritten, since the
                 // freshly loaded config is the one whose hydrate ran.
                 let unreadable = config.unreadable_secrets.clone();
+                let left = plaintext_keys_card(&config.keys_left_in_file);
                 self.config = config;
                 // The file is the truth again; an old failed write must not be
                 // re-applied over it later.
                 self.unsaved.clear();
                 self.apply_config();
-                if unreadable.is_empty() {
-                    self.card.show_answer("Settings reloaded", "", 3, None);
-                } else {
-                    let (headline, detail) = unreadable_secrets_card(&unreadable);
-                    self.card.show_error(&headline, &detail);
+                let unreadable =
+                    (!unreadable.is_empty()).then(|| unreadable_secrets_card(&unreadable));
+                match merge_cards(unreadable, left) {
+                    None => self.card.show_answer("Settings reloaded", "", 3, None),
+                    Some((headline, detail)) => self.card.show_error(&headline, &detail),
                 }
             }
             Err(e) => {
@@ -9330,6 +9352,16 @@ mod tests {
             "must not read as a deletion: {detail}"
         );
         assert!(!detail.contains("deleted the"));
+    }
+
+    #[test]
+    fn plaintext_keys_card_names_the_providers_and_is_absent_when_none() {
+        use super::plaintext_keys_card;
+        assert!(plaintext_keys_card(&[]).is_none());
+        let (headline, detail) =
+            plaintext_keys_card(&["openai".to_string(), "lab".to_string()]).unwrap();
+        assert!(detail.contains("openai, lab"), "{detail}");
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
     }
 
     #[test]
