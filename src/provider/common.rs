@@ -221,11 +221,19 @@ fn is_provably_unsent(e: &ureq::Error) -> bool {
 /// `NO_PROXY` happened to list it. A loopback address never uses a proxy; any
 /// other address keeps the environment's proxy settings.
 fn agent_for(url: &str) -> ureq::Agent {
+    agent_with_base(url, ureq::Agent::config_builder())
+}
+
+/// [`agent_for`] over a given base config (the seam the tests use to put a proxy
+/// in place without touching the process environment).
+fn agent_with_base(
+    url: &str,
+    base: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+) -> ureq::Agent {
     if crate::usage::is_loopback_url(url) {
-        let config = ureq::Agent::config_builder().proxy(None).build();
-        ureq::Agent::new_with_config(config)
+        ureq::Agent::new_with_config(base.proxy(None).build())
     } else {
-        ureq::Agent::new_with_defaults()
+        ureq::Agent::new_with_config(base.build())
     }
 }
 
@@ -3089,10 +3097,12 @@ mod tests {
         );
     }
 
-    /// #1157, end to end: with `HTTP_PROXY` pointing at a port nobody listens
-    /// on, a request to a local server still arrives.
+    /// #1157, end to end: with a proxy configured at a port nobody listens on,
+    /// a request to a local server still arrives, and one to any other
+    /// address still takes the proxy. The proxy is put in place through the
+    /// config, not the environment, so parallel tests are not affected.
     #[test]
-    fn loopback_request_ignores_a_dead_env_proxy() {
+    fn loopback_request_ignores_a_dead_proxy_and_a_remote_one_does_not() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3104,16 +3114,23 @@ mod tests {
                 s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         });
         // Port 9 (discard) on loopback is closed on a normal machine.
-        // SAFETY: only this test touches HTTP_PROXY.
-        unsafe { std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9") };
+        let dead_proxy = || {
+            ureq::Agent::config_builder()
+                .proxy(Some(ureq::Proxy::new("http://127.0.0.1:9").unwrap()))
+        };
         let url = format!("http://127.0.0.1:{port}/");
-        let result = agent_for(&url).get(&url).call();
-        unsafe { std::env::remove_var("HTTP_PROXY") };
-        let mut response = result.expect("loopback call must not use the proxy");
+        let mut response = agent_with_base(&url, dead_proxy())
+            .get(&url)
+            .call()
+            .expect("loopback call must not use the proxy");
         assert_eq!(response.body_mut().read_to_string().unwrap(), "ok");
         server.join().unwrap();
-    }
 
+        // A remote address keeps the proxy: the dead proxy makes it fail.
+        let remote = "http://192.0.2.1:80/";
+        let err = agent_with_base(remote, dead_proxy()).get(remote).call();
+        assert!(err.is_err(), "a remote call must go through the proxy");
+    }
     /// #1157: every `ureq` send in this file must be built from
     /// [`agent_for`], or a new call site silently skips the loopback bypass.
     #[test]
