@@ -4182,6 +4182,10 @@ struct EditColors {
     disabled_text: u32,
     /// #1109: a hovered combo's border (the system highlight in high contrast).
     hover_border: u32,
+    /// #1169: the row under the pointer or cursor in a dropped-open list (the
+    /// system highlight in high contrast), and the ink on it.
+    item_hover: u32,
+    item_text_hot: u32,
 }
 
 /// How far a disabled box's fill moves from the text box fill toward the
@@ -4195,9 +4199,14 @@ fn edit_colors(
     face: u32,
 ) -> EditColors {
     use crate::ui::card_buttons::blend;
-    use crate::ui::theme::{menu_text_color, Theme, Tokens};
+    use crate::ui::theme::{menu_hover_fill, menu_text_color, Theme, Tokens};
     let theme = Theme::resolve(true, high_contrast);
     let t = Tokens::for_theme(theme, sys);
+    // A list's rows lie on the text box fill, so the hover tint is taken from it.
+    let on_list = Tokens {
+        surface: t.control_fill,
+        ..t
+    };
     let (disabled_fill, disabled_border) = if high_contrast {
         // No tints in high contrast: the window colour, and GrayText ink.
         (sys.window, sys.gray_text)
@@ -4221,6 +4230,8 @@ fn edit_colors(
         } else {
             blend(t.border, t.text, EDIT_HOVER_BORDER_PCT)
         },
+        item_hover: menu_hover_fill(theme, &on_list, sys),
+        item_text_hot: menu_text_color(theme, &on_list, sys, true, false),
     }
 }
 
@@ -4292,6 +4303,8 @@ struct EditStyle {
     /// The line between rows (#877): the border token, or the system's window
     /// text in high contrast.
     hairline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// The hovered row of a combo's drop list (#1169).
+    item_hover_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 }
 
 thread_local! {
@@ -4314,6 +4327,7 @@ unsafe fn edit_style() -> EditStyle {
         brush: solid(colors.fill),
         disabled_brush: solid(colors.disabled_fill),
         hairline_brush: solid(colors.border),
+        item_hover_brush: solid(colors.item_hover),
     };
     EDIT_STYLE.set(Some(style));
     style
@@ -4326,6 +4340,7 @@ unsafe fn invalidate_edit_style() {
         let _ = DeleteObject(HGDIOBJ(style.brush.0));
         let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.hairline_brush.0));
+        let _ = DeleteObject(HGDIOBJ(style.item_hover_brush.0));
     }
 }
 
@@ -5279,6 +5294,7 @@ impl Ctx {
                         COMBO_SUBCLASS_ID,
                         0,
                     );
+                    subclass_combo_list(hwnd);
                 }
             }
             if class == WC_EDIT {
@@ -8207,6 +8223,104 @@ unsafe extern "system" fn combo_subclass(
     }
 }
 
+const COMBO_LIST_SUBCLASS_ID: usize = 0x1164;
+
+/// Gives the drop list of `combo` the Settings look: its frame and the fill
+/// behind its rows (#1169). The list window exists from the combo's creation, so
+/// it is subclassed once here and goes away with the combo.
+unsafe fn subclass_combo_list(combo: HWND) {
+    use windows::Win32::UI::Controls::COMBOBOXINFO;
+    use windows::Win32::UI::WindowsAndMessaging::CB_GETCOMBOBOXINFO;
+    let mut info = COMBOBOXINFO {
+        cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+        ..Default::default()
+    };
+    SendMessageW(
+        combo,
+        CB_GETCOMBOBOXINFO,
+        Some(WPARAM(0)),
+        Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+    );
+    if !info.hwndList.is_invalid() {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            info.hwndList,
+            Some(combo_list_subclass),
+            COMBO_LIST_SUBCLASS_ID,
+            0,
+        );
+    }
+}
+
+/// The drop list's own frame and background: the border colour of the closed
+/// combo around it, and the list fill where no row reaches (#1169). Only cached
+/// brushes. A list long enough for a scroll bar lets the system draw that first.
+/// The list is a top-level popup, so `dpi_for` reads its own monitor's scale on
+/// every paint (nothing is cached per DPI); the cached colours are dropped on a
+/// theme change and the list repaints whole each time it opens.
+unsafe extern "system" fn combo_list_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{FillRect, GetWindowDC, ReleaseDC, HDC};
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowLongPtrW, GWL_STYLE, SM_CXBORDER, WM_ERASEBKGND, WM_NCDESTROY,
+        WM_NCPAINT,
+    };
+    match msg {
+        WM_ERASEBKGND => {
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() {
+                FillRect(HDC(wparam.0 as *mut c_void), &rc, edit_style().brush);
+                LRESULT(1)
+            } else {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_NCPAINT => {
+            let scrolls = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL.0;
+            let result = if scrolls != 0 {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            } else {
+                LRESULT(0)
+            };
+            let mut wr = RECT::default();
+            let hdc = GetWindowDC(Some(hwnd));
+            if !hdc.is_invalid() {
+                if GetWindowRect(hwnd, &mut wr).is_ok() {
+                    // The ring the system reserves for the frame, in the border
+                    // colour of the closed combo.
+                    let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+                    let edge = GetSystemMetricsForDpi(SM_CXBORDER, dpi_for(hwnd)).max(1);
+                    let brush = edit_style().hairline_brush;
+                    let side = |left, top, right, bottom| RECT {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    };
+                    FillRect(hdc, &side(0, 0, w, edge), brush);
+                    FillRect(hdc, &side(0, h - edge, w, h), brush);
+                    FillRect(hdc, &side(0, 0, edge, h), brush);
+                    FillRect(hdc, &side(w - edge, 0, w, h), brush);
+                }
+                ReleaseDC(Some(hwnd), hdc);
+            }
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(combo_list_subclass), COMBO_LIST_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
 /// The height of a dropdown's list items: a row less the frame.
 fn combo_item_h_px(dpi: u32) -> i32 {
     to_px(ROW_H, dpi) - to_px(COMBO_FRAME_DP, dpi)
@@ -8260,17 +8374,54 @@ unsafe fn measure_combo_item(lparam: LPARAM, dpi: u32) -> bool {
     true
 }
 
-/// `WM_DRAWITEM` for a combo: the item (or the closed field) on the system
-/// colours, its text kept `COMBO_TEXT_PAD_DP` off the border. Returns false
-/// for anything else. Only system brushes and colours, so nothing to free and
-/// high contrast needs no special case.
+/// The hover pill of a list row (#1169): inset like a Windows 11 menu's, with
+/// 4 dp corners, filled with the cached hover brush. High contrast fills the
+/// whole row square, as every native list does. Nothing is created or freed.
+unsafe fn draw_item_pill(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rc: windows::Win32::Foundation::RECT,
+    dpi: u32,
+    style: &EditStyle,
+) {
+    use crate::ui::theme::{COMBO_ITEM_INSET_Y_DP, CONTROL_RADIUS_DP, MENU_EDGE_PAD_DP};
+    use windows::Win32::Graphics::Gdi::{
+        FillRect, GetStockObject, RoundRect, SelectObject, NULL_PEN,
+    };
+    if crate::ui::card_buttons::system_high_contrast().is_some() {
+        FillRect(hdc, &rc, style.item_hover_brush);
+        return;
+    }
+    let (inset_x, inset_y) = (
+        to_px(MENU_EDGE_PAD_DP, dpi),
+        to_px(COMBO_ITEM_INSET_Y_DP, dpi),
+    );
+    let round = 2 * to_px(CONTROL_RADIUS_DP, dpi);
+    let old_brush = SelectObject(hdc, HGDIOBJ(style.item_hover_brush.0));
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    // A null pen leaves the right and bottom edges off, so grow them by one.
+    let _ = RoundRect(
+        hdc,
+        rc.left + inset_x,
+        rc.top + inset_y,
+        rc.right - inset_x + 1,
+        rc.bottom - inset_y + 1,
+        round,
+        round,
+    );
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+}
+
+/// `WM_DRAWITEM` for a combo: the item (or the closed field), its text kept
+/// `COMBO_TEXT_PAD_DP` off the border. Returns false for anything else. Colours
+/// come from the cached [`edit_style`] (system colours in high contrast) or the
+/// system's own brushes, so nothing is created per paint.
 unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::Graphics::Gdi::{
         DrawTextW, FillRect, GetSysColor, GetSysColorBrush, SelectObject, SetBkMode, SetTextColor,
-        COLOR_3DFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-        COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        TRANSPARENT,
+        COLOR_3DFACE, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{CB_GETLBTEXT, CB_GETLBTEXTLEN, WM_GETFONT};
 
@@ -8287,14 +8438,27 @@ unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     // frame draws is its focus mark.
     let in_field = state & ODS_COMBOBOXEDIT != 0;
     let selected = state & ODS_SELECTED != 0 && !disabled && !in_field;
-    let (face, ink) = if disabled {
-        (COLOR_3DFACE, COLOR_GRAYTEXT)
-    } else if selected {
-        (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT)
+    // A list row lies on the text box fill and its hover is a rounded pill, as
+    // in Windows 11's own lists (#1169); the closed field and a disabled combo
+    // keep the system colours.
+    let ink = if !in_field && !disabled {
+        let style = edit_style();
+        FillRect(hdc, &rc, style.brush);
+        if selected {
+            draw_item_pill(hdc, rc, dpi_for(di.hwndItem), &style);
+            style.colors.item_text_hot
+        } else {
+            style.colors.text
+        }
     } else {
-        (COLOR_WINDOW, COLOR_WINDOWTEXT)
+        let (face, ink) = if disabled {
+            (COLOR_3DFACE, COLOR_GRAYTEXT)
+        } else {
+            (COLOR_WINDOW, COLOR_WINDOWTEXT)
+        };
+        FillRect(hdc, &rc, GetSysColorBrush(face));
+        GetSysColor(ink)
     };
-    FillRect(hdc, &rc, GetSysColorBrush(face));
 
     // An empty combo asks to be drawn with item id -1: just the background.
     let Ok(index) = usize::try_from(di.itemID as i32) else {
@@ -8322,7 +8486,7 @@ unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     let font = SendMessageW(di.hwndItem, WM_GETFONT, None, None).0;
     let old = (font != 0).then(|| SelectObject(hdc, HGDIOBJ(font as *mut c_void)));
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, COLORREF(GetSysColor(ink)));
+    SetTextColor(hdc, COLORREF(ink));
     DrawTextW(
         hdc,
         &mut text,
@@ -11940,6 +12104,8 @@ mod tests {
             disabled_border: 0x0000_8080,
             disabled_text: 0,
             hover_border: 0x0000_0080,
+            item_hover: 0x00EE_EEEE,
+            item_text_hot: 0,
         };
         for dpi in [96u32, 240] {
             let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
@@ -11990,6 +12156,8 @@ mod tests {
             disabled_border: 0x0000_8080,
             disabled_text: 0,
             hover_border: 0x0000_0080,
+            item_hover: 0x00EE_EEEE,
+            item_text_hot: 0,
         };
         let (w, h) = (to_px(120, 96), to_px(ROW_H, 96));
         let (screen, dc, bmp) = unsafe {
@@ -13927,13 +14095,14 @@ mod tests {
     /// Draws a combo's selected item through the real `draw_combo_item` into
     /// a white bitmap and returns the first column with ink, and the width.
     fn first_ink_column(dpi: u32, disabled: bool) -> (i32, i32) {
-        let (first, w, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
+        let (first, w, _, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
         (first, w)
     }
 
     /// [`first_ink_column`] for any item state; also returns the item's
-    /// background colour (its top-left pixel as a `COLORREF`).
-    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32) {
+    /// colour at its middle right (clear of the text, as a `COLORREF`) and
+    /// at its top-left pixel.
+    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32, u32) {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, DeleteDC, GdiFlush, SelectObject, BITMAPINFO,
@@ -13975,7 +14144,7 @@ mod tests {
         }
         let (w, h) = (300i32, 24i32);
         let mut first = -1;
-        let back;
+        let (back, corner);
         unsafe {
             let dc = CreateCompatibleDC(None);
             let bmi = BITMAPINFO {
@@ -14015,7 +14184,12 @@ mod tests {
             let _ = GdiFlush();
             let px = std::slice::from_raw_parts(pixels as *const u8, (w * h * 4) as usize);
             let bg = [px[0], px[1], px[2]];
-            back = u32::from(px[2]) | u32::from(px[1]) << 8 | u32::from(px[0]) << 16;
+            let at = |x: i32, y: i32| {
+                let i = ((y * w + x) * 4) as usize;
+                u32::from(px[i + 2]) | u32::from(px[i + 1]) << 8 | u32::from(px[i]) << 16
+            };
+            corner = at(0, 0);
+            back = at(w - 24, h / 2);
             'cols: for x in 0..w {
                 for y in 0..h {
                     let i = ((y * w + x) * 4) as usize;
@@ -14030,7 +14204,7 @@ mod tests {
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(combo);
         }
-        (first, w, back)
+        (first, w, back, corner)
     }
 
     #[test]
@@ -14040,11 +14214,84 @@ mod tests {
         let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) } & 0x00FF_FFFF;
         assert_ne!(window, highlight, "the check needs two different colours");
         // The closed field, focused: the combo hands us ODS_SELECTED with it.
-        let (_, _, field) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
+        let (_, _, field, _) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
         assert_eq!(field, window, "a focused field stays on the window colour");
-        // A list item under the pointer or cursor still highlights.
-        let (_, _, item) = probe_combo(96, ODS_SELECTED);
-        assert_eq!(item, highlight, "a selected list item highlights");
+        // A list item under the pointer or cursor still highlights, in the
+        // theme's own hover fill and not the system's bright blue (#1169).
+        let (_, _, item, _) = probe_combo(96, ODS_SELECTED);
+        let hover = unsafe { edit_style() }.colors.item_hover;
+        assert_eq!(item, hover, "a selected list item takes the hover fill");
+        assert_ne!(item, highlight, "and not the system highlight");
+    }
+
+    #[test]
+    fn a_list_item_is_a_rounded_pill_on_the_list_fill() {
+        use crate::ui::theme::{CONTROL_RADIUS_DP, MENU_EDGE_PAD_DP};
+        if crate::ui::card_buttons::system_high_contrast().is_some() {
+            return; // high contrast fills the whole row, square
+        }
+        let colors = unsafe { edit_style() }.colors;
+        for dpi in [96u32, 144, 240] {
+            let (_, _, idle, corner) = probe_combo(dpi, 0);
+            assert_eq!(idle, colors.fill, "an idle item is the list fill at {dpi}");
+            let (_, _, hot, hot_corner) = probe_combo(dpi, ODS_SELECTED);
+            assert_eq!(hot, colors.item_hover, "pill fill at {dpi}");
+            assert_eq!(corner, colors.fill);
+            assert_eq!(
+                hot_corner, colors.fill,
+                "the pill is inset from the row at {dpi}"
+            );
+            assert!(to_px(MENU_EDGE_PAD_DP, dpi) > 0 && to_px(CONTROL_RADIUS_DP, dpi) > 0);
+        }
+    }
+
+    /// High contrast: the hovered row is the system Highlight with
+    /// HighlightText on it, whatever the tokens say.
+    #[test]
+    fn high_contrast_list_rows_use_the_system_highlight() {
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, rgb(0, 103, 192), sys.window);
+            assert_eq!(c.item_hover, sys.highlight);
+            assert_eq!(c.item_text_hot, sys.highlight_text);
+        }
+    }
+
+    /// Every combo's drop list is the one the frame and fill are given to.
+    /// Debug builds only on purpose: it needs `GalleryWindow`, which release
+    /// builds do not contain.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_settings_combo_list_gets_the_list_subclass() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Controls::COMBOBOXINFO;
+        use windows::Win32::UI::Shell::GetWindowSubclass;
+        use windows::Win32::UI::WindowsAndMessaging::CB_GETCOMBOBOXINFO;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let w = GalleryWindow::open(HINSTANCE(h.0), Some(96)).expect("open");
+        let combo = get_dlg_item(w.hwnd(), ID_ACTIVE_PROVIDER).expect("combo");
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_GETCOMBOBOXINFO,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+            );
+            assert!(!info.hwndList.is_invalid(), "the combo has a list window");
+            let mut data = 0usize;
+            let found = GetWindowSubclass(
+                info.hwndList,
+                Some(combo_list_subclass),
+                COMBO_LIST_SUBCLASS_ID,
+                Some(&mut data),
+            );
+            assert!(found.as_bool(), "the list is subclassed");
+        }
+        drop(w);
     }
 
     /// The combo is a real Settings combo, and the body window really draws it.
