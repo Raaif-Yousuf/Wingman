@@ -202,6 +202,14 @@ pub const WM_APP_SETTINGS_COMMAND: u32 = WM_APP + 28;
 /// `WM_APP_FIRST_RUN`.
 pub const WM_APP_MACHINE_CHECK_RESULT: u32 = WM_APP + 21;
 
+/// #709: posted by the worker of a selection-first action ("Relative dates to
+/// real dates") when the selection it read was empty, so the screen is needed
+/// after all. `wparam` is the run number the worker was started for; there is
+/// no payload. The screenshot is taken by the handler on the main thread, so
+/// the pending card is hidden before the capture and never appears in it.
+/// `WM_APP + 31`.
+pub const WM_APP_NEED_SCREEN: u32 = WM_APP + 31;
+
 /// Set while a machine check is gathering, so a second click does not start
 /// a second worker. Cleared by the worker just before it posts, so an
 /// ignored (Settings open) or dropped result can never leave it stuck.
@@ -754,6 +762,10 @@ struct App {
     /// `WM_APP_PENDING_STAGE` carries the number it started under, so a late
     /// stage cannot relabel the card of a newer run.
     run_generation: u64,
+    /// #709: what a selection-first action does with the screenshot, held from
+    /// the press until the worker says the selection was empty (or the run
+    /// ends). One slot: a newer run replaces it.
+    screen_step: Option<(u64, ScreenStep)>,
     /// #133: the number of the latest first-run probe. A probe's answer
     /// carries the number it started under; an older one is ignored, so two
     /// quick presses cannot make the first answer clobber the second's card.
@@ -1051,6 +1063,7 @@ pub fn run() -> Result<()> {
         pending_preview: None,
         pending_preview_generation: 0,
         run_generation: 0,
+        screen_step: None,
         first_run_probe: 0,
         first_run_for_options: false,
         first_run_not_running_until: None,
@@ -1709,6 +1722,50 @@ fn result_is_current(posted_run: usize, current_run: u64) -> bool {
     posted_run == 0 || posted_run as u64 == current_run
 }
 
+/// #709: what to do with a worker's request for the screen.
+#[derive(Debug, PartialEq, Eq)]
+enum NeedScreenStep {
+    /// The run it was for is over or replaced: do nothing, show nothing.
+    Stale,
+    /// The run is current but its follow-up work is gone: say so on a card.
+    Lost,
+    /// Paused since the press: the card says so and nothing is captured.
+    Paused,
+    /// Hide the card, capture, and run the follow-up work.
+    Capture,
+}
+
+/// #709: decides [`NeedScreenStep`] on the main thread, before anything is
+/// captured. Unlike [`result_is_current`], a run number of 0 is never current:
+/// the request is always posted with a real one. Cannot fail open: any doubt
+/// about the run is `Stale`, and Pause is read at this moment.
+fn need_screen_step(
+    posted_run: usize,
+    current_run: u64,
+    busy: bool,
+    has_step: bool,
+    paused: bool,
+) -> NeedScreenStep {
+    if posted_run == 0 || posted_run as u64 != current_run || !busy {
+        NeedScreenStep::Stale
+    } else if !has_step {
+        NeedScreenStep::Lost
+    } else if paused {
+        NeedScreenStep::Paused
+    } else {
+        NeedScreenStep::Capture
+    }
+}
+
+/// #709: the work a selection-first action still has to do when its selection
+/// was empty: read the text on the screenshot the main thread takes.
+struct ScreenStep {
+    work: ScreenWork,
+}
+
+/// What a [`ScreenStep`] runs on the screenshot, on a worker thread.
+type ScreenWork = Box<dyn FnOnce(&crate::capture::RawShot) -> anyhow::Result<Answer> + Send>;
+
 /// #723: the messages carrying a worker's result for the run in flight.
 fn is_run_result(msg: u32) -> bool {
     matches!(
@@ -1718,6 +1775,8 @@ fn is_run_result(msg: u32) -> bool {
             | WM_APP_REVIEW_RESULT
             | WM_APP_FORM_FILL_RESULT
             | WM_APP_GENERIC_ACTION_RESULT
+            // #709: a screenshot asked for by a run that is gone is not taken.
+            | WM_APP_NEED_SCREEN
             // The worker is blocked on this preview; a stale one is freed,
             // which drops its reply channel and cancels that send.
             | WM_APP_SEND_PREVIEW
@@ -3005,9 +3064,17 @@ impl App {
         }
         let (today, now_minute) = local_date_and_minute();
         let week = local_week_start();
-        self.run_model_free_screen_action(move |raw| {
-            actions::relative_dates::run(raw, today, Some(now_minute), week)
-        });
+        // #709: the selection is read first; the screen only when it is empty.
+        self.run_selection_first_action(
+            move |selection| {
+                actions::relative_dates::selection_text(selection).map(|text| {
+                    actions::relative_dates::answer_at(&text, today, Some(now_minute), week)
+                })
+            },
+            move |raw| {
+                actions::relative_dates::screen_answer_ocr(raw, today, Some(now_minute), week)
+            },
+        );
     }
 
     /// The shared body of the model-free screen actions: gate on Paused,
@@ -3031,19 +3098,8 @@ impl App {
             return;
         }
 
-        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.hide_card();
-            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-        }
-
-        let raw = match actions::extract_text::capture_screen() {
-            Ok(r) => r,
-            Err(e) => {
-                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't capture the screen", &detail);
-                return;
-            }
+        let Some(raw) = self.hide_card_and_capture() else {
+            return;
         };
 
         self.note_run_started();
@@ -3054,6 +3110,35 @@ impl App {
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
 
+        self.spawn_screen_worker(raw, work);
+    }
+
+    /// Hides a stale card and takes the screenshot, on the main thread. A
+    /// failure ends in a card (rule 7) and returns `None`.
+    fn hide_card_and_capture(&mut self) -> Option<crate::capture::RawShot> {
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.hide_card();
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        }
+
+        match actions::extract_text::capture_screen() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
+                None
+            }
+        }
+    }
+
+    /// Runs `work` on `raw` on a worker thread and posts its answer as
+    /// `WM_APP_RESULT` for the run now in flight.
+    fn spawn_screen_worker(
+        &self,
+        raw: crate::capture::RawShot,
+        work: impl FnOnce(&crate::capture::RawShot) -> anyhow::Result<Answer> + Send + 'static,
+    ) {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         std::thread::spawn(move || {
@@ -3067,21 +3152,133 @@ impl App {
                     )
                 })
             });
-            let payload = Box::into_raw(Box::new(result));
-            unsafe {
-                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(HWND(target as *mut _)),
-                    WM_APP_RESULT,
-                    WPARAM(run as usize),
-                    LPARAM(payload as isize),
-                )
-                .is_err()
-                {
-                    // Window gone: nobody will take the box, so free it here.
-                    free_boxed_payload(WM_APP_RESULT, LPARAM(payload as isize));
-                }
+            post_run_result(target, run, result);
+        });
+    }
+
+    /// #709: a model-free action that works on the selected text and only needs
+    /// the screen when nothing is selected. Reading the selection can block on
+    /// another app, so it runs on the worker; the screenshot has to be taken on
+    /// the main thread before a pending card shows (or the card is in the
+    /// shot). So the pending card says "Reading your selection", and:
+    ///
+    /// - `from_selection` returns the answer when the selection is enough: no
+    ///   screenshot is taken and the card is not hidden;
+    /// - otherwise the worker posts `WM_APP_NEED_SCREEN`, and `on_need_screen`
+    ///   hides the card, captures and runs `from_screen` on the shot.
+    ///
+    /// Same gates as [`App::run_model_free_screen_action`]: Paused and the
+    /// password-manager refusal, before anything is read.
+    fn run_selection_first_action(
+        &mut self,
+        from_selection: impl FnOnce(&dyn crate::calc::SelectionSource) -> Option<Answer>
+            + Send
+            + 'static,
+        from_screen: impl FnOnce(&crate::capture::RawShot) -> anyhow::Result<Answer> + Send + 'static,
+    ) {
+        if self.busy_now() {
+            self.show_busy_card();
+            return;
+        }
+
+        if let Err((headline, detail)) = actions::extract_text::gate(pause::is_paused_now()) {
+            self.card.show_answer(headline, detail, 3, None);
+            return;
+        }
+
+        if self.refuse_if_password_manager() {
+            return;
+        }
+
+        self.note_run_started();
+        self.set_busy(true);
+        self.set_watch(false);
+        self.card
+            .show_pending(crate::ui::card::PendingStage::ReadingSelection);
+
+        let target = self.hwnd_isize();
+        let run = self.run_generation;
+        self.screen_step = Some((
+            run,
+            ScreenStep {
+                work: Box::new(from_screen),
+            },
+        ));
+        std::thread::spawn(move || {
+            crate::ui::send_gate::set_worker_run(run);
+            let picked: std::result::Result<Option<Answer>, String> =
+                catch_worker(|| Ok(from_selection(&crate::calc::ForegroundSelection)));
+            match picked {
+                // Enough: no screenshot is taken for this run (#709).
+                Ok(Some(answer)) => post_run_result(target, run, Ok(answer)),
+                Err(packed) => post_run_result(target, run, Err(packed)),
+                // Nothing usable selected: ask the main thread for the screen.
+                // If the window is gone nobody is left to tell.
+                Ok(None) => unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(HWND(target as *mut _)),
+                        WM_APP_NEED_SCREEN,
+                        WPARAM(run as usize),
+                        LPARAM(0),
+                    );
+                },
             }
         });
+    }
+
+    /// #709: the worker's selection was empty. Re-checks everything on the main
+    /// thread (the run, busy, Pause, the password-manager refusal), then hides
+    /// the pending card, captures and starts the follow-up work. Every failure
+    /// ends in a card (rule 7).
+    fn on_need_screen(&mut self, posted_run: usize) {
+        let held_for_run = self
+            .screen_step
+            .as_ref()
+            .is_some_and(|(run, _)| *run as usize == posted_run);
+        match need_screen_step(
+            posted_run,
+            self.run_generation,
+            self.busy,
+            held_for_run,
+            pause::is_paused_now(),
+        ) {
+            // Not this run's request: a newer run may own the slot, so it is
+            // left alone.
+            NeedScreenStep::Stale => {}
+            NeedScreenStep::Lost => {
+                self.set_busy(false);
+                let detail = self.track_error(
+                    "Couldn't read the screen",
+                    "the screen step for this run was missing",
+                );
+                self.card
+                    .show_error_with_details("Couldn't read the screen", &detail);
+            }
+            NeedScreenStep::Paused => {
+                self.screen_step = None;
+                self.set_busy(false);
+                self.card
+                    .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+            }
+            NeedScreenStep::Capture => {
+                let Some((_, step)) = self.screen_step.take() else {
+                    return;
+                };
+                if self.refuse_if_password_manager() {
+                    self.set_busy(false);
+                    return;
+                }
+                // The pending card was up while the selection was read: it
+                // goes away before the shot, so it is not in it.
+                let Some(raw) = self.hide_card_and_capture() else {
+                    self.set_busy(false);
+                    return;
+                };
+                self.card
+                    .show_pending(crate::ui::card::PendingStage::Working);
+                self.spawn_screen_worker(raw, step.work);
+            }
+        }
     }
 
     /// #809: the model-free overlay branch of the generic runner: the same
@@ -5747,6 +5944,7 @@ impl App {
                 DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
                 DeferredMessage::SettingsCommand(command) => self.on_settings_command(command),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
+                DeferredMessage::NeedScreen(run) => self.on_need_screen(run as usize),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
                 }
@@ -7133,7 +7331,10 @@ fn form_fill_worker(
         ));
     }
 
-    let proposal = actions::fill_form::build_proposal(&candidates, &mapped, require_tick_for);
+    let proposal = actions::fill_form::with_partial_read_note(
+        actions::fill_form::build_proposal(&candidates, &mapped, require_tick_for),
+        snapshot.truncated,
+    );
     // Local-only run: say which fields were left alone.
     Ok(if use_model {
         proposal
@@ -8360,6 +8561,25 @@ fn quit_refusal(exec_in_flight: bool, gpu_fix_running: bool) -> Option<&'static 
 /// posted and `busy` is always cleared. Only matters where panics unwind
 /// (dev and test builds); a release build aborts, and the crash note
 /// (`crash_note.rs`) covers that instead.
+/// Posts a finished run's answer to the owner window as `WM_APP_RESULT`, tagged
+/// with the run it belongs to. Frees the box itself if the window is gone.
+fn post_run_result(target: isize, run: u64, result: std::result::Result<Answer, String>) {
+    let payload = Box::into_raw(Box::new(result));
+    unsafe {
+        if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(target as *mut _)),
+            WM_APP_RESULT,
+            WPARAM(run as usize),
+            LPARAM(payload as isize),
+        )
+        .is_err()
+        {
+            // Window gone: nobody will take the box, so free it here.
+            free_boxed_payload(WM_APP_RESULT, LPARAM(payload as isize));
+        }
+    }
+}
+
 fn catch_worker<T>(
     work: impl FnOnce() -> std::result::Result<T, String>,
 ) -> std::result::Result<T, String> {
@@ -8600,6 +8820,9 @@ enum DeferredMessage {
     /// the loop. The hook swallowed that key for a tray "Set ... key", so it
     /// ends in a card (`learn_lost_card`).
     LearnLost,
+    /// `WM_APP_NEED_SCREEN` (#709): the run it was posted for. Checked again
+    /// when delivered (`on_need_screen`), so a stale one captures nothing.
+    NeedScreen(u64),
 }
 
 /// The card for a key the hook captured for a shortcut change that could not be
@@ -8947,6 +9170,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_SETTINGS_LEFT
         | WM_APP_SETTINGS_SAVE
         | WM_APP_SETTINGS_COMMAND
+        // #709: no payload; checked again (run, busy, Pause) when delivered.
+        | WM_APP_NEED_SCREEN
         // #1013: the hook swallowed the key, so it ends in a card.
         | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
@@ -9185,6 +9410,7 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             DeferredMessage::SettingsCommand(SettingsCommand::from_wparam(wparam.0)?)
         }
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
+        WM_APP_NEED_SCREEN => DeferredMessage::NeedScreen(wparam.0 as u64),
         // #1011: tray menu only; see `tray_menu_policy`.
         WM_APP_ROUTER_RESULT => {
             let (generation, result) = unsafe {
@@ -9314,6 +9540,9 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_SEND_PREVIEW
         | WM_APP_PAUSE_TOGGLE
+        // #709: the capture must not land on the window being typed in; it
+        // waits, and `on_need_screen` checks the run again when it is let go.
+        | WM_APP_NEED_SCREEN
         // #1013: a chord the hook swallowed for a tray "Set ... key" while
         // Settings is in front. Settings takes its own Change's chord before
         // it gets here, so this one belongs to the tray; it ends in a card.
@@ -9935,6 +10164,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_result(result);
             LRESULT(0)
         }
+        WM_APP_NEED_SCREEN => {
+            // No payload: the run number is the whole message.
+            app.on_need_screen(wparam.0);
+            LRESULT(0)
+        }
         WM_APP_CALENDAR_RESULT => {
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
@@ -10242,8 +10476,9 @@ mod tests {
     };
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
-        WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
-        WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT, WM_APP_SEND_PREVIEW,
+        WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_NEED_SCREEN,
+        WM_APP_PENDING_STAGE, WM_APP_RESULT, WM_APP_REVIEW_RESULT, WM_APP_ROUTER_RESULT,
+        WM_APP_SEND_PREVIEW,
     };
     use crate::actions::{self, Origin};
     use crate::capture;
@@ -10417,6 +10652,9 @@ mod tests {
             WM_APP_PREVIEW_DECIDED,
             WM_APP_SEND_PREVIEW,
             WM_APP_PAUSE_TOGGLE,
+            // #709: the screenshot a selection-first action asked for waits
+            // until Settings is left, then is checked again.
+            WM_APP_NEED_SCREEN,
             // #1013: a chord the hook swallowed for a tray "Set ... key" must
             // end in a card, not vanish.
             WM_APP_LEARNED,
@@ -12000,7 +12238,7 @@ mod tests {
     #[test]
     fn the_run_is_noted_after_the_gates_and_just_before_it_goes_busy() {
         let src = lf(include_str!("app.rs"));
-        let paths: [(&str, &[&str]); 3] = [
+        let paths: [(&str, &[&str]); 4] = [
             (
                 "    fn begin_action<",
                 &[
@@ -12016,7 +12254,7 @@ mod tests {
                     "busy_now()",
                     "gate(pause::is_paused_now())",
                     "refuse_if_password_manager()",
-                    "capture_screen()",
+                    "hide_card_and_capture()",
                 ],
             ),
             (
@@ -12024,6 +12262,14 @@ mod tests {
                 &[
                     "busy_now()",
                     "is_paused_now()",
+                    "refuse_if_password_manager()",
+                ],
+            ),
+            (
+                "    fn run_selection_first_action(",
+                &[
+                    "busy_now()",
+                    "gate(pause::is_paused_now())",
                     "refuse_if_password_manager()",
                 ],
             ),
@@ -12041,7 +12287,7 @@ mod tests {
             assert!(body[note..busy].lines().count() <= 3, "{sig}");
             checked += 1;
         }
-        assert_eq!(checked, 3);
+        assert_eq!(checked, 4);
     }
 
     /// #42: Check my work from the key or the tray is remembered too, and the
@@ -12379,7 +12625,12 @@ mod tests {
         assert!(super::result_is_current(5, 5));
         assert!(!super::result_is_current(4, 5));
         assert!(super::result_is_current(0, 5));
-        for msg in [WM_APP_RESULT, WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT] {
+        for msg in [
+            WM_APP_RESULT,
+            WM_APP_CALENDAR_RESULT,
+            WM_APP_REVIEW_RESULT,
+            WM_APP_NEED_SCREEN,
+        ] {
             assert!(super::is_run_result(msg));
         }
         // A send preview from an abandoned run is stale too.
@@ -12390,6 +12641,84 @@ mod tests {
         let src = lf(include_str!("app.rs"));
         let tagged = src.matches("send_gate::set_worker_run(run);").count();
         assert!(tagged >= 7, "workers that tag their run: {tagged}");
+    }
+
+    /// #709: what the main thread does when the worker says the selection was
+    /// empty. Only the run still in flight may capture; a paused app, or a run
+    /// whose step went missing, ends in a card instead of a silent no-op.
+    #[test]
+    fn a_screen_request_is_checked_again_before_anything_is_captured() {
+        use super::{need_screen_step as step, NeedScreenStep as S};
+        // Current run, busy, step held, not paused: capture.
+        assert_eq!(step(5, 5, true, true, false), S::Capture);
+        // Abandoned or replaced run, and a run that already ended: dropped.
+        assert_eq!(step(4, 5, true, true, false), S::Stale);
+        assert_eq!(step(5, 5, false, true, false), S::Stale);
+        // A run number of 0 is not "always current" here, unlike a result.
+        assert_eq!(step(0, 5, true, true, false), S::Stale);
+        // Paused after the press: the pending card becomes the Paused card.
+        assert_eq!(step(5, 5, true, true, true), S::Paused);
+        // Pause outranks nothing stale: a stale request never shows a card.
+        assert_eq!(step(4, 5, true, true, true), S::Stale);
+        // The follow-up work is gone: an error card, never a hang.
+        assert_eq!(step(5, 5, true, false, false), S::Lost);
+    }
+
+    /// #709: the wiring. The selection is read on the worker, the capture is
+    /// made only by the handler of `WM_APP_NEED_SCREEN` after it re-checks, and
+    /// "Relative dates to real dates" goes through that path.
+    #[test]
+    fn the_capture_waits_for_the_selection_and_the_handler_checks_first() {
+        let src = lf(include_str!("app.rs"));
+        let dates = body_between(&src, "    fn resolve_dates(", "\n    }\n");
+        assert!(dates.contains("run_selection_first_action("), "{dates}");
+        assert!(!dates.contains("run_model_free_screen_action("), "{dates}");
+        let first = body_between(&src, "    fn run_selection_first_action(", "\n    }\n");
+        assert!(!first.is_empty());
+        assert!(!first.contains("capture_screen()"), "{first}");
+        assert!(first.contains("WM_APP_NEED_SCREEN"), "{first}");
+        assert!(first.contains("PendingStage::ReadingSelection"), "{first}");
+        let at = |needle: &str| first.find(needle).unwrap_or_else(|| panic!("`{needle}`"));
+        assert!(
+            at("refuse_if_password_manager()") < at("self.note_run_started();"),
+            "{first}"
+        );
+        assert!(
+            at("self.note_run_started();") < at("self.set_busy(true);"),
+            "{first}"
+        );
+        let handler = body_between(&src, "    fn on_need_screen(", "\n    }\n");
+        assert!(!handler.is_empty());
+        let check = handler.find("need_screen_step(").expect("no re-check");
+        let grab = handler
+            .find("self.hide_card_and_capture()")
+            .expect("no capture");
+        assert!(check < grab, "{handler}");
+        // The card goes away before the shot, so it is not in it.
+        let capture = body_between(
+            &src,
+            "    fn hide_card_and_capture(",
+            "
+    }
+",
+        );
+        let hide = capture.find("self.hide_card()").expect("card stays up");
+        let shot = capture.find("capture_screen()").expect("no capture");
+        assert!(hide < shot, "{capture}");
+        assert!(
+            handler.contains("refuse_if_password_manager()"),
+            "{handler}"
+        );
+        // The message reaches the handler, live and when it was deferred.
+        let proc_src = wnd_proc_body(&src);
+        let arm = proc_src
+            .split("WM_APP_NEED_SCREEN => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_NEED_SCREEN arm");
+        assert!(arm[..arm.find("LRESULT(0)").unwrap()].contains("on_need_screen(wparam.0)"));
+        let deliver = body_between(&src, "    fn deliver_deferred(", "\n    }\n");
+        assert!(deliver
+            .contains("DeferredMessage::NeedScreen(run) => self.on_need_screen(run as usize)"));
     }
 
     /// #723: every worker result is posted with its run generation, or the
@@ -12411,7 +12740,12 @@ mod tests {
                 seen += 1;
             }
         }
-        assert!(seen >= 7, "expected the result post sites, found {seen}");
+        assert!(seen >= 6, "expected the result post sites, found {seen}");
+        // #709: the shared poster tags the run too, and its callers pass one.
+        let poster = body_between(&src, "fn post_run_result(", "\n}\n");
+        assert!(poster.contains("WPARAM(run as usize)"), "{poster}");
+        let calls = src.matches("post_run_result(target, run, ").count();
+        assert!(calls >= 3, "post_run_result callers: {calls}");
     }
 
     /// #805: opening the palette sends nothing. The router's request (a
@@ -13946,6 +14280,7 @@ mod tests {
         ("WM_APP_SETTINGS_SAVE", WM_APP_SETTINGS_SAVE),
         ("WM_APP_SETTINGS_COMMAND", WM_APP_SETTINGS_COMMAND),
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
+        ("WM_APP_NEED_SCREEN", WM_APP_NEED_SCREEN),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -14863,9 +15198,26 @@ mod tests {
             "the scan found {checked} ids: the list moved"
         );
         // The payload-free ones can be taken without a box.
-        for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE, WM_APP_PAUSE_TOGGLE] {
+        for id in [
+            WM_APP_HOTKEY,
+            WM_APP_ACTIVATE,
+            WM_APP_PAUSE_TOGGLE,
+            WM_APP_NEED_SCREEN,
+        ] {
             assert!(take_deferred(id, WPARAM(0), LPARAM(0)).is_some(), "{id}");
         }
+    }
+
+    /// #709: the deferred screenshot request keeps the run it was posted for,
+    /// so it is checked against the run in flight when it is finally delivered.
+    #[test]
+    fn a_deferred_screen_request_keeps_its_run() {
+        use super::{take_deferred, DeferredMessage};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        assert!(matches!(
+            take_deferred(WM_APP_NEED_SCREEN, WPARAM(7), LPARAM(0)),
+            Some(DeferredMessage::NeedScreen(7))
+        ));
     }
 
     /// #722: the tray menu defers what Settings drops, so opening the menu
@@ -15097,6 +15449,11 @@ mod tests {
         (
             "WM_APP_SETTINGS_COMMAND",
             WM_APP_SETTINGS_COMMAND,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_NEED_SCREEN",
+            WM_APP_NEED_SCREEN,
             SettingsReentrancy::Defer,
         ),
     ];
