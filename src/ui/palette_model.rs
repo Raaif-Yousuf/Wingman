@@ -51,6 +51,25 @@ pub fn effect_for_executor(executor: &str) -> Effect {
     }
 }
 
+/// #308, #859: whether the Wingman key may run an option by itself.
+///
+/// Only an option that cannot change anything without a further Enter and
+/// cannot overwrite the clipboard: a read-only answer or a preview. A
+/// clipboard-writing option is picked by click or by digit, never by the key.
+///
+/// The model's confidence is deliberately not an input. It comes from a model
+/// that reads the screen, so text on the screen can claim any confidence it
+/// likes (#859), and a habit press must never overwrite the clipboard with
+/// whatever the page said. The options card spec (resolved question 2) would
+/// allow a clipboard option above `palette.router_threshold`; this is the
+/// stricter rule the injection finding asked for.
+pub fn key_pickable(effect: Effect) -> bool {
+    match effect {
+        Effect::None | Effect::Preview => true,
+        Effect::Clipboard => false,
+    }
+}
+
 /// One row the palette shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
@@ -1292,6 +1311,36 @@ mod tests {
             effect(crate::actions::fill_form::ACTION_ID),
             Effect::Preview
         );
+    }
+
+    #[test]
+    fn a_clipboard_effect_is_never_key_pickable_and_the_others_are() {
+        assert!(key_pickable(Effect::None));
+        assert!(key_pickable(Effect::Preview));
+        assert!(!key_pickable(Effect::Clipboard));
+    }
+
+    /// #859: for every action in the catalogue, an option whose effect writes
+    /// the clipboard is never key-picked, whatever confidence a router reply
+    /// (or text on the screen) gave it. The built-ins and the two tray
+    /// utilities are all checked, and the set is not empty.
+    #[test]
+    fn no_clipboard_action_in_the_catalogue_is_key_pickable() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        let clipboard: Vec<&PaletteAction> = cat
+            .iter()
+            .filter(|a| a.effect == Effect::Clipboard)
+            .collect();
+        assert!(clipboard.len() >= 3, "copy text, read QR, copy region");
+        for a in &clipboard {
+            assert!(!key_pickable(a.effect), "{}", a.id);
+        }
+        // And every non-clipboard action is, so the rule is the effect and
+        // nothing else.
+        for a in cat.iter().filter(|a| a.effect != Effect::Clipboard) {
+            assert!(key_pickable(a.effect), "{}", a.id);
+        }
     }
 
     #[test]

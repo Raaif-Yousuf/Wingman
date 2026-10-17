@@ -223,6 +223,36 @@ pub struct Hotkeys {
     /// state rather than `pause`'s lock-free atomic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub palette: Option<Chord>,
+    /// #308: what one press of the Wingman key does. `"options"` (the
+    /// default) shows the options card; an action id (`"check-my-work"` for
+    /// the old one-press flow) runs that action at once, with no router call.
+    /// An id that is not in the catalogue shows one card naming this setting
+    /// and the id the first time the key is pressed; later presses show the
+    /// options card. See [`Hotkeys::primary_target`].
+    pub primary_action: String,
+}
+
+/// What a press of the Wingman key runs, from `hotkeys.primary_action`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimaryAction {
+    /// The options card.
+    Options,
+    /// This action id, straight away.
+    Action(String),
+}
+
+impl Hotkeys {
+    /// `primary_action` read as a target. An empty value (or only spaces) is
+    /// the default, `Options`, and the word is matched without regard to case
+    /// or surrounding spaces; anything else is an action id, kept as typed.
+    pub fn primary_target(&self) -> PrimaryAction {
+        let t = self.primary_action.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("options") {
+            PrimaryAction::Options
+        } else {
+            PrimaryAction::Action(t.to_string())
+        }
+    }
 }
 
 impl Default for Hotkeys {
@@ -244,6 +274,7 @@ impl Default for Hotkeys {
             },
             pause: None,
             palette: None,
+            primary_action: "options".to_string(),
         }
     }
 }
@@ -729,12 +760,15 @@ pub struct Forms {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Palette {
-    /// INERT until #308: nothing reads this at runtime (the palette no longer
-    /// asks the router, #805), so changing it has no effect today. It is kept
-    /// so existing configs keep parsing and #308 can wire it.
+    /// INERT: nothing reads this at runtime, so changing it has no effect.
+    /// The palette no longer asks the router (#805), and the options card's
+    /// key never runs a clipboard-writing option on the model's confidence
+    /// (#859: text on the screen can claim any confidence), so there is no bar
+    /// left for it to set. It is kept so existing configs keep parsing and a
+    /// signal the screen cannot set can use it later.
     ///
-    /// Minimum `RouterOption::confidence` (0.0..=1.0) for a router option to
-    /// be picked by a bare key press rather than by a click. Kept as a plain
+    /// Minimum `RouterOption::confidence` (0.0..=1.0) a router option would
+    /// need to be picked by a bare key press. Kept as a plain
     /// `f64` rather than a clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never clears (or always clears) the
     /// threshold, which is a safe degradation, not a crash.
     pub router_threshold: f64,
@@ -2303,6 +2337,45 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.options, cfg.options);
+    }
+
+    // -- hotkeys.primary_action (issue #308) ----------------------------------
+
+    #[test]
+    fn a_bare_key_press_shows_the_options_card_by_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hotkeys.primary_action, "options");
+        assert_eq!(cfg.hotkeys.primary_target(), PrimaryAction::Options);
+    }
+
+    #[test]
+    fn primary_action_options_is_matched_loosely_and_anything_else_is_an_id() {
+        let target = |s: &str| {
+            Hotkeys {
+                primary_action: s.to_string(),
+                ..Hotkeys::default()
+            }
+            .primary_target()
+        };
+        for s in ["options", "Options", "  OPTIONS ", ""] {
+            assert_eq!(target(s), PrimaryAction::Options, "{s:?}");
+        }
+        assert_eq!(
+            target(" check-my-work "),
+            PrimaryAction::Action("check-my-work".to_string())
+        );
+    }
+
+    #[test]
+    fn an_existing_config_without_primary_action_loads_with_the_default() {
+        let cfg: Config = toml::from_str("[hotkeys]\n").unwrap();
+        assert_eq!(cfg.hotkeys.primary_target(), PrimaryAction::Options);
+        let pinned: Config =
+            toml::from_str("[hotkeys]\nprimary_action = \"check-my-work\"\n").unwrap();
+        assert_eq!(
+            pinned.hotkeys.primary_target(),
+            PrimaryAction::Action("check-my-work".to_string())
+        );
     }
 
     // -- options.auto_dismiss_secs and claim_keys (issue #307) ----------------

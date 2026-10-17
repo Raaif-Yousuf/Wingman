@@ -301,6 +301,10 @@ is the hard off.
 
 ## 6. The core loop: Look, Propose, Confirm, Do
 
+> What one press of the key does now is specified in the
+> [options card spec](2026-10-16-options-card-design.md): the key shows the
+> options card by default, and `hotkeys.primary_action` pins an action instead.
+
 ### Actions are data
 
 ```toml
