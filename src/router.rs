@@ -71,8 +71,8 @@ pub const ROUTER_MAX_TOKENS: u32 = 1000;
 
 /// How long the options card waits for the router before it gives up and shows
 /// its fallback options. A slow local model that talks on for the whole token
-/// budget must not keep the card on "Looking at your screen" for minutes. The call itself still ends on its own HTTP timeout;
-/// only the wait is capped.
+/// budget must not keep the card on "Looking at your screen" for minutes. The call's own HTTP timeout is capped to the
+/// same deadline (#843), so it is not billed long after the card gave up.
 pub const ROUTER_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Waits at most `cap` for the router's result. `None` means the cap passed
@@ -206,8 +206,8 @@ pub fn build_request(image_png: Vec<u8>, candidates: &[RouterCandidate]) -> Requ
 /// The router's chain: just `provider`, never previewing, and stopping at
 /// [`ROUTER_WALL_CLOCK`] after `started` (#792). It bounds only the chain:
 /// past that point no further provider call and no repair request is
-/// started (and billed). A call already in flight is not interrupted; it
-/// ends on its own HTTP timeout.
+/// started (and billed). A call already in flight has its HTTP timeout capped
+/// to the same deadline (#843), so it ends at about that time.
 pub fn router_chain(
     provider: Box<dyn crate::provider::Provider>,
     started: std::time::Instant,
