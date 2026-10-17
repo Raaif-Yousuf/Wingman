@@ -1390,9 +1390,56 @@ fn clipboard_fallback(max_chars: usize, wait_budget: Duration) -> anyhow::Result
     }
 }
 
+/// Test helper (#1114): runs `body`, which may write the real OS clipboard,
+/// then puts back whatever was on it before (every format this module
+/// preserves, and the empty state). Holds one process-wide lock so two such
+/// tests never overwrite each other's clipboard. The restore also runs if
+/// `body` panics.
+#[cfg(test)]
+pub(crate) fn with_real_clipboard_restored<R>(body: impl FnOnce() -> R) -> R {
+    static REAL_CLIPBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = REAL_CLIPBOARD_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    restore_real_clipboard_after(body)
+}
+
+/// [`with_real_clipboard_restored`] without the lock, for a caller that
+/// already holds it.
+#[cfg(test)]
+pub(crate) fn restore_real_clipboard_after<R>(body: impl FnOnce() -> R) -> R {
+    let clipboard = win32::Win32Clipboard;
+    let mut guard = ClipboardGuard::capture(&clipboard, &win32::preserved_formats());
+    let result = body();
+    if let Err(e) = guard.restore_now() {
+        eprintln!("could not restore the real clipboard: {e:#}");
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1114 wired-to-nothing: the helper must give back what was on the real
+    /// clipboard. If the restore were not wired, the sentinel would be gone.
+    #[test]
+    fn the_real_clipboard_helper_restores_what_was_there() {
+        with_real_clipboard_restored(|| {
+            let mut c = match arboard::Clipboard::new() {
+                Ok(c) => c,
+                Err(_) => return, // clipboard unavailable: nothing to check
+            };
+            if c.set_text("wingman-sentinel-1114").is_err() {
+                return;
+            }
+            restore_real_clipboard_after(|| {
+                let _ = c.set_text("something the test wrote");
+            });
+            let mut c = arboard::Clipboard::new().expect("clipboard");
+            assert_eq!(c.get_text().unwrap(), "wingman-sentinel-1114");
+        });
+    }
 
     // -- plan_from_probe: which path (tests-first's first observable) -----
 
