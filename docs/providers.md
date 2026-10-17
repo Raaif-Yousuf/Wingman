@@ -146,6 +146,13 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Auth:** none. `ready()` only checks that `base_url` is non-empty; a
   local server that isn't actually listening fails as a transport error,
   which `Chain` already falls through on.
+- **A remote `base_url` is allowed, with one warning** (#806). A home server
+  or another PC on the network is still Ollama, so Local mode accepts it.
+  The first press that would send to an address that is not on this PC
+  (`src/remote_ollama.rs`: not 127.0.0.1, `::1` or `localhost`) shows a card
+  saying the screenshot goes there, sends nothing, and remembers the address
+  in `%LOCALAPPDATA%\Wingman\remote-ollama-ack.txt`. The next press goes
+  through. A new address warns again. 127.0.0.1 never shows it.
 - **127.0.0.1, never `localhost`** (AGENTS.md rule 6): IPv6-first resolution
   of `localhost` stalls about 2 seconds per connection on Windows, MEASURED
   in the sibling CLAIR repo. `DEFAULT_BASE_URL` is asserted in tests to

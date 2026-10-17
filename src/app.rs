@@ -1275,6 +1275,27 @@ impl App {
         self.show_setup_card(&headline, &detail);
     }
 
+    /// #806: the first press that would ask an Ollama that is not on this PC
+    /// shows a card saying where the screenshot goes, instead of sending it.
+    /// Returns `true` when it did (the caller must stop). The address is
+    /// remembered, so the next press goes through; 127.0.0.1 never shows it.
+    fn show_remote_ollama_notice(&mut self) -> bool {
+        let selected = self
+            .config
+            .providers
+            .selected_order_for_mode(self.config.mode, true);
+        if !crate::remote_ollama::notice_applies(self.config.mode, &selected) {
+            return false;
+        }
+        let Some((headline, detail)) =
+            crate::remote_ollama::take_notice(&self.config.providers.ollama.base_url)
+        else {
+            return false;
+        };
+        self.show_setup_card(&headline, &detail);
+        true
+    }
+
     /// #339: a password manager is in front now, or was when Wingman's own
     /// UI (tray menu, palette) took the foreground.
     fn password_manager_now(&self) -> bool {
@@ -1399,6 +1420,11 @@ impl App {
                 return None;
             }
             self.show_setup_card(&headline, &detail);
+            return None;
+        }
+
+        // #806: before anything is captured or sent.
+        if plan.asks_model && self.show_remote_ollama_notice() {
             return None;
         }
 
@@ -10804,6 +10830,24 @@ mod tests {
         assert!(body.contains("take_skipped_notice()"));
         let begin = src.find("fn begin_action<T>").expect("fn exists");
         assert!(src[begin..begin + 1500].contains("queue_skipped_from_disk()"));
+    }
+
+    /// #806: the remote-Ollama notice is checked in `begin_action`, before the
+    /// screen is captured, so the screenshot is never grabbed for a press the
+    /// notice replaces. Without that call the module would be wired to nothing.
+    #[test]
+    fn begin_action_shows_the_remote_ollama_notice_before_capture() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let begin = src.find("fn begin_action<T>").expect("fn exists");
+        let rest = &src[begin..];
+        let end = rest.find("\n    fn ").expect("a later fn");
+        let body = &rest[..end];
+        let notice = body
+            .find("show_remote_ollama_notice()")
+            .expect("begin_action must call the notice");
+        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        assert!(notice < capture, "the notice must come before the capture");
+        assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
     }
 
     /// #541: every handler that ends a run on a result card must consult the
