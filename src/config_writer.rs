@@ -444,6 +444,30 @@ pub fn guard_whole_values(changes: Vec<FieldChange>, before: &Config) -> Result<
         .collect())
 }
 
+/// Makes every value change in `changes` conditional on the file still holding
+/// what `before` held there, scalars included. For an Undo: it puts back only
+/// what the change wrote, so a value the user edited by hand since is refused
+/// rather than overwritten with the stale old one. A removal cannot be
+/// conditional and stays as it is.
+pub fn guard_every_value(changes: Vec<FieldChange>, before: &Config) -> Result<Vec<FieldChange>> {
+    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
+    blank_secrets(&mut before);
+    Ok(changes
+        .into_iter()
+        .map(|change| match change {
+            FieldChange::Set { path, value } => {
+                let expected = value_at(&before, &path).cloned();
+                FieldChange::SetIfUnchanged {
+                    path,
+                    expected,
+                    value,
+                }
+            }
+            other => other,
+        })
+        .collect())
+}
+
 /// The settings as `text` (the file's contents) holds them, defaults for every key
 /// it does not spell out: what [`guard_whole_values`] must compare against, since
 /// the writer compares with the file read the same way. The running config is not

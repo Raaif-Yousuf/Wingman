@@ -447,9 +447,21 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 /// anywhere else Enter applies the box it is in (#875).
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
-        ID_UNDO | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
-        | ID_CHANGE_SECONDARY | ID_CHANGE_PAUSE | ID_PAUSE_BUTTON | ID_RESUME_BUTTON
-        | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
+        ID_UNDO
+        | ID_PROMPT_TOGGLE
+        | ID_RESET_PROMPT
+        | ID_OLLAMA_LINK
+        | ID_CHANGE_PRIMARY
+        | ID_CHANGE_SECONDARY
+        | ID_CHANGE_PAUSE
+        | ID_PAUSE_BUTTON
+        | ID_RESUME_BUTTON
+        | ID_PULL_BUTTON
+        | ID_OPEN_CONFIG
+        | ID_ADD_PROVIDER
+        | ID_OPENAI_SHOW_KEY
+        | ID_ANTHROPIC_SHOW_KEY
+        | ID_GEMINI_SHOW_KEY => ctrl_id,
         // #635: Enter in the Pull model box starts the pull.
         ID_PULL_NAME => ID_PULL_BUTTON,
         _ => ID_APPLY_FOCUSED,
@@ -761,6 +773,9 @@ struct SettingsInner {
     undo_shown: bool,
     /// Set once the window is closing: nothing is committed from then on.
     closing: bool,
+    /// The window is not the active one (`WM_ACTIVATE` inactive): a key box that
+    /// loses the focus for that reason is not applied.
+    deactivated: bool,
     /// #875: the file's path and the modified time the window last read, so
     /// coming back to the window reads it again only when it moved. `None` in the
     /// tests' windows (rule 9: they never read the real file).
@@ -850,6 +865,7 @@ impl SettingsInner {
             tracker: Default::default(),
             undo_shown: false,
             closing: false,
+            deactivated: false,
             file_path: None,
             file_mtime: None,
             refreshing: false,
@@ -1022,18 +1038,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // in another app would otherwise be captured as the new shortcut.
             stop_learning(inner);
             set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            inner.deactivated = true;
             tell_owner_left(inner.owner, 0);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // #871: losing the foreground releases whatever waited for it (a
-        // finished request's card, a press of the Wingman key).
+        // finished request's card, a press of the Wingman key). Set before the
+        // default handling takes the focus away, so a key box losing it for this
+        // reason is not applied.
         WM_ACTIVATE if (wparam.0 & 0xFFFF) == 0 => {
+            inner.deactivated = true;
             tell_owner_left(inner.owner, 0);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // #875: coming back to the window, read the file again (on a worker)
         // so a hand edit made meanwhile shows in the rows nobody is typing in.
         WM_ACTIVATE => {
+            inner.deactivated = false;
             start_refresh(inner);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -1116,6 +1137,12 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
     // the user leaves the field. Leaving it applies it too (#875).
     if let Some(index) = typed_key_vendor(id, notify) {
         fetch_for_typed_key(inner, index);
+        // A box the window lost because it was deactivated (alt-tab) keeps its
+        // text: a half-typed key must not be stored. Enter and moving to another
+        // control of Settings apply it.
+        if inner.deactivated {
+            return;
+        }
         if let Some(field) = commit_trigger(id, notify) {
             commit_field(inner, field);
         }
@@ -1358,6 +1385,39 @@ fn raw_text(raw: &RawForm, field: Field) -> &str {
     }
 }
 
+/// Why a typed API key is not stored, or `None`: it has the wrong shape for its
+/// vendor (#678). Only a key that differs from the applied one is checked, so the
+/// mask, the unreadable-key placeholder and a cleared box are left alone. The
+/// typed-key network check is a later slice.
+fn key_refusal(applied: &Config, field: Field, raw: &RawForm) -> Option<&'static str> {
+    let (index, text, applied_key, why) = match field {
+        Field::OpenAiKey => (
+            0,
+            &raw.openai_key,
+            &applied.providers.openai.api_key,
+            "That does not look like an OpenAI key. It starts with sk-.",
+        ),
+        Field::AnthropicKey => (
+            1,
+            &raw.anthropic_key,
+            &applied.providers.anthropic.api_key,
+            "That does not look like an Anthropic key. It starts with sk-ant-.",
+        ),
+        Field::GeminiKey => (
+            2,
+            &raw.gemini_key,
+            &applied.providers.gemini.api_key,
+            "That does not look like a Gemini key. It starts with AIza.",
+        ),
+        _ => return None,
+    };
+    let key = resolve_key_field(applied_key, text);
+    if key == *applied_key || key.trim().is_empty() || key_fits_vendor(index, &key) {
+        return None;
+    }
+    Some(why)
+}
+
 /// Puts the status line's text up, and shows or hides Undo with it.
 fn set_status(inner: &mut SettingsInner, text: &str, undo: bool) {
     if let Some(line) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
@@ -1395,10 +1455,14 @@ fn commit_field(inner: &mut SettingsInner, field: Field) {
         return;
     }
     let raw = read_raw_form(inner);
-    if let Some(why) = commit::invalid(field, raw_text(&raw, field)) {
-        // Not written, and the text stays for fixing. The focus is left alone:
-        // moving it from here would send another box its `EN_KILLFOCUS` in the
-        // middle of this one.
+    let refused = commit::invalid(field, raw_text(&raw, field))
+        .or_else(|| key_refusal(&inner.original, field, &raw));
+    if let Some(why) = refused {
+        // Not written, and the text stays for fixing. The row is failed, so the
+        // next commit's status line does not hide it and closing counts it. The
+        // focus is left alone: moving it from here would send another box its
+        // `EN_KILLFOCUS` in the middle of this one.
+        inner.tracker.fail(field, why);
         set_status(inner, &commit::invalid_line(field.label(), why), false);
         return;
     }
@@ -1406,8 +1470,10 @@ fn commit_field(inner: &mut SettingsInner, field: Field) {
     let plan = match commit::plan(field, &inner.baseline, &inner.original, &edited) {
         Ok(Some(plan)) => plan,
         Ok(None) => {
-            // Nothing changed. A box shows the applied text again, so stray
-            // spaces or a blank do not linger.
+            // Nothing changed: the value in the box is the applied one, so a
+            // row that was failed for a bad entry is fine again. A box shows the
+            // applied text again, so stray spaces or a blank do not linger.
+            inner.tracker.clear_failed(field);
             if field.is_text_box() {
                 let applied = inner.original.clone();
                 show_field(inner, field, &applied);
@@ -1553,12 +1619,18 @@ fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
             }
         }
         Err(reason) => {
-            // The file still holds the old value: so does the window again.
-            if let Ok(back) = commit::copy_field(field, &entry.before_original, &inner.original) {
-                inner.original = back;
-            }
-            if let Ok(back) = commit::copy_field(field, &entry.before_baseline, &inner.baseline) {
-                inner.baseline = back;
+            // The file still holds the old value: so does the window again,
+            // unless a newer write of the field is waiting. Then the window
+            // keeps the newer value, which may still save.
+            if !inner.tracker.settle_failed(&entry) {
+                if let Ok(back) = commit::copy_field(field, &entry.before_original, &inner.original)
+                {
+                    inner.original = back;
+                }
+                if let Ok(back) = commit::copy_field(field, &entry.before_baseline, &inner.baseline)
+                {
+                    inner.baseline = back;
+                }
             }
             fail_row(inner, field, reason);
         }
@@ -12403,6 +12475,15 @@ mod tests {
         assert_eq!(enter_command(ID_RESET_PROMPT), ID_RESET_PROMPT);
         assert_eq!(enter_command(ID_UNDO), ID_UNDO);
         assert_eq!(enter_command(ID_OLLAMA_LINK), ID_OLLAMA_LINK);
+        // Every other push button too: Enter on a button presses it.
+        for button in [
+            ID_ADD_PROVIDER,
+            ID_OPENAI_SHOW_KEY,
+            ID_ANTHROPIC_SHOW_KEY,
+            ID_GEMINI_SHOW_KEY,
+        ] {
+            assert_eq!(enter_command(button), button);
+        }
         assert_eq!(enter_command(ID_CARD_SECONDS), ID_APPLY_FOCUSED);
         assert_eq!(enter_command(ID_OPENAI_KEY), ID_APPLY_FOCUSED);
         assert_eq!(enter_command(0), ID_APPLY_FOCUSED);
@@ -14164,6 +14245,122 @@ mod tests {
         assert!(after.contains("card_seconds = 11 # hand edit"), "{after}");
     }
 
+    /// A number that does not parse is a failed row, not only a status line: the
+    /// next commit rewrites the status line, and closing must still say that the
+    /// value was dropped. Through the real arms: leave the box, commit another
+    /// field, close.
+    #[test]
+    fn an_invalid_number_survives_the_next_commit_and_is_counted_on_close() {
+        with_open_window(|hwnd, owner| {
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "2ooo");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert!(status(hwnd).starts_with("Error"), "{}", status(hwnd));
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            assert!(answer(hwnd, "Card corner", Ok(())));
+            assert!(!status(hwnd).starts_with("Error"), "the status moved on");
+            close_now();
+            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
+            assert_eq!(left.wParam.0, 1, "the dropped number must be counted");
+        });
+    }
+
+    /// Fixing the number (or putting the applied one back) clears the row.
+    #[test]
+    fn a_good_commit_of_the_field_clears_its_failed_row() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            let seconds = get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap();
+            set_text(seconds, "2ooo");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 1);
+            set_text(seconds, "9");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+            // The applied value typed back is also a fix.
+            set_text(seconds, "2ooo");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 1);
+            set_text(seconds, "9");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+        });
+    }
+
+    /// Two writes of one field are waiting and the older one fails: the window
+    /// keeps the newer value instead of going back past it.
+    #[test]
+    fn an_older_failed_write_leaves_the_newer_value_showing() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            pick(hwnd, ID_CARD_CORNER, "Top right");
+            assert!(answer(hwnd, "Card corner", Err("disk full".to_string())));
+            let inner = unsafe { &*raw };
+            assert_eq!(inner.original.ui.card_corner, CardCorner::TopRight);
+            assert_eq!(
+                get_text(get_dlg_item(hwnd, ID_CARD_CORNER).unwrap()),
+                card_corner_label(CardCorner::TopRight)
+            );
+            assert!(answer(hwnd, "Card corner", Ok(())));
+            assert_eq!(
+                unsafe { &*raw }.tracker.failed_count(),
+                0,
+                "the newer write saved, so the row is fine"
+            );
+            assert_eq!(
+                unsafe { &*raw }.original.ui.card_corner,
+                CardCorner::TopRight
+            );
+        });
+    }
+
+    /// A key box applies on Enter or when the focus moves to another control of
+    /// Settings, never because the window was deactivated (alt-tab): a half-typed
+    /// key would be stored and the old one lost.
+    #[test]
+    fn a_key_box_is_not_applied_when_the_window_is_deactivated() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE;
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(key, "sk-half-typed");
+            unsafe {
+                SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            leave(hwnd, ID_OPENAI_KEY);
+            assert!(seen.borrow().is_empty(), "alt-tab stored a key");
+            assert_eq!(get_text(key), "sk-half-typed", "the text stays for later");
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+            // Back in the window, leaving the box for another control applies it.
+            unsafe {
+                SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
+            }
+            leave(hwnd, ID_OPENAI_KEY);
+            assert_eq!(seen.borrow().len(), 1, "moving inside Settings applies it");
+        });
+    }
+
+    /// A key of the wrong shape for its vendor is not stored: the row errors
+    /// and the text stays for fixing.
+    #[test]
+    fn a_key_that_does_not_fit_its_vendor_is_not_stored() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            let key = get_dlg_item(hwnd, ID_ANTHROPIC_KEY).unwrap();
+            set_text(key, "sk-this-is-an-openai-key");
+            leave(hwnd, ID_ANTHROPIC_KEY);
+            assert!(seen.borrow().is_empty(), "a wrong key was stored");
+            assert!(status(hwnd).starts_with("Error"), "{}", status(hwnd));
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 1);
+            assert_eq!(get_text(key), "sk-this-is-an-openai-key");
+            set_text(key, "sk-ant-right-one");
+            leave(hwnd, ID_ANTHROPIC_KEY);
+            assert_eq!(seen.borrow().len(), 1);
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+        });
+    }
+
     /// A hand edit shows in every row that is not being typed in, and the row
     /// being typed in keeps its text.
     #[test]
@@ -14255,20 +14452,34 @@ mod tests {
         assert!(code.contains("fn commit_field("), "the module moved");
         assert!(!code.contains("ID_SAVE") && !code.contains("ID_CANCEL"));
         assert!(!code.contains("\"Save\"") && !code.contains("\"Cancel\""));
-        // The arms that apply.
-        let wndproc = &code[code.find("unsafe extern \"system\" fn wndproc").unwrap()..];
+        // The arms that apply: the window procedure ends where `handle_command`
+        // starts, so a call elsewhere in the file cannot satisfy the check.
+        let start = code.find("unsafe extern \"system\" fn wndproc").unwrap();
+        let end = code.find("\nfn handle_command(").unwrap();
+        assert!(
+            start < end,
+            "the module was reordered: slice the function by hand"
+        );
+        let wndproc = &code[start..end];
+        assert!(wndproc.len() > 500, "the slice is not the window procedure");
         for arm in [
             "commit_focused(inner);",
-            "TB_ENDTRACK",
+            "commit_field(inner, Field::TextScale)",
             "WM_SETTINGS_WRITE_RESULT =>",
             "WM_SETTINGS_REFRESH =>",
             "start_refresh(inner);",
         ] {
             assert!(wndproc.contains(arm), "wndproc has no `{arm}`");
         }
-        let command = &code[code.find("fn handle_command(").unwrap()..];
+        assert!(
+            wndproc.contains("TB_ENDTRACK") && wndproc.contains("WM_HSCROLL =>"),
+            "the slider applies on release"
+        );
+        let command_end = code[end..].find("\nfn commit_focused(").unwrap() + end;
+        let command = &code[end..command_end];
         assert!(command.contains("commit_trigger(id, notify)"));
         assert!(command.contains("ID_UNDO if notify == BN_CLICKED"));
+        assert!(command.contains("ID_APPLY_FOCUSED => commit_focused(inner)"));
         // No timer but the one a pending shortcut needs, and no polling.
         assert_eq!(code.matches("SetTimer(").count(), 1, "a timer was added");
         // The commit path never touches the file.

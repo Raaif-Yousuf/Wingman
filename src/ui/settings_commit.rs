@@ -205,7 +205,8 @@ pub(crate) fn plan(
     }
     let after_baseline = config_writer::reapply(baseline, &own).map_err(err)?;
     let back = own_changes(field, config_writer::diff(&after, original).map_err(err)?);
-    let undo = config_writer::guard_whole_values(back, &after_baseline).map_err(err)?;
+    // Undo writes back only what this change wrote: a hand edit since is refused.
+    let undo = config_writer::guard_every_value(back, &after_baseline).map_err(err)?;
     Ok(Some(Plan {
         changes,
         undo,
@@ -353,6 +354,30 @@ impl Tracker {
     pub(crate) fn finish(&mut self, field: Field) -> Option<InFlight> {
         let at = self.in_flight.iter().position(|e| e.field == field)?;
         Some(self.in_flight.remove(at))
+    }
+
+    /// A write that `finish` returned did not save. Returns whether a newer write
+    /// of the same field is still waiting: then the window keeps showing the newer
+    /// value (it may still save) and must not roll back past it. The waiting
+    /// writes now go back to what the file really holds, the value before this one.
+    pub(crate) fn settle_failed(&mut self, failed: &InFlight) -> bool {
+        let mut newer = false;
+        for e in self
+            .in_flight
+            .iter_mut()
+            .filter(|e| e.field == failed.field)
+        {
+            newer = true;
+            if let Ok(back) = copy_field(failed.field, &failed.before_original, &e.before_original)
+            {
+                e.before_original = back;
+            }
+            if let Ok(back) = copy_field(failed.field, &failed.before_baseline, &e.before_baseline)
+            {
+                e.before_baseline = back;
+            }
+        }
+        newer
     }
 
     pub(crate) fn writes_in_flight(&self) -> usize {
@@ -704,5 +729,112 @@ pub(crate) mod tests {
         t.clear_failed(Field::CardCorner);
         assert_eq!(t.failed_count(), 1);
         assert_eq!(t.failed(Field::CardCorner), None);
+    }
+
+    fn write_of(field: Field, before: &Config) -> InFlight {
+        InFlight {
+            field,
+            undoing: false,
+            before_original: before.clone(),
+            before_baseline: before.clone(),
+        }
+    }
+
+    /// Two writes of one field are in flight and the older one fails first: the
+    /// picture must keep the newer value (which may still save), not go back past it.
+    #[test]
+    fn an_older_failed_write_does_not_roll_back_past_a_newer_one() {
+        let first_value = Config::default();
+        let second_value = changed(Field::CardSeconds, &first_value);
+        let third_value = {
+            let mut c = second_value.clone();
+            c.ui.card_seconds += 1;
+            c
+        };
+        let mut t = Tracker::default();
+        t.begin(write_of(Field::CardSeconds, &first_value));
+        t.begin(write_of(Field::CardSeconds, &second_value));
+        let older = t.finish(Field::CardSeconds).unwrap();
+        assert!(
+            t.settle_failed(&older),
+            "a newer write of the field is still waiting"
+        );
+        // The window shows the third value (the newer write's). Nothing restores.
+        let newer = t.finish(Field::CardSeconds).unwrap();
+        // If the newer one fails too, it goes back to what the file really holds:
+        // the value before the older write, not the older write's value.
+        assert_eq!(
+            newer.before_original.ui.card_seconds,
+            first_value.ui.card_seconds
+        );
+        assert_eq!(
+            newer.before_baseline.ui.card_seconds,
+            first_value.ui.card_seconds
+        );
+        assert!(!t.settle_failed(&newer), "nothing newer is left");
+        let _ = third_value;
+    }
+
+    #[test]
+    fn a_failed_write_of_another_field_is_not_superseded() {
+        let base = Config::default();
+        let mut t = Tracker::default();
+        t.begin(write_of(Field::CardSeconds, &base));
+        t.begin(write_of(Field::CardCorner, &base));
+        let e = t.finish(Field::CardSeconds).unwrap();
+        assert!(!t.settle_failed(&e));
+    }
+
+    /// Undo puts back only what it wrote over: a hand edit made since is refused,
+    /// not overwritten with the stale old value.
+    #[test]
+    fn undo_is_refused_when_the_file_was_edited_by_hand_since() {
+        let base = Config::default();
+        let edited = changed(Field::CardSeconds, &base);
+        let plan = plan(Field::CardSeconds, &base, &base, &edited)
+            .unwrap()
+            .unwrap();
+        match &plan.undo[..] {
+            [FieldChange::SetIfUnchanged { expected, .. }] => {
+                assert_eq!(
+                    expected.as_ref().and_then(|v| v.as_integer()),
+                    Some(i64::from(edited.ui.card_seconds))
+                );
+            }
+            other => panic!("the undo is not conditional: {other:?}"),
+        }
+        let path =
+            std::env::temp_dir().join(format!("wingman-settings-undo-{}.toml", std::process::id()));
+        // The change was written, then the user edited the same line by hand.
+        std::fs::write(
+            &path,
+            "[ui]
+card_seconds = 99 # hand edit
+",
+        )
+        .unwrap();
+        let refused = config_writer::write_changes(&path, &plan.undo);
+        let after = std::fs::read_to_string(&path).unwrap();
+        // And with the file as the change left it, the undo goes through.
+        std::fs::write(
+            &path,
+            format!(
+                "[ui]
+card_seconds = {}
+",
+                edited.ui.card_seconds
+            ),
+        )
+        .unwrap();
+        let allowed = config_writer::write_changes(&path, &plan.undo);
+        let undone = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(refused.is_err(), "the hand edit was overwritten");
+        assert!(after.contains("card_seconds = 99 # hand edit"), "{after}");
+        assert!(allowed.is_ok(), "{allowed:?}");
+        assert!(
+            undone.contains(&format!("card_seconds = {}", base.ui.card_seconds)),
+            "{undone}"
+        );
     }
 }
