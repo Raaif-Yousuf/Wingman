@@ -262,6 +262,8 @@ impl Card {
             accent_reads: 0,
             theme_forced: false,
             dpi_forced: false,
+            #[cfg(any(test, debug_assertions))]
+            button_demo: None,
             fonts: Fonts::null(),
             text_scale: 1.0,
             corner: CardCorner::default(),
@@ -624,6 +626,24 @@ impl Card {
         self.inner.dpi = dpi.max(1);
         self.inner.dpi_forced = true;
         self.inner.rebuild_fonts();
+    }
+
+    /// The UI gallery's button states: paints the preview button with control
+    /// id `demo.0` as hovered, pressed or focused (the gallery cannot hold the
+    /// mouse or keyboard there). `None` goes back to the real state.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn set_button_demo_for_gallery(&mut self, demo: Option<(i32, ButtonDemo)>) {
+        self.inner.button_demo = demo;
+        if let Some(preview) = self.inner.preview.as_ref() {
+            for b in [Some(preview.do_it_btn), preview.edit_btn]
+                .into_iter()
+                .flatten()
+            {
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(b), None, false);
+                }
+            }
+        }
     }
 
     /// The UI gallery's expanded answer: what a click on the card does.
@@ -1562,6 +1582,10 @@ struct CardInner {
     /// Set by the UI gallery's `--dpi`: `dpi` is simulated and neither the
     /// monitor the card moves to nor `WM_DPICHANGED` may replace it.
     dpi_forced: bool,
+    /// Set by the UI gallery: paint one preview button as if the pointer or
+    /// keyboard were on it (#818). Cleared when the preview goes away.
+    #[cfg(any(test, debug_assertions))]
+    button_demo: Option<(i32, ButtonDemo)>,
     fonts: Fonts,
     /// User-tunable multiplier applied to every font size. Set via
     /// [`Card::set_text_scale`]; defaults to 1.0.
@@ -2053,7 +2077,24 @@ impl CardInner {
         } else {
             btn::Role::Secondary
         };
-        let hovered = button_is_hovered(dis.hwndItem);
+        #[allow(unused_mut)]
+        let mut hovered = button_is_hovered(dis.hwndItem);
+        #[cfg(any(test, debug_assertions))]
+        let demo_dis = {
+            let mut copy = *dis;
+            if let Some((id, demo)) = self.button_demo {
+                if id as u32 == dis.CtlID {
+                    match demo {
+                        ButtonDemo::Hover => hovered = true,
+                        ButtonDemo::Pressed => copy.itemState.0 |= 0x0001,
+                        ButtonDemo::Focus => copy.itemState.0 |= 0x0010,
+                    }
+                }
+            }
+            copy
+        };
+        #[cfg(any(test, debug_assertions))]
+        let dis = &demo_dis;
         let look = btn::look(
             role,
             btn::state_of(dis, hovered),
@@ -4256,6 +4297,10 @@ impl CardInner {
     /// guards that). Every other way out of Preview leaves the flag set,
     /// and the owner is told here.
     fn leave_preview_if_active(&mut self) {
+        #[cfg(any(test, debug_assertions))]
+        {
+            self.button_demo = None;
+        }
         if self.preview.is_some() {
             self.destroy_preview_controls();
             self.preview = None;
@@ -4967,8 +5012,17 @@ fn esc_hint_rect(
     })
 }
 
-const ID_PREVIEW_DO_IT: i32 = 3900;
-const ID_PREVIEW_EDIT: i32 = 3901;
+/// A button state the UI gallery can force (#818).
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ButtonDemo {
+    Hover,
+    Pressed,
+    Focus,
+}
+
+pub(crate) const ID_PREVIEW_DO_IT: i32 = 3900;
+pub(crate) const ID_PREVIEW_EDIT: i32 = 3901;
 const ID_PREVIEW_CANCEL: i32 = 3902;
 
 /// Subclass id passed to `SetWindowSubclass`/`RemoveWindowSubclass`. A
@@ -6895,6 +6949,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_gallery_can_show_a_button_hovered_pressed_or_focused() {
+        // The gallery cannot hold the mouse or the keyboard on a button, so
+        // it asks the card to paint that state (#818). Each must differ from
+        // the resting look, and clearing it must bring the resting look back.
+        if crate::ui::card_buttons::system_high_contrast().is_some() {
+            return;
+        }
+        let mut card = preview_card_for_buttons(Theme::Light);
+        let do_it = card.inner.preview.as_ref().unwrap().do_it_btn;
+        let rest = drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12);
+        let ring = |card: &mut Card| {
+            (2..6)
+                .map(|x| drawn_pixel(card, do_it, ID_PREVIEW_DO_IT, 0, x, 12))
+                .collect::<Vec<_>>()
+        };
+        let rest_ring = ring(&mut card);
+        card.set_button_demo_for_gallery(Some((ID_PREVIEW_DO_IT, ButtonDemo::Hover)));
+        assert_ne!(
+            rest,
+            drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12),
+            "hover"
+        );
+        card.set_button_demo_for_gallery(Some((ID_PREVIEW_DO_IT, ButtonDemo::Pressed)));
+        assert_ne!(
+            rest,
+            drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12),
+            "pressed"
+        );
+        card.set_button_demo_for_gallery(Some((ID_PREVIEW_DO_IT, ButtonDemo::Focus)));
+        assert_ne!(rest_ring, ring(&mut card), "focus ring");
+        card.set_button_demo_for_gallery(None);
+        assert_eq!(
+            rest,
+            drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12)
+        );
+    }
     #[test]
     fn a_focused_button_gets_a_focus_ring() {
         let mut card = preview_card_for_buttons(Theme::Light);

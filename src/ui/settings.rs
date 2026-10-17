@@ -12563,7 +12563,12 @@ mod tests {
             let key = format!("sk-ant-api03-{}", "A".repeat(95));
             let field = get_dlg_item(hwnd, ID_ANTHROPIC_KEY).expect("anthropic key field");
             set_text(field, "");
-            if put_on_clipboard(hwnd, &key) {
+            // The real clipboard is the point of this check; put the user's
+            // own contents back afterwards (#1114).
+            crate::inputs::selection::with_real_clipboard_restored(|| {
+                if !put_on_clipboard(hwnd, &key) {
+                    return;
+                }
                 unsafe {
                     SendMessageW(field, WM_PASTE, None, None);
                 }
@@ -12576,7 +12581,7 @@ mod tests {
                     key.chars().count()
                 );
                 assert_eq!(got, key);
-            }
+            });
             set_text(field, "");
         }
 

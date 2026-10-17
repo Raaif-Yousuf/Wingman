@@ -681,6 +681,9 @@ struct App {
     /// #81: the knowledge folder watcher, while a usable folder is set and the
     /// watch is alive. Dropping it asks its thread to stop.
     knowledge_watch: Option<crate::knowledge::watch::Watcher>,
+    /// #81: the start-up scan, while it may still be running. Dropping it asks
+    /// it to stop, so a Reload or quit ends it within one file.
+    knowledge_scan: Option<crate::knowledge::ingest::ScanHandle>,
     /// The `[knowledge] folder` text the scan and watcher were last started for.
     knowledge_folder: String,
     card: Card,
@@ -914,7 +917,8 @@ pub fn run() -> Result<()> {
     // is only known on the scan thread and waits in its own notice queue.
     let knowledge_setting_problem =
         crate::knowledge::ingest::startup_problem(&config.knowledge.folder);
-    let (knowledge_watch, knowledge_spawn_problem) = start_knowledge(&config.knowledge.folder);
+    let (knowledge_watch, knowledge_scan, knowledge_spawn_problem) =
+        start_knowledge(&config.knowledge.folder);
     let chain = Arc::new(config.build_chain());
 
     // #105: every `Chain` built from here on asks the owner window to show
@@ -996,6 +1000,7 @@ pub fn run() -> Result<()> {
         instance,
         taskbar_created_msg,
         knowledge_watch,
+        knowledge_scan,
         knowledge_folder,
         config,
         unsaved: Vec::new(),
@@ -1210,7 +1215,13 @@ fn knowledge_needs_restart(started_for: &str, wanted: &str, watch_ended: bool) -
 /// watch is armed first (`watch::start` waits for that, bounded), so a file
 /// changed while the scan walks is still seen. Returns the watcher, if one is
 /// running, and a plain sentence for whatever could not be started.
-fn start_knowledge(folder: &str) -> (Option<crate::knowledge::watch::Watcher>, Option<String>) {
+fn start_knowledge(
+    folder: &str,
+) -> (
+    Option<crate::knowledge::watch::Watcher>,
+    Option<crate::knowledge::ingest::ScanHandle>,
+    Option<String>,
+) {
     let mut problems = Vec::new();
     let watch = match crate::knowledge::watch::start(folder) {
         Ok(watch) => watch,
@@ -1219,11 +1230,15 @@ fn start_knowledge(folder: &str) -> (Option<crate::knowledge::watch::Watcher>, O
             None
         }
     };
-    if let Err(e) = crate::knowledge::ingest::start_scan(folder) {
-        problems.push(e);
-    }
+    let scan = match crate::knowledge::ingest::start_scan(folder) {
+        Ok(scan) => Some(scan),
+        Err(e) => {
+            problems.push(e);
+            None
+        }
+    };
     let problem = (!problems.is_empty()).then(|| problems.join("\n\n"));
-    (watch, problem)
+    (watch, scan, problem)
 }
 
 /// #1054: the start-up card for a knowledge folder that will not be indexed
@@ -5787,10 +5802,13 @@ impl App {
         }
         // Stop the old watch first, so it cannot apply a batch to a root the
         // new scan is about to retire.
+        // The old start-up scan too: dropping it stops it within one file.
         self.knowledge_watch = None;
+        self.knowledge_scan = None;
         self.knowledge_folder = folder.clone();
-        let (watch, problem) = start_knowledge(&folder);
+        let (watch, scan, problem) = start_knowledge(&folder);
         self.knowledge_watch = watch;
+        self.knowledge_scan = scan;
         for text in [crate::knowledge::ingest::startup_problem(&folder), problem]
             .into_iter()
             .flatten()
@@ -13476,6 +13494,19 @@ mod tests {
         let scan_at = run.find("start_scan(").expect("starts the scan");
         assert!(watch_at < scan_at, "the watch is armed before the scan");
         assert!(app_src.contains("start_knowledge(&config.knowledge.folder)"));
+        let restart = app_src
+            .split("fn restart_knowledge_if_needed(")
+            .nth(1)
+            .and_then(|b| b.split("\n    }\n").next())
+            .expect("restart_knowledge_if_needed exists");
+        let drop_scan = restart
+            .find("self.knowledge_scan = None")
+            .expect("a Reload stops the old start-up scan (#81)");
+        let new_start = restart.find("start_knowledge(&folder)").expect("restarts");
+        assert!(
+            drop_scan < new_start,
+            "the old scan stops before the new one starts"
+        );
     }
 
     #[test]
