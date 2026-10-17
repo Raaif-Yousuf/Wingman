@@ -254,7 +254,7 @@ mod tests {
             "tokenizer: fast",
             "mypassword: x",
             "password:",
-            "password:   \nnext line",
+            "password:   \n\nnext line",
             "secretary: Ann",
             "the token",
         ] {
