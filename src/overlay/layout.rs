@@ -87,6 +87,52 @@ fn clamp_span(v: i32, len: i32, lo: i32, hi: i32) -> i32 {
     }
 }
 
+/// How far a label may slide along the text, in label heights. Past that it
+/// is too far from its word to read as being about it.
+const SLIDE_REACH_HEIGHTS: i32 = 10;
+
+/// Most steps a slide takes. Each step jumps past every blocker in the way, so
+/// this bounds the cost per candidate to a few passes over `blockers`.
+const SLIDE_STEPS: usize = 16;
+
+/// Moves `from` sideways (`dir` is 1 for right, -1 for left) until nothing in
+/// `blockers` touches it. `None` if it leaves the monitor, goes further than
+/// `reach` from where it started, or does not settle in [`SLIDE_STEPS`].
+fn slide(
+    from: ScreenRect,
+    dir: i32,
+    blockers: &[ScreenRect],
+    monitor: &ScreenRect,
+    gap: i32,
+    reach: i32,
+) -> Option<ScreenRect> {
+    let size = (
+        from.right.saturating_sub(from.left),
+        from.bottom.saturating_sub(from.top),
+    );
+    let mut c = from;
+    for _ in 0..SLIDE_STEPS {
+        let hit = blockers.iter().filter(|o| intersects(&c, o));
+        let left = if dir > 0 {
+            match hit.map(|o| o.right).max() {
+                None => return Some(c),
+                Some(edge) => edge.saturating_add(gap),
+            }
+        } else {
+            match hit.map(|o| o.left).min() {
+                None => return Some(c),
+                Some(edge) => edge.saturating_sub(gap).saturating_sub(size.0),
+            }
+        };
+        c = at(left, c.top, size);
+        let moved = i64::from(c.left) - i64::from(from.left);
+        if moved.abs() > i64::from(reach) || c.left < monitor.left || c.right > monitor.right {
+            return None;
+        }
+    }
+    None
+}
+
 /// Places each label above, then right, then below, then left of its anchor.
 /// A mark that runs over a line break is placed at its first line, where the
 /// reader starts; every line still keeps labels off it.
@@ -121,7 +167,7 @@ pub fn place_labels(
         };
         let x = clamp_span(b.left, size.0, monitor.left, monitor.right);
         let y = clamp_span(b.top, size.1, monitor.top, monitor.bottom);
-        let candidates = [
+        let mut candidates = vec![
             (
                 Side::Above,
                 at(x, b.top.saturating_sub(gap).saturating_sub(size.1), size),
@@ -133,12 +179,57 @@ pub fn place_labels(
                 at(b.left.saturating_sub(gap).saturating_sub(size.0), y, size),
             ),
         ];
+        // On a packed page every spot above, below or beside the word touches
+        // a neighbouring line. Slide each spot along the text, past whatever is
+        // in the way, to the white space at a line end or start (#1134).
+        // Everything stays in the candidate list, so the least-covered one wins.
+        let blockers: Vec<ScreenRect> = text
+            .iter()
+            .chain(all_anchors.iter())
+            .chain(placed.iter().map(|p| &p.rect))
+            .copied()
+            .collect();
+        let reach = size.1.saturating_mul(SLIDE_REACH_HEIGHTS);
+        let bottom_aligned = b.bottom.saturating_sub(size.1);
+        let bases = [
+            (Side::Right, candidates[1].1),
+            (
+                Side::Right,
+                at(b.right.saturating_add(gap), bottom_aligned, size),
+            ),
+            (Side::Above, candidates[0].1),
+            (Side::Below, candidates[2].1),
+            (Side::Left, candidates[3].1),
+            (
+                Side::Left,
+                at(
+                    b.left.saturating_sub(gap).saturating_sub(size.0),
+                    bottom_aligned,
+                    size,
+                ),
+            ),
+        ];
+        for (side, base) in bases {
+            let toward_right = matches!(side, Side::Right | Side::Above | Side::Below);
+            let toward_left = matches!(side, Side::Left | Side::Above | Side::Below);
+            if toward_right {
+                if let Some(c) = slide(base, 1, &blockers, &monitor, gap, reach) {
+                    candidates.push((side, c));
+                }
+            }
+            if toward_left {
+                if let Some(c) = slide(base, -1, &blockers, &monitor, gap, reach) {
+                    candidates.push((side, c));
+                }
+            }
+        }
         let free = |c: &ScreenRect| {
             inside(c, &monitor)
                 && !all_anchors.iter().any(|a| intersects(c, a))
                 && !placed.iter().any(|p| intersects(c, &p.rect))
         };
-        // The free spot that covers the least other text; the first on a tie.
+        // The free spot that covers the least other text; the first on a tie,
+        // so the nearer spots (listed first) win.
         let pick = candidates
             .into_iter()
             .filter(|(_, c)| free(c))
@@ -307,11 +398,12 @@ mod tests {
     #[test]
     fn when_every_side_touches_text_the_old_order_still_places_it() {
         let a = r(100, 100, 200, 120);
+        // Text runs to both monitor edges, so sliding along it finds no gap.
         let around = [
-            r(100, 70, 200, 98),
-            r(204, 100, 260, 120),
-            r(100, 124, 200, 150),
-            r(40, 100, 96, 120),
+            r(0, 70, 1000, 98),
+            r(204, 100, 1000, 120),
+            r(0, 124, 1000, 150),
+            r(0, 100, 96, 120),
         ];
         let l = place_labels(&[req(a, 50, 20)], &around, MON, GAP_DESIGN_PX);
         assert_eq!(l.placed.len(), 1, "a label over text beats no label");
@@ -465,5 +557,65 @@ mod tests {
         let field = r(10, 10, 300, 40);
         assert_eq!(skipped_tag(field, (50, 20)), Some(r(250, 15, 300, 35)));
         assert_eq!(skipped_tag(r(0, 0, 0, 0), (50, 20)), None);
+    }
+
+    /// A packed page: lines 24 px apart, words 21 px tall, so a 28 px label
+    /// touches two lines wherever it goes beside or above a word.
+    fn packed_page(line_ends: [i32; 3]) -> Vec<ScreenRect> {
+        let mut words = Vec::new();
+        for (row, end) in line_ends.into_iter().enumerate() {
+            let top = 100 + 24 * row as i32;
+            let mut x = 16;
+            while x + 60 <= end {
+                words.push(r(x, top, x + 60, top + 21));
+                x += 68;
+            }
+        }
+        words
+    }
+
+    #[test]
+    fn on_a_packed_page_the_label_goes_to_white_space_not_over_text() {
+        let words = packed_page([560, 560, 300]);
+        // The mark is the 4th word of the middle line.
+        let anchor = words[8 + 3];
+        let l = place_labels(&[req(anchor, 90, 28)], &words, MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed.len(), 1);
+        let covered: i64 = words
+            .iter()
+            .filter(|w| **w != anchor)
+            .map(|w| overlap_area(&l.placed[0].rect, w))
+            .sum();
+        assert!(covered <= 20, "covers {covered} px of other text");
+    }
+
+    #[test]
+    fn a_far_away_gap_is_not_worth_a_label_that_far_from_its_word() {
+        // The only white space is 700 px away: stay near, as before.
+        let words = packed_page([900, 900, 900]);
+        let anchor = words[13 + 1];
+        let l = place_labels(&[req(anchor, 90, 28)], &words, MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed.len(), 1);
+        let dx = l.placed[0].rect.left - anchor.left;
+        assert!(dx.abs() <= 300, "label moved {dx} px away");
+    }
+
+    #[test]
+    fn a_slid_label_keeps_off_other_labels_and_anchors() {
+        let words = packed_page([560, 560, 300]);
+        let a = words[8 + 3];
+        let b = words[8 + 5];
+        let l = place_labels(
+            &[req(a, 90, 28), req(b, 90, 28)],
+            &words,
+            MON,
+            GAP_DESIGN_PX,
+        );
+        assert_eq!(l.placed.len(), 2);
+        assert!(!intersects(&l.placed[0].rect, &l.placed[1].rect));
+        for p in &l.placed {
+            assert!(!intersects(&p.rect, &a) && !intersects(&p.rect, &b));
+            assert!(inside(&p.rect, &MON));
+        }
     }
 }
