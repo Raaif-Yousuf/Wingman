@@ -235,7 +235,7 @@ fn tooltip_spend() -> Option<String> {
 
 /// #1203: posted by the one-shot worker that opens `config.toml` or the
 /// knowledge folder, only when that failed. No payload: the worker leaves the
-/// failure in [`SHELL_OPEN_FAILURE`] first, so a message that is dropped or
+/// failure in [`SHELL_OPEN_FAILURES`] first, so a message that is dropped or
 /// arrives after the window is gone costs nothing. The file and shell work
 /// runs off the message thread because it can block (a network share, a slow
 /// shell extension, `icacls`), and that thread also hosts the keyboard hook,
@@ -251,17 +251,62 @@ struct ShellOpenFailure {
     with_details: bool,
 }
 
-static SHELL_OPEN_FAILURE: std::sync::Mutex<Option<ShellOpenFailure>> = std::sync::Mutex::new(None);
+/// A queue, not a slot: two failures close together must both be reported.
+static SHELL_OPEN_FAILURES: std::sync::Mutex<Vec<ShellOpenFailure>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn store_shell_open_failure(failure: ShellOpenFailure) {
-    *SHELL_OPEN_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure);
-}
-
-fn take_shell_open_failure() -> Option<ShellOpenFailure> {
-    SHELL_OPEN_FAILURE
+    SHELL_OPEN_FAILURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .take()
+        .push(failure);
+}
+
+fn take_shell_open_failures() -> Vec<ShellOpenFailure> {
+    std::mem::take(
+        &mut *SHELL_OPEN_FAILURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+/// One card for everything that failed since the last one: a single failure
+/// as itself, several as one list.
+fn merge_shell_open_failures(mut failures: Vec<ShellOpenFailure>) -> Option<ShellOpenFailure> {
+    match failures.len() {
+        0 => None,
+        1 => failures.pop(),
+        _ => Some(ShellOpenFailure {
+            title: "Couldn't open it".into(),
+            detail: failures
+                .iter()
+                .map(|f| format!("{}: {}", f.title, f.detail))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            with_details: failures.iter().any(|f| f.with_details),
+        }),
+    }
+}
+
+/// Makes sure `config.toml` exists before the shell is asked to open it:
+/// `save` runs only when the file was missing, and a failed save is the
+/// failure to show (rule 7). Pure so it is unit-tested with a stand-in save.
+fn ensure_config_file(
+    needed_create: bool,
+    save: impl FnOnce() -> anyhow::Result<()>,
+) -> std::result::Result<(), ShellOpenFailure> {
+    let save_result = if needed_create { save() } else { Ok(()) };
+    if App::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
+        return Ok(());
+    }
+    Err(ShellOpenFailure {
+        title: "Couldn't save settings".into(),
+        detail: save_result
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default(),
+        with_details: true,
+    })
 }
 
 /// #1203: the file and shell work behind "Edit settings" and "Open knowledge
@@ -285,19 +330,7 @@ fn run_shell_open_job(job: ShellOpenJob) -> std::result::Result<(), ShellOpenFai
     match job {
         ShellOpenJob::ConfigFile { config, path } => {
             // Make sure the file exists before asking the shell to open it.
-            let needed_create = !path.exists();
-            let save_result = if needed_create { config.save() } else { Ok(()) };
-            if !App::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
-                // Rule 7: the save the user's click caused must not fail silently.
-                return Err(ShellOpenFailure {
-                    title: "Couldn't save settings".into(),
-                    detail: save_result
-                        .err()
-                        .map(|e| format!("{e:#}"))
-                        .unwrap_or_default(),
-                    with_details: true,
-                });
-            }
+            ensure_config_file(!path.exists(), || config.save())?;
             open_with_shell(&path, "Couldn't open config.toml", "Windows")
         }
         ShellOpenJob::Folder { path } => {
@@ -6531,7 +6564,7 @@ impl App {
 
     /// `WM_APP_SHELL_OPEN_DONE` (#1203): the worker's failure becomes a card.
     fn on_shell_open_done(&mut self) {
-        let Some(failure) = take_shell_open_failure() else {
+        let Some(failure) = merge_shell_open_failures(take_shell_open_failures()) else {
             return;
         };
         if failure.with_details {
@@ -10692,7 +10725,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_SHELL_OPEN_DONE => {
-            // #1203: no payload; the failure is in SHELL_OPEN_FAILURE.
+            // #1203: no payload; the failures are in SHELL_OPEN_FAILURES.
             app.on_shell_open_done();
             LRESULT(0)
         }
@@ -15246,15 +15279,51 @@ mod tests {
     }
 
     #[test]
-    fn the_shell_failure_slot_hands_over_once() {
-        super::store_shell_open_failure(super::ShellOpenFailure {
-            title: "t".into(),
-            detail: "d".into(),
+    fn two_close_shell_failures_are_both_kept_and_shown_once() {
+        let fail = |t: &str, d: &str| super::ShellOpenFailure {
+            title: t.into(),
+            detail: d.into(),
             with_details: false,
-        });
-        let first = super::take_shell_open_failure();
-        assert_eq!(first.map(|f| f.title), Some("t".to_string()));
-        assert!(super::take_shell_open_failure().is_none());
+        };
+        // Nothing queued by another test: this one owns the queue while it runs.
+        let _ = super::take_shell_open_failures();
+        super::store_shell_open_failure(fail("A", "one"));
+        super::store_shell_open_failure(fail("B", "two"));
+        let all = super::take_shell_open_failures();
+        assert_eq!(all.len(), 2);
+        assert!(super::take_shell_open_failures().is_empty());
+        let merged = super::merge_shell_open_failures(all).unwrap();
+        assert!(merged.detail.contains("A: one"), "{}", merged.detail);
+        assert!(merged.detail.contains("B: two"), "{}", merged.detail);
+        let single = super::merge_shell_open_failures(vec![fail("A", "one")]).unwrap();
+        assert_eq!(
+            (single.title.as_str(), single.detail.as_str()),
+            ("A", "one")
+        );
+        assert!(super::merge_shell_open_failures(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn the_config_file_is_saved_only_when_missing_and_a_save_error_is_the_card_text() {
+        let mut calls = 0;
+        assert!(super::ensure_config_file(false, || {
+            calls += 1;
+            Ok(())
+        })
+        .is_ok());
+        assert_eq!(calls, 0, "saved over an existing config.toml");
+        assert!(super::ensure_config_file(true, || {
+            calls += 1;
+            Ok(())
+        })
+        .is_ok());
+        assert_eq!(calls, 1);
+        let Err(failure) = super::ensure_config_file(true, || anyhow::bail!("disk full")) else {
+            panic!("a failed save was treated as success");
+        };
+        assert_eq!(failure.title, "Couldn't save settings");
+        assert!(failure.detail.contains("disk full"), "{}", failure.detail);
+        assert!(failure.with_details);
     }
 
     #[test]
