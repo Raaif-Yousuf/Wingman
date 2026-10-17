@@ -99,6 +99,9 @@ impl From<rusqlite::Error> for StoreError {
         if let rusqlite::Error::SqliteFailure(f, _) = &e {
             if matches!(f.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) {
                 CORRUPT_EVENTS.fetch_add(1, Ordering::SeqCst);
+                if is_fts_corrupt(&e) {
+                    FTS_CORRUPT_EVENTS.fetch_add(1, Ordering::SeqCst);
+                }
                 return StoreError::Corrupt(e.to_string());
             }
         }
@@ -115,9 +118,25 @@ fn is_corrupt(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Whether `e` is SQLite's "virtual table is damaged" (`SQLITE_CORRUPT_VTAB`,
+/// extended code 267, primary code 11): what a full-text index that disagrees
+/// with its table raises.
+fn is_fts_corrupt(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.extended_code == rusqlite::ffi::SQLITE_CORRUPT_VTAB
+    )
+}
+
 /// Counts corrupt-class errors seen anywhere in the process (#660). A store
 /// whose own count is behind checks itself the next time it is locked.
 static CORRUPT_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The part of [`CORRUPT_EVENTS`] that came from a virtual table (the
+/// full-text index, #1159). The index check reads the whole corpus, so it runs
+/// only when this moved.
+static FTS_CORRUPT_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -126,6 +145,8 @@ pub struct Store {
     path: Option<PathBuf>,
     /// The value of [`CORRUPT_EVENTS`] this store last checked itself against.
     seen: AtomicU64,
+    /// The value of [`FTS_CORRUPT_EVENTS`] the index was last checked against.
+    fts_seen: AtomicU64,
     /// Only touched with `conn` held, so it never contends.
     heal_state: Mutex<HealState>,
     /// How long a failed heal waits before the next try.
@@ -155,6 +176,8 @@ enum Heal {
     Fine,
     /// The file was never moved and is open again as it was.
     Reopened,
+    /// Only the full-text index was damaged; it was rebuilt in place.
+    Rebuilt,
     /// A fresh database replaced the damaged (or missing) one; the notice for
     /// the user.
     Replaced(String),
@@ -184,6 +207,7 @@ impl Store {
             conn: Mutex::new(conn),
             path,
             seen: AtomicU64::new(CORRUPT_EVENTS.load(Ordering::SeqCst)),
+            fts_seen: AtomicU64::new(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst)),
             heal_state: Mutex::new(HealState::default()),
             retry_gap: RETRY_GAP,
         }
@@ -237,6 +261,11 @@ impl Store {
                     .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
                 note_recovery(reopened_notice());
             }
+            Heal::Rebuilt => {
+                self.seen
+                    .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
+                note_recovery(rebuilt_notice());
+            }
             Heal::Replaced(notice) => {
                 *state = HealState::default();
                 self.seen
@@ -282,7 +311,30 @@ impl Store {
                 }
             } else {
                 if !file_is_damaged(conn) {
-                    return Heal::Fine;
+                    // The file passes, but the full-text index may disagree
+                    // with its table (#1159): rebuild just that, so the user
+                    // keeps history and documents. A rebuild that hits damage
+                    // too means the file is damaged after all.
+                    //
+                    // That check reads the whole corpus, so it runs only when
+                    // a virtual-table error was seen since the last one.
+                    let fts_now = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
+                    if self.fts_seen.load(Ordering::SeqCst) == fts_now
+                        || !fts_index_out_of_step(conn)
+                    {
+                        self.fts_seen.store(fts_now, Ordering::SeqCst);
+                        return Heal::Fine;
+                    }
+                    match rebuild_verdict(rebuild_fts_index(conn)) {
+                        RebuildVerdict::Rebuilt => {
+                            self.fts_seen.store(fts_now, Ordering::SeqCst);
+                            return Heal::Rebuilt;
+                        }
+                        RebuildVerdict::Damaged => {}
+                        // Busy or disk full: the index is still wrong, so
+                        // try again later instead of calling it healthy.
+                        RebuildVerdict::Retry(why) => return Heal::Stuck(why),
+                    }
                 }
                 // Closing the old connection first: Windows will not rename an open file.
                 let Ok(empty) = Connection::open_in_memory() else {
@@ -352,6 +404,48 @@ fn reopen_original(conn: &mut Connection, path: &Path) -> bool {
 /// back without moving anything.
 fn reopened_notice() -> String {
     "Wingman's saved data could not be opened for a while and is open again. Usage and request history from that time may be missing.".into()
+}
+
+/// True when the full-text index says it no longer matches the chunk table.
+/// `quick_check` does not look at that. Only SQLite's own corrupt verdict
+/// counts: a check that could not run (busy, missing table) is "no".
+fn fts_index_out_of_step(conn: &Connection) -> bool {
+    match conn.execute(
+        // Rank 1 also compares the index with the chunk table (external content).
+        "INSERT INTO chunk_fts (chunk_fts, rank) VALUES ('integrity-check', 1)",
+        [],
+    ) {
+        Ok(_) => false,
+        Err(e) => is_corrupt(&e),
+    }
+}
+
+/// Rebuilds the full-text index from the chunk table.
+fn rebuild_fts_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO chunk_fts (chunk_fts) VALUES ('rebuild')", [])
+        .map(|_| ())
+}
+
+/// How an index rebuild ended.
+enum RebuildVerdict {
+    Rebuilt,
+    /// The rebuild itself hit damage: the file is damaged after all.
+    Damaged,
+    /// Failed for another reason (busy, disk full); worth trying again.
+    Retry(String),
+}
+
+fn rebuild_verdict(r: rusqlite::Result<()>) -> RebuildVerdict {
+    match r {
+        Ok(()) => RebuildVerdict::Rebuilt,
+        Err(e) if is_corrupt(&e) => RebuildVerdict::Damaged,
+        Err(e) => RebuildVerdict::Retry(e.to_string()),
+    }
+}
+
+/// The card text after only the search index was rebuilt.
+fn rebuilt_notice() -> String {
+    "Wingman's search index over your documents was damaged while it was running and has been rebuilt. Nothing was lost.".into()
 }
 
 /// The card text after a store lost its file connection and the file was gone
@@ -1225,6 +1319,141 @@ mod tests {
         s.record_usage("2026-10-16", "a", "m", Some(0.2), None)
             .unwrap();
         assert_eq!(damaged_copies(&dir), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk saved while the full-text triggers are gone: the table is fine,
+    /// the index no longer agrees with it. `quick_check` cannot see that.
+    fn store_with_index_out_of_step(name: &str) -> (Store, PathBuf) {
+        let (s, dir) = knowledge_store(name);
+        {
+            let conn = s.lock();
+            conn.execute_batch("DROP TRIGGER chunk_fts_insert;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+                 VALUES (1, 0, 'ledgerword in the notes', 'h0', 4)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER chunk_fts_insert AFTER INSERT ON chunk BEGIN
+                     INSERT INTO chunk_fts (rowid, text) VALUES (new.id, new.text);
+                 END;",
+            )
+            .unwrap();
+            assert_eq!(fts_hits(&conn, "ledgerword"), 0, "the index misses it");
+            assert!(!file_is_damaged(&conn), "quick_check passes");
+        }
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        (s, dir)
+    }
+
+    /// #1159: an index that disagrees with its table is rebuilt in place. The
+    /// file is not moved aside and the usage history stays.
+    #[test]
+    fn an_index_out_of_step_is_rebuilt_without_losing_anything() {
+        let _serial = FTS_EVENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (s, dir) = store_with_index_out_of_step("fts-rebuild");
+        // A virtual-table error is what a mismatched index raises.
+        let _ = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT_VTAB),
+            None,
+        ));
+
+        assert!(s.day_total("2026-10-15").unwrap().is_some(), "history kept");
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 1, "searchable again");
+        assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tests that move the process-wide virtual-table counter run one at a
+    /// time, so one cannot make another store check its index.
+    static FTS_EVENT_TESTS: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn the_extended_code_for_a_damaged_virtual_table_counts_as_corrupt() {
+        let vtab = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT_VTAB),
+            None,
+        );
+        assert_eq!(rusqlite::ffi::SQLITE_CORRUPT_VTAB, 267);
+        assert_eq!(rusqlite::ffi::SQLITE_CORRUPT_VTAB & 0xff, 11);
+        assert!(is_corrupt(&vtab));
+        assert!(is_fts_corrupt(&vtab));
+        let plain = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        );
+        assert!(is_corrupt(&plain));
+        assert!(!is_fts_corrupt(&plain));
+    }
+
+    /// A rebuild that fails for a reason other than damage is retried later,
+    /// not reported as healthy.
+    #[test]
+    fn a_rebuild_that_fails_for_another_reason_is_retried() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(matches!(
+            rebuild_verdict(Err(busy)),
+            RebuildVerdict::Retry(_)
+        ));
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        assert!(matches!(
+            rebuild_verdict(Err(full)),
+            RebuildVerdict::Retry(_)
+        ));
+        let vtab = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT_VTAB),
+            None,
+        );
+        assert!(matches!(
+            rebuild_verdict(Err(vtab)),
+            RebuildVerdict::Damaged
+        ));
+        assert!(matches!(rebuild_verdict(Ok(())), RebuildVerdict::Rebuilt));
+    }
+
+    /// A corrupt error that did not come from the full-text index does not
+    /// pay for the O(corpus) index check.
+    #[test]
+    fn a_corrupt_error_outside_the_index_does_not_rebuild_it() {
+        let _serial = FTS_EVENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (s, dir) = store_with_index_out_of_step("fts-not-checked");
+        let _ = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+
+        assert!(s.day_total("2026-10-15").unwrap().is_some());
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 0, "index left alone");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index that agrees with its table is left alone.
+    #[test]
+    fn a_healthy_index_is_not_rebuilt() {
+        let (s, dir) = knowledge_store("fts-healthy");
+        {
+            let conn = s.lock();
+            conn.execute(
+                "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+                 VALUES (1, 0, 'ledgerword in the notes', 'h0', 4)",
+                [],
+            )
+            .unwrap();
+            assert!(!fts_index_out_of_step(&conn));
+        }
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
