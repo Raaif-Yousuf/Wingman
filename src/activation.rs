@@ -30,6 +30,8 @@ pub enum Trigger {
     Tray,
     /// A row chosen in the Quick Ask palette.
     Palette,
+    /// A row chosen on the options card (#964).
+    Options,
 }
 
 impl Trigger {
@@ -40,6 +42,7 @@ impl Trigger {
             Trigger::Activation => "activation",
             Trigger::Tray => "tray",
             Trigger::Palette => "palette",
+            Trigger::Options => "options",
         }
     }
 }
@@ -135,6 +138,12 @@ thread_local! {
 /// inheriting the last ask's trigger.
 pub fn set_worker_trigger(trigger: Trigger) {
     WORKER_TRIGGER.with(|t| t.set(Some(trigger)));
+}
+
+/// Like [`set_worker_trigger`], for a run whose entry point is not known
+/// (a confirmation step, say): `None` leaves the row unlabelled.
+pub fn set_worker_trigger_opt(trigger: Option<Trigger>) {
+    WORKER_TRIGGER.with(|t| t.set(trigger));
 }
 
 /// The label for the calling thread, if it was marked.
@@ -241,6 +250,19 @@ mod tests {
         labels.dedup();
         assert_eq!(labels.len(), all.len());
         assert_eq!(Trigger::Activation.label(), "activation");
+    }
+
+    #[test]
+    fn the_options_card_has_its_own_trigger_label() {
+        assert_eq!(Trigger::Options.label(), "options");
+        std::thread::spawn(|| {
+            set_worker_trigger_opt(None);
+            assert_eq!(worker_trigger_label(), None);
+            set_worker_trigger_opt(Some(Trigger::Options));
+            assert_eq!(worker_trigger_label(), Some("options"));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
