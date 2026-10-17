@@ -55,16 +55,17 @@
 //!   a newly focused control into view, and takes a captured shortcut
 //!   (`WM_APP_LEARNED`, posted to the main window) while a Change is pending.
 //!   It is one atomic load when no window is open.
-//! - **Theme**: this window is always drawn with the stock (light) system
-//!   control appearance, regardless of the OS light/dark setting. Unlike
-//!   `card.rs` (which paints its own surface and can safely follow
-//!   `AppsUseLightTheme`), a real dark mode for *native* controls (edit,
-//!   combo, button, trackbar) needs per-control owner-draw or
-//!   `SetWindowTheme("DarkMode_Explorer", ..)` plus `WM_CTLCOLOR*` brushes,
-//!   and even then list/combo popups and the trackbar thumb stay
-//!   light-on-light or otherwise inconsistent. Per the design note that a
-//!   correct light window beats a broken half-dark one, this module does
-//!   not attempt it.
+//! - **Theme** (#582): a real window is still drawn with the stock (light)
+//!   system control appearance, whatever the OS light/dark setting is. Dark is
+//!   being built slice by slice (spec `2026-10-16-settings-dark-and-high-
+//!   contrast-design.md`) and stays off for users, behind
+//!   `settings_theme::SETTINGS_DARK_ENABLED`, until every control follows it:
+//!   a correct light window beats a half-dark one. So far the title bar, the
+//!   window face, the labels, the text boxes, the rail and the footer divider
+//!   follow the theme; buttons, checkboxes, combos, the trackbar and the
+//!   scrollbar are still stock. `edit_style` resolves the theme once per change
+//!   and everything else reads it. The UI gallery forces a theme
+//!   (`--ui-gallery --theme`), which bypasses the gate.
 //!
 //! Fields intentionally not exposed here:
 //! - `providers.openai.models` / `providers.anthropic.models` (the list
@@ -295,6 +296,7 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
             inner_ref.ollama_status.clone(),
             inner_ref.alive.clone(),
         );
+        start_checking_animation(inner_ref, crate::ui::card::client_area_animation_enabled());
         // #183: the model list arrives later, off the UI thread.
         spawn_ollama_models_fetch(
             hwnd,
@@ -452,6 +454,9 @@ fn enter_command(ctrl_id: i32) -> i32 {
         | ID_RESUME_BUTTON
         | ID_PULL_BUTTON
         | ID_OPEN_CONFIG
+        | ID_OPEN_ACTIONS
+        | ID_IMPORT_ACTION
+        | ID_EXPORT_ACTION
         | ID_ADD_PROVIDER
         | ID_OPENAI_SHOW_KEY
         | ID_ANTHROPIC_SHOW_KEY
@@ -717,6 +722,9 @@ struct SettingsInner {
     ollama_fix: bool,
     /// #527: the Ollama status probe's result, filled by its worker.
     ollama_status: OllamaStatusSlot,
+    /// #828: the dot frame of the "Checking Ollama" cue; `Some` only while the
+    /// check runs and the cue's timer is set.
+    checking_frame: Option<usize>,
     /// #183: the pulled-model list the background fetch reports into.
     ollama_tags: OllamaTags,
     /// #380: the cloud providers' live model lists, filled the same way.
@@ -800,6 +808,11 @@ struct SettingsInner {
     autostart_again: bool,
     autostart_slot: AutostartSlot,
     autostart_seams: AutostartSeams,
+    /// #1152: the Actions page's worker (the file check, the list to export),
+    /// one at a time, and the actions its Export menu offers.
+    actions_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    actions_slot: ActionsSlot,
+    export_choices: Vec<(String, String)>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and is applied at once when a chord is learned.
     hotkeys: Hotkeys,
@@ -910,6 +923,7 @@ impl SettingsInner {
             ollama_link_shown: false,
             ollama_fix: false,
             ollama_status: Default::default(),
+            checking_frame: None,
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
             cloud_sync: Default::default(),
@@ -942,6 +956,9 @@ impl SettingsInner {
             autostart_again: false,
             autostart_slot: Default::default(),
             autostart_seams: AutostartSeams::REAL,
+            actions_busy: Default::default(),
+            actions_slot: Default::default(),
+            export_choices: Vec::new(),
             learning: None,
             pending_conflict: None,
             original,
@@ -981,6 +998,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     if msg == WM_PAUSE_MENU {
         run_pause_menu(hwnd);
+        return LRESULT(0);
+    }
+    if msg == WM_EXPORT_MENU {
+        run_export_menu(hwnd);
         return LRESULT(0);
     }
     let inner = &mut *ptr;
@@ -1031,6 +1052,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             take_autostart(inner);
             LRESULT(0)
         }
+        // #1152: the Actions page's worker answered.
+        WM_SETTINGS_ACTIONS => {
+            take_actions(inner);
+            LRESULT(0)
+        }
         // #1105: the worker read the file the window opened on.
         WM_SETTINGS_OPENED => {
             take_open_read(inner);
@@ -1055,12 +1081,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         // The rail's background is the window's, not the list box's white.
-        WM_CTLCOLORLISTBOX => LRESULT(
-            windows::Win32::Graphics::Gdi::GetSysColorBrush(
-                windows::Win32::Graphics::Gdi::COLOR_3DFACE,
-            )
-            .0 as isize,
-        ),
+        WM_CTLCOLORLISTBOX => LRESULT(face_brush_now().0 as isize),
+        // #582: the title bar follows the theme from the first frame.
+        windows::Win32::UI::WindowsAndMessaging::WM_CREATE => {
+            apply_title_bar(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // #582: the window's own face and the labels on it (the status line),
+        // where Settings paints them (dark). Otherwise the class brush and the
+        // default colours, as before.
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND if edit_style().paints_face => {
+            erase_with_face(hwnd, wparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC if edit_style().paints_face => {
+            answer_label_colors(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void))
+        }
         WM_SETTINGS_PAGE => {
             handle_page_request(inner, wparam.0, lparam.0);
             LRESULT(0)
@@ -1070,6 +1105,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_OLLAMA_STATUS => {
+            stop_checking_animation(inner);
             let section = inner.ollama_status.lock().ok().and_then(|g| g.clone());
             if let Some(section) = section {
                 apply_ollama_section(inner, &section);
@@ -1166,20 +1202,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             learn_timed_out(inner);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == CHECK_TIMER_ID => {
+            tick_checking_animation(inner);
+            LRESULT(0)
+        }
         // #934: the text box colours (and the accent in them) are read once
         // per change, not per paint; repaint the boxes with the new ones.
         windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
         | windows::Win32::UI::WindowsAndMessaging::WM_SYSCOLORCHANGE
         | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED
         | WM_DWMCOLORIZATIONCOLORCHANGED_MSG => {
+            // #582: the erase repaints the painted face, so it is only asked
+            // for when the face was painted before or is now (light does not
+            // flicker more than it did).
+            let was_painted = edit_style().paints_face;
             invalidate_edit_style();
             invalidate_rail_style();
+            // The one owner of the theme resolves it again here; the title
+            // bar follows.
+            apply_title_bar(hwnd);
+            let erase = if was_painted || edit_style().paints_face {
+                windows::Win32::Graphics::Gdi::RDW_ERASE
+            } else {
+                Default::default()
+            };
             let _ = RedrawWindow(
                 Some(hwnd),
                 None,
                 None,
                 windows::Win32::Graphics::Gdi::RDW_FRAME
                     | RDW_INVALIDATE
+                    | erase
                     | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
             );
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1190,6 +1243,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             invalidate_rail_style();
             inner.closing = true;
             inner.alive.store(false, Ordering::SeqCst);
+            stop_checking_animation(inner);
             if inner.owns_itself {
                 OPEN_HWND.store(0, Ordering::SeqCst);
             }
@@ -1297,6 +1351,18 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             }
         }
         ID_OPEN_CONFIG if notify == BN_CLICKED => open_config_file(inner),
+        ID_OPEN_ACTIONS if notify == BN_CLICKED => start_actions_job(inner, ActionsJob::Open),
+        ID_IMPORT_ACTION if notify == BN_CLICKED => {
+            send_command(inner, crate::app::SettingsCommand::ImportAction)
+        }
+        ID_EXPORT_ACTION if notify == BN_CLICKED => {
+            // Like the Pause button: a pending Change would eat the menu's keys.
+            if inner.learning.is_some() {
+                stop_learning(inner);
+                set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            }
+            start_actions_job(inner, ActionsJob::Export)
+        }
         ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
@@ -2734,6 +2800,11 @@ const ID_ESCAPE: i32 = 159;
 const ID_ROW_DESC: i32 = 160;
 /// #877: the hairline above a row. Shared the same way.
 const ID_ROW_SEPARATOR: i32 = 161;
+/// #1152: the Actions page's buttons. Each asks the app for what the tray's
+/// item does (Open actions file has no tray item).
+const ID_OPEN_ACTIONS: i32 = 162;
+const ID_IMPORT_ACTION: i32 = 163;
+const ID_EXPORT_ACTION: i32 = 164;
 const TB_ENDTRACK: u32 = 8;
 
 /// One cloud vendor's three rows on the Models page (#877): the ids of its
@@ -2793,7 +2864,10 @@ const CLOUD_ROWS: [CloudRows; 3] = [
 /// a screen reader says which one it is (#781, #877). Their text stays short,
 /// as it sits in a narrow column. Everything else is named by its own text or,
 /// for a box, by the title before it.
-const ACCESSIBLE_NAMES: [(i32, &str); 6] = [
+const ACCESSIBLE_NAMES: [(i32, &str); 9] = [
+    (ID_OPEN_ACTIONS, "Open your actions file"),
+    (ID_IMPORT_ACTION, "Import an action from a file"),
+    (ID_EXPORT_ACTION, "Export one of your actions to a file"),
     (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
     (ID_ANTHROPIC_SHOW_KEY, "Show Anthropic key"),
     (ID_GEMINI_SHOW_KEY, "Show Gemini key"),
@@ -2979,7 +3053,7 @@ const RAIL_NAME: &str = "Settings pages";
 
 /// The Actions page's note, in plain words. Import and export still live in
 /// the tray's Help group.
-const ACTIONS_NOTE: &str = "Actions are what Wingman does once you confirm: reply to an email, fill in a form, add a calendar event. Importing and exporting your own actions is in the tray menu, under Help.";
+const ACTIONS_NOTE: &str = "Actions are what Wingman does once you confirm: reply to an email, fill in a form, add a calendar event. You can write your own, and share them as files.";
 
 /// Every control id on each page, for the test that nothing is lost or listed
 /// twice. The window builds its pages with the same grouping (`Ctx::page`),
@@ -3048,7 +3122,15 @@ const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
             ID_REQUIRE_TICK_FOR,
         ],
     ),
-    (Page::Actions, &[ID_ACTIONS_NOTE]),
+    (
+        Page::Actions,
+        &[
+            ID_ACTIONS_NOTE,
+            ID_OPEN_ACTIONS,
+            ID_IMPORT_ACTION,
+            ID_EXPORT_ACTION,
+        ],
+    ),
     (
         Page::Advanced,
         &[ID_PROMPT_TOGGLE, ID_PROMPT_EDIT, ID_RESET_PROMPT],
@@ -3138,6 +3220,9 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_REDACT_HINT", ID_REDACT_HINT),
     ("ID_RAIL", ID_RAIL),
     ("ID_ACTIONS_NOTE", ID_ACTIONS_NOTE),
+    ("ID_OPEN_ACTIONS", ID_OPEN_ACTIONS),
+    ("ID_IMPORT_ACTION", ID_IMPORT_ACTION),
+    ("ID_EXPORT_ACTION", ID_EXPORT_ACTION),
     ("ID_MODE", ID_MODE),
     ("ID_PAUSE_STATUS", ID_PAUSE_STATUS),
     ("ID_PAUSE_BUTTON", ID_PAUSE_BUTTON),
@@ -3389,6 +3474,90 @@ fn forced_dpi() -> Option<u32> {
 
 fn to_px(dp: i32, dpi: u32) -> i32 {
     ((dp as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The gallery's forced theme for this thread's Settings window, if any
+    /// (#582). A forced theme ignores the system and bypasses the dark gate.
+    static FORCED_THEME: std::cell::Cell<Option<crate::ui::theme::Theme>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Forces `theme` (or none) and drops the cached styles built under the old
+/// one, so the next paint resolves again.
+#[cfg(any(test, debug_assertions))]
+fn force_theme(theme: Option<crate::ui::theme::Theme>) {
+    FORCED_THEME.with(|f| f.set(theme));
+    unsafe {
+        invalidate_edit_style();
+        invalidate_rail_style();
+    }
+}
+
+/// What Settings draws with right now: the theme, the system colours that
+/// theme reads (high contrast), and whether the gallery forced it. Resolved
+/// once per change by [`edit_style`]; nothing else resolves the theme.
+#[derive(Debug, Clone, Copy)]
+struct Look {
+    theme: crate::ui::theme::Theme,
+    sys: crate::ui::theme::SysColors,
+    forced: bool,
+}
+
+/// Resolves the look: the forced theme (the gallery, which draws high contrast
+/// with Windows' black colours since it cannot switch the system), else the
+/// detected one, with dark gated off for real users (see
+/// `settings_theme::SETTINGS_DARK_ENABLED`).
+fn current_look() -> Look {
+    use crate::ui::theme::{detect_theme, SysColors};
+    #[cfg(any(test, debug_assertions))]
+    if let Some(theme) = FORCED_THEME.with(std::cell::Cell::get) {
+        let sys = if theme == crate::ui::theme::Theme::HighContrast {
+            crate::ui::theme::HC_BLACK
+        } else {
+            SysColors::read()
+        };
+        return Look {
+            theme,
+            sys,
+            forced: true,
+        };
+    }
+    Look {
+        theme: crate::ui::settings_theme::gate(
+            detect_theme(),
+            crate::ui::settings_theme::SETTINGS_DARK_ENABLED,
+        ),
+        sys: SysColors::read(),
+        forced: false,
+    }
+}
+
+/// Sets the title bar to the theme (`DWMWA_USE_IMMERSIVE_DARK_MODE`, documented
+/// since Windows 10 20H1). Left alone in high contrast, where the system draws
+/// the caption. A failure leaves the title bar as it was: the body is still
+/// right, so it fails safe. Light is only written back after a dark one was
+/// applied, so a light-only run never touches the attribute.
+unsafe fn apply_title_bar(hwnd: HWND) {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    thread_local! {
+        static DARK_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if let Some(dark) = crate::ui::settings_theme::title_bar_dark(edit_style().look.theme) {
+        if !dark && !DARK_APPLIED.get() {
+            return;
+        }
+        DARK_APPLIED.set(dark);
+        let value = BOOL::from(dark);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &value as *const BOOL as *const c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+    }
 }
 
 /// Below this the prompt box stops being usable; scroll rather than shrink
@@ -4160,21 +4329,23 @@ fn is_hint_id(id: i32) -> bool {
 }
 
 /// The text colour of the helper lines (#824, #972). Secondary text, never the
-/// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
-/// system's own button text in high contrast (where grey means disabled).
-/// Settings is drawn on the system face today; the dark-mode work swaps in
-/// the theme's tokens.
-fn hint_text_color(high_contrast: bool, btn_text: u32) -> u32 {
-    if high_contrast {
+/// disabled grey: the theme's `text_dim` token, and the system's own button
+/// text in high contrast (where grey means disabled).
+fn hint_text_color(
+    theme: crate::ui::theme::Theme,
+    tokens: &crate::ui::theme::Tokens,
+    btn_text: u32,
+) -> u32 {
+    if theme == crate::ui::theme::Theme::HighContrast {
         btn_text
     } else {
-        crate::ui::theme::LIGHT.text_dim
+        tokens.text_dim
     }
 }
 
 /// #934: the colours of a text box. Tokens in a normal theme, system colours in
-/// high contrast. Settings is drawn on the system face and does not follow
-/// dark mode yet, so a normal theme here is always the light one.
+/// high contrast. `theme` is the look's: light for a real window until dark
+/// ships (#582).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditColors {
     fill: u32,
@@ -4201,15 +4372,22 @@ struct EditColors {
 const EDIT_DISABLED_FILL_PCT: u32 = 60;
 
 fn edit_colors(
-    high_contrast: bool,
+    theme: crate::ui::theme::Theme,
     sys: &crate::ui::theme::SysColors,
     accent: u32,
     face: u32,
 ) -> EditColors {
     use crate::ui::card_buttons::blend;
     use crate::ui::theme::{menu_hover_fill, menu_text_color, Theme, Tokens};
-    let theme = Theme::resolve(true, high_contrast);
+    let high_contrast = theme == Theme::HighContrast;
     let t = Tokens::for_theme(theme, sys);
+    // Dark draws the control edge token (3:1); light keeps its hairline until
+    // light moves onto the new paint (spec: no change to light in this slice).
+    let edge = if theme == Theme::Dark {
+        t.control_border
+    } else {
+        t.border
+    };
     // A list's rows lie on the text box fill, so the hover tint is taken from it.
     let on_list = Tokens {
         surface: t.control_fill,
@@ -4219,14 +4397,11 @@ fn edit_colors(
         // No tints in high contrast: the window colour, and GrayText ink.
         (sys.window, sys.gray_text)
     } else {
-        (
-            blend(t.control_fill, face, EDIT_DISABLED_FILL_PCT),
-            t.border,
-        )
+        (blend(t.control_fill, face, EDIT_DISABLED_FILL_PCT), edge)
     };
     EditColors {
         fill: t.control_fill,
-        border: t.border,
+        border: edge,
         text: t.text,
         focus_line: if high_contrast { sys.highlight } else { accent },
         face,
@@ -4236,7 +4411,7 @@ fn edit_colors(
         hover_border: if high_contrast {
             sys.highlight
         } else {
-            blend(t.border, t.text, EDIT_HOVER_BORDER_PCT)
+            blend(edge, t.text, EDIT_HOVER_BORDER_PCT)
         },
         item_hover: menu_hover_fill(theme, &on_list, sys),
         item_text_hot: menu_text_color(theme, &on_list, sys, true, false),
@@ -4267,20 +4442,6 @@ thread_local! {
     static EDIT_STYLE_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// The colours for a text box right now. Reads the registry (the accent), so
-/// only [`edit_style`] calls it.
-unsafe fn current_edit_colors() -> EditColors {
-    use crate::ui::theme::{SysColors, Theme, LIGHT};
-    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
-    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-    edit_colors(
-        high_contrast,
-        &SysColors::read(),
-        crate::ui::card_buttons::system_accent(Theme::Light, LIGHT.surface),
-        GetSysColor(COLOR_3DFACE),
-    )
-}
-
 /// The focus line of a text box `w` by `h` px: along the bottom, between the
 /// rounded corners, as thick as Windows 11's 2 dp accent underline. The
 /// bottom border row is part of it, so the line reads as the border turning
@@ -4305,6 +4466,18 @@ const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
 /// back. Owned here and freed by [`invalidate_edit_style`].
 #[derive(Clone, Copy)]
 struct EditStyle {
+    /// #582: the one place the theme is resolved; the rail, the divider, the
+    /// title bar and the colour messages all read it from here.
+    look: Look,
+    /// Whether Settings fills its own face (dark, or the gallery's forced high
+    /// contrast). False means the system draws it, as before.
+    paints_face: bool,
+    /// The window face: the surface token where Settings paints it, else the
+    /// system's.
+    face: u32,
+    face_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// The helper lines' ink (#824, #972).
+    hint_text: u32,
     colors: EditColors,
     brush: windows::Win32::Graphics::Gdi::HBRUSH,
     disabled_brush: windows::Win32::Graphics::Gdi::HBRUSH,
@@ -4322,15 +4495,37 @@ thread_local! {
 /// The cached style, built on first use after a theme change. Painting and
 /// colour messages run on the UI thread, so they never reach the registry.
 unsafe fn edit_style() -> EditStyle {
-    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
+    use crate::ui::settings_theme::{face_color, paints_face};
+    use crate::ui::theme::{Theme, Tokens};
+    use windows::Win32::Graphics::Gdi::{
+        CreateSolidBrush, GetSysColor, COLOR_3DFACE, COLOR_BTNTEXT,
+    };
     if let Some(style) = EDIT_STYLE.get() {
         return style;
     }
     #[cfg(test)]
     EDIT_STYLE_BUILDS.set(EDIT_STYLE_BUILDS.get() + 1);
-    let colors = current_edit_colors();
+    let look = current_look();
+    let tokens = Tokens::for_theme(look.theme, &look.sys);
+    let face = face_color(look.theme, look.forced, &tokens, GetSysColor(COLOR_3DFACE));
+    let accent = if look.theme == Theme::HighContrast {
+        face
+    } else {
+        crate::ui::card_buttons::system_accent(look.theme, tokens.surface)
+    };
+    let colors = edit_colors(look.theme, &look.sys, accent, face);
+    let btn_text = if look.forced {
+        look.sys.window_text
+    } else {
+        GetSysColor(COLOR_BTNTEXT)
+    };
     let solid = |c: u32| CreateSolidBrush(windows::Win32::Foundation::COLORREF(c));
     let style = EditStyle {
+        look,
+        paints_face: paints_face(look.theme, look.forced),
+        face,
+        face_brush: solid(face),
+        hint_text: hint_text_color(look.theme, &tokens, btn_text),
         colors,
         brush: solid(colors.fill),
         disabled_brush: solid(colors.disabled_fill),
@@ -4345,6 +4540,7 @@ unsafe fn edit_style() -> EditStyle {
 /// on a theme, accent or system colour change, and when Settings closes.
 unsafe fn invalidate_edit_style() {
     if let Some(style) = EDIT_STYLE.take() {
+        let _ = DeleteObject(HGDIOBJ(style.face_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.brush.0));
         let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.hairline_brush.0));
@@ -4378,6 +4574,45 @@ unsafe fn answer_edit_colors(hdc: windows::Win32::Graphics::Gdi::HDC, disabled: 
     SetTextColor(hdc, COLORREF(ink));
     SetBkColor(hdc, COLORREF(fill));
     LRESULT(brush.0 as isize)
+}
+
+/// The brush the window's face is, for the controls it shows through: the
+/// surface token where Settings paints its face (#582), else the system's.
+unsafe fn face_brush_now() -> windows::Win32::Graphics::Gdi::HBRUSH {
+    let style = edit_style();
+    if style.paints_face {
+        style.face_brush
+    } else {
+        windows::Win32::Graphics::Gdi::GetSysColorBrush(windows::Win32::Graphics::Gdi::COLOR_3DFACE)
+    }
+}
+
+/// Answers a label's colour request when Settings paints its own face: the
+/// text token on a transparent background, with the face brush behind it. The
+/// caller only asks while `paints_face` is set, so light and the system's high
+/// contrast keep the default answer.
+unsafe fn answer_label_colors(hdc: windows::Win32::Graphics::Gdi::HDC) -> LRESULT {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TRANSPARENT};
+    let style = edit_style();
+    SetTextColor(hdc, COLORREF(style.colors.text));
+    SetBkMode(hdc, TRANSPARENT);
+    LRESULT(face_brush_now().0 as isize)
+}
+
+/// `WM_ERASEBKGND` when Settings paints its own face: fills the client area
+/// with the face colour. The class brush is the system face, which would show
+/// light in dark.
+unsafe fn erase_with_face(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        windows::Win32::Graphics::Gdi::FillRect(
+            windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+            &rc,
+            face_brush_now(),
+        );
+    }
+    LRESULT(1)
 }
 
 /// Draws a text box's frame onto `hdc` (#934): the Windows 11 look of a
@@ -4610,11 +4845,9 @@ fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i3
 
 /// #935: the divider's colour: the hairline token of the current theme, which
 /// is the system's window text in high contrast, where a pale hairline would
-/// not show. Settings does not follow dark mode yet, so a normal theme here is
-/// the light one (as for the text boxes).
-fn footer_divider_color(high_contrast: bool, sys: &crate::ui::theme::SysColors) -> u32 {
-    use crate::ui::theme::{Theme, Tokens};
-    Tokens::for_theme(Theme::resolve(true, high_contrast), sys).border
+/// not show.
+fn footer_divider_color(theme: crate::ui::theme::Theme, sys: &crate::ui::theme::SysColors) -> u32 {
+    crate::ui::theme::Tokens::for_theme(theme, sys).border
 }
 
 /// Paints the footer divider (#935). The class background has already filled
@@ -4627,8 +4860,8 @@ unsafe fn paint_footer_divider(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = windows::Win32::Foundation::RECT::default();
     if GetClientRect(hwnd, &mut rc).is_ok() {
-        let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-        let ink = footer_divider_color(high_contrast, &crate::ui::theme::SysColors::read());
+        let look = edit_style().look;
+        let ink = footer_divider_color(look.theme, &look.sys);
         let (l, t, r, b) =
             footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
@@ -4665,16 +4898,18 @@ unsafe extern "system" fn body_wndproc(
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
             if is_hint_id(GetDlgCtrlID(HWND(lparam.0 as *mut c_void))) =>
         {
-            use windows::Win32::Graphics::Gdi::{
-                GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
-                COLOR_BTNTEXT, TRANSPARENT,
-            };
+            use windows::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TRANSPARENT};
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-            let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-            let ink = hint_text_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
+            SetTextColor(
+                hdc,
+                windows::Win32::Foundation::COLORREF(edit_style().hint_text),
+            );
             SetBkMode(hdc, TRANSPARENT);
-            LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
+            LRESULT(face_brush_now().0 as isize)
+        }
+        // #582: the body's own face, where Settings paints it (dark).
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND if edit_style().paints_face => {
+            erase_with_face(hwnd, wparam)
         }
         // #877: a hairline is a one pixel static filled with the border token.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
@@ -4696,6 +4931,12 @@ unsafe extern "system" fn body_wndproc(
                 windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
                 true,
             )
+        }
+        // #582: every other label (and a group box's caption) in the text
+        // token on the painted face. Light and the system's high contrast take
+        // the default answer, as before.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC if edit_style().paints_face => {
+            answer_label_colors(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void))
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -6708,22 +6949,31 @@ const WM_PAUSE_MENU: u32 = 0x8000 + 0x873;
 /// window's state: the owner is copied first, and nothing of the state is read
 /// after the menu, which may have outlived the window.
 unsafe fn run_pause_menu(hwnd: HWND) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
-        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
-    };
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
     if state.is_null() {
         return;
     }
     let owner = (*state).owner;
-    let Some(button) = get_dlg_item(hwnd, ID_PAUSE_BUTTON) else {
+    let labels: Vec<String> = PAUSE_MENU.iter().map(|(_, l)| l.to_string()).collect();
+    let Some(i) = pick_from_menu(hwnd, ID_PAUSE_BUTTON, &labels) else {
         return;
     };
-    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
-        return;
+    if let Some((choice, _)) = PAUSE_MENU.get(i) {
+        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
+    }
+}
+
+/// A small menu under the button `button_id` with one item per label; the
+/// index picked, or `None` when it was dismissed or the window closed while
+/// the menu was up. Holds no borrow of the window's state.
+unsafe fn pick_from_menu(hwnd: HWND, button_id: i32, labels: &[String]) -> Option<usize> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
     };
-    for (i, (_, label)) in PAUSE_MENU.iter().enumerate() {
+    let button = get_dlg_item(hwnd, button_id)?;
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
+    for (i, label) in labels.iter().enumerate() {
         let text = wide_z(label);
         unsafe {
             let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(text.as_ptr()));
@@ -6747,19 +6997,181 @@ unsafe fn run_pause_menu(hwnd: HWND) {
     }
     // A Quit while the menu was up closed the window: say nothing to it.
     if !IsWindow(Some(hwnd)).as_bool() {
-        return;
+        return None;
     }
-    let choice = usize::try_from(picked.0)
+    usize::try_from(picked.0)
         .ok()
         .and_then(|n| n.checked_sub(1))
-        .and_then(|i| PAUSE_MENU.get(i));
-    if let Some((choice, _)) = choice {
-        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
+        .filter(|i| *i < labels.len())
+}
+
+/// Posted by the Export button to the window itself, once the worker has the
+/// list of actions to offer (#1152). Same reason as [`WM_PAUSE_MENU`].
+const WM_EXPORT_MENU: u32 = 0x8000 + 0x874;
+
+/// The Export menu: the user's actions under the button; the pick goes to the
+/// app, which asks for the file name. The list is copied out before the menu.
+unsafe fn run_export_menu(hwnd: HWND) {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if state.is_null() {
+        return;
+    }
+    let owner = (*state).owner;
+    let choices = (*state).export_choices.clone();
+    let labels: Vec<String> = choices.iter().map(|(_, name)| menu_label(name)).collect();
+    let Some(i) = pick_from_menu(hwnd, ID_EXPORT_ACTION, &labels) else {
+        return;
+    };
+    let Some((id, _)) = choices.into_iter().nth(i) else {
+        return;
+    };
+    if owner.0.is_null() {
+        return;
+    }
+    if !crate::app::post_export_pick(owner.0 as isize, id) {
+        say(hwnd, ID_VALIDATION_MESSAGE, MAIN_WINDOW_GONE);
+    }
+}
+
+/// A menu item's text with each `&` doubled, so a name shows as written.
+fn menu_label(name: &str) -> String {
+    name.replace('&', "&&")
+}
+
+const MAIN_WINDOW_GONE: &str = "Wingman's main window is not running.";
+
+/// What the Actions page's worker can be asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionsJob {
+    /// Find the actions file, to open it.
+    Open,
+    /// List the actions the user wrote, for the Export menu.
+    Export,
+}
+
+/// What the worker found. The window acts on it: the shell and the menu are
+/// not for a worker thread.
+enum ActionsDone {
+    OpenPath(std::path::PathBuf),
+    Say(String),
+    Export(Result<Vec<(String, String)>, String>),
+}
+
+type ActionsSlot = std::sync::Arc<std::sync::Mutex<Option<ActionsDone>>>;
+
+/// Shown when there is no actions file yet (rule 7: a line, not a no-op).
+const NO_ACTIONS_FILE: &str = "There is no actions file yet. Import an action to start one.";
+const OPEN_ACTIONS_FAILED: &str = "Could not open the actions file.";
+const NO_ACTIONS_TO_EXPORT: &str =
+    "You have not written any actions yet, so there is nothing to export.";
+const ACTIONS_NOT_STARTED: &str = "Could not start. Try again.";
+
+/// The worker's whole job (#1152): the only place the Actions page reads the disk.
+fn run_actions_job(job: ActionsJob) -> ActionsDone {
+    match job {
+        ActionsJob::Open => match crate::actions::path() {
+            Ok(path) if path.exists() => ActionsDone::OpenPath(path),
+            Ok(_) => ActionsDone::Say(NO_ACTIONS_FILE.to_string()),
+            Err(_) => ActionsDone::Say(OPEN_ACTIONS_FAILED.to_string()),
+        },
+        ActionsJob::Export => ActionsDone::Export(
+            crate::actions::load_actions()
+                .map(|all| crate::actions::share::export_candidates(&all))
+                .map_err(|e| format!("{e:#}")),
+        ),
+    }
+}
+
+/// What the Export button does with the worker's list.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportOutcome {
+    Menu(Vec<(String, String)>),
+    Say(String),
+}
+
+fn export_outcome(list: Result<Vec<(String, String)>, String>) -> ExportOutcome {
+    match list {
+        Ok(list) if list.is_empty() => ExportOutcome::Say(NO_ACTIONS_TO_EXPORT.to_string()),
+        Ok(list) => ExportOutcome::Menu(list),
+        Err(e) => ExportOutcome::Say(format!("Could not read your actions: {e}")),
+    }
+}
+
+/// Hands `job` to a worker thread; the answer comes back as
+/// `WM_SETTINGS_ACTIONS`. One at a time: a click while one runs does nothing,
+/// as the line it will print is on its way.
+fn start_actions_job(inner: &mut SettingsInner, job: ActionsJob) {
+    if inner.closing || inner.actions_busy.load(Ordering::SeqCst) {
+        return;
+    }
+    inner.actions_busy.store(true, Ordering::SeqCst);
+    let slot = inner.actions_slot.clone();
+    let alive = inner.alive.clone();
+    let busy = inner.actions_busy.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let spawned = std::thread::Builder::new()
+        .name("settings-actions".into())
+        .spawn(move || {
+            let done = run_actions_job(job);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(done);
+            }
+            let mut posted = false;
+            post_while_open(&alive, || {
+                posted = unsafe {
+                    PostMessageW(
+                        Some(HWND(hwnd as *mut c_void)),
+                        WM_SETTINGS_ACTIONS,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                }
+                .is_ok();
+            });
+            // Nobody will answer: free the page for the next click.
+            if !posted {
+                busy.store(false, Ordering::SeqCst);
+            }
+        });
+    if spawned.is_err() {
+        inner.actions_busy.store(false, Ordering::SeqCst);
+        say(inner.hwnd, ID_VALIDATION_MESSAGE, ACTIONS_NOT_STARTED);
+    }
+}
+
+/// The worker's answer: open the file, say what is wrong, or ask the window to
+/// show the Export menu (not from here: this runs in the window's handler).
+fn take_actions(inner: &mut SettingsInner) {
+    inner.actions_busy.store(false, Ordering::SeqCst);
+    let Some(done) = inner.actions_slot.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    if inner.closing {
+        return;
+    }
+    match done {
+        ActionsDone::OpenPath(path) => {
+            if !open_url(&path.to_string_lossy()) {
+                say(inner.hwnd, ID_VALIDATION_MESSAGE, OPEN_ACTIONS_FAILED);
+            }
+        }
+        ActionsDone::Say(line) => say(inner.hwnd, ID_VALIDATION_MESSAGE, &line),
+        ActionsDone::Export(list) => match export_outcome(list) {
+            ExportOutcome::Say(line) => say(inner.hwnd, ID_VALIDATION_MESSAGE, &line),
+            ExportOutcome::Menu(list) => {
+                inner.export_choices = list;
+                unsafe {
+                    let _ = PostMessageW(Some(inner.hwnd), WM_EXPORT_MENU, WPARAM(0), LPARAM(0));
+                }
+            }
+        },
     }
 }
 
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
+/// #1152: the width of the Actions page's buttons, in dp.
+const ACTIONS_BUTTON_W: i32 = 140;
 /// #874: the width of "Add another provider".
 const ADD_PROVIDER_W: i32 = 170;
 
@@ -6798,6 +7210,56 @@ fn open_url(url: &str) -> bool {
 
 /// What the Ollama status shows until the probe reports (#527, #568).
 const OLLAMA_CHECKING_TEXT: &str = "Checking Ollama...";
+
+/// #828: the timer that moves the dots of [`OLLAMA_CHECKING_TEXT`] while the
+/// check runs. Set when the window opens, killed when the result arrives or
+/// the window closes, so nothing ticks once the check is done (AGENTS.md
+/// rule 5).
+const CHECK_TIMER_ID: usize = 0x346;
+const CHECK_TIMER_MS: u32 = 400;
+
+/// The cue's text for `frame`: one, two or three dots. Frame 2 is the static
+/// text the window is built with.
+fn checking_text(frame: usize) -> String {
+    format!("Checking Ollama{}", ".".repeat(frame % 3 + 1))
+}
+
+/// True for any frame of the cue, so a tick never overwrites another message
+/// (a started fix, a result).
+fn is_checking_text(text: &str) -> bool {
+    text.strip_prefix("Checking Ollama")
+        .is_some_and(|dots| matches!(dots, "." | ".." | "..."))
+}
+
+/// Starts the cue unless the user turned client-area animation off (then the
+/// static text stays).
+fn start_checking_animation(inner: &mut SettingsInner, animate: bool) {
+    if !animate || inner.checking_frame.is_some() {
+        return;
+    }
+    inner.checking_frame = Some(2);
+    unsafe { SetTimer(Some(inner.hwnd), CHECK_TIMER_ID, CHECK_TIMER_MS, None) };
+}
+
+fn tick_checking_animation(inner: &mut SettingsInner) {
+    let Some(frame) = inner.checking_frame else {
+        let _ = unsafe { KillTimer(Some(inner.hwnd), CHECK_TIMER_ID) };
+        return;
+    };
+    let next = (frame + 1) % 3;
+    inner.checking_frame = Some(next);
+    if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+        if is_checking_text(&get_text(status)) {
+            set_text(status, &checking_text(next));
+        }
+    }
+}
+
+fn stop_checking_animation(inner: &mut SettingsInner) {
+    if inner.checking_frame.take().is_some() {
+        let _ = unsafe { KillTimer(Some(inner.hwnd), CHECK_TIMER_ID) };
+    }
+}
 
 /// The most characters the two-row Ollama status label shows without
 /// clipping, with room to spare for word wrapping (#527). Optional parts
@@ -7596,8 +8058,8 @@ fn build_ui_recorded(
 
     // -- Actions (#872): no setting yet, so one note, never an empty page ---
     ctx.page.set(Some(Page::Actions));
-    let r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
-    let note_h = ROW_H * 3;
+    let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
+    let note_h = ROW_H * 2;
     ctx.create(
         WC_STATIC,
         ACTIONS_NOTE,
@@ -7609,7 +8071,43 @@ fn build_ui_recorded(
         note_h,
         ID_ACTIONS_NOTE,
     );
-    page_bottom[Page::Actions.index()] = r.y + 2 * ROW_PAD + note_h;
+    r.y += 2 * ROW_PAD + note_h;
+    // #1152: the three buttons, one row each, the title before the button.
+    for (title, desc, text, id) in [
+        (
+            "Your actions &file",
+            "Where the actions you wrote live.",
+            "Open actions file",
+            ID_OPEN_ACTIONS,
+        ),
+        (
+            "Import an actio&n",
+            "Pick a file someone shared. You see what it does first.",
+            "Import action",
+            ID_IMPORT_ACTION,
+        ),
+        (
+            "&Export an action",
+            "Save one of your actions to a file to share.",
+            "Export action",
+            ID_EXPORT_ACTION,
+        ),
+    ] {
+        let g = ctx.begin_row(&mut r, title, 0, 1);
+        ctx.create(
+            WC_BUTTON,
+            text,
+            BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+            0,
+            r.control_x(),
+            g.control_y(),
+            ACTIONS_BUTTON_W,
+            ROW_H,
+            id,
+        );
+        ctx.end_row(&mut r, &g, Some((desc, ID_ROW_DESC)));
+    }
+    page_bottom[Page::Actions.index()] = r.y;
 
     // -- Prompt (Advanced; grows to fill the space above the button row) ----
     ctx.page.set(Some(Page::Advanced));
@@ -7864,6 +8362,9 @@ const WM_SETTINGS_AUTOSTART: u32 = 0x8000 + 52; // WM_APP + 52
 
 /// Posted when the open-time read of the file has stored its answer (#1105).
 const WM_SETTINGS_OPENED: u32 = 0x8000 + 53; // WM_APP + 53
+
+/// Posted when the Actions page's worker has stored its answer (#1152).
+const WM_SETTINGS_ACTIONS: u32 = 0x8000 + 54; // WM_APP + 54
 /// `lparam` is the page's rail position.
 const PAGE_PICK: usize = 0;
 /// `lparam` is how many pages to move (negative goes back), wrapping.
@@ -8087,10 +8588,7 @@ thread_local! {
 
 /// The cached rail style for `dpi`, built on first use after a change.
 unsafe fn rail_style(dpi: u32) -> RailStyle {
-    use crate::ui::theme::{
-        accent_fill, read_accent_shades, SysColors, Theme, Tokens, ICON_FONT_DP,
-    };
-    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_BTNFACE};
+    use crate::ui::theme::{accent_fill, read_accent_shades, Theme, Tokens, ICON_FONT_DP};
     if let Some(style) = RAIL_STYLE.get() {
         if style.dpi == dpi {
             return style;
@@ -8099,11 +8597,10 @@ unsafe fn rail_style(dpi: u32) -> RailStyle {
     }
     #[cfg(test)]
     RAIL_STYLE_BUILDS.set(RAIL_STYLE_BUILDS.get() + 1);
-    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-    let sys = SysColors::read();
-    let theme = Theme::resolve(true, high_contrast);
+    let shared = edit_style();
+    let (theme, sys, face) = (shared.look.theme, shared.look.sys, shared.face);
+    let high_contrast = theme == Theme::HighContrast;
     let tokens = Tokens::for_theme(theme, &sys);
-    let face = GetSysColor(COLOR_BTNFACE);
     let accent = if high_contrast {
         face
     } else {
@@ -8463,7 +8960,7 @@ unsafe fn draw_item_pill(
     use windows::Win32::Graphics::Gdi::{
         FillRect, GetStockObject, RoundRect, SelectObject, NULL_PEN,
     };
-    if crate::ui::card_buttons::system_high_contrast().is_some() {
+    if style.look.theme == crate::ui::theme::Theme::HighContrast {
         FillRect(hdc, &rc, style.item_hover_brush);
         return;
     }
@@ -9780,7 +10277,21 @@ impl GalleryWindow {
     /// Opens the window and shows it without taking focus. `dpi` lays it out
     /// at that DPI whatever the monitor says (the gallery's `--dpi`); `None`
     /// uses the window's own.
+    #[cfg(test)]
     pub fn open(instance: HINSTANCE, dpi: Option<u32>) -> Option<GalleryWindow> {
+        GalleryWindow::open_themed(instance, dpi, None)
+    }
+
+    /// Opens the window and shows it without taking focus, under a forced theme
+    /// (#582); `None` follows the system. `dpi` is as for the plain open. The
+    /// forced theme lasts until the window is dropped. High contrast is drawn
+    /// with Windows' black colours, since the gallery cannot switch the system
+    /// theme; dark is drawn although real windows keep it off.
+    pub fn open_themed(
+        instance: HINSTANCE,
+        dpi: Option<u32>,
+        theme: Option<crate::ui::theme::Theme>,
+    ) -> Option<GalleryWindow> {
         static ONCE: std::sync::Once = std::sync::Once::new();
         static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         ONCE.call_once(|| {
@@ -9798,6 +10309,7 @@ impl GalleryWindow {
         let unaware = (dpi == Some(96)).then(UnawareScope::enter);
         let dpi = if unaware.is_some() { None } else { dpi };
         FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
+        force_theme(theme);
 
         let config = Config::default();
         let raw = Box::into_raw(Box::new(SettingsInner::new(config.clone())));
@@ -9821,6 +10333,7 @@ impl GalleryWindow {
         };
         let Ok(hwnd) = created else {
             FORCED_DPI.with(|f| f.set(None));
+            force_theme(None);
             unsafe { drop(Box::from_raw(raw)) };
             return None;
         };
@@ -9967,12 +10480,14 @@ impl Drop for GalleryWindow {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
         }
+        force_theme(None);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::Theme;
     use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
 
     #[test]
@@ -11888,6 +12403,126 @@ mod tests {
         assert!(!OPEN_CONFIG_FAILED.contains('\u{2014}'));
     }
 
+    /// #1152 wired-to-nothing: the three buttons are real controls on the
+    /// Actions page, named for a screen reader, and Enter presses each.
+    #[test]
+    fn the_actions_page_has_its_three_buttons() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for (id, text) in [
+                (ID_OPEN_ACTIONS, "Open actions file"),
+                (ID_IMPORT_ACTION, "Import action"),
+                (ID_EXPORT_ACTION, "Export action"),
+            ] {
+                let button = get_dlg_item(hwnd, id).expect("button exists");
+                assert_eq!(get_text(button), text);
+                assert_eq!(enter_command(id), id);
+                assert!(
+                    ACCESSIBLE_NAMES.iter().any(|(i, _)| *i == id),
+                    "{text} has no accessible name"
+                );
+                assert!(!is_shown(hwnd, id), "{text} shows on another page");
+            }
+            unsafe {
+                SendMessageW(inner.rail, LB_SETCURSEL, Some(WPARAM(3)), None);
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_RAIL as usize | ((LBN_SELCHANGE as usize) << 16))),
+                    Some(LPARAM(inner.rail.0 as isize)),
+                );
+            }
+            for id in [ID_OPEN_ACTIONS, ID_IMPORT_ACTION, ID_EXPORT_ACTION] {
+                assert!(is_shown(hwnd, id));
+            }
+        });
+        assert!(!ACTIONS_NOTE.contains("tray"), "{ACTIONS_NOTE}");
+    }
+
+    /// #1152: the export list becomes a menu, or one plain line when there is
+    /// nothing to pick. Never a silent no-op (rule 7).
+    #[test]
+    fn the_export_list_becomes_a_menu_or_a_plain_line() {
+        let two = vec![
+            ("a".to_string(), "A & B".to_string()),
+            ("b".to_string(), "C".to_string()),
+        ];
+        assert_eq!(export_outcome(Ok(two.clone())), ExportOutcome::Menu(two));
+        assert_eq!(
+            export_outcome(Ok(Vec::new())),
+            ExportOutcome::Say(NO_ACTIONS_TO_EXPORT.to_string())
+        );
+        match export_outcome(Err("boom".to_string())) {
+            ExportOutcome::Say(line) => {
+                assert!(line.contains("boom"), "{line}");
+                assert!(!line.contains('\u{2014}'), "{line}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for line in [NO_ACTIONS_TO_EXPORT, NO_ACTIONS_FILE, OPEN_ACTIONS_FAILED] {
+            assert!(!line.contains('\u{2014}'), "{line}");
+        }
+    }
+
+    /// #1152: a menu label with an ampersand shows it, not an underline.
+    #[test]
+    fn an_export_menu_label_shows_its_ampersands() {
+        assert_eq!(menu_label("A & B"), "A && B");
+        assert_eq!(menu_label("Plain"), "Plain");
+    }
+
+    /// #1152 wired-to-nothing: each button's click reaches the app's own
+    /// handler or a worker, the window answers the worker and the menu by
+    /// message, and the click itself does no file IO.
+    #[test]
+    fn the_actions_buttons_are_wired_to_the_apps_handlers() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for arm in [
+            "ID_IMPORT_ACTION if notify == BN_CLICKED => {",
+            "ID_OPEN_ACTIONS if notify == BN_CLICKED => start_actions_job(inner, ActionsJob::Open),",
+            "WM_SETTINGS_ACTIONS =>",
+            "msg == WM_EXPORT_MENU",
+            "crate::app::SettingsCommand::ImportAction",
+            "crate::app::post_export_pick(",
+        ] {
+            assert!(code.contains(arm), "no `{arm}`");
+        }
+        let click = code
+            .split("ID_EXPORT_ACTION if notify == BN_CLICKED")
+            .nth(1)
+            .expect("no export arm");
+        let click = click.split("ID_PULL_BUTTON").next().unwrap();
+        assert!(click.contains("ActionsJob::Export"), "{click}");
+        assert!(!click.contains("load_actions"), "IO in the click: {click}");
+    }
+
+    /// #1152: a worker whose answer could not be posted frees the page for the
+    /// next click instead of leaving it busy for good. (When the window is
+    /// gone nothing reads the flag.)
+    #[test]
+    fn a_failed_post_clears_the_actions_busy_flag() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let job = code
+            .split("fn start_actions_job(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn take_actions(").next())
+            .expect("start_actions_job moved");
+        assert!(job.contains("if !posted {"), "{job}");
+        assert!(job.contains("busy.store(false"), "{job}");
+        assert!(job.contains(".is_ok()"), "{job}");
+    }
+
+    /// #1152: with no owner (as here) a click asks nobody and does not panic.
+    #[test]
+    fn clicking_import_in_a_window_with_no_owner_does_nothing() {
+        with_window(Config::default(), |hwnd, raw| {
+            handle_command(unsafe { &mut *raw }, ID_IMPORT_ACTION, BN_CLICKED);
+            assert!(get_dlg_item(hwnd, ID_IMPORT_ACTION).is_some());
+        });
+    }
+
     /// #824: the hotkey hint is not the disabled grey. It is an enabled
     /// control (a disabled static is drawn in the faint disabled colour), and
     /// the colour chosen for it reads at 4.5:1 on the Settings surface.
@@ -11912,13 +12547,17 @@ mod tests {
                     windows::Win32::Graphics::Gdi::COLOR_3DFACE,
                 )
             };
-            let ink = hint_text_color(false, rgb(0, 0, 0));
+            let light =
+                crate::ui::theme::Tokens::for_theme(Theme::Light, &crate::ui::theme::HC_BLACK);
+            let ink = hint_text_color(Theme::Light, &light, rgb(0, 0, 0));
             let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
             assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
         }
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
-        assert_eq!(hint_text_color(true, hc), hc);
+        let hc_tokens =
+            crate::ui::theme::Tokens::for_theme(Theme::HighContrast, &crate::ui::theme::HC_BLACK);
+        assert_eq!(hint_text_color(Theme::HighContrast, &hc_tokens, hc), hc);
     }
 
     /// #972: every helper line is drawn as a hint (secondary text colour), and
@@ -12044,10 +12683,38 @@ mod tests {
     #[test]
     fn footer_divider_colour_comes_from_the_tokens() {
         use crate::ui::theme::{HC_BLACK, HC_WHITE, LIGHT};
-        assert_eq!(footer_divider_color(false, &HC_BLACK), LIGHT.border);
+        assert_eq!(footer_divider_color(Theme::Light, &HC_BLACK), LIGHT.border);
+        assert_eq!(
+            footer_divider_color(Theme::Dark, &HC_BLACK),
+            crate::ui::theme::DARK.border
+        );
         for sys in [HC_BLACK, HC_WHITE] {
-            assert_eq!(footer_divider_color(true, &sys), sys.window_text);
+            assert_eq!(
+                footer_divider_color(Theme::HighContrast, &sys),
+                sys.window_text
+            );
         }
+    }
+
+    /// #582: a helper line is the dim text token in light and dark, and the
+    /// system's button text in high contrast.
+    #[test]
+    fn hint_text_colour_follows_the_theme() {
+        use crate::ui::theme::{Tokens, DARK, HC_BLACK, LIGHT};
+        let btn = 0x0012_3456;
+        let t = |theme| Tokens::for_theme(theme, &HC_BLACK);
+        assert_eq!(
+            hint_text_color(Theme::Light, &t(Theme::Light), btn),
+            LIGHT.text_dim
+        );
+        assert_eq!(
+            hint_text_color(Theme::Dark, &t(Theme::Dark), btn),
+            DARK.text_dim
+        );
+        assert_eq!(
+            hint_text_color(Theme::HighContrast, &t(Theme::HighContrast), btn),
+            btn
+        );
     }
 
     /// #934: a text box takes its fill, border and text from the theme tokens
@@ -12058,14 +12725,26 @@ mod tests {
         use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE, LIGHT};
         let accent = rgb(0, 103, 192);
         let face = rgb(240, 240, 240);
-        let c = edit_colors(false, &HC_BLACK, accent, face);
+        let c = edit_colors(Theme::Light, &HC_BLACK, accent, face);
         assert_eq!(c.fill, LIGHT.control_fill);
         assert_eq!(c.border, LIGHT.border);
         assert_eq!(c.text, LIGHT.text);
         assert_eq!(c.focus_line, accent);
         assert_eq!(c.face, face);
+        // #582: dark is the dark tokens, with the control edge (not the
+        // decorative hairline) as the border.
+        let d = edit_colors(
+            Theme::Dark,
+            &HC_BLACK,
+            accent,
+            crate::ui::theme::DARK.surface,
+        );
+        assert_eq!(d.fill, crate::ui::theme::DARK.control_fill);
+        assert_eq!(d.border, crate::ui::theme::DARK.control_border);
+        assert_eq!(d.text, crate::ui::theme::DARK.text);
+        assert_eq!(d.face, crate::ui::theme::DARK.surface);
         for sys in [HC_BLACK, HC_WHITE] {
-            let c = edit_colors(true, &sys, accent, face);
+            let c = edit_colors(Theme::HighContrast, &sys, accent, face);
             assert_eq!(c.fill, sys.window);
             assert_eq!(c.border, sys.window_text);
             assert_eq!(c.text, sys.window_text);
@@ -12080,18 +12759,180 @@ mod tests {
         use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
         let accent = rgb(0, 103, 192);
         let face = rgb(240, 240, 240);
-        let c = edit_colors(false, &HC_BLACK, accent, face);
+        let c = edit_colors(Theme::Light, &HC_BLACK, accent, face);
         assert_ne!(
             c.hover_border, c.border,
             "a hovered box has a firmer border"
         );
         for sys in [HC_BLACK, HC_WHITE] {
-            let c = edit_colors(true, &sys, accent, face);
+            let c = edit_colors(Theme::HighContrast, &sys, accent, face);
             assert_eq!(c.hover_border, sys.highlight);
         }
         let hovered = frame_colors(&c, true);
         assert_eq!(hovered.border, c.hover_border);
         assert_eq!(frame_colors(&c, false).border, c.border);
+    }
+
+    /// Forces a theme for the test's thread and puts it back on drop, even if
+    /// the test panics.
+    struct Forced;
+    impl Forced {
+        fn new(theme: Theme) -> Forced {
+            force_theme(Some(theme));
+            Forced
+        }
+    }
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            force_theme(None);
+        }
+    }
+
+    /// The colour of the pixel the window paints at (5, 5) when asked to erase
+    /// its background into a memory bitmap.
+    fn erased_face_pixel(hwnd: HWND) -> u32 {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetPixel, SelectObject,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND;
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, 64, 64);
+            let old = SelectObject(dc, bitmap.into());
+            let answer = SendMessageW(hwnd, WM_ERASEBKGND, Some(WPARAM(dc.0 as usize)), None);
+            assert_eq!(answer.0, 1, "the erase is answered");
+            let pixel = GetPixel(dc, 5, 5).0;
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            pixel
+        }
+    }
+
+    /// What the window answers a label's colour request with: the brush's
+    /// colour and the text colour left on the DC.
+    fn label_answer(hwnd: HWND) -> (u32, u32) {
+        let status = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line");
+        label_answer_for(hwnd, status)
+    }
+
+    /// The same, asked of `window` about `label` (the body answers for its own
+    /// labels).
+    fn label_answer_for(window: HWND, label: HWND) -> (u32, u32) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetObjectW, GetTextColor, LOGBRUSH,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let brush = SendMessageW(
+                window,
+                WM_CTLCOLORSTATIC,
+                Some(WPARAM(dc.0 as usize)),
+                Some(LPARAM(label.0 as isize)),
+            );
+            let mut logbrush = LOGBRUSH::default();
+            GetObjectW(
+                HGDIOBJ(brush.0 as *mut c_void),
+                std::mem::size_of::<LOGBRUSH>() as i32,
+                Some(&mut logbrush as *mut LOGBRUSH as *mut c_void),
+            );
+            let text = GetTextColor(dc).0;
+            let _ = DeleteDC(dc);
+            (logbrush.lbColor.0, text)
+        }
+    }
+
+    fn get_dlg_item_body(hwnd: HWND) -> HWND {
+        unsafe { GetDlgItem(Some(hwnd), ID_BODY) }.expect("body window")
+    }
+
+    /// A plain label under the body, with no id the body singles out.
+    fn body_test_label(body: HWND) -> HWND {
+        let class = wide_z("STATIC");
+        unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class.as_ptr()),
+                PCWSTR::null(),
+                WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                Some(body),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a body label")
+    }
+
+    /// Whether the title bar asks for the dark frame.
+    fn title_bar_is_dark(hwnd: HWND) -> bool {
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+        let mut value = 0i32;
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &mut value as *mut i32 as *mut c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+            .expect("read the title bar attribute");
+        }
+        value != 0
+    }
+
+    /// #582, wired-to-nothing check: with nothing wired, a dark window would
+    /// still erase to the system face and answer labels with the default
+    /// colours. It erases to the surface token, answers labels with the text
+    /// token on it, and asks DWM for the dark title bar. Light keeps the
+    /// system's answer, and a theme change while open switches between them.
+    #[test]
+    fn a_dark_window_paints_its_face_and_labels_from_the_tokens() {
+        use crate::ui::theme::{DARK, HC_BLACK};
+        use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
+        use windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED;
+        let system_face = unsafe { GetSysColor(COLOR_3DFACE) };
+        {
+            let _forced = Forced::new(Theme::Dark);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert_eq!(erased_face_pixel(hwnd), DARK.surface);
+                assert_eq!(label_answer(hwnd), (DARK.surface, DARK.text));
+                assert!(title_bar_is_dark(hwnd));
+                // The body answers for its own face and labels too.
+                let body = get_dlg_item_body(hwnd);
+                let label = body_test_label(body);
+                assert_eq!(erased_face_pixel(body), DARK.surface);
+                assert_eq!(label_answer_for(body, label), (DARK.surface, DARK.text));
+                // Live re-theme: back to light, the same window.
+                force_theme(Some(Theme::Light));
+                unsafe { SendMessageW(hwnd, WM_THEMECHANGED, None, None) };
+                assert_eq!(erased_face_pixel(hwnd), system_face);
+                assert!(!title_bar_is_dark(hwnd));
+                assert_ne!(label_answer_for(body, label).0, DARK.surface);
+            });
+        }
+        {
+            let _forced = Forced::new(Theme::Light);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert_eq!(erased_face_pixel(hwnd), system_face);
+                assert_eq!(label_answer(hwnd).0, system_face);
+                assert!(!title_bar_is_dark(hwnd));
+            });
+        }
+        {
+            // The gallery's high contrast is Windows' black theme.
+            let _forced = Forced::new(Theme::HighContrast);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert_eq!(erased_face_pixel(hwnd), HC_BLACK.window);
+                assert_eq!(label_answer(hwnd), (HC_BLACK.window, HC_BLACK.window_text));
+            });
+        }
     }
 
     /// #1109: the mouse over a combo hovers it, once: moving inside it again
@@ -12344,11 +13185,21 @@ mod tests {
     fn disabled_edit_colours_come_from_the_tokens() {
         use crate::ui::theme::{rgb, HC_BLACK};
         let face = rgb(240, 240, 240);
-        let c = edit_colors(true, &HC_BLACK, rgb(0, 103, 192), face);
+        let c = edit_colors(
+            crate::ui::theme::Theme::HighContrast,
+            &HC_BLACK,
+            rgb(0, 103, 192),
+            face,
+        );
         assert_eq!(c.disabled_fill, HC_BLACK.window);
         assert_eq!(c.disabled_border, HC_BLACK.gray_text);
         assert_eq!(c.disabled_text, HC_BLACK.gray_text);
-        let c = edit_colors(false, &HC_BLACK, rgb(0, 103, 192), face);
+        let c = edit_colors(
+            crate::ui::theme::Theme::Light,
+            &HC_BLACK,
+            rgb(0, 103, 192),
+            face,
+        );
         assert_ne!(c.disabled_fill, c.fill);
         assert_ne!(c.disabled_text, c.text);
     }
@@ -12869,6 +13720,114 @@ mod tests {
     }
 
     // -- clamp_text_scale --------------------------------------------------
+
+    /// #828 (d): the "Checking Ollama" cue cycles one, two, three dots and
+    /// the third frame is the static text the window is built with.
+    #[test]
+    fn checking_frames_cycle_dots_and_end_on_the_static_text() {
+        assert_eq!(checking_text(0), "Checking Ollama.");
+        assert_eq!(checking_text(1), "Checking Ollama..");
+        assert_eq!(checking_text(2), OLLAMA_CHECKING_TEXT);
+        assert_eq!(checking_text(3), checking_text(0));
+        assert_eq!(checking_text(usize::MAX), checking_text(usize::MAX % 3));
+        assert!(is_checking_text(&checking_text(1)));
+        assert!(!is_checking_text("Fixing: stopping Ollama"));
+        assert!(!is_checking_text("Ollama is installed but not running"));
+    }
+
+    /// #828 (d) wired-to-nothing check: a timer message moves the real
+    /// window's Ollama status to the next frame, and the probe's result
+    /// stops the animation for good (nothing ticks once the check is done).
+    #[test]
+    fn the_checking_cue_animates_then_stops_on_the_result() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+        let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (checking cue test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU,
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        struct Guard(HWND, *mut SettingsInner);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    drop(Box::from_raw(self.1));
+                }
+            }
+        }
+        let _guard = Guard(hwnd, raw);
+        let font = build_font(96);
+        let client_h_dp = client_size(hwnd).1;
+        let built = build_ui_recorded(hwnd, instance, 96, font, &Config::default(), client_h_dp);
+        {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.adopt(built);
+            start_checking_animation(inner, true);
+            assert!(inner.checking_frame.is_some(), "the cue is running");
+        }
+        let status = get_dlg_item(hwnd, ID_OLLAMA_STATUS).expect("status label");
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_TIMER,
+                Some(WPARAM(CHECK_TIMER_ID)),
+                Some(LPARAM(0)),
+            );
+        }
+        assert_eq!(get_text(status), checking_text(0));
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_TIMER,
+                Some(WPARAM(CHECK_TIMER_ID)),
+                Some(LPARAM(0)),
+            );
+        }
+        assert_eq!(get_text(status), checking_text(1));
+
+        // The result arrives: the text is the result, and a late tick
+        // changes nothing.
+        let inner = unsafe { &mut *raw };
+        if let Ok(mut g) = inner.ollama_status.lock() {
+            *g = Some(OllamaSection {
+                text: "Ollama is installed but not running.".to_string(),
+                link: None,
+                fix: false,
+            });
+        }
+        unsafe {
+            SendMessageW(hwnd, WM_OLLAMA_STATUS, None, None);
+            SendMessageW(
+                hwnd,
+                WM_TIMER,
+                Some(WPARAM(CHECK_TIMER_ID)),
+                Some(LPARAM(0)),
+            );
+        }
+        assert!(inner.checking_frame.is_none(), "the cue stopped");
+        assert_eq!(get_text(status), "Ollama is installed but not running.");
+    }
 
     /// #828: the slider's value reads as a percent, like the rest of Windows.
     #[test]
@@ -14434,7 +15393,12 @@ mod tests {
     fn high_contrast_list_rows_use_the_system_highlight() {
         use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
         for sys in [HC_BLACK, HC_WHITE] {
-            let c = edit_colors(true, &sys, rgb(0, 103, 192), sys.window);
+            let c = edit_colors(
+                crate::ui::theme::Theme::HighContrast,
+                &sys,
+                rgb(0, 103, 192),
+                sys.window,
+            );
             assert_eq!(c.item_hover, sys.highlight);
             assert_eq!(c.item_text_hot, sys.highlight_text);
         }
@@ -17102,8 +18066,10 @@ mod tests {
         assert!(command.contains("commit_trigger(id, notify)"));
         assert!(command.contains("ID_UNDO if notify == BN_CLICKED"));
         assert!(command.contains("ID_APPLY_FOCUSED => commit_focused(inner)"));
-        // No timer but the one a pending shortcut needs, and no polling.
-        assert_eq!(code.matches("SetTimer(").count(), 1, "a timer was added");
+        // No timer but the one a pending shortcut needs and the "Checking
+        // Ollama" cue (#828, stopped by the result), and no polling.
+        assert_eq!(code.matches("SetTimer(").count(), 2, "a timer was added");
+        assert!(code.contains("fn stop_checking_animation("));
         // The commit path never touches the file.
         let a = code.find("fn commit_field(").unwrap();
         let b = code.find("fn commit_autostart(").unwrap();
