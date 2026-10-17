@@ -244,6 +244,7 @@ impl Card {
             corner: CardCorner::default(),
             monitor: MonitorChoice::Cursor,
             follow_anchor: POINT::default(),
+            cursor_pos: live_cursor_pos,
             place_from_cursor: false,
             anim_frame: 0,
             scroll_offset: 0,
@@ -1451,6 +1452,10 @@ struct CardInner {
     /// reused by Expanded and Preview, so a card the user is reading does
     /// not chase the mouse.
     follow_anchor: POINT,
+    /// #922: where the card reads the pointer from. The live path is
+    /// `GetCursorPos`; a test swaps in a fixed point so it never depends on
+    /// where the real mouse is.
+    cursor_pos: fn() -> POINT,
     /// Issue #109: set when a preview is shown from Hidden, so its layout
     /// reads the pointer and the pointer's monitor afresh instead of using
     /// the position an earlier card left behind. Consumed by `layout_preview`.
@@ -2363,8 +2368,7 @@ impl CardInner {
         use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
         let base = unsafe {
             if from_cursor {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
+                let pt = (self.cursor_pos)();
                 self.follow_anchor = pt;
                 MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
             } else {
@@ -4991,6 +4995,15 @@ fn ray_point(cx: i32, cy: i32, angle_deg: f32, len: i32) -> (i32, i32) {
 
 /// Issue #109: every monitor, numbered left to right (what
 /// `ui.card_monitor = "2"` indexes into; see `sort_left_to_right`).
+/// The real pointer position (the live `CardInner::cursor_pos`).
+fn live_cursor_pos() -> POINT {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    pt
+}
+
 fn sorted_monitors() -> Vec<(RECT, windows::Win32::Graphics::Gdi::HMONITOR)> {
     use windows::Win32::Graphics::Gdi::HMONITOR;
     unsafe extern "system" fn collect(
@@ -5444,28 +5457,20 @@ mod tests {
     fn preview_from_hidden_anchors_follow_mouse_to_the_current_pointer() {
         // Issue #109: a preview shown from Hidden used to place itself with
         // whatever pointer position an earlier card had recorded.
-        // #514: pin the pointer first, so a moving mouse cannot change what
-        // the card should record. Read it back (the system may clamp the
-        // point) and put the user's pointer back afterwards.
-        use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
-        let mut original = POINT::default();
-        let mut pinned = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut original);
-            let _ = SetCursorPos(200, 200);
-            let _ = GetCursorPos(&mut pinned);
+        // #922: the card reads the pointer through a seam, so the test
+        // supplies a fixed point and never touches the real cursor.
+        fn fixed_pointer() -> POINT {
+            POINT { x: 200, y: 200 }
         }
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
+        card.inner.cursor_pos = fixed_pointer;
         card.set_placement(CardCorner::FollowMouse, "cursor");
         card.inner.follow_anchor = POINT { x: -5000, y: -5000 };
         let (schema, value) = calendar_schema_and_value();
         let _ = card.show_preview("Add to calendar", &schema, &value, false);
         let anchor = (card.inner.follow_anchor.x, card.inner.follow_anchor.y);
-        unsafe {
-            let _ = SetCursorPos(original.x, original.y);
-        }
-        assert_eq!(anchor, (pinned.x, pinned.y));
+        assert_eq!(anchor, (200, 200));
     }
 
     #[test]
