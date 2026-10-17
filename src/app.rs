@@ -499,7 +499,35 @@ fn refine_key_phase(
         {
             keypress::Phase::Answer
         }
+        keypress::Phase::Other if matches!(card_state, CardState::Preview) => {
+            keypress::Phase::Preview
+        }
         other => other,
+    }
+}
+
+/// #809, #324: after a click hid the overlay's marks, whether the summary card
+/// stays and so needs its line rewritten: the click landed on it, or the click
+/// is outside it and click-away would not hide this card (the setting is off).
+/// Pure; the click-away rule lives in [`click_away_hides`] only.
+fn click_leaves_card_up(
+    click_in_card: bool,
+    card: crate::ui::card::CardState,
+    click_away_dismiss: bool,
+) -> bool {
+    click_in_card || !click_away_hides(card, click_away_dismiss)
+}
+
+/// #324: whether a click outside the card hides it. `click_away_dismiss` is
+/// `options.click_away_dismiss`; it governs answer and options cards. A
+/// preview never closes on a click (it can hold edits), and a card that is
+/// not showing has nothing to hide. Pure.
+fn click_away_hides(card: crate::ui::card::CardState, click_away_dismiss: bool) -> bool {
+    use crate::ui::card::CardState;
+    match card {
+        CardState::Hidden | CardState::Preview => false,
+        CardState::Collapsed | CardState::Expanded | CardState::Options => click_away_dismiss,
+        CardState::Pending => true,
     }
 }
 
@@ -5284,7 +5312,11 @@ impl App {
                 return;
             }
             HideReason::OwnerGone => return,
-            HideReason::Click => click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+            HideReason::Click => click_leaves_card_up(
+                click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+                self.card.state(),
+                self.config.options.click_away_dismiss,
+            ),
             HideReason::Changed | HideReason::Age => true,
         };
         if rewrite {
@@ -7135,6 +7167,11 @@ impl App {
             return;
         }
         if self.point_in_card(x, y) {
+            return;
+        }
+        // #324: with click-away off the card stays, and the watcher stays
+        // armed so a later click still reaches this check.
+        if !click_away_hides(self.card.state(), self.config.options.click_away_dismiss) {
             return;
         }
         self.hide_card();
@@ -12795,12 +12832,48 @@ mod tests {
                 Phase::Answer
             );
         }
-        for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
+        for st in [CardState::Hidden, CardState::Pending] {
             assert_eq!(
                 super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Other
             );
         }
+        // #324: a preview survives focus loss, so the key is how it closes.
+        assert_eq!(
+            super::refine_key_phase(Phase::Other, CardState::Preview, None, ms(300), false),
+            Phase::Preview
+        );
+
+        // #324: `options.click_away_dismiss` governs answer and options cards.
+        for st in [
+            CardState::Collapsed,
+            CardState::Expanded,
+            CardState::Options,
+        ] {
+            assert!(super::click_away_hides(st, true), "{st:?}");
+            assert!(!super::click_away_hides(st, false), "{st:?}");
+        }
+        // Nothing else follows the setting: a preview never closes on a click,
+        // a hidden card has nothing to hide, a pending card hides as before.
+        assert!(!super::click_away_hides(CardState::Preview, true));
+        assert!(!super::click_away_hides(CardState::Preview, false));
+        assert!(!super::click_away_hides(CardState::Hidden, true));
+        assert!(super::click_away_hides(CardState::Pending, true));
+        assert!(super::click_away_hides(CardState::Pending, false));
+
+        // #809: the overlay's summary card is rewritten when it stays.
+        use super::click_leaves_card_up as stays;
+        assert!(
+            !stays(false, CardState::Expanded, true),
+            "hides, no rewrite"
+        );
+        assert!(
+            stays(false, CardState::Expanded, false),
+            "setting off: rewrite"
+        );
+        assert!(stays(false, CardState::Collapsed, false));
+        assert!(stays(true, CardState::Expanded, true), "click on the card");
+        assert!(stays(true, CardState::Expanded, false));
         let opts = Phase::Options {
             count: 2,
             pickable: [true, true],
