@@ -83,7 +83,7 @@ function Get-OwnerOnlyAclProblem {
 # The README's command for running a script of ours, as an argument list for
 # powershell.exe (#1050): no profile, Bypass for a Restricted default policy,
 # -File. Pure.
-function Get-DocumentedScriptArgs {
+function Get-DocumentedScriptCommand {
     param(
         [Parameter(Mandatory)] [string] $Script,
         [string[]] $ScriptArgs = @()
@@ -105,7 +105,7 @@ function Invoke-DocumentedScript {
     $before = $env:PSExecutionPolicyPreference
     try {
         $env:PSExecutionPolicyPreference = 'Restricted'
-        & powershell.exe @(Get-DocumentedScriptArgs -Script $Script -ScriptArgs $ScriptArgs) | Out-Host
+        & powershell.exe @(Get-DocumentedScriptCommand -Script $Script -ScriptArgs $ScriptArgs) | Out-Host
         $code = $LASTEXITCODE
     }
     finally {

@@ -95,9 +95,9 @@ Describe 'the smoke runs the documented command (#1050)' {
         $script:smoke = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''
     }
     It 'builds the README argument list: no profile, Bypass, -File, then the script and its switches' {
-        Get-DocumentedScriptArgs -Script 'C:\x\install.ps1' -ScriptArgs @('-SkipBuild') |
+        Get-DocumentedScriptCommand -Script 'C:\x\install.ps1' -ScriptArgs @('-SkipBuild') |
             Should -Be @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\x\install.ps1', '-SkipBuild')
-        Get-DocumentedScriptArgs -Script 'C:\x\uninstall.ps1' |
+        Get-DocumentedScriptCommand -Script 'C:\x\uninstall.ps1' |
             Should -Be @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\x\uninstall.ps1')
     }
     It 'starts install.ps1 and uninstall.ps1 through it, in a child powershell.exe, never in process' {
