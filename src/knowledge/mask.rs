@@ -75,6 +75,44 @@ fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
 }
 
+/// Short words that may sit between a label and its value: "PIN number:",
+/// "PIN code 1234", "password for wifi:", "Passwort lautet:". Returns the
+/// index after the filler, or `j` when there is none. The caller still needs
+/// a `:`/`=` or a digit after it.
+fn skip_filler(chars: &[(usize, char)], j: usize) -> usize {
+    let mut k = j;
+    while chars.get(k).is_some_and(|&(_, c)| is_blank(c)) {
+        k += 1;
+    }
+    if k == j {
+        return j;
+    }
+    let word_end = |from: usize| {
+        let mut e = from;
+        while chars.get(e).is_some_and(|&(_, c)| c.is_alphanumeric()) {
+            e += 1;
+        }
+        e
+    };
+    for word in ["number", "no.", "code", "lautet", "est", "es"] {
+        if let Some(e) = match_label(chars, k, word) {
+            if word.ends_with('.') || !chars.get(e).is_some_and(|&(_, c)| c.is_alphanumeric()) {
+                return e;
+            }
+        }
+    }
+    if let Some(e) = match_label(chars, k, "for") {
+        let mut w = e;
+        while chars.get(w).is_some_and(|&(_, c)| is_blank(c)) {
+            w += 1;
+        }
+        if w > e && word_end(w) > w {
+            return word_end(w);
+        }
+    }
+    j
+}
+
 /// Byte ranges of values that follow a secret label: `password: hunter2`,
 /// `pwd=abc`, `"pin": "1234"`, `PIN 1234`. The value runs to the next
 /// whitespace, never past the end of the line. A label alone does not count
@@ -110,6 +148,7 @@ fn secret_spans(text: &str) -> Vec<Range<usize>> {
             i += 1;
             continue;
         }
+        j = skip_filler(&chars, j);
         // A closing quote around the label (`"pin":`).
         if chars
             .get(j)
@@ -253,6 +292,35 @@ mod tests {
             ("token:\tabc", "token:\t[secret]"),
         ] {
             assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+    }
+
+    #[test]
+    fn a_short_filler_between_label_and_value_is_allowed() {
+        for (text, want) in [
+            ("PIN number: 1234", "PIN number: [secret]"),
+            ("PIN no. 1234", "PIN no. [secret]"),
+            ("PIN code 1234", "PIN code [secret]"),
+            ("pin code: 1234", "pin code: [secret]"),
+            ("password for wifi: x", "password for wifi: [secret]"),
+            ("Passwort lautet: x", "Passwort lautet: [secret]"),
+            ("mot de passe est : x", "mot de passe est : [secret]"),
+            ("contraseña es: x", "contraseña es: [secret]"),
+            ("password for wifi hunter2", "password for wifi [secret]"),
+        ] {
+            assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+    }
+
+    #[test]
+    fn a_filler_without_a_separator_or_digit_is_prose() {
+        for text in [
+            "the PIN number policy",
+            "the PIN code is printed on the card",
+            "password for the router",
+            "Passwort lautet geheim",
+        ] {
+            assert_eq!(mask_sensitive(text), text, "input: {text}");
         }
     }
 

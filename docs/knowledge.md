@@ -139,7 +139,8 @@ A labelled secret is a value after a word such as `password`, `pwd`, `pin`,
 (any capitals). `password: hunter2`, `pwd=abc` and `"pin": "1234"` become
 `password: [secret]` and so on. The value must follow a `:` or `=`, or, after
 a plain space, contain a digit (`PIN 1234`), so "the password policy" is left
-alone. The value ends at the next space or the end of the line. A secret
+alone. A short word may sit between (`PIN number:`, `PIN code 1234`,
+`password for wifi:`, `Passwort lautet:`). The value ends at the next space or the end of the line. A secret
 written in some other way, such as "the password is hunter2", is not
 recognised.
 
