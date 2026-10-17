@@ -4367,6 +4367,18 @@ impl App {
                 return;
             }
         }
+        // #1020: a rejected key, no credit, an unusable model or Ollama not
+        // running: a plain headline and a click into Settings, not the raw
+        // vendor text with "Try again". Recorded like any failure (the chain
+        // goes to Copy diagnostics) but not a fault: no failed dot.
+        if let Err(packed) = &result {
+            let chain = unpack_error(packed).1.to_string();
+            if let Some((headline, detail)) = setup_failure(&chain) {
+                let _ = self.record_last(Err(pack_error(&headline, &chain)));
+                self.show_setup_card(&headline, &detail);
+                return;
+            }
+        }
         let is_err = result.is_err();
         let mut answer = self.record_last(result);
         // A store failure never fails the request (#46); it rides on the
@@ -4513,9 +4525,20 @@ impl App {
     /// because the chain was empty, shows the setup card (not a fault: no
     /// failed dot, no "Try again") and returns true. The Quick Ask palette's
     /// router hint already drops any failure quietly.
+    ///
+    /// #1020: also the first failures Settings fixes (a rejected key, no
+    /// credit, a model the account cannot use, Ollama not running): a plain
+    /// headline and a click into Settings, the raw text kept in the
+    /// diagnostics chain only.
     fn show_empty_chain_failure(&mut self, packed: &str) -> bool {
         if !is_no_providers(packed) {
-            return false;
+            let chain = unpack_error(packed).1;
+            let Some((headline, detail)) = setup_failure(chain) else {
+                return false;
+            };
+            self.record_run_failure(&headline, &headline, chain);
+            self.show_setup_card(&headline, &detail);
+            return true;
         }
         let (headline, detail) = self.empty_chain_card_now();
         self.record_run_failure(&headline, &headline, unpack_error(packed).1);
@@ -7583,6 +7606,99 @@ fn is_send_cancelled(packed: &str) -> bool {
     unpack_error(packed)
         .1
         .contains(crate::provider::SEND_CANCELLED_TEXT)
+}
+
+/// The providers whose failures [`setup_failure`] reads: the tag in the error
+/// text (`provider/common.rs`: `"{tag}: HTTP {status}: ..."`) and the name a
+/// user knows it by.
+const FAILURE_TAGS: [(&str, &str); 4] = [
+    ("openai", "OpenAI"),
+    ("anthropic", "Anthropic"),
+    ("gemini", "Gemini"),
+    ("ollama", "Ollama"),
+];
+
+/// #1020: the failures a new user meets first, and Settings fixes: a key that
+/// was not accepted (401, 403), an account with no credit (402), a model the
+/// key cannot use or Ollama has not downloaded (404), Ollama not running.
+/// Returns the plain headline and a detail that says what to do, from the raw
+/// chain. The vendor's body is not echoed: the redacted chain stays in the
+/// diagnostics ("Copy diagnostics"). Anything else (a 429, a 5xx, a timeout,
+/// prose) is `None` and keeps the usual error card with "Try again". Pure.
+pub(crate) fn setup_failure(raw_chain: &str) -> Option<(String, String)> {
+    // The earliest provider-tagged failure in the chain is the one that
+    // surfaced (a full-chain failure reports the first provider's).
+    let mut first: Option<(usize, &str, &str, bool)> = None;
+    for (tag, name) in FAILURE_TAGS {
+        for (marker, is_http) in [
+            (format!("{tag}: HTTP "), true),
+            (format!("{tag}: transport error:"), false),
+        ] {
+            if let Some(at) = raw_chain.find(&marker) {
+                if first.map_or(true, |(best, ..)| at < best) {
+                    first = Some((at, tag, name, is_http));
+                }
+            }
+        }
+    }
+    let (at, tag, name, is_http) = first?;
+    if !is_http {
+        // Only a local server that cannot be reached is "not running"; a
+        // timeout means it is there and slow.
+        let rest = raw_chain[at..].to_ascii_lowercase();
+        let refused = ["refused", "10061", "could not connect", "connection failed"]
+            .iter()
+            .any(|m| rest.contains(m));
+        if tag != "ollama" || !refused {
+            return None;
+        }
+        return Some((
+            "Ollama is not running".to_string(),
+            "Start Ollama, then press again. Settings shows the address Wingman uses. Details: Ollama could not be reached."
+                .to_string(),
+        ));
+    }
+    let after = raw_chain[at..].strip_prefix(&format!("{tag}: HTTP "))?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    let status: u16 = digits.parse().ok()?;
+    let shown = status;
+    // `http_error` marks a credit or key failure its status alone does not
+    // tell: `HTTP 429 (no_credit): ...`.
+    let kind = after[digits.len()..]
+        .strip_prefix(" (")
+        .and_then(|k| k.split(')').next());
+    let status = match (tag == "ollama", kind) {
+        (false, Some(crate::provider::common::KIND_NO_CREDIT)) => 402,
+        (false, Some(crate::provider::common::KIND_KEY_INVALID)) => 401,
+        _ => status,
+    };
+    let (headline, fix) = match (tag == "ollama", status) {
+        (false, 401) => (
+            format!("The {name} key was not accepted"),
+            format!("Check the {name} key in Settings."),
+        ),
+        (false, 403) => (
+            format!("The {name} key does not have access"),
+            format!("Check the {name} key and the model in Settings."),
+        ),
+        (false, 402) => (
+            format!("The {name} account has no credit left"),
+            format!("Add credit with {name}, or pick another provider in Settings."),
+        ),
+        (false, 404) => (
+            format!("That model is not available to this {name} key"),
+            "Pick another model in Settings.".to_string(),
+        ),
+        (true, 404) => (
+            "That model is not downloaded in Ollama".to_string(),
+            "Download it in Settings, or pick another model.".to_string(),
+        ),
+        _ => return None,
+    };
+    Some((
+        headline,
+        format!("{fix} Details: {tag} answered HTTP {shown}."),
+    ))
 }
 
 /// #832: whether a worker's packed error is the empty chain ("no providers
@@ -10826,6 +10942,167 @@ mod tests {
         let wrapped = anyhow::anyhow!("boom").context("outer");
         let packed = super::pack_error("x", &super::worker_error_chain_text(&wrapped));
         assert!(!super::is_no_providers(&packed));
+    }
+
+    // -- #1020: the failures a new user meets first get a plain card ----------
+
+    fn failure(raw: &str) -> Option<(String, String)> {
+        super::setup_failure(raw)
+    }
+
+    #[test]
+    fn a_rejected_key_gets_a_plain_headline_and_a_settings_fix() {
+        let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let raw = format!(
+            "{:#}",
+            crate::provider::common::http_error("anthropic", 401, body)
+        );
+        let (headline, detail) = failure(&raw).expect("a 401 is a setup failure");
+        assert_eq!(headline, "The Anthropic key was not accepted");
+        assert!(detail.contains("Settings"), "{detail}");
+        assert!(detail.contains("HTTP 401"), "{detail}");
+        // The vendor body stays in the diagnostics chain, never on the card.
+        assert!(!detail.contains("invalid x-api-key"), "{detail}");
+        assert!(!detail.contains("Try again"), "{detail}");
+    }
+
+    #[test]
+    fn each_first_failure_class_maps_to_its_own_sentence() {
+        let http = |tag: &str, status: u16| {
+            format!(
+                "{:#}",
+                crate::provider::common::http_error(tag, status, r#"{"error":"x"}"#)
+            )
+        };
+        let cases = [
+            (http("openai", 401), "The OpenAI key was not accepted"),
+            (http("gemini", 403), "The Gemini key does not have access"),
+            (http("openai", 402), "The OpenAI account has no credit left"),
+            (
+                http("openai", 404),
+                "That model is not available to this OpenAI key",
+            ),
+            (
+                http("ollama", 404),
+                "That model is not downloaded in Ollama",
+            ),
+            (
+                "ollama: transport error: connect error: Connection refused (os error 10061)"
+                    .to_string(),
+                "Ollama is not running",
+            ),
+        ];
+        for (raw, headline) in cases {
+            let (got, detail) = failure(&raw).unwrap_or_else(|| panic!("unmapped: {raw}"));
+            assert_eq!(got, headline, "{raw}");
+            assert!(got.chars().count() <= 88);
+            assert!(detail.contains("Settings"), "{detail}");
+            for text in [&got, &detail] {
+                assert!(
+                    !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn credit_and_bad_key_failures_are_read_from_the_vendor_body() {
+        let http = |tag: &str, status: u16, body: &str| {
+            format!(
+                "{:#}",
+                crate::provider::common::http_error(tag, status, body)
+            )
+        };
+        let quota = http(
+            "openai",
+            429,
+            r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"quota"}}"#,
+        );
+        let (head, detail) = failure(&quota).expect("no credit");
+        assert_eq!(head, "The OpenAI account has no credit left");
+        assert!(detail.contains("HTTP 429"), "{detail}");
+        let low = http(
+            "anthropic",
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}"#,
+        );
+        assert_eq!(
+            failure(&low).expect("no credit").0,
+            "The Anthropic account has no credit left"
+        );
+        let bad = http(
+            "gemini",
+            400,
+            r#"{"error":{"code":400,"message":"API key not valid.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#,
+        );
+        let (head, detail) = failure(&bad).expect("bad key");
+        assert_eq!(head, "The Gemini key was not accepted");
+        assert!(detail.contains("HTTP 400"), "{detail}");
+        // A plain 400 or 429 stays on the old card.
+        assert_eq!(
+            failure(&http("anthropic", 400, r#"{"error":{"message":"bad"}}"#)),
+            None
+        );
+        assert_eq!(
+            failure("openai: too many requests. Retry after 20 seconds."),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_refused_connection_means_ollama_is_not_running() {
+        for raw in [
+            "ollama: transport error: connect error: Connection refused (os error 10061)",
+            "ollama: transport error: ConnectionRefused",
+        ] {
+            assert_eq!(failure(raw).expect(raw).0, "Ollama is not running", "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_context_prefix_does_not_hide_the_failure_class() {
+        let raw = "model request failed: anthropic: HTTP 401: {}";
+        assert!(failure(raw).is_some());
+    }
+
+    #[test]
+    fn failures_settings_cannot_fix_are_left_alone() {
+        for raw in [
+            "openai: too many requests. Retry after 20 seconds.",
+            "openai: HTTP 500: oops",
+            "openai: HTTP 429: slow down",
+            "ollama: HTTP 401: nope",
+            "ollama: transport error: operation timed out after 30s",
+            "ollama: transport error: connection reset by peer",
+            "ollama: transport error: could not resolve the address",
+            "openai: HTTP 429 (rate_limit): slow down",
+            "openai: transport error: Connection refused",
+            "No such file or directory (os error 2)",
+            "openai-compat: HTTP 404: not found",
+            "",
+        ] {
+            assert_eq!(failure(raw), None, "{raw}");
+        }
+    }
+
+    /// Wired-to-nothing: the ask result and every action handler offer a
+    /// failure to the plain setup card before building the raw error card.
+    #[test]
+    fn the_result_handlers_show_the_setup_card_for_a_first_failure() {
+        let on_result = app_method_body("on_result");
+        let class = on_result
+            .find("setup_failure(")
+            .unwrap_or_else(|| panic!("on_result never maps the failure: {on_result}"));
+        let card = class
+            + on_result[class..]
+                .find("self.show_setup_card(")
+                .expect("no card");
+        let raw = on_result.find("show_error_with_details").expect("moved");
+        assert!(class < card && card < raw, "{on_result}");
+        let chain = app_method_body("show_empty_chain_failure");
+        assert!(chain.contains("setup_failure("), "{chain}");
+        assert!(chain.contains("self.show_setup_card("), "{chain}");
     }
 
     #[test]

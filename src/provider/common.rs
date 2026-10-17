@@ -483,6 +483,38 @@ fn content_policy_code(body: &str) -> Option<&'static str> {
     None
 }
 
+/// #1020: the failure kinds Settings can fix that a vendor reports only in the
+/// body of a status shared with other failures. They go into the error text as
+/// `HTTP {status} ({kind})`, which `app::setup_failure` reads.
+pub(crate) const KIND_NO_CREDIT: &str = "no_credit";
+pub(crate) const KIND_KEY_INVALID: &str = "key_invalid";
+
+/// #1020: the credit or key kind an error body carries, from its structured
+/// fields only (never the status alone, so an ordinary 429 stays a rate limit):
+/// OpenAI's 429 `insufficient_quota`, Anthropic's 400 "credit balance is too
+/// low", Gemini's 400 `API_KEY_INVALID`. Pure.
+pub(crate) fn failure_kind(status: u16, body: &str) -> Option<&'static str> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    let message = text(error.get("message"));
+    match status {
+        429 => ["code", "type"]
+            .iter()
+            .any(|f| text(error.get(*f)) == "insufficient_quota")
+            .then_some(KIND_NO_CREDIT),
+        400 | 402 if message.contains("credit balance") => Some(KIND_NO_CREDIT),
+        400 | 403 => {
+            let reason = error
+                .get("details")
+                .and_then(Value::as_array)
+                .is_some_and(|d| d.iter().any(|e| text(e.get("reason")) == "api_key_invalid"));
+            (reason || message.contains("api key not valid")).then_some(KIND_KEY_INVALID)
+        }
+        _ => None,
+    }
+}
+
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
@@ -496,7 +528,10 @@ pub(crate) fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
         }
     }
     let truncated = redact_and_truncate(body);
-    anyhow!("{tag}: HTTP {status}: {truncated}")
+    match failure_kind(status, body) {
+        Some(kind) => anyhow!("{tag}: HTTP {status} ({kind}): {truncated}"),
+        None => anyhow!("{tag}: HTTP {status}: {truncated}"),
+    }
 }
 
 /// #253: the one place network-derived text becomes user-facing text.
@@ -678,6 +713,11 @@ pub(crate) fn post_json_with(
                 }
 
                 if resp.status == 429 {
+                    // #1020: out of credit, not a rate limit: no retry, and the
+                    // text says so.
+                    if failure_kind(429, &resp.body).is_some() {
+                        return Err(http_error(tag, 429, &resp.body));
+                    }
                     let retry_after = parse_retry_after(&resp.headers, env.clock);
                     if !retried_429 && wall_clock_remaining() > policy.retry_floor {
                         if let Some(delay) = retry_after {
@@ -1535,6 +1575,37 @@ mod tests {
         }
     }
 
+    // -- #1020: credit and key failures, read from the structured body --------
+
+    #[test]
+    fn a_429_for_no_credit_is_told_apart_from_a_rate_limit() {
+        let quota = r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        assert_eq!(failure_kind(429, quota), Some(KIND_NO_CREDIT));
+        let text = http_error("openai", 429, quota).to_string();
+        assert!(text.starts_with("openai: HTTP 429 (no_credit): "), "{text}");
+        // An ordinary rate limit, or a body that is not JSON, is not credit.
+        let rate = r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#;
+        assert_eq!(failure_kind(429, rate), None);
+        assert_eq!(failure_kind(429, "insufficient_quota"), None);
+        assert_eq!(failure_kind(500, quota), None);
+    }
+
+    #[test]
+    fn anthropic_low_credit_and_gemini_bad_key_are_read_from_the_body() {
+        let low = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#;
+        assert_eq!(failure_kind(400, low), Some(KIND_NO_CREDIT));
+        let other = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens must be positive"}}"#;
+        assert_eq!(failure_kind(400, other), None);
+        let key = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"x","reason":"API_KEY_INVALID"}]}}"#;
+        assert_eq!(failure_kind(400, key), Some(KIND_KEY_INVALID));
+        let text = http_error("gemini", 400, key).to_string();
+        assert!(
+            text.starts_with("gemini: HTTP 400 (key_invalid): "),
+            "{text}"
+        );
+        let plain = r#"{"error":{"code":400,"message":"Bad field","status":"INVALID_ARGUMENT"}}"#;
+        assert_eq!(failure_kind(400, plain), None);
+    }
     #[test]
     fn wire_schema_removes_editable_everywhere_and_keeps_every_other_key_in_order() {
         let kinds = crate::actions::schema::PROPOSAL_KINDS;
