@@ -453,6 +453,9 @@ fn enter_command(ctrl_id: i32) -> i32 {
         | ID_RESUME_BUTTON
         | ID_PULL_BUTTON
         | ID_OPEN_CONFIG
+        | ID_OPEN_ACTIONS
+        | ID_IMPORT_ACTION
+        | ID_EXPORT_ACTION
         | ID_ADD_PROVIDER
         | ID_OPENAI_SHOW_KEY
         | ID_ANTHROPIC_SHOW_KEY
@@ -801,6 +804,11 @@ struct SettingsInner {
     autostart_again: bool,
     autostart_slot: AutostartSlot,
     autostart_seams: AutostartSeams,
+    /// #1152: the Actions page's worker (the file check, the list to export),
+    /// one at a time, and the actions its Export menu offers.
+    actions_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    actions_slot: ActionsSlot,
+    export_choices: Vec<(String, String)>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and is applied at once when a chord is learned.
     hotkeys: Hotkeys,
@@ -943,6 +951,9 @@ impl SettingsInner {
             autostart_again: false,
             autostart_slot: Default::default(),
             autostart_seams: AutostartSeams::REAL,
+            actions_busy: Default::default(),
+            actions_slot: Default::default(),
+            export_choices: Vec::new(),
             learning: None,
             pending_conflict: None,
             original,
@@ -982,6 +993,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
     if msg == WM_PAUSE_MENU {
         run_pause_menu(hwnd);
+        return LRESULT(0);
+    }
+    if msg == WM_EXPORT_MENU {
+        run_export_menu(hwnd);
         return LRESULT(0);
     }
     let inner = &mut *ptr;
@@ -1030,6 +1045,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // #1105: the Start with Windows worker answered.
         WM_SETTINGS_AUTOSTART => {
             take_autostart(inner);
+            LRESULT(0)
+        }
+        // #1152: the Actions page's worker answered.
+        WM_SETTINGS_ACTIONS => {
+            take_actions(inner);
             LRESULT(0)
         }
         // #1105: the worker read the file the window opened on.
@@ -1320,6 +1340,18 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             }
         }
         ID_OPEN_CONFIG if notify == BN_CLICKED => open_config_file(inner),
+        ID_OPEN_ACTIONS if notify == BN_CLICKED => start_actions_job(inner, ActionsJob::Open),
+        ID_IMPORT_ACTION if notify == BN_CLICKED => {
+            send_command(inner, crate::app::SettingsCommand::ImportAction)
+        }
+        ID_EXPORT_ACTION if notify == BN_CLICKED => {
+            // Like the Pause button: a pending Change would eat the menu's keys.
+            if inner.learning.is_some() {
+                stop_learning(inner);
+                set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            }
+            start_actions_job(inner, ActionsJob::Export)
+        }
         ID_PULL_BUTTON if notify == BN_CLICKED => on_pull_button(inner),
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
@@ -2757,6 +2789,11 @@ const ID_ESCAPE: i32 = 159;
 const ID_ROW_DESC: i32 = 160;
 /// #877: the hairline above a row. Shared the same way.
 const ID_ROW_SEPARATOR: i32 = 161;
+/// #1152: the Actions page's buttons. Each asks the app for what the tray's
+/// item does (Open actions file has no tray item).
+const ID_OPEN_ACTIONS: i32 = 162;
+const ID_IMPORT_ACTION: i32 = 163;
+const ID_EXPORT_ACTION: i32 = 164;
 const TB_ENDTRACK: u32 = 8;
 
 /// One cloud vendor's three rows on the Models page (#877): the ids of its
@@ -2816,7 +2853,10 @@ const CLOUD_ROWS: [CloudRows; 3] = [
 /// a screen reader says which one it is (#781, #877). Their text stays short,
 /// as it sits in a narrow column. Everything else is named by its own text or,
 /// for a box, by the title before it.
-const ACCESSIBLE_NAMES: [(i32, &str); 6] = [
+const ACCESSIBLE_NAMES: [(i32, &str); 9] = [
+    (ID_OPEN_ACTIONS, "Open your actions file"),
+    (ID_IMPORT_ACTION, "Import an action from a file"),
+    (ID_EXPORT_ACTION, "Export one of your actions to a file"),
     (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
     (ID_ANTHROPIC_SHOW_KEY, "Show Anthropic key"),
     (ID_GEMINI_SHOW_KEY, "Show Gemini key"),
@@ -3002,7 +3042,7 @@ const RAIL_NAME: &str = "Settings pages";
 
 /// The Actions page's note, in plain words. Import and export still live in
 /// the tray's Help group.
-const ACTIONS_NOTE: &str = "Actions are what Wingman does once you confirm: reply to an email, fill in a form, add a calendar event. Importing and exporting your own actions is in the tray menu, under Help.";
+const ACTIONS_NOTE: &str = "Actions are what Wingman does once you confirm: reply to an email, fill in a form, add a calendar event. You can write your own, and share them as files.";
 
 /// Every control id on each page, for the test that nothing is lost or listed
 /// twice. The window builds its pages with the same grouping (`Ctx::page`),
@@ -3071,7 +3111,15 @@ const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
             ID_REQUIRE_TICK_FOR,
         ],
     ),
-    (Page::Actions, &[ID_ACTIONS_NOTE]),
+    (
+        Page::Actions,
+        &[
+            ID_ACTIONS_NOTE,
+            ID_OPEN_ACTIONS,
+            ID_IMPORT_ACTION,
+            ID_EXPORT_ACTION,
+        ],
+    ),
     (
         Page::Advanced,
         &[ID_PROMPT_TOGGLE, ID_PROMPT_EDIT, ID_RESET_PROMPT],
@@ -3161,6 +3209,9 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_REDACT_HINT", ID_REDACT_HINT),
     ("ID_RAIL", ID_RAIL),
     ("ID_ACTIONS_NOTE", ID_ACTIONS_NOTE),
+    ("ID_OPEN_ACTIONS", ID_OPEN_ACTIONS),
+    ("ID_IMPORT_ACTION", ID_IMPORT_ACTION),
+    ("ID_EXPORT_ACTION", ID_EXPORT_ACTION),
     ("ID_MODE", ID_MODE),
     ("ID_PAUSE_STATUS", ID_PAUSE_STATUS),
     ("ID_PAUSE_BUTTON", ID_PAUSE_BUTTON),
@@ -6887,22 +6938,31 @@ const WM_PAUSE_MENU: u32 = 0x8000 + 0x873;
 /// window's state: the owner is copied first, and nothing of the state is read
 /// after the menu, which may have outlived the window.
 unsafe fn run_pause_menu(hwnd: HWND) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
-        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
-    };
     let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
     if state.is_null() {
         return;
     }
     let owner = (*state).owner;
-    let Some(button) = get_dlg_item(hwnd, ID_PAUSE_BUTTON) else {
+    let labels: Vec<String> = PAUSE_MENU.iter().map(|(_, l)| l.to_string()).collect();
+    let Some(i) = pick_from_menu(hwnd, ID_PAUSE_BUTTON, &labels) else {
         return;
     };
-    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
-        return;
+    if let Some((choice, _)) = PAUSE_MENU.get(i) {
+        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
+    }
+}
+
+/// A small menu under the button `button_id` with one item per label; the
+/// index picked, or `None` when it was dismissed or the window closed while
+/// the menu was up. Holds no borrow of the window's state.
+unsafe fn pick_from_menu(hwnd: HWND, button_id: i32, labels: &[String]) -> Option<usize> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
     };
-    for (i, (_, label)) in PAUSE_MENU.iter().enumerate() {
+    let button = get_dlg_item(hwnd, button_id)?;
+    let menu = unsafe { CreatePopupMenu() }.ok()?;
+    for (i, label) in labels.iter().enumerate() {
         let text = wide_z(label);
         unsafe {
             let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(text.as_ptr()));
@@ -6926,19 +6986,181 @@ unsafe fn run_pause_menu(hwnd: HWND) {
     }
     // A Quit while the menu was up closed the window: say nothing to it.
     if !IsWindow(Some(hwnd)).as_bool() {
-        return;
+        return None;
     }
-    let choice = usize::try_from(picked.0)
+    usize::try_from(picked.0)
         .ok()
         .and_then(|n| n.checked_sub(1))
-        .and_then(|i| PAUSE_MENU.get(i));
-    if let Some((choice, _)) = choice {
-        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
+        .filter(|i| *i < labels.len())
+}
+
+/// Posted by the Export button to the window itself, once the worker has the
+/// list of actions to offer (#1152). Same reason as [`WM_PAUSE_MENU`].
+const WM_EXPORT_MENU: u32 = 0x8000 + 0x874;
+
+/// The Export menu: the user's actions under the button; the pick goes to the
+/// app, which asks for the file name. The list is copied out before the menu.
+unsafe fn run_export_menu(hwnd: HWND) {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if state.is_null() {
+        return;
+    }
+    let owner = (*state).owner;
+    let choices = (*state).export_choices.clone();
+    let labels: Vec<String> = choices.iter().map(|(_, name)| menu_label(name)).collect();
+    let Some(i) = pick_from_menu(hwnd, ID_EXPORT_ACTION, &labels) else {
+        return;
+    };
+    let Some((id, _)) = choices.into_iter().nth(i) else {
+        return;
+    };
+    if owner.0.is_null() {
+        return;
+    }
+    if !crate::app::post_export_pick(owner.0 as isize, id) {
+        say(hwnd, ID_VALIDATION_MESSAGE, MAIN_WINDOW_GONE);
+    }
+}
+
+/// A menu item's text with each `&` doubled, so a name shows as written.
+fn menu_label(name: &str) -> String {
+    name.replace('&', "&&")
+}
+
+const MAIN_WINDOW_GONE: &str = "Wingman's main window is not running.";
+
+/// What the Actions page's worker can be asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionsJob {
+    /// Find the actions file, to open it.
+    Open,
+    /// List the actions the user wrote, for the Export menu.
+    Export,
+}
+
+/// What the worker found. The window acts on it: the shell and the menu are
+/// not for a worker thread.
+enum ActionsDone {
+    OpenPath(std::path::PathBuf),
+    Say(String),
+    Export(Result<Vec<(String, String)>, String>),
+}
+
+type ActionsSlot = std::sync::Arc<std::sync::Mutex<Option<ActionsDone>>>;
+
+/// Shown when there is no actions file yet (rule 7: a line, not a no-op).
+const NO_ACTIONS_FILE: &str = "There is no actions file yet. Import an action to start one.";
+const OPEN_ACTIONS_FAILED: &str = "Could not open the actions file.";
+const NO_ACTIONS_TO_EXPORT: &str =
+    "You have not written any actions yet, so there is nothing to export.";
+const ACTIONS_NOT_STARTED: &str = "Could not start. Try again.";
+
+/// The worker's whole job (#1152): the only place the Actions page reads the disk.
+fn run_actions_job(job: ActionsJob) -> ActionsDone {
+    match job {
+        ActionsJob::Open => match crate::actions::path() {
+            Ok(path) if path.exists() => ActionsDone::OpenPath(path),
+            Ok(_) => ActionsDone::Say(NO_ACTIONS_FILE.to_string()),
+            Err(_) => ActionsDone::Say(OPEN_ACTIONS_FAILED.to_string()),
+        },
+        ActionsJob::Export => ActionsDone::Export(
+            crate::actions::load_actions()
+                .map(|all| crate::actions::share::export_candidates(&all))
+                .map_err(|e| format!("{e:#}")),
+        ),
+    }
+}
+
+/// What the Export button does with the worker's list.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportOutcome {
+    Menu(Vec<(String, String)>),
+    Say(String),
+}
+
+fn export_outcome(list: Result<Vec<(String, String)>, String>) -> ExportOutcome {
+    match list {
+        Ok(list) if list.is_empty() => ExportOutcome::Say(NO_ACTIONS_TO_EXPORT.to_string()),
+        Ok(list) => ExportOutcome::Menu(list),
+        Err(e) => ExportOutcome::Say(format!("Could not read your actions: {e}")),
+    }
+}
+
+/// Hands `job` to a worker thread; the answer comes back as
+/// `WM_SETTINGS_ACTIONS`. One at a time: a click while one runs does nothing,
+/// as the line it will print is on its way.
+fn start_actions_job(inner: &mut SettingsInner, job: ActionsJob) {
+    if inner.closing || inner.actions_busy.load(Ordering::SeqCst) {
+        return;
+    }
+    inner.actions_busy.store(true, Ordering::SeqCst);
+    let slot = inner.actions_slot.clone();
+    let alive = inner.alive.clone();
+    let busy = inner.actions_busy.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let spawned = std::thread::Builder::new()
+        .name("settings-actions".into())
+        .spawn(move || {
+            let done = run_actions_job(job);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(done);
+            }
+            let mut posted = false;
+            post_while_open(&alive, || {
+                posted = unsafe {
+                    PostMessageW(
+                        Some(HWND(hwnd as *mut c_void)),
+                        WM_SETTINGS_ACTIONS,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                }
+                .is_ok();
+            });
+            // Nobody will answer: free the page for the next click.
+            if !posted {
+                busy.store(false, Ordering::SeqCst);
+            }
+        });
+    if spawned.is_err() {
+        inner.actions_busy.store(false, Ordering::SeqCst);
+        say(inner.hwnd, ID_VALIDATION_MESSAGE, ACTIONS_NOT_STARTED);
+    }
+}
+
+/// The worker's answer: open the file, say what is wrong, or ask the window to
+/// show the Export menu (not from here: this runs in the window's handler).
+fn take_actions(inner: &mut SettingsInner) {
+    inner.actions_busy.store(false, Ordering::SeqCst);
+    let Some(done) = inner.actions_slot.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    if inner.closing {
+        return;
+    }
+    match done {
+        ActionsDone::OpenPath(path) => {
+            if !open_url(&path.to_string_lossy()) {
+                say(inner.hwnd, ID_VALIDATION_MESSAGE, OPEN_ACTIONS_FAILED);
+            }
+        }
+        ActionsDone::Say(line) => say(inner.hwnd, ID_VALIDATION_MESSAGE, &line),
+        ActionsDone::Export(list) => match export_outcome(list) {
+            ExportOutcome::Say(line) => say(inner.hwnd, ID_VALIDATION_MESSAGE, &line),
+            ExportOutcome::Menu(list) => {
+                inner.export_choices = list;
+                unsafe {
+                    let _ = PostMessageW(Some(inner.hwnd), WM_EXPORT_MENU, WPARAM(0), LPARAM(0));
+                }
+            }
+        },
     }
 }
 
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
+/// #1152: the width of the Actions page's buttons, in dp.
+const ACTIONS_BUTTON_W: i32 = 140;
 /// #874: the width of "Add another provider".
 const ADD_PROVIDER_W: i32 = 170;
 
@@ -7775,8 +7997,8 @@ fn build_ui_recorded(
 
     // -- Actions (#872): no setting yet, so one note, never an empty page ---
     ctx.page.set(Some(Page::Actions));
-    let r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
-    let note_h = ROW_H * 3;
+    let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
+    let note_h = ROW_H * 2;
     ctx.create(
         WC_STATIC,
         ACTIONS_NOTE,
@@ -7788,7 +8010,43 @@ fn build_ui_recorded(
         note_h,
         ID_ACTIONS_NOTE,
     );
-    page_bottom[Page::Actions.index()] = r.y + 2 * ROW_PAD + note_h;
+    r.y += 2 * ROW_PAD + note_h;
+    // #1152: the three buttons, one row each, the title before the button.
+    for (title, desc, text, id) in [
+        (
+            "Your actions &file",
+            "Where the actions you wrote live.",
+            "Open actions file",
+            ID_OPEN_ACTIONS,
+        ),
+        (
+            "Import an actio&n",
+            "Pick a file someone shared. You see what it does first.",
+            "Import action",
+            ID_IMPORT_ACTION,
+        ),
+        (
+            "&Export an action",
+            "Save one of your actions to a file to share.",
+            "Export action",
+            ID_EXPORT_ACTION,
+        ),
+    ] {
+        let g = ctx.begin_row(&mut r, title, 0, 1);
+        ctx.create(
+            WC_BUTTON,
+            text,
+            BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+            0,
+            r.control_x(),
+            g.control_y(),
+            ACTIONS_BUTTON_W,
+            ROW_H,
+            id,
+        );
+        ctx.end_row(&mut r, &g, Some((desc, ID_ROW_DESC)));
+    }
+    page_bottom[Page::Actions.index()] = r.y;
 
     // -- Prompt (Advanced; grows to fill the space above the button row) ----
     ctx.page.set(Some(Page::Advanced));
@@ -8043,6 +8301,9 @@ const WM_SETTINGS_AUTOSTART: u32 = 0x8000 + 52; // WM_APP + 52
 
 /// Posted when the open-time read of the file has stored its answer (#1105).
 const WM_SETTINGS_OPENED: u32 = 0x8000 + 53; // WM_APP + 53
+
+/// Posted when the Actions page's worker has stored its answer (#1152).
+const WM_SETTINGS_ACTIONS: u32 = 0x8000 + 54; // WM_APP + 54
 /// `lparam` is the page's rail position.
 const PAGE_PICK: usize = 0;
 /// `lparam` is how many pages to move (negative goes back), wrapping.
@@ -12079,6 +12340,126 @@ mod tests {
         });
         assert_eq!(enter_command(ID_OPEN_CONFIG), ID_OPEN_CONFIG);
         assert!(!OPEN_CONFIG_FAILED.contains('\u{2014}'));
+    }
+
+    /// #1152 wired-to-nothing: the three buttons are real controls on the
+    /// Actions page, named for a screen reader, and Enter presses each.
+    #[test]
+    fn the_actions_page_has_its_three_buttons() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for (id, text) in [
+                (ID_OPEN_ACTIONS, "Open actions file"),
+                (ID_IMPORT_ACTION, "Import action"),
+                (ID_EXPORT_ACTION, "Export action"),
+            ] {
+                let button = get_dlg_item(hwnd, id).expect("button exists");
+                assert_eq!(get_text(button), text);
+                assert_eq!(enter_command(id), id);
+                assert!(
+                    ACCESSIBLE_NAMES.iter().any(|(i, _)| *i == id),
+                    "{text} has no accessible name"
+                );
+                assert!(!is_shown(hwnd, id), "{text} shows on another page");
+            }
+            unsafe {
+                SendMessageW(inner.rail, LB_SETCURSEL, Some(WPARAM(3)), None);
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_RAIL as usize | ((LBN_SELCHANGE as usize) << 16))),
+                    Some(LPARAM(inner.rail.0 as isize)),
+                );
+            }
+            for id in [ID_OPEN_ACTIONS, ID_IMPORT_ACTION, ID_EXPORT_ACTION] {
+                assert!(is_shown(hwnd, id));
+            }
+        });
+        assert!(!ACTIONS_NOTE.contains("tray"), "{ACTIONS_NOTE}");
+    }
+
+    /// #1152: the export list becomes a menu, or one plain line when there is
+    /// nothing to pick. Never a silent no-op (rule 7).
+    #[test]
+    fn the_export_list_becomes_a_menu_or_a_plain_line() {
+        let two = vec![
+            ("a".to_string(), "A & B".to_string()),
+            ("b".to_string(), "C".to_string()),
+        ];
+        assert_eq!(export_outcome(Ok(two.clone())), ExportOutcome::Menu(two));
+        assert_eq!(
+            export_outcome(Ok(Vec::new())),
+            ExportOutcome::Say(NO_ACTIONS_TO_EXPORT.to_string())
+        );
+        match export_outcome(Err("boom".to_string())) {
+            ExportOutcome::Say(line) => {
+                assert!(line.contains("boom"), "{line}");
+                assert!(!line.contains('\u{2014}'), "{line}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for line in [NO_ACTIONS_TO_EXPORT, NO_ACTIONS_FILE, OPEN_ACTIONS_FAILED] {
+            assert!(!line.contains('\u{2014}'), "{line}");
+        }
+    }
+
+    /// #1152: a menu label with an ampersand shows it, not an underline.
+    #[test]
+    fn an_export_menu_label_shows_its_ampersands() {
+        assert_eq!(menu_label("A & B"), "A && B");
+        assert_eq!(menu_label("Plain"), "Plain");
+    }
+
+    /// #1152 wired-to-nothing: each button's click reaches the app's own
+    /// handler or a worker, the window answers the worker and the menu by
+    /// message, and the click itself does no file IO.
+    #[test]
+    fn the_actions_buttons_are_wired_to_the_apps_handlers() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for arm in [
+            "ID_IMPORT_ACTION if notify == BN_CLICKED => {",
+            "ID_OPEN_ACTIONS if notify == BN_CLICKED => start_actions_job(inner, ActionsJob::Open),",
+            "WM_SETTINGS_ACTIONS =>",
+            "msg == WM_EXPORT_MENU",
+            "crate::app::SettingsCommand::ImportAction",
+            "crate::app::post_export_pick(",
+        ] {
+            assert!(code.contains(arm), "no `{arm}`");
+        }
+        let click = code
+            .split("ID_EXPORT_ACTION if notify == BN_CLICKED")
+            .nth(1)
+            .expect("no export arm");
+        let click = click.split("ID_PULL_BUTTON").next().unwrap();
+        assert!(click.contains("ActionsJob::Export"), "{click}");
+        assert!(!click.contains("load_actions"), "IO in the click: {click}");
+    }
+
+    /// #1152: a worker whose answer could not be posted frees the page for the
+    /// next click instead of leaving it busy for good. (When the window is
+    /// gone nothing reads the flag.)
+    #[test]
+    fn a_failed_post_clears_the_actions_busy_flag() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let job = code
+            .split("fn start_actions_job(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn take_actions(").next())
+            .expect("start_actions_job moved");
+        assert!(job.contains("if !posted {"), "{job}");
+        assert!(job.contains("busy.store(false"), "{job}");
+        assert!(job.contains(".is_ok()"), "{job}");
+    }
+
+    /// #1152: with no owner (as here) a click asks nobody and does not panic.
+    #[test]
+    fn clicking_import_in_a_window_with_no_owner_does_nothing() {
+        with_window(Config::default(), |hwnd, raw| {
+            handle_command(unsafe { &mut *raw }, ID_IMPORT_ACTION, BN_CLICKED);
+            assert!(get_dlg_item(hwnd, ID_IMPORT_ACTION).is_some());
+        });
     }
 
     /// #824: the hotkey hint is not the disabled grey. It is an enabled
