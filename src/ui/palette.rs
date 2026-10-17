@@ -2199,7 +2199,9 @@ mod tests {
                         }
                     }
                 }
-                if GetPixel(mem, (b.left + b.right) / 2, b.bottom - 1).0 == colors.focus_line {
+                // Rows of the focus colour up from the bottom, middle column.
+                let mid = (b.left + b.right) / 2;
+                while GetPixel(mem, mid, b.bottom - 1 - run).0 == colors.focus_line {
                     run += 1;
                 }
                 SelectObject(mem, old);
@@ -2207,7 +2209,8 @@ mod tests {
                 let _ = DeleteDC(mem);
                 ReleaseDC(None, screen);
             }
-            assert_eq!(run, 1, "dpi {dpi}: the straight run is the focus colour");
+            let width = crate::ui::palette_paint::px(2, dpi).max(1);
+            assert_eq!(run, width, "dpi {dpi}: rows of focus colour at the bottom");
             assert!(corner > 0, "dpi {dpi}: no focus pixel in the corner square");
         }
     }
