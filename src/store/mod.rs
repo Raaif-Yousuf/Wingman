@@ -155,6 +155,8 @@ enum Heal {
     Fine,
     /// The file was never moved and is open again as it was.
     Reopened,
+    /// Only the full-text index was damaged; it was rebuilt in place.
+    Rebuilt,
     /// A fresh database replaced the damaged one; the notice for the user.
     Replaced(String),
     /// Could not finish. The text says why. Tried again after [`RETRY_GAP`].
@@ -236,6 +238,11 @@ impl Store {
                     .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
                 note_recovery(reopened_notice());
             }
+            Heal::Rebuilt => {
+                self.seen
+                    .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
+                note_recovery(rebuilt_notice());
+            }
             Heal::Replaced(notice) => {
                 *state = HealState::default();
                 self.seen
@@ -275,7 +282,18 @@ impl Store {
                 }
             } else {
                 if !file_is_damaged(conn) {
-                    return Heal::Fine;
+                    // The file passes, but the full-text index may disagree
+                    // with its table (#1159): rebuild just that, so the user
+                    // keeps history and documents. A rebuild that hits damage
+                    // too means the file is damaged after all.
+                    if !fts_index_out_of_step(conn) {
+                        return Heal::Fine;
+                    }
+                    match rebuild_fts_index(conn) {
+                        Ok(()) => return Heal::Rebuilt,
+                        Err(e) if is_corrupt(&e) => {}
+                        Err(_) => return Heal::Fine,
+                    }
                 }
                 // Closing the old connection first: Windows will not rename an open file.
                 let Ok(empty) = Connection::open_in_memory() else {
@@ -345,6 +363,31 @@ fn reopen_original(conn: &mut Connection, path: &Path) -> bool {
 /// back without moving anything.
 fn reopened_notice() -> String {
     "Wingman's saved data could not be opened for a while and is open again. Usage and request history from that time may be missing.".into()
+}
+
+/// True when the full-text index says it no longer matches the chunk table.
+/// `quick_check` does not look at that. Only SQLite's own corrupt verdict
+/// counts: a check that could not run (busy, missing table) is "no".
+fn fts_index_out_of_step(conn: &Connection) -> bool {
+    match conn.execute(
+        // Rank 1 also compares the index with the chunk table (external content).
+        "INSERT INTO chunk_fts (chunk_fts, rank) VALUES ('integrity-check', 1)",
+        [],
+    ) {
+        Ok(_) => false,
+        Err(e) => is_corrupt(&e),
+    }
+}
+
+/// Rebuilds the full-text index from the chunk table.
+fn rebuild_fts_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute("INSERT INTO chunk_fts (chunk_fts) VALUES ('rebuild')", [])
+        .map(|_| ())
+}
+
+/// The card text after only the search index was rebuilt.
+fn rebuilt_notice() -> String {
+    "Wingman's search index over your documents was damaged while it was running and has been rebuilt. Nothing was lost.".into()
 }
 
 /// True if a `-wal` or `-shm` sits next to `path`.
@@ -1212,6 +1255,70 @@ mod tests {
         s.record_usage("2026-10-16", "a", "m", Some(0.2), None)
             .unwrap();
         assert_eq!(damaged_copies(&dir), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chunk saved while the full-text triggers are gone: the table is fine,
+    /// the index no longer agrees with it. `quick_check` cannot see that.
+    fn store_with_index_out_of_step(name: &str) -> (Store, PathBuf) {
+        let (s, dir) = knowledge_store(name);
+        {
+            let conn = s.lock();
+            conn.execute_batch("DROP TRIGGER chunk_fts_insert;")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+                 VALUES (1, 0, 'ledgerword in the notes', 'h0', 4)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER chunk_fts_insert AFTER INSERT ON chunk BEGIN
+                     INSERT INTO chunk_fts (rowid, text) VALUES (new.id, new.text);
+                 END;",
+            )
+            .unwrap();
+            assert_eq!(fts_hits(&conn, "ledgerword"), 0, "the index misses it");
+            assert!(!file_is_damaged(&conn), "quick_check passes");
+        }
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        (s, dir)
+    }
+
+    /// #1159: an index that disagrees with its table is rebuilt in place. The
+    /// file is not moved aside and the usage history stays.
+    #[test]
+    fn an_index_out_of_step_is_rebuilt_without_losing_anything() {
+        let (s, dir) = store_with_index_out_of_step("fts-rebuild");
+        // Any corrupt-class error in the process makes every store check itself.
+        let _ = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+
+        assert!(s.day_total("2026-10-15").unwrap().is_some(), "history kept");
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 1, "searchable again");
+        assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An index that agrees with its table is left alone.
+    #[test]
+    fn a_healthy_index_is_not_rebuilt() {
+        let (s, dir) = knowledge_store("fts-healthy");
+        {
+            let conn = s.lock();
+            conn.execute(
+                "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+                 VALUES (1, 0, 'ledgerword in the notes', 'h0', 4)",
+                [],
+            )
+            .unwrap();
+            assert!(!fts_index_out_of_step(&conn));
+        }
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
