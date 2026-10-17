@@ -3421,6 +3421,8 @@ struct EditColors {
     disabled_fill: u32,
     disabled_border: u32,
     disabled_text: u32,
+    /// #1109: a hovered combo's border (the system highlight in high contrast).
+    hover_border: u32,
 }
 
 /// How far a disabled box's fill moves from the text box fill toward the
@@ -3455,6 +3457,28 @@ fn edit_colors(
         disabled_fill,
         disabled_border,
         disabled_text: menu_text_color(theme, &t, sys, false, true),
+        hover_border: if high_contrast {
+            sys.highlight
+        } else {
+            blend(t.border, t.text, EDIT_HOVER_BORDER_PCT)
+        },
+    }
+}
+
+/// How far a hovered combo's border moves from the border colour toward the
+/// text colour, in percent. The tint of the field is left out: the system draws
+/// the arrow button, so a tinted field would sit beside a white button.
+const EDIT_HOVER_BORDER_PCT: u32 = 30;
+
+/// The colours the frame is drawn with: the border of a hovered box is firmer.
+fn frame_colors(colors: &EditColors, hovered: bool) -> EditColors {
+    EditColors {
+        border: if hovered {
+            colors.hover_border
+        } else {
+            colors.border
+        },
+        ..*colors
     }
 }
 
@@ -3640,7 +3664,7 @@ unsafe fn paint_edit_frame(hwnd: HWND) {
         wr.right - wr.left,
         wr.bottom - wr.top,
         dpi_for(hwnd),
-        &edit_style().colors,
+        &frame_colors(&edit_style().colors, combo_is_hovered(hwnd)),
         GetFocus() == hwnd,
         windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool(),
     );
@@ -7512,6 +7536,86 @@ fn combo_text_rect(
 
 const COMBO_SUBCLASS_ID: usize = 0x854;
 
+/// The Card corner combo, which the gallery puts the mouse over.
+#[cfg(debug_assertions)]
+pub(crate) const CARD_CORNER_COMBO: i32 = ID_CARD_CORNER;
+
+/// `WM_MOUSELEAVE`, sent once after `TrackMouseEvent(TME_LEAVE)`.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+thread_local! {
+    /// #1109: the combo the mouse is over (0: none). One mouse, one hover.
+    static HOVERED_COMBO: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// How many times a hover change repainted a combo, for the tests.
+    #[cfg(test)]
+    static COMBO_HOVER_REPAINTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn combo_is_hovered(hwnd: HWND) -> bool {
+    HOVERED_COMBO.get() == hwnd.0 as isize
+}
+
+#[cfg(test)]
+fn combo_hover_repaints() -> u32 {
+    COMBO_HOVER_REPAINTS.get()
+}
+
+/// Moves the hover to `hwnd` (`on`) or takes it off `hwnd`. Repaints the combos
+/// that changed, and returns whether anything did: a mouse moving inside the
+/// field changes nothing and costs nothing.
+fn set_combo_hover(hwnd: HWND, on: bool) -> bool {
+    let me = hwnd.0 as isize;
+    let before = HOVERED_COMBO.get();
+    let after = if on {
+        me
+    } else if before == me {
+        0
+    } else {
+        before
+    };
+    if after == before {
+        return false;
+    }
+    HOVERED_COMBO.set(after);
+    #[cfg(test)]
+    COMBO_HOVER_REPAINTS.set(COMBO_HOVER_REPAINTS.get() + 1);
+    for changed in [before, after] {
+        if changed != 0 {
+            unsafe {
+                let _ = RedrawWindow(
+                    Some(HWND(changed as *mut c_void)),
+                    None,
+                    None,
+                    windows::Win32::Graphics::Gdi::RDW_FRAME | RDW_INVALIDATE,
+                );
+            }
+        }
+    }
+    true
+}
+
+/// Asks Windows for one `WM_MOUSELEAVE` when the mouse leaves `hwnd`.
+fn track_mouse_leave(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    };
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        let _ = TrackMouseEvent(&mut track);
+    }
+}
+
+/// Gives the gallery a hovered combo: the state a mouse over it leaves.
+#[cfg(debug_assertions)]
+fn hover_combo_for_gallery(combo: HWND) {
+    set_combo_hover(combo, true);
+}
+
 /// An owner-drawn combo loses the system's light themed frame, so the frame is
 /// put back after each paint in the text box's look (#934): the same border,
 /// corners and accent line, which also keeps a row of controls consistent.
@@ -7530,7 +7634,20 @@ unsafe extern "system" fn combo_subclass(
             paint_edit_frame(hwnd);
             result
         }
+        // #1109: the mouse over the field hovers it; Windows says when it leaves.
+        // Only a change repaints, and nothing runs while the mouse is still.
+        windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE => {
+            if set_combo_hover(hwnd, true) {
+                track_mouse_leave(hwnd);
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            set_combo_hover(hwnd, false);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
         WM_NCDESTROY => {
+            set_combo_hover(hwnd, false);
             let _ = RemoveWindowSubclass(hwnd, Some(combo_subclass), COMBO_SUBCLASS_ID);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
@@ -8985,6 +9102,14 @@ impl GalleryWindow {
         if let Some(combo) = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER) {
             combo_select_index(combo, provider.index() as i32);
             unsafe { sync_models_flow(inner) };
+        }
+    }
+
+    /// Puts the mouse over the combo `id` (what hovering it leaves), for the gallery.
+    pub(crate) fn hover_combo(&mut self, id: i32) {
+        let inner = unsafe { &mut *self.raw };
+        if let Some(combo) = get_dlg_item(inner.hwnd, id) {
+            hover_combo_for_gallery(combo);
         }
     }
 
@@ -10533,6 +10658,55 @@ mod tests {
         }
     }
 
+    /// #1109: the hovered look is a firmer border in a normal theme and the system
+    /// highlight border in high contrast.
+    #[test]
+    fn hover_colours_come_from_the_tokens() {
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
+        let accent = rgb(0, 103, 192);
+        let face = rgb(240, 240, 240);
+        let c = edit_colors(false, &HC_BLACK, accent, face);
+        assert_ne!(
+            c.hover_border, c.border,
+            "a hovered box has a firmer border"
+        );
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, accent, face);
+            assert_eq!(c.hover_border, sys.highlight);
+        }
+        let hovered = frame_colors(&c, true);
+        assert_eq!(hovered.border, c.hover_border);
+        assert_eq!(frame_colors(&c, false).border, c.border);
+    }
+
+    /// #1109: the mouse over a combo hovers it, once: moving inside it again
+    /// repaints nothing, and leaving clears it. No timer is involved.
+    #[test]
+    fn a_combo_is_hovered_while_the_mouse_is_over_it() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        const WM_MOUSELEAVE: u32 = 0x02A3;
+        with_window(Config::default(), |hwnd, _raw| {
+            let combo = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            let other = get_dlg_item(hwnd, ID_MONITOR).unwrap();
+            let send = |to: HWND, msg: u32| unsafe {
+                SendMessageW(to, msg, Some(WPARAM(0)), Some(LPARAM(0x0005_0005)));
+            };
+            let base = combo_hover_repaints();
+            assert!(!combo_is_hovered(combo));
+            send(combo, WM_MOUSEMOVE);
+            assert!(combo_is_hovered(combo));
+            assert!(!combo_is_hovered(other));
+            assert_eq!(combo_hover_repaints(), base + 1);
+            send(combo, WM_MOUSEMOVE);
+            assert_eq!(combo_hover_repaints(), base + 1, "no change, no repaint");
+            send(combo, WM_MOUSELEAVE);
+            assert!(!combo_is_hovered(combo));
+            assert_eq!(combo_hover_repaints(), base + 2);
+            send(combo, WM_MOUSELEAVE);
+            assert_eq!(combo_hover_repaints(), base + 2);
+        });
+    }
+
     /// #934: the focus line is a bar along the bottom of the box, inside the
     /// border and clear of the rounded corners, at every scale.
     #[test]
@@ -10624,6 +10798,7 @@ mod tests {
             disabled_fill: 0x0080_8080,
             disabled_border: 0x0000_8080,
             disabled_text: 0,
+            hover_border: 0x0000_0080,
         };
         for dpi in [96u32, 240] {
             let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
@@ -10673,6 +10848,7 @@ mod tests {
             disabled_fill: 0x0080_8080,
             disabled_border: 0x0000_8080,
             disabled_text: 0,
+            hover_border: 0x0000_0080,
         };
         let (w, h) = (to_px(120, 96), to_px(ROW_H, 96));
         let (screen, dc, bmp) = unsafe {

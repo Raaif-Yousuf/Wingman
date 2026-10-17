@@ -82,6 +82,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsComboHover
     )
 }
 
@@ -143,6 +144,7 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsComboHover
     )
 }
 
@@ -295,6 +297,8 @@ pub enum GalleryState {
     SettingsInvalid,
     /// #875: a write that failed, on the status line.
     SettingsNotSaved,
+    /// #1109: the General page with the mouse over the Card corner combo.
+    SettingsComboHover,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -356,6 +360,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsSaved,
         SettingsInvalid,
         SettingsNotSaved,
+        SettingsComboHover,
         RegionOverlay,
         TrayMenu,
         TrayMenuSubmenu,
@@ -415,6 +420,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsSaved => "settings-saved",
         SettingsInvalid => "settings-invalid",
         SettingsNotSaved => "settings-not-saved",
+        SettingsComboHover => "settings-combo-hover",
         RegionOverlay => "region-overlay",
         TrayMenu => "tray-menu",
         TrayMenuSubmenu => "tray-menu-submenu",
@@ -1230,7 +1236,8 @@ mod driver {
             | SettingsAdvancedPromptOpen
             | SettingsSaved
             | SettingsInvalid
-            | SettingsNotSaved => {
+            | SettingsNotSaved
+            | SettingsComboHover => {
                 card.hide();
                 palette.hide();
                 let mut w = GalleryWindow::open(instance, variant.dpi)
@@ -1252,6 +1259,7 @@ mod driver {
                         "Not saved: Card corner. The disk is full. Wingman is still using the old value.",
                         false,
                     ),
+                    SettingsComboHover => w.hover_combo(crate::ui::settings::CARD_CORNER_COMBO),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1274,7 +1282,8 @@ mod driver {
             | SettingsAdvancedPromptOpen
             | SettingsSaved
             | SettingsInvalid
-            | SettingsNotSaved => settings
+            | SettingsNotSaved
+            | SettingsComboHover => settings
                 .as_ref()
                 .map(|w| w.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
@@ -1899,8 +1908,8 @@ mod tests {
         // Models page with Claude active and with every provider shown (#874)
         // = 41, + the palette with a widened thumb (#988) = 42, + the preview's
         // button states (#818) = 46, + the status line saved, not valid and not
-        // saved (#875) = 49.
-        assert_eq!(states.len(), 49);
+        // saved (#875) = 49, + the Settings combo under the mouse (#1109) = 50.
+        assert_eq!(states.len(), 50);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1942,14 +1951,15 @@ mod tests {
             "settings-saved",
             "settings-invalid",
             "settings-not-saved",
+            "settings-combo-hover",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 6,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874) and the status line three (#875)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 7,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line three (#875) and the combo hover (#1109)"
         );
     }
 
