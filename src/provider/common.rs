@@ -486,7 +486,7 @@ fn content_policy_code(body: &str) -> Option<&'static str> {
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
-fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
+pub(crate) fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
     // #920: a 400 that says the content was declined is a decline (it stops
     // the chain), not a failure to retry on the next vendor. Read from the
     // raw body: the redaction below rewrites these underscore words.
@@ -938,8 +938,7 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
         .with_context(|| format!("{tag}: failed to read response body"))?;
 
     if !status.is_success() {
-        let truncated = redact_and_truncate(&body_text);
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status.as_u16(), &body_text));
     }
 
     Ok(body_text)
@@ -986,8 +985,7 @@ pub(crate) fn get_json_with_headers(
     // `e` was redacted by `get_with_headers_raw` already.
     let resp = result.map_err(|e| anyhow!("{tag}: transport error: {}", e))?;
     if !(200..300).contains(&resp.status) {
-        let truncated = redact_and_truncate(&resp.body);
-        return Err(anyhow!("{tag}: HTTP {}: {truncated}", resp.status));
+        return Err(http_error(tag, resp.status, &resp.body));
     }
     Ok(resp.body)
 }
@@ -1147,8 +1145,7 @@ pub(crate) fn post_json_read_body<T>(
     if !(200..300).contains(&status) {
         let mut text = Vec::new();
         let _ = (&mut body_reader).take(4096).read_to_end(&mut text);
-        let truncated = redact_and_truncate(&String::from_utf8_lossy(&text));
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status, &String::from_utf8_lossy(&text)));
     }
     read(&mut body_reader)
 }
@@ -1215,8 +1212,7 @@ fn post_json_read_body_ureq<T>(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.body_mut().read_to_string().unwrap_or_default();
-        let truncated = redact_and_truncate(&body_text);
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status.as_u16(), &body_text));
     }
 
     let mut reader = response.body_mut().as_reader();
@@ -1410,7 +1406,7 @@ pub(crate) fn post_json_with_connect_timeout(
             ),
             &redactions,
         );
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status.as_u16(), &body_text));
     }
 
     record_entry(
@@ -3326,7 +3322,7 @@ mod tests {
         // #281: without this, a rename of the local would empty the
         // haystack and the test would pass by checking nothing.
         assert!(
-            candidates.len() >= 4,
+            candidates.len() >= 2,
             "the scanner found only {} `let truncated` bindings; the naming must have changed and this test is no longer checking anything",
             candidates.len()
         );
@@ -3619,6 +3615,118 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    // -- #941 / #942: one shared HTTP error builder -------------------------
+
+    const POLICY_BODY: &str = r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"content_policy_violation"}}"#;
+
+    /// A loopback server that reads one request up to the blank line (and a
+    /// `}` body end, when a body follows) and answers `status` with `body`.
+    fn status_server(status: u16, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n")
+                    || (req.starts_with(b"POST") && !req.ends_with(b"}"))
+                {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/x")
+    }
+
+    /// #942: every send and read helper treats a content-policy 400 as a
+    /// decline, so it stops the chain and the card shows the vendor's reason.
+    #[test]
+    fn every_http_helper_recognises_a_content_policy_decline() {
+        let _g = network_guard();
+        let t = Duration::from_secs(3);
+        let results = [
+            (
+                "post_json_read_body",
+                post_json_read_body(
+                    &status_server(400, POLICY_BODY),
+                    &json!({"model": "m"}),
+                    t,
+                    "test",
+                    &std::sync::atomic::AtomicBool::new(false),
+                    t,
+                    |_| Ok(()),
+                )
+                .map(|()| String::new()),
+            ),
+            (
+                "post_json_with_connect_timeout",
+                post_json_with_connect_timeout(
+                    &status_server(400, POLICY_BODY),
+                    &[],
+                    json!({"model": "m"}),
+                    t,
+                    t,
+                    "test",
+                ),
+            ),
+            (
+                "get_text_with_timeout",
+                get_text_with_timeout(&status_server(400, POLICY_BODY), t, "test"),
+            ),
+            (
+                "get_json_with_headers",
+                get_json_with_headers(&status_server(400, POLICY_BODY), &[], t, "test"),
+            ),
+        ];
+        for (name, result) in results {
+            let err = result.expect_err(name);
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_some(),
+                "{name}: {err:#}"
+            );
+        }
+    }
+
+    /// #941: the vendor's own error type and code survive redaction on the
+    /// card, and a key echoed next to them does not.
+    #[test]
+    fn vendor_error_type_and_code_survive_redaction() {
+        // A key with short word-like segments is not on the vendor list.
+        let word_key = "tok_prod_abcdefghijkl";
+        let body = format!(
+            r#"{{"error":{{"message":"Incorrect key {FAKE_KEY} or {word_key}","type":"invalid_request_error","code":"model_not_found"}}}}"#
+        );
+        let msg = http_error("openai", 404, &body).to_string();
+        assert!(msg.contains("invalid_request_error"), "{msg}");
+        assert!(msg.contains("model_not_found"), "{msg}");
+        assert!(!msg.contains(FAKE_KEY), "{msg}");
+        assert!(!msg.contains(word_key), "{msg}");
+    }
+
+    /// #942: the `HTTP {status}: {body}` text is built in exactly one place.
+    #[test]
+    fn the_http_status_error_text_is_built_in_one_place() {
+        let src = include_str!("common.rs").replace('\r', "");
+        let calls = anyhow_invocations(&src);
+        let builders: Vec<&String> = calls
+            .iter()
+            .filter(|c| {
+                c.contains("HTTP {status}: {truncated}") || c.contains("HTTP {}: {truncated}")
+            })
+            .collect();
+        assert_eq!(builders.len(), 1, "{builders:?}");
     }
 
     // -- post_json_read_body over its own socket (#635) --------------------
