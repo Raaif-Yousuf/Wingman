@@ -1502,10 +1502,23 @@ fn key_refusal(applied: &Config, field: Field, raw: &RawForm) -> Option<&'static
 
 /// Puts the status line's text up, and shows or hides Undo with it.
 fn set_status(inner: &mut SettingsInner, text: &str, undo: bool) {
-    if let Some(line) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-        set_text(line, text);
-    }
+    say(inner.hwnd, ID_VALIDATION_MESSAGE, text);
     set_undo_shown(inner, undo);
+}
+
+/// Sets the words of a status line (the footer's, or the shortcut line) and
+/// raises a live region change on it, so a screen reader announces "Saved:
+/// Card corner" and every error without the focus moving (#781, #877). A
+/// static is a plain, enabled control, which is what the event needs.
+fn say(hwnd: HWND, id: i32, text: &str) {
+    use windows::Win32::UI::Accessibility::NotifyWinEvent;
+    use windows::Win32::UI::WindowsAndMessaging::EVENT_OBJECT_LIVEREGIONCHANGED;
+    const OBJID_CLIENT: i32 = -4;
+    let Some(line) = get_dlg_item(hwnd, id) else {
+        return;
+    };
+    set_text(line, text);
+    unsafe { NotifyWinEvent(EVENT_OBJECT_LIVEREGIONCHANGED, line, OBJID_CLIENT, 0) };
 }
 
 fn set_undo_shown(inner: &mut SettingsInner, shown: bool) {
@@ -2468,8 +2481,28 @@ fn annotate_accessible_names(hwnd: HWND) {
                 );
             }
         }
+        // A screen reader announces a live region change only for a control
+        // whose UIA LiveSetting is set, so the status lines say Polite.
+        let polite = windows::Win32::System::Variant::VARIANT::from(
+            windows::Win32::UI::Accessibility::Polite.0,
+        );
+        for id in LIVE_STATUS_IDS {
+            if let Some(line) = get_dlg_item(hwnd, id) {
+                let _ = service.SetHwndProp(
+                    line,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    windows::Win32::UI::Accessibility::LiveSetting_Property_GUID,
+                    &polite,
+                );
+            }
+        }
     });
 }
+
+/// The status lines that announce what they say: the footer's and the
+/// shortcut line's.
+const LIVE_STATUS_IDS: [i32; 2] = [ID_VALIDATION_MESSAGE, ID_HOTKEY_STATUS];
 
 /// Takes the names of [`annotate_accessible_names`] back as the window goes:
 /// the service keeps them by window handle, and Windows recycles handles, so a
@@ -2480,6 +2513,16 @@ fn clear_accessible_names(hwnd: HWND) {
         for (id, _) in ACCESSIBLE_NAMES {
             if let Some(button) = get_dlg_item(hwnd, id) {
                 let _ = service.ClearHwndProps(button, ACC_OBJID_CLIENT, 0, &[PROPID_ACC_NAME]);
+            }
+        }
+        for id in LIVE_STATUS_IDS {
+            if let Some(line) = get_dlg_item(hwnd, id) {
+                let _ = service.ClearHwndProps(
+                    line,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    &[windows::Win32::UI::Accessibility::LiveSetting_Property_GUID],
+                );
             }
         }
     });
@@ -6222,9 +6265,11 @@ fn send_command_to(hwnd: HWND, owner: HWND, command: crate::app::SettingsCommand
     }
     if !crate::app::post_settings_command(owner.0 as isize, command) {
         // Rule 7: say so inline, never a silent no-op.
-        if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
-            set_text(msg, "Wingman's main window is not running.");
-        }
+        say(
+            hwnd,
+            ID_VALIDATION_MESSAGE,
+            "Wingman's main window is not running.",
+        );
     }
 }
 
@@ -6306,9 +6351,7 @@ fn open_config_file(inner: &SettingsInner) {
         _ => false,
     };
     if !opened {
-        if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-            set_text(msg, OPEN_CONFIG_FAILED);
-        }
+        say(inner.hwnd, ID_VALIDATION_MESSAGE, OPEN_CONFIG_FAILED);
     }
 }
 
@@ -8309,9 +8352,7 @@ fn finalize_config(inner: &SettingsInner, raw: &RawForm) -> Config {
 }
 
 fn set_hotkey_status(hwnd: HWND, text: &str) {
-    if let Some(status) = get_dlg_item(hwnd, ID_HOTKEY_STATUS) {
-        set_text(status, text);
-    }
+    say(hwnd, ID_HOTKEY_STATUS, text);
 }
 
 /// Points the two shortcut labels at `hotkeys`.
@@ -8954,9 +8995,7 @@ fn lock_env_key_fields(hwnd: HWND) {
             }
         }
     }
-    if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
-        set_text(msg, &env_key_hint(&env_hint_vars()));
-    }
+    say(hwnd, ID_VALIDATION_MESSAGE, &env_key_hint(&env_hint_vars()));
 }
 
 /// The names of the set key variables, for [`env_key_hint`].
@@ -10168,6 +10207,118 @@ mod tests {
             assert_ne!(a, 0, "the hairline got a brush");
             assert_eq!(a, b, "the brush is cached, not made per ask");
             assert_eq!(a, unsafe { edit_style() }.hairline_brush.0 as isize);
+        });
+    }
+
+    thread_local! {
+        /// Live region events the test hook has seen, as the window handles.
+        static LIVE_EVENTS: std::cell::RefCell<Vec<isize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "system" fn live_event_proc(
+        _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+        _event: u32,
+        hwnd: HWND,
+        _id_object: i32,
+        _id_child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        LIVE_EVENTS.with(|e| e.borrow_mut().push(hwnd.0 as isize));
+    }
+
+    /// The observable of the live region: a message on the status line raises
+    /// `EVENT_OBJECT_LIVEREGIONCHANGED` on that control, which is what a
+    /// screen reader listens for. A real out-of-context event hook, pumped on
+    /// this thread, hears it; with the call missing it hears nothing.
+    #[test]
+    fn a_status_message_raises_a_live_region_event_on_the_status_line() {
+        use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PeekMessageW, EVENT_OBJECT_LIVEREGIONCHANGED, PM_REMOVE,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            LIVE_EVENTS.with(|e| e.borrow_mut().clear());
+            let hook = unsafe {
+                SetWinEventHook(
+                    EVENT_OBJECT_LIVEREGIONCHANGED,
+                    EVENT_OBJECT_LIVEREGIONCHANGED,
+                    None,
+                    Some(live_event_proc),
+                    std::process::id(),
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                    0, // WINEVENT_OUTOFCONTEXT
+                )
+            };
+            assert!(!hook.0.is_null(), "the event hook was installed");
+            set_status(unsafe { &mut *raw }, "Saved: Card corner", true);
+            let mut m = MSG::default();
+            let until = std::time::Instant::now() + Duration::from_secs(2);
+            while LIVE_EVENTS.with(|e| e.borrow().is_empty()) && std::time::Instant::now() < until {
+                while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&m) };
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            unsafe {
+                let _ = UnhookWinEvent(hook);
+            }
+            let line = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line");
+            let heard = LIVE_EVENTS.with(|e| e.borrow().clone());
+            assert!(heard.contains(&(line.0 as isize)), "heard {heard:?}");
+            assert_eq!(get_text(line), "Saved: Card corner");
+        });
+    }
+
+    /// Narrator announces a live region change only for a control whose UIA
+    /// `LiveSetting` is set. Read back through real UI Automation (from a
+    /// second thread, as a screen reader is another process; this thread
+    /// pumps the window), both status lines say Polite. Without the annotation
+    /// the property reads 0 (Off) and this fails.
+    #[test]
+    fn the_status_lines_are_polite_uia_live_regions() {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+        use windows::Win32::UI::Accessibility::UIA_LiveSettingPropertyId;
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, PM_REMOVE};
+        with_window(Config::default(), |hwnd, _raw| {
+            let lines: Vec<isize> = LIVE_STATUS_IDS
+                .iter()
+                .map(|id| get_dlg_item(hwnd, *id).expect("status line").0 as isize)
+                .collect();
+            let reader = std::thread::spawn(move || unsafe {
+                let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let automation = crate::inputs::uia_automation::create_automation();
+                let out: Vec<i32> = match automation {
+                    Ok(a) => lines
+                        .iter()
+                        .map(|h| {
+                            a.ElementFromHandle(HWND(*h as *mut c_void))
+                                .and_then(|e| e.GetCurrentPropertyValue(UIA_LiveSettingPropertyId))
+                                .ok()
+                                .and_then(|v| i32::try_from(&v).ok())
+                                .unwrap_or(-1)
+                        })
+                        .collect(),
+                    Err(_) => vec![-1; lines.len()],
+                };
+                if init.is_ok() {
+                    CoUninitialize();
+                }
+                out
+            });
+            let mut m = MSG::default();
+            while !reader.is_finished() {
+                while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&m) };
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let got = reader.join().expect("reader thread");
+            assert_eq!(
+                got,
+                vec![1, 1],
+                "LiveSetting of the two status lines (1 = Polite)"
+            );
         });
     }
 
