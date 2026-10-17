@@ -1476,6 +1476,7 @@ mod tests {
             "time_list",
             "scam_check",
             "jargon_terms",
+            "contact_card",
         ];
         for id in ids {
             for want_difficulty in [false, true] {

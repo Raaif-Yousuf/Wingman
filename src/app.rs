@@ -2855,6 +2855,18 @@ impl App {
             return;
         }
 
+        // #71: no name, email or phone is an answer, not a blank preview.
+        if actions::contact::is_empty_result(&action.proposal, &proposal) {
+            self.card.show_answer(
+                actions::contact::NO_CONTACT_HEADLINE,
+                &with_pending_notices(""),
+                0,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
+
         // A write-back whose text is the selection as it was has nothing to
         // write: say so instead of showing a pointless preview.
         // The text also takes the document's line endings here, so the card,

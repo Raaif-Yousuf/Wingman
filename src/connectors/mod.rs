@@ -20,6 +20,12 @@ pub mod registry;
 // scope").
 #[allow(unused_imports)]
 pub use ics::{parse_event_time, IcsConnector, Opener};
+// The contact action (#71) writes a `.vcf` the same way: same temp folder,
+// same shell open, same text escaping and line folding.
+pub(crate) use ics::{
+    cleanup_stale_ics_files, escape_text, fold_line, generate_uid, sanitize_filename, temp_dir_for,
+    ShellOpener,
+};
 
 use civil_time::{CivilDate, CivilDateTime};
 
