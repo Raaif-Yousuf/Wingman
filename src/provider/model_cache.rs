@@ -1,56 +1,30 @@
-//! A 24 hour on-disk copy of each cloud vendor's model list (#585).
+//! An on-disk copy of each cloud vendor's last good model list (#585).
 //!
-//! Settings shows the cached list the moment it opens, so the dropdown is full
-//! before the network answers, and a failed refresh keeps the last good list.
-//! The file holds model ids and a save time and nothing else: no key, no
-//! header, no response body, so there is nothing secret to leak from it.
+//! Settings always asks the vendor again; the copy only fills the dropdown
+//! first and stays when that refresh fails. The file holds model ids and
+//! nothing else: no key, no header, no response body, so there is nothing
+//! secret to leak from it.
 //!
 //! `%LOCALAPPDATA%\Wingman\model-list-<vendor>.json`. Every read and write is
-//! best effort: a missing, unreadable or damaged file reads as "no cache".
+//! best effort: a missing, unreadable, oversized or damaged file reads as "no
+//! cache".
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::model_list::Vendor;
 
-/// A list younger than this needs no refresh when Settings opens.
-pub const FRESH_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 /// A file claiming more ids or longer ids than any vendor sends is damaged.
 const MAX_IDS: usize = 2000;
 const MAX_ID_LEN: usize = 200;
+/// A file bigger than this is not read: 2000 ids of 200 bytes would fit.
+const MAX_FILE_BYTES: u64 = 256 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
-    saved_at: u64,
     ids: Vec<String>,
-}
-
-/// A cached list and when it was saved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cached {
-    pub ids: Vec<String>,
-    pub saved_at: u64,
-}
-
-impl Cached {
-    /// Whether the list is younger than [`FRESH_FOR`] at `now` (seconds since
-    /// the Unix epoch). A save time in the future (clock moved back) is not
-    /// fresh, so the next open refreshes it.
-    pub fn is_fresh(&self, now: u64) -> bool {
-        now.checked_sub(self.saved_at)
-            .is_some_and(|age| age < FRESH_FOR.as_secs())
-    }
-}
-
-/// Seconds since the Unix epoch, for [`Cached::is_fresh`]. A clock before 1970
-/// reads as 0, which makes every list stale: the safe outcome (it refreshes).
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn file_name(vendor: Vendor) -> &'static str {
@@ -91,36 +65,35 @@ fn ids_ok(ids: &[String]) -> bool {
         })
 }
 
-/// The text to write for `ids` saved at `now`, or `None` when the list is not
-/// worth keeping (empty, or an id that is not a model id).
-fn encode(ids: &[String], now: u64) -> Option<String> {
+/// The text to write for `ids`, or `None` when the list is not worth keeping
+/// (empty, or an id that is not a model id).
+fn encode(ids: &[String]) -> Option<String> {
     if !ids_ok(ids) {
         return None;
     }
-    serde_json::to_string(&CacheFile {
-        saved_at: now,
-        ids: ids.to_vec(),
-    })
-    .ok()
+    serde_json::to_string(&CacheFile { ids: ids.to_vec() }).ok()
 }
 
 /// The list in `text`, or `None` for anything that is not a well formed cache.
-fn decode(text: &str) -> Option<Cached> {
+fn decode(text: &str) -> Option<Vec<String>> {
     let file: CacheFile = serde_json::from_str(text).ok()?;
-    ids_ok(&file.ids).then_some(Cached {
-        ids: file.ids,
-        saved_at: file.saved_at,
-    })
+    ids_ok(&file.ids).then_some(file.ids)
 }
 
-fn read_at(path: &Path) -> Option<Cached> {
+fn read_at(path: &Path) -> Option<Vec<String>> {
+    if std::fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
+        return None;
+    }
     decode(&std::fs::read_to_string(path).ok()?)
 }
 
-/// Writes through a temporary file and a rename, so a crash mid-write leaves
-/// the previous list, not half of a new one.
-fn write_at(path: &Path, ids: &[String], now: u64) -> bool {
-    let Some(text) = encode(ids, now) else {
+/// Writes through a uniquely named temporary file and a rename, so a crash
+/// mid-write leaves the previous list, not half of a new one, and two workers
+/// never share a temporary file. A failed write or rename removes the
+/// temporary file.
+fn write_at(path: &Path, ids: &[String]) -> bool {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let Some(text) = encode(ids) else {
         return false;
     };
     let Some(dir) = path.parent() else {
@@ -129,13 +102,21 @@ fn write_at(path: &Path, ids: &[String], now: u64) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_ok()
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let done = std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, path).is_ok();
+    if !done {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    done
 }
 
 /// The cached list for `vendor`, if there is a usable one. Blocking file read:
 /// call it from a worker thread.
-pub fn load(vendor: Vendor) -> Option<Cached> {
+pub fn load(vendor: Vendor) -> Option<Vec<String>> {
     read_at(&path_for(vendor)?)
 }
 
@@ -143,7 +124,7 @@ pub fn load(vendor: Vendor) -> Option<Cached> {
 /// not a model id leaves the previous file alone. Best effort.
 pub fn store(vendor: Vendor, ids: &[String]) {
     if let Some(path) = path_for(vendor) {
-        let _ = write_at(&path, ids, now());
+        let _ = write_at(&path, ids);
     }
 }
 
@@ -167,10 +148,8 @@ mod tests {
     #[test]
     fn a_list_round_trips_through_the_file() {
         let path = scratch("round-trip.json");
-        assert!(write_at(&path, &ids(&["gpt-5", "o3"]), 1000));
-        let got = read_at(&path).expect("cache");
-        assert_eq!(got.ids, ids(&["gpt-5", "o3"]));
-        assert_eq!(got.saved_at, 1000);
+        assert!(write_at(&path, &ids(&["gpt-5", "o3"])));
+        assert_eq!(read_at(&path), Some(ids(&["gpt-5", "o3"])));
     }
 
     #[test]
@@ -180,9 +159,9 @@ mod tests {
             "",
             "not json",
             "{}",
-            r#"{"saved_at":1,"ids":[]}"#,
-            r#"{"saved_at":1,"ids":[""]}"#,
-            r#"{"saved_at":-1,"ids":["a"]}"#,
+            r#"{"ids":[]}"#,
+            r#"{"ids":[""]}"#,
+            r#"{"ids":[1]}"#,
         ] {
             assert_eq!(decode(bad), None, "{bad}");
         }
@@ -191,32 +170,46 @@ mod tests {
     #[test]
     fn an_empty_or_odd_list_is_never_written_and_keeps_the_old_file() {
         let path = scratch("keeps-old.json");
-        assert!(write_at(&path, &ids(&["good"]), 5));
-        assert!(!write_at(&path, &[], 6));
-        assert!(!write_at(&path, &ids(&["bad\nid"]), 6));
-        assert!(!write_at(&path, &ids(&[&"x".repeat(MAX_ID_LEN + 1)]), 6));
-        assert_eq!(read_at(&path).unwrap().ids, ids(&["good"]));
+        assert!(write_at(&path, &ids(&["good"])));
+        assert!(!write_at(&path, &[]));
+        assert!(!write_at(&path, &ids(&["bad\nid"])));
+        assert!(!write_at(&path, &ids(&[&"x".repeat(MAX_ID_LEN + 1)])));
+        assert_eq!(read_at(&path), Some(ids(&["good"])));
     }
 
     #[test]
-    fn a_list_is_fresh_for_a_day_and_a_future_save_time_is_not_fresh() {
-        let c = Cached {
-            ids: ids(&["a"]),
-            saved_at: 1000,
-        };
-        assert!(c.is_fresh(1000));
-        assert!(c.is_fresh(1000 + FRESH_FOR.as_secs() - 1));
-        assert!(!c.is_fresh(1000 + FRESH_FOR.as_secs()));
-        assert!(!c.is_fresh(999));
+    fn a_file_over_the_size_cap_is_not_read() {
+        let path = scratch("too-big.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let pad = " ".repeat(MAX_FILE_BYTES as usize);
+        std::fs::write(&path, format!(r#"{{"ids":["a"]}}{pad}"#)).unwrap();
+        assert_eq!(read_at(&path), None);
     }
 
     #[test]
-    fn the_file_holds_only_ids_and_a_time() {
-        let text = encode(&ids(&["gpt-5"]), 7).unwrap();
+    fn a_failed_write_leaves_no_temporary_file() {
+        // The target is a directory, so the rename cannot succeed.
+        let dir = scratch("target-is-a-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!write_at(&dir, &ids(&["a"])));
+        let left: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("target-is-a-dir.")
+            })
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn the_file_holds_only_ids() {
+        let text = encode(&ids(&["gpt-5"])).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        keys.sort();
-        assert_eq!(keys, ["ids", "saved_at"]);
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["ids"]);
     }
 
     #[test]
@@ -233,8 +226,6 @@ mod tests {
     #[test]
     fn store_then_load_uses_the_test_path() {
         store(Vendor::Gemini, &ids(&["gemini-3-pro"]));
-        let got = load(Vendor::Gemini).expect("cache");
-        assert_eq!(got.ids, ids(&["gemini-3-pro"]));
-        assert!(got.is_fresh(now()));
+        assert_eq!(load(Vendor::Gemini), Some(ids(&["gemini-3-pro"])));
     }
 }

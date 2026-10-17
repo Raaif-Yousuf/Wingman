@@ -5804,28 +5804,6 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
     );
 }
 
-/// What to do with a vendor's saved list when Settings opens (#585).
-#[derive(Debug, PartialEq, Eq)]
-struct CachePlan {
-    /// Put the saved list in the dropdown now.
-    show: bool,
-    /// Still ask the vendor: there is no saved list, or it is a day old.
-    refresh: bool,
-}
-
-fn cache_plan(cached: Option<&crate::provider::model_cache::Cached>, now: u64) -> CachePlan {
-    match cached {
-        Some(c) => CachePlan {
-            show: true,
-            refresh: !c.is_fresh(now),
-        },
-        None => CachePlan {
-            show: false,
-            refresh: true,
-        },
-    }
-}
-
 /// Keeps a saved list for vendor `index` while nothing better is there: not
 /// over a fetched list, and not when a newer fetch has started. Does not mark
 /// a key as fetched, so a failed refresh is still retried. Returns whether it
@@ -5865,14 +5843,10 @@ fn spawn_one_cloud_fetch(
         .name("settings-cloud-models".into())
         .spawn(move || {
             // #585: the saved list first, so the dropdown is full before the
-            // network answers. A list under a day old needs no refresh.
-            let mut refresh = true;
+            // network answers. The vendor is asked again either way.
             if use_cache {
-                let cached = crate::provider::model_cache::load(vendor);
-                let plan = cache_plan(cached.as_ref(), crate::provider::model_cache::now());
-                refresh = plan.refresh;
-                if let (true, Some(cached)) = (plan.show, cached) {
-                    if store_cached_list(&slots, &sync, index, mine, cached.ids) {
+                if let Some(ids) = crate::provider::model_cache::load(vendor) {
+                    if store_cached_list(&slots, &sync, index, mine, ids) {
                         post_while_open(&alive, || unsafe {
                             let _ = PostMessageW(
                                 Some(HWND(hwnd_raw as *mut c_void)),
@@ -5883,9 +5857,6 @@ fn spawn_one_cloud_fetch(
                         });
                     }
                 }
-            }
-            if !refresh {
-                return;
             }
             let ids = match crate::provider::model_list::fetch(vendor, &key) {
                 Ok(ids) => ids,
@@ -5900,9 +5871,8 @@ fn spawn_one_cloud_fetch(
                     return;
                 }
             };
-            // Only a good list is kept; a failed fetch returned above and
-            // left the last good one (the cache and the slot) as it was.
-            crate::provider::model_cache::store(vendor, &ids);
+            // A failed fetch returned above and left the last good list (the
+            // slot and the saved copy) as it was.
             if !store_fetched_list(&slots, &sync, index, mine, &key, ids) {
                 return;
             }
@@ -5921,6 +5891,10 @@ fn spawn_one_cloud_fetch(
 /// started while this one ran: its result wins, so this one is dropped. The check
 /// and the store happen under one lock, so an older worker cannot pass the check
 /// and then store after a newer one finished (#678). Returns whether it stored.
+///
+/// The list is also saved to disk (#585), under the same lock and only once
+/// accepted, so a superseded worker never overwrites a newer saved list. The
+/// write is a small file on a worker thread.
 fn store_fetched_list(
     slots: &CloudModels,
     sync: &CloudSync,
@@ -5935,6 +5909,7 @@ fn store_fetched_list(
     if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
         return false;
     }
+    crate::provider::model_cache::store(CLOUD_VENDORS[index], &ids);
     guard[index] = Some(ids);
     // The fetched-key record is written under the same slots lock (always slots
     // first, then keys), so it cannot go stale.
@@ -9982,33 +9957,32 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
 
     #[test]
-    fn a_saved_list_is_shown_and_only_an_old_or_missing_one_is_refreshed() {
-        use crate::provider::model_cache::{Cached, FRESH_FOR};
-        let c = Cached {
-            ids: vec!["a".into()],
-            saved_at: 100,
-        };
-        let day = FRESH_FOR.as_secs();
+    fn a_superseded_worker_does_not_overwrite_the_saved_list() {
+        use crate::provider::model_list::Vendor;
+        let slots: CloudModels = Default::default();
+        let sync = CloudSync::default();
+        // Worker 1 started, then worker 2 replaced it.
+        sync.generation[1].store(2, Ordering::SeqCst);
+        assert!(store_fetched_list(
+            &slots,
+            &sync,
+            1,
+            2,
+            "k",
+            vec!["from-worker-2".into()]
+        ));
+        // Worker 1 returns last: dropped, and the saved copy stays worker 2's.
+        assert!(!store_fetched_list(
+            &slots,
+            &sync,
+            1,
+            1,
+            "k",
+            vec!["from-worker-1".into()]
+        ));
         assert_eq!(
-            cache_plan(Some(&c), 100 + day - 1),
-            CachePlan {
-                show: true,
-                refresh: false
-            }
-        );
-        assert_eq!(
-            cache_plan(Some(&c), 100 + day),
-            CachePlan {
-                show: true,
-                refresh: true
-            }
-        );
-        assert_eq!(
-            cache_plan(None, 100),
-            CachePlan {
-                show: false,
-                refresh: true
-            }
+            crate::provider::model_cache::load(Vendor::Anthropic),
+            Some(vec!["from-worker-2".to_string()])
         );
     }
 

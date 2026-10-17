@@ -365,63 +365,6 @@ pub fn parse_gemini(body: &str) -> Result<Vec<String>> {
     Ok(kept.into_iter().map(str::to_string).collect())
 }
 
-/// The `GET` URL for a compat endpoint's model list: its base URL (which has
-/// no `/chat/completions`) plus `/models`.
-// Nothing in the app calls the three compat functions until Settings has a
-// picker for them (a separate issue); the tests cover them meanwhile.
-#[allow(dead_code)]
-pub fn compat_models_url(base_url: &str) -> String {
-    format!("{}/models", base_url.trim().trim_end_matches('/'))
-}
-
-/// `GET <base>/models` on an OpenAI-compatible server: `{"data": [{"id"}]}`.
-/// Ids only. There are no capability flags and no reliable names to filter
-/// by (a local server lists whatever is loaded), so every id is kept, in the
-/// server's order, once each. Nothing says which ids take images, so the
-/// caller keeps using the entry's own `vision` setting.
-#[allow(dead_code)]
-pub fn parse_compat(body: &str) -> Result<Vec<String>> {
-    let mut ids: Vec<String> = Vec::new();
-    for m in data_array(body, "data")? {
-        if let Some(id) = m.get("id").and_then(Value::as_str).map(str::trim) {
-            if !id.is_empty() && !ids.iter().any(|i| i == id) {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    if ids.is_empty() {
-        return Err(anyhow!("compat models: the list had no usable models"));
-    }
-    Ok(ids)
-}
-
-/// Asks a compat endpoint for its model list. The credential goes in a header
-/// the same way a request does, never the URL. Blocking: a worker thread only.
-#[allow(dead_code)]
-pub fn fetch_compat(
-    base_url: &str,
-    auth: super::openai_compat::CompatAuth,
-    auth_header: &str,
-    api_key: &str,
-) -> Result<Vec<String>> {
-    use super::openai_compat::CompatAuth;
-    let bearer = format!("Bearer {api_key}");
-    let headers: Vec<(&str, &str)> = match auth {
-        CompatAuth::Bearer => vec![("Authorization", bearer.as_str())],
-        CompatAuth::ApiKeyHeader if !auth_header.trim().is_empty() => {
-            vec![(auth_header, api_key)]
-        }
-        _ => Vec::new(),
-    };
-    let body = common::get_json_with_headers(
-        &compat_models_url(base_url),
-        &headers,
-        LIST_TIMEOUT,
-        "compat models",
-    )?;
-    parse_compat(&body)
-}
-
 /// The dropdown's list: the fetched ids first, then any configured model the
 /// vendor did not list (a hand-added or since-retired id stays selectable).
 /// The user's current model is never dropped: the caller's combo-fill puts
@@ -444,48 +387,6 @@ mod tests {
         std::fs::read_to_string(format!("tests/fixtures/{name}"))
             .expect("fixture file should exist")
             .replace('\r', "")
-    }
-
-    #[test]
-    fn compat_url_is_the_base_plus_models_with_one_slash() {
-        assert_eq!(
-            compat_models_url("http://127.0.0.1:1234/v1"),
-            "http://127.0.0.1:1234/v1/models"
-        );
-        assert_eq!(
-            compat_models_url("https://openrouter.ai/api/v1/ "),
-            "https://openrouter.ai/api/v1/models"
-        );
-    }
-
-    #[test]
-    fn compat_keeps_every_id_in_the_servers_order_without_repeats() {
-        let body = r#"{"object":"list","data":[
-            {"id":"qwen2.5-vl-7b","object":"model"},
-            {"id":"text-embedding-nomic","object":"model"},
-            {"id":"qwen2.5-vl-7b"},
-            {"id":"llama-3.2-11b-vision"}]}"#;
-        assert_eq!(
-            parse_compat(body).unwrap(),
-            [
-                "qwen2.5-vl-7b",
-                "text-embedding-nomic",
-                "llama-3.2-11b-vision"
-            ]
-        );
-    }
-
-    #[test]
-    fn compat_skips_entries_without_a_usable_id() {
-        let body = r#"{"data":[{"id":""},{"id":"  "},{"name":"x"},{"id":7},{"id":"ok"}]}"#;
-        assert_eq!(parse_compat(body).unwrap(), ["ok"]);
-    }
-
-    #[test]
-    fn compat_with_no_models_or_a_wrong_shape_is_an_error() {
-        assert!(parse_compat(r#"{"data":[]}"#).is_err());
-        assert!(parse_compat(r#"{"models":[]}"#).is_err());
-        assert!(parse_compat("<html>").is_err());
     }
 
     #[test]
