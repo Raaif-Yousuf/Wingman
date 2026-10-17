@@ -22,6 +22,7 @@ pub mod generic_answer;
 pub mod generic_inputs;
 pub mod generic_replace;
 pub mod jargon;
+pub mod knowledge_answer;
 pub mod link_summary;
 pub mod page_summary;
 pub mod read_qr;
@@ -50,8 +51,9 @@ pub const DEFAULT_ACTION_ID: &str = "check-my-work";
 /// What an action gathers before the model is asked. A generic action's
 /// worker gathers `Screen`, `Selection`, `Clipboard`, `Uia`, `PageText` and
 /// `LinkedPage` (`actions::generic_inputs`, `actions::link_summary`); `Window` and `Region` are treated as
-/// `Screen`, and `Text` and `Context` are accepted but gathered by nothing
-/// yet (expansion plan §7 "Inputs"). A closed enum, not a
+/// `Screen`. `Text` (the line typed in the palette, #92) and `Knowledge`
+/// (excerpts of the user's documents, #92) are gathered too; `Context` is
+/// accepted but gathered by nothing yet (expansion plan §7 "Inputs"). A closed enum, not a
 /// bare `String`, so an action naming an input Wingman doesn't gather yet
 /// (a typo, or a forward reference to a later phase) is a parse error
 /// instead of a silently-ignored string.
@@ -72,6 +74,9 @@ pub enum InputKind {
     /// clipboard or on screen. Fetched only after the user confirms the
     /// link (#127).
     LinkedPage,
+    /// Excerpts of the files in the user's knowledge folder that match the
+    /// typed `text` (#92). Read only when an action lists this input.
+    Knowledge,
     Context,
 }
 
@@ -438,6 +443,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `jargon_terms`, executor `none`. Lists the technical terms and acronyms in
 ///   the selection (else on screen) with a short plain meaning each, on the
 ///   card.
+/// - `"ask-my-documents"` (#92, `knowledge_answer::builtin_action`): proposal
+///   `knowledge_answer`, executor `none`. Answers the line typed in the palette
+///   from the user's knowledge folder, with quotes Wingman checked and a
+///   citation Wingman built.
 pub fn builtin_actions() -> Vec<Action> {
     let mut actions = vec![
         Action {
@@ -501,6 +510,7 @@ pub fn builtin_actions() -> Vec<Action> {
         relative_dates::builtin_action(),
         jargon::builtin_action(),
         contact::builtin_action(),
+        knowledge_answer::builtin_action(),
     ];
     actions.extend(code_actions::builtin_actions());
     actions.extend(rewrite_tone::builtin_actions());

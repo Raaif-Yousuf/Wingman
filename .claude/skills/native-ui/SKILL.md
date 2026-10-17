@@ -108,3 +108,4 @@ every finding so it can be checked again after the fix.
   owner/custom draw and DWM attributes.
 - A theme change arrives as `WM_SETTINGCHANGE` with `ImmersiveColorSet`; a
   surface that only reads the theme at creation looks wrong until restart.
+- The Settings gallery is real at 100% only (#1016, #1052): that scale is a DPI-unaware window, so its checkbox boxes and scrollbar are the real 96 DPI ones. At 150%, 200% and 250% the layout follows `--dpi` but native checkbox glyphs and the scrollbar keep the screen's own DPI, so a checkbox box looks too big there. Judge checkbox and scrollbar detail at 100% or on a screen at that scale.
