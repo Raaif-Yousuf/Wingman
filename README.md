@@ -144,11 +144,28 @@ Try Wingman in under two minutes, no Rust and no build step:
 That is the whole path: the hotkey is a system-wide keyboard hook that works
 the moment `wingman.exe` is running, with nothing to register first. What
 this download does not do is add Wingman to Start, to the Copilot key picker
-in **Settings**, or to start-with-Windows. For that OS-level integration, see
+in **Settings**, or to start-with-Windows: the zip alone has no Start entry,
+no picker entry and no autostart. For that OS-level integration, see
 **Install** below, which builds from source: `install.ps1` needs the
 `packaging\` folder, which this zip does not include.
 
 ## Install
+
+Install is the full-integration path and it builds from source, so it needs a
+few things first (the zip above is the quick path and needs none of them):
+
+- A clone of this repository (`git clone https://github.com/Raaif-Yousuf/Wingman`);
+  `install.ps1` is in it, not in the zip.
+- Rust, from [rustup](https://rustup.rs). `rust-toolchain.toml` pins the
+  version and the Windows MSVC target, so the first build downloads that
+  toolchain.
+- The MSVC build tools, which Rust needs to link ("Desktop development with
+  C++" in the Visual Studio Installer).
+- The Windows SDK, for `makeappx.exe` and `signtool.exe`, which package and
+  sign the app. The "Desktop development with C++" workload includes it. The
+  script stops with "Windows SDK not found" if it is missing.
+
+Then, from the cloned folder:
 
 ```powershell
 .\install.ps1
@@ -190,6 +207,10 @@ at the top. Everything else lives there too: model, thinking time,
 screenshot detail, card corner, monitor and timeout, and the prompt. A saved key moves into Windows
 Credential Manager, not the file; Settings shows only its last four
 characters afterward.
+
+No key but Ollama running on this PC? The first press finds a model that can
+read images, saves it as your setup and says so on the card. It does not ask
+yet: press again to ask it.
 
 Settings has key and model fields for OpenAI, Anthropic and Gemini (with a
 key saved, opening Settings asks the provider for its current model list, so

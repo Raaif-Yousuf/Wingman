@@ -96,11 +96,15 @@ Respond with exactly two fields, and write them in this order:
 Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline. Never use an em dash; write a full stop, a colon, or the word "and" or "but" instead."""
 
 [palette]
+# Not used yet: nothing reads this until the key picks an option
+# (#308). Changing it has no effect today.
 router_threshold = 0.7
 
 [options]
 max_options = 4
 min_confidence = 0.2
+auto_dismiss_secs = 20
+claim_keys = true
 
 [forms]
 require_tick_for = "sensitive"

@@ -157,7 +157,10 @@ pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 /// [`WM_APP_CARD_COPY_DETAILS`], the facts come from `App`, not the card.
 /// `App::report_problem` opens the browser at a prefilled new-issue page.
 /// Registered in `app.rs`'s `ALL_WM_APP_IDS` (issue #163).
-pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 23;
+pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 24;
+
+mod options;
+pub use options::{OptionRow, OptionsBehavior};
 
 use crate::provider::Difficulty;
 pub use crate::ui::pending_status::PendingStage;
@@ -180,6 +183,10 @@ pub enum CardState {
     /// undo -- Esc or a click elsewhere dismiss it instead. See
     /// [`Card::show_preview`].
     Preview,
+    /// The options card (#307): a summary and 2 to 4 one-click choices for
+    /// what is on screen. Never takes focus; nothing has run until a row is
+    /// picked. See [`Card::show_options`].
+    Options,
 }
 
 /// A single owned notification-card window.
@@ -244,6 +251,7 @@ impl Card {
             scroll_page: 0,
             ex_noactivate_removed: false,
             preview: None,
+            options: None,
             last_confirmed: None,
             owner: None,
             open_settings_on_click: false,
@@ -628,6 +636,9 @@ impl Drop for Card {
         // delivered (and handled by our WNDPROC via the still-valid raw
         // pointer) before DestroyWindow returns, so this is safe to do while
         // `self.inner` is still alive.
+        // #307: a card dropped while the options show must not leave the
+        // keyboard hook claiming keys for a card that no longer exists.
+        self.inner.leave_options_if_active();
         unsafe {
             if !self.inner.hwnd.0.is_null() {
                 let _ = DestroyWindow(self.inner.hwnd);
@@ -1456,6 +1467,10 @@ struct CardInner {
     /// see `leave_preview_if_active`, the single choke point every path out
     /// of Preview goes through.
     preview: Option<PreviewUi>,
+    /// Live state for `CardState::Options` (#307), `None` in every other
+    /// state. `Some` for exactly as long as the row buttons exist, see
+    /// `leave_options_if_active`.
+    options: Option<options::OptionsUi>,
     /// The `Confirmed<Value>` from the most recent "Do it" / Enter, read
     /// (and cleared) by `Card::take_confirmed`. Deliberately NOT stored
     /// inside `PreviewUi`: `preview_do_it` closes the preview (via
@@ -1607,6 +1622,7 @@ impl CardInner {
     /// directly at `AskingModel`.
     fn show_pending(&mut self, stage: PendingStage) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         self.reset_activation_and_timers();
         // `headline`/`detail` stay unused by Pending (issue #354's status
         // line is driven by `pending_stage`/`pending_status_text`, painted
@@ -1734,6 +1750,7 @@ impl CardInner {
         open_settings: bool,
     ) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         self.reset_activation_and_timers();
         self.headline = headline.to_string();
         self.detail = detail.to_string();
@@ -1790,6 +1807,7 @@ impl CardInner {
 
     fn hide(&mut self) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         self.stop_reading();
         self.kill_timers();
         self.copy_feedback = CopyFeedback::None;
@@ -2548,6 +2566,7 @@ impl CardInner {
                 self.layout_preview();
                 self.reposition_preview_controls();
             }
+            CardState::Options => self.relayout_options(),
         }
         self.invalidate();
     }
@@ -2795,6 +2814,7 @@ impl CardInner {
                 CardState::Collapsed => self.paint_collapsed(hdc, rc, padding, &palette),
                 CardState::Expanded => self.paint_expanded(hdc, rc, padding, gap, &palette),
                 CardState::Preview => self.paint_preview(hdc, &palette),
+                CardState::Options => self.paint_options(hdc, &palette),
             }
         }
     }
@@ -3239,7 +3259,11 @@ impl CardInner {
                 Some(LRESULT(self.edit_bg_brush.0 as isize))
             }
             WM_DRAWITEM => {
-                self.draw_preview_button(lparam);
+                if self.state == CardState::Options {
+                    self.draw_option_button(lparam);
+                } else {
+                    self.draw_preview_button(lparam);
+                }
                 Some(LRESULT(1))
             }
             WM_PAINT => {
@@ -3420,9 +3444,11 @@ impl CardInner {
                 Some(LRESULT(0))
             }
             WM_COMMAND => {
+                let id = (wparam.0 & 0xFFFF) as i32;
                 if self.state == CardState::Preview {
-                    let id = (wparam.0 & 0xFFFF) as i32;
                     self.run_preview_command(id);
+                } else if self.state == CardState::Options {
+                    self.options_command(id);
                 }
                 Some(LRESULT(0))
             }
@@ -3515,6 +3541,7 @@ impl CardInner {
         note: Option<&str>,
     ) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         // Issue #77: the preview replaces whatever was showing, including an
         // answer being read aloud.
         self.stop_reading();
