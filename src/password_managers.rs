@@ -754,9 +754,7 @@ mod tests {
         let ask = body
             .find("self.password_manager_now()")
             .expect("toggle_palette never asks whether a password manager is in front");
-        let show = body
-            .find("self.palette.show(")
-            .expect("no palette.show call");
+        let show = body.find("palette.show(").expect("no palette.show call");
         assert!(ask < show, "the palette steals the foreground when shown");
         // #805: opening the palette starts no router request, so the answer
         // is kept for the action the user picks.

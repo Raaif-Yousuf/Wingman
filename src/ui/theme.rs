@@ -478,6 +478,9 @@ pub(crate) const PADDING_DP: i32 = SPACE_LG_DP;
 pub(crate) const GAP_DP: i32 = SPACE_SM_DP;
 /// Corner radius of owner-drawn controls, in dp.
 pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
+/// Thickness of the accent line under a focused text box, in dp (the
+/// Windows 11 text box underline).
+pub(crate) const FOCUS_LINE_DP: i32 = 2;
 /// The icon font on Windows 11, and the one it replaced, which Windows 10
 /// still has. Use [`icon_font_face`] to pick one.
 pub(crate) const FLUENT_ICON_FONT_FACE: &str = "Segoe Fluent Icons";

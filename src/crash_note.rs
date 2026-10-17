@@ -140,6 +140,14 @@ fn field<'a>(note: &'a str, key: &str) -> Option<&'a str> {
 pub fn card_text(note: &str) -> (String, String) {
     let location = field(note, "location").unwrap_or("unknown");
     let message = field(note, "message").unwrap_or("");
+    if location == STARTUP_LOCATION {
+        let mut detail = "Wingman could not finish starting and closed.".to_string();
+        if !message.is_empty() {
+            detail.push_str(&format!("\n\nReason: {message}"));
+        }
+        detail.push_str("\n\nThis message shows once. Start Wingman again from the Start menu.");
+        return ("Wingman could not start last time".to_string(), detail);
+    }
     let mut detail = format!("Wingman stopped because of an internal error in {location}.");
     if !message.is_empty() {
         detail.push_str(&format!("\n\nError: {message}"));
@@ -149,6 +157,40 @@ pub fn card_text(note: &str) -> (String, String) {
          This message shows once.",
     );
     ("Wingman closed unexpectedly last time".to_string(), detail)
+}
+
+/// The `location` of a note written by [`record_startup_failure`].
+const STARTUP_LOCATION: &str = "startup";
+
+/// #1019: the note for a start that failed before a card could be shown. Pure;
+/// the error text goes through [`sanitize`] like a panic message.
+pub fn startup_failure_note(error: &str, profile: &str, unix_secs: u64) -> String {
+    format_note(
+        &PanicFacts {
+            thread: "main",
+            location: STARTUP_LOCATION,
+            message: error,
+            version: env!("CARGO_PKG_VERSION"),
+            unix_secs,
+        },
+        profile,
+    )
+}
+
+/// #1019: writes [`startup_failure_note`] for the next start to show as a
+/// card. Best effort: a release build has no console, so the note is the only
+/// trace of why the process vanished.
+pub fn record_startup_failure(error: &str) {
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let profile = crate::known_folder::user_profile()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if let Ok(path) = note_path() {
+        let _ = write_note(&path, &startup_failure_note(error, &profile, unix_secs));
+    }
 }
 
 /// Writes `note` to `path`, creating the folder. Best effort for the hook.
@@ -307,6 +349,27 @@ mod tests {
         assert!(detail.contains("Error: boom"));
         assert!(detail.contains("Copy diagnostics"));
         assert!(!detail.contains('\u{2014}'));
+    }
+
+    // #1019: a start that fails before any window can show a card leaves a
+    // note, so the next start can say why.
+    #[test]
+    fn a_startup_failure_note_reads_as_a_startup_card() {
+        let note = startup_failure_note("creating the notification card: no window", "", 7);
+        let (headline, detail) = card_text(&note);
+        assert_eq!(headline, "Wingman could not start last time");
+        assert!(
+            detail.contains("creating the notification card: no window"),
+            "{detail}"
+        );
+        assert!(!detail.contains("internal error"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_startup_failure_note_hides_the_account_name() {
+        let note = startup_failure_note("cannot open C:\\Users\\jane\\x", "C:\\Users\\jane", 7);
+        assert!(!note.contains("jane"), "{note}");
     }
 
     #[test]
