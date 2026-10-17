@@ -79,6 +79,7 @@ impl Executor for CalendarAddExecutor {
             })?;
 
         let path = result.path.clone();
+        let opened = result.opened;
         let opened_note = if result.opened {
             String::new()
         } else {
@@ -104,7 +105,8 @@ impl Executor for CalendarAddExecutor {
             std::fs::remove_file(&path)
                 .with_context(|| format!("could not remove {}", path.display()))?;
             Ok(())
-        }))
+        })
+        .with_outcome(super::Outcome::Opened(opened)))
     }
 }
 
@@ -309,6 +311,33 @@ mod tests {
     }
 
     // -- execute: wires through to the connector and back ------------------
+
+    struct FailingOpener;
+
+    impl Opener for FailingOpener {
+        fn open(&self, _path: &Path) -> Result<()> {
+            Err(anyhow!("no handler"))
+        }
+    }
+
+    /// #1215: the opened flag is typed, so an event titled with the phrase
+    /// the summary uses for "not opened" cannot flip it.
+    #[test]
+    fn the_outcome_says_whether_it_opened_whatever_the_title_says() {
+        let (executor, dir) = executor_with_recording_opener("outcome-opened");
+        let mut proposal = sample_proposal();
+        proposal["title"] = Value::from("could not be opened automatically");
+        let undo = executor.execute(confirmed(proposal)).unwrap();
+        assert_eq!(undo.outcome, super::super::Outcome::Opened(true));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = test_temp_dir("outcome-failed");
+        let connector = IcsConnector::with_temp_dir_and_opener(dir.clone(), FailingOpener);
+        let executor = CalendarAddExecutor::with_connector(Box::new(connector));
+        let undo = executor.execute(confirmed(sample_proposal())).unwrap();
+        assert_eq!(undo.outcome, super::super::Outcome::Opened(false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// #1214: hidden characters are gone from the card summary and the file,
     /// and a runaway title is refused with a named error.
