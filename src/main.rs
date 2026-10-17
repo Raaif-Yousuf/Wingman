@@ -77,6 +77,9 @@ fn main() {
     }
 
     if let Err(e) = app::run() {
+        // #1019: no console in a release build, so leave a note the next
+        // start shows as a card.
+        crash_note::record_startup_failure(&format!("{e:#}"));
         eprintln!("Wingman: {e:#}");
         std::process::exit(1);
     }
