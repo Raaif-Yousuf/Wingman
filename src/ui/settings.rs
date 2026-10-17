@@ -14876,8 +14876,14 @@ mod tests {
             while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
             // The close button: `WM_CLOSE`, not a bare destroy.
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
-                .expect("closing tells the owner");
+            // A real activation change of this hidden window, while other tests
+            // make windows, can post an earlier "left" (count 0) of its own:
+            // the close's is the last one posted.
+            let mut last = None;
+            while let Some(m) = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT) {
+                last = Some(m);
+            }
+            let left = last.expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "a key that does not fit is counted");
         });
         with_open_window(|hwnd, owner| {
