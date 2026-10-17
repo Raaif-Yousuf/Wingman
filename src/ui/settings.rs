@@ -928,8 +928,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // per change, not per paint; repaint the boxes with the new ones.
         windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
         | windows::Win32::UI::WindowsAndMessaging::WM_SYSCOLORCHANGE
-        | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED => {
+        | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED
+        | WM_DWMCOLORIZATIONCOLORCHANGED_MSG => {
             invalidate_edit_style();
+            invalidate_rail_style();
             let _ = RedrawWindow(
                 Some(hwnd),
                 None,
@@ -942,6 +944,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             invalidate_edit_style();
+            invalidate_rail_style();
             inner.alive.store(false, Ordering::SeqCst);
             if inner.owns_itself {
                 OPEN_HWND.store(0, Ordering::SeqCst);
@@ -1948,6 +1951,7 @@ fn child_rect_px(
 /// and re-lays-out every child at the new scale.
 unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPARAM) {
     inner.dpi = dpi_from_wparam(wparam.0);
+    invalidate_rail_style();
     if lparam.0 != 0 {
         let rect = &*(lparam.0 as *const windows::Win32::Foundation::RECT);
         let mut pos = suggested_pos(rect);
@@ -2393,6 +2397,9 @@ fn edit_focus_line_rect(w: i32, h: i32, dpi: u32) -> (i32, i32, i32, i32) {
 }
 
 const EDIT_SUBCLASS_ID: usize = 0x934;
+
+/// `WM_DWMCOLORIZATIONCOLORCHANGED`: the accent changed (#1055).
+const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
 
 /// Everything a text box paint needs, built once per theme change: the
 /// colours and the two brushes `WM_CTLCOLOREDIT` / `WM_CTLCOLORSTATIC` hand
@@ -5831,6 +5838,76 @@ fn fluent_icons_installed() -> bool {
     *FLUENT.get_or_init(|| font_face_exists(crate::ui::theme::FLUENT_ICON_FONT_FACE))
 }
 
+/// #1055: everything a rail item paint needs that costs a registry read or a
+/// GDI font: both colour sets and the icon font. Built once per theme, accent
+/// or dpi change; owned here and freed by [`invalidate_rail_style`].
+#[derive(Clone, Copy)]
+struct RailStyle {
+    dpi: u32,
+    high_contrast: bool,
+    normal: RailColors,
+    selected: RailColors,
+    /// The focus ring's ink.
+    focus_ink: u32,
+    icons: HFONT,
+}
+
+thread_local! {
+    static RAIL_STYLE: std::cell::Cell<Option<RailStyle>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the rail style was rebuilt (a registry read and a font
+    /// each) on this thread: painting must not move it.
+    static RAIL_STYLE_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The cached rail style for `dpi`, built on first use after a change.
+unsafe fn rail_style(dpi: u32) -> RailStyle {
+    use crate::ui::theme::{
+        accent_fill, read_accent_shades, SysColors, Theme, Tokens, ICON_FONT_DP,
+    };
+    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_BTNFACE};
+    if let Some(style) = RAIL_STYLE.get() {
+        if style.dpi == dpi {
+            return style;
+        }
+        invalidate_rail_style();
+    }
+    #[cfg(test)]
+    RAIL_STYLE_BUILDS.set(RAIL_STYLE_BUILDS.get() + 1);
+    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+    let sys = SysColors::read();
+    let theme = Theme::resolve(true, high_contrast);
+    let tokens = Tokens::for_theme(theme, &sys);
+    let face = GetSysColor(COLOR_BTNFACE);
+    let accent = if high_contrast {
+        face
+    } else {
+        accent_fill(theme, read_accent_shades(), face)
+    };
+    let style = RailStyle {
+        dpi,
+        high_contrast,
+        normal: rail_colors(false, high_contrast, face, &tokens, &sys, face),
+        selected: rail_colors(true, high_contrast, face, &tokens, &sys, accent),
+        focus_ink: tokens.text,
+        icons: icon_font(ICON_FONT_DP, dpi),
+    };
+    RAIL_STYLE.set(Some(style));
+    style
+}
+
+/// Drops the cached rail style and frees its font; the next paint rebuilds
+/// it. Called on a theme, accent, system colour or dpi change, and when
+/// Settings closes.
+unsafe fn invalidate_rail_style() {
+    if let Some(style) = RAIL_STYLE.take() {
+        let _ = DeleteObject(HGDIOBJ(style.icons.0));
+    }
+}
+
 /// An icon font `dp` tall at `dpi`. The caller deletes it.
 unsafe fn icon_font(dp: i32, dpi: u32) -> HFONT {
     let mut lf = LOGFONTW {
@@ -5858,15 +5935,14 @@ unsafe fn measure_rail_item(lparam: LPARAM, dpi: u32) {
 /// `WM_DRAWITEM` for the rail: one item.
 unsafe fn draw_rail_item(lparam: LPARAM) {
     use crate::ui::theme::{
-        accent_fill, read_accent_shades, SysColors, Theme, Tokens, CONTROL_RADIUS_DP,
-        FOCUS_LINE_DP, ICON_FONT_DP, RAIL_ICON_X_DP, RAIL_INSET_DP, RAIL_PILL_H_DP, RAIL_PILL_W_DP,
-        RAIL_TEXT_X_DP,
+        CONTROL_RADIUS_DP, FOCUS_LINE_DP, RAIL_ICON_X_DP, RAIL_INSET_DP, RAIL_PILL_H_DP,
+        RAIL_PILL_W_DP, RAIL_TEXT_X_DP,
     };
     use windows::Win32::Foundation::{COLORREF, RECT};
     use windows::Win32::Graphics::Gdi::{
-        CreateSolidBrush, FillRect, FrameRect, GetStockObject, GetSysColor, RoundRect,
-        SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, DT_END_ELLIPSIS, DT_LEFT,
-        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, NULL_PEN, TRANSPARENT,
+        CreateSolidBrush, FillRect, FrameRect, GetStockObject, RoundRect, SelectObject, SetBkMode,
+        SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, NULL_PEN,
+        TRANSPARENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
 
@@ -5883,17 +5959,15 @@ unsafe fn draw_rail_item(lparam: LPARAM) {
     let dpi = dpi_for(di.hwndItem);
     let selected = di.itemState.0 & ODS_SELECTED != 0;
 
-    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-    let sys = SysColors::read();
-    let theme = Theme::resolve(true, high_contrast);
-    let tokens = Tokens::for_theme(theme, &sys);
-    let face = GetSysColor(COLOR_BTNFACE);
-    let accent = if selected && !high_contrast {
-        accent_fill(theme, read_accent_shades(), face)
+    // #1055: the colours and the icon font are cached, so a paint reads
+    // neither the registry nor builds a font.
+    let style = rail_style(dpi);
+    let high_contrast = style.high_contrast;
+    let colors = if selected {
+        style.selected
     } else {
-        face
+        style.normal
     };
-    let colors = rail_colors(selected, high_contrast, face, &tokens, &sys, accent);
 
     let brush = CreateSolidBrush(COLORREF(colors.face));
     FillRect(hdc, &rc, brush);
@@ -5948,8 +6022,7 @@ unsafe fn draw_rail_item(lparam: LPARAM) {
     SetTextColor(hdc, COLORREF(colors.text));
     let flags = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS;
     // The icon.
-    let icons = icon_font(ICON_FONT_DP, dpi);
-    let old_font = SelectObject(hdc, HGDIOBJ(icons.0));
+    let old_font = SelectObject(hdc, HGDIOBJ(style.icons.0));
     let mut icon_rc = rc;
     icon_rc.left += to_px(RAIL_ICON_X_DP, dpi);
     icon_rc.right = rc.left + to_px(RAIL_TEXT_X_DP, dpi);
@@ -5965,12 +6038,11 @@ unsafe fn draw_rail_item(lparam: LPARAM) {
     text_rc.right -= inset;
     crate::ui::text::draw_text_line(hdc, page.label(), text_rc, flags);
     SelectObject(hdc, old_font);
-    let _ = DeleteObject(HGDIOBJ(icons.0));
 
     // A focus ring only when Windows says to draw one (keyboard use).
     if di.itemState.0 & ODS_FOCUS != 0 && di.itemState.0 & ODS_NOFOCUSRECT == 0 {
         let ring = to_px(FOCUS_LINE_DP, dpi).max(1);
-        let b = CreateSolidBrush(COLORREF(tokens.text));
+        let b = CreateSolidBrush(COLORREF(style.focus_ink));
         let mut r = fill_rc;
         for _ in 0..ring {
             FrameRect(hdc, &r, b);
@@ -8786,6 +8858,76 @@ mod tests {
             assert_eq!(EDIT_STYLE_BUILDS.get(), builds + 1);
             unsafe { invalidate_edit_style() };
             assert!(EDIT_STYLE.get().is_none(), "the brushes are released");
+        });
+    }
+
+    /// #1055: painting a rail item uses the cached style: it does not rebuild
+    /// it (a registry read and a font each). A theme, accent or dpi change
+    /// drops the cache and the next paint builds it once. Closing frees the
+    /// icon font.
+    #[test]
+    fn painting_a_rail_item_does_not_read_the_registry_or_build_a_font() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODT_LISTBOX};
+        use windows::Win32::UI::WindowsAndMessaging::{WM_SETTINGCHANGE, WM_THEMECHANGED};
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let rail = inner.rail;
+            let paint = |selected: bool| unsafe {
+                let hdc = GetDC(Some(rail));
+                let di = DRAWITEMSTRUCT {
+                    CtlType: ODT_LISTBOX,
+                    CtlID: ID_RAIL as u32,
+                    itemID: 1,
+                    itemState: windows::Win32::UI::Controls::ODS_FLAGS(if selected {
+                        ODS_SELECTED
+                    } else {
+                        0
+                    }),
+                    hwndItem: rail,
+                    hDC: hdc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 200,
+                        bottom: 40,
+                    },
+                    itemData: 0,
+                    itemAction: Default::default(),
+                };
+                SendMessageW(
+                    hwnd,
+                    WM_DRAWITEM,
+                    Some(WPARAM(ID_RAIL as usize)),
+                    Some(LPARAM(&di as *const _ as isize)),
+                );
+                ReleaseDC(Some(rail), hdc);
+            };
+            paint(true);
+            let builds = RAIL_STYLE_BUILDS.get();
+            for _ in 0..6 {
+                paint(true);
+                paint(false);
+            }
+            assert_eq!(
+                RAIL_STYLE_BUILDS.get(),
+                builds,
+                "painting rebuilt the style"
+            );
+            unsafe { SendMessageW(hwnd, WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0))) };
+            paint(true);
+            assert_eq!(
+                RAIL_STYLE_BUILDS.get(),
+                builds + 1,
+                "a change rebuilds once"
+            );
+            unsafe { SendMessageW(hwnd, WM_SETTINGCHANGE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            paint(false);
+            paint(true);
+            assert_eq!(RAIL_STYLE_BUILDS.get(), builds + 2);
+            unsafe { invalidate_rail_style() };
+            assert!(RAIL_STYLE.get().is_none(), "the icon font is released");
         });
     }
 
