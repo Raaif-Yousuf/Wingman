@@ -5507,15 +5507,16 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         let mut config = Config::default();
         let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
         a.api_key.clear();
-        let mut b = compat_entry("Lab", "http://127.0.0.1:2/v1");
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
         b.api_key.clear();
         config.providers.compat = vec![a, b];
         let store = InMemoryStore::default();
         store.set(&target_name("compat:lab"), "stored").unwrap();
         config.hydrate_secrets(&store);
+        // One line for the one name, not one per entry.
         assert_eq!(
             config.keys_left_in_file.len(),
-            2,
+            1,
             "{:?}",
             config.keys_left_in_file
         );
