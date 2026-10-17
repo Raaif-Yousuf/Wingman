@@ -786,6 +786,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+    if msg == WM_PAUSE_MENU {
+        run_pause_menu(hwnd);
+        return LRESULT(0);
+    }
     let inner = &mut *ptr;
 
     match msg {
@@ -1076,7 +1080,17 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 }
             }
         }
-        ID_PAUSE_BUTTON if notify == BN_CLICKED => on_pause_button(inner),
+        ID_PAUSE_BUTTON if notify == BN_CLICKED => {
+            // A pending Change leaves the keyboard hook capturing, which would
+            // eat the menu's arrow keys and Esc as a new shortcut.
+            if inner.learning.is_some() {
+                stop_learning(inner);
+                set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            }
+            unsafe {
+                let _ = PostMessageW(Some(inner.hwnd), WM_PAUSE_MENU, WPARAM(0), LPARAM(0));
+            }
+        }
         ID_RESUME_BUTTON if notify == BN_CLICKED => {
             send_command(inner, crate::app::SettingsCommand::Resume)
         }
@@ -4319,25 +4333,44 @@ fn apply_live(hwnd: HWND, mode: crate::mode::Mode, paused: Option<&str>) {
 /// Asks the app to do `command` (#873). The app runs the handler the tray menu
 /// item runs. A window with no owner (the tests') asks nobody.
 fn send_command(inner: &SettingsInner, command: crate::app::SettingsCommand) {
-    if inner.owner.0.is_null() {
+    send_command_to(inner.hwnd, inner.owner, command);
+}
+
+/// [`send_command`] with the two handles copied out, for code that holds no
+/// borrow of the window's state.
+fn send_command_to(hwnd: HWND, owner: HWND, command: crate::app::SettingsCommand) {
+    if owner.0.is_null() {
         return;
     }
-    if !crate::app::post_settings_command(inner.owner.0 as isize, command) {
+    if !crate::app::post_settings_command(owner.0 as isize, command) {
         // Rule 7: say so inline, never a silent no-op.
-        if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+        if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
             set_text(msg, "Wingman's main window is not running.");
         }
     }
 }
 
-/// The Pause button: a small menu under it with the three choices; the pick is
-/// sent to the app. Dismissing the menu does nothing.
-fn on_pause_button(inner: &SettingsInner) {
+/// Posted by the Pause button to the window itself. The menu's own message
+/// loop must not run inside `handle_command`, which holds `&mut SettingsInner`:
+/// a Quit during the menu can free that state, and other messages handled in the
+/// loop take their own borrow. The window procedure runs it before it borrows.
+const WM_PAUSE_MENU: u32 = 0x8000 + 0x873;
+
+/// The Pause button's menu: a small menu under it with the three choices; the pick
+/// is sent to the app. Dismissing the menu does nothing. Holds no borrow of the
+/// window's state: the owner is copied first, and nothing of the state is read
+/// after the menu, which may have outlived the window.
+unsafe fn run_pause_menu(hwnd: HWND) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_LEFTALIGN,
-        TPM_RETURNCMD, TPM_TOPALIGN,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
     };
-    let Some(button) = get_dlg_item(inner.hwnd, ID_PAUSE_BUTTON) else {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if state.is_null() {
+        return;
+    }
+    let owner = (*state).owner;
+    let Some(button) = get_dlg_item(hwnd, ID_PAUSE_BUTTON) else {
         return;
     };
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
@@ -4358,19 +4391,23 @@ fn on_pause_button(inner: &SettingsInner) {
             at.left,
             at.bottom,
             None,
-            inner.hwnd,
+            hwnd,
             None,
         )
     };
     unsafe {
         let _ = DestroyMenu(menu);
     }
+    // A Quit while the menu was up closed the window: say nothing to it.
+    if !IsWindow(Some(hwnd)).as_bool() {
+        return;
+    }
     let choice = usize::try_from(picked.0)
         .ok()
         .and_then(|n| n.checked_sub(1))
         .and_then(|i| PAUSE_MENU.get(i));
     if let Some((choice, _)) = choice {
-        send_command(inner, crate::app::SettingsCommand::Pause(*choice));
+        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
     }
 }
 
@@ -12763,8 +12800,68 @@ mod tests {
         });
     }
 
-    /// The pause shortcut is a row on General: a label, a Change button, and a
-    /// Change that arms the pause slot (`HK_PAUSE`) like the other two.
+    /// #873: the Pause button asks for its menu by message, so the menu's own
+    /// loop never runs inside the handler that holds the window's state, and a
+    /// pending Change is cancelled first (the hook would eat the menu's keys).
+    #[test]
+    fn the_pause_button_defers_its_menu_and_cancels_a_pending_change() {
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            inner.learning = Some(HK_PRIMARY);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_PAUSE_BUTTON as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            let inner =
+                unsafe { &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner) };
+            assert_eq!(inner.learning, None, "the pending Change was not cancelled");
+            assert!(
+                take_posted(hwnd, WM_PAUSE_MENU).is_some(),
+                "the menu was not asked for by message"
+            );
+        });
+    }
+
+    /// The Change beside the pause shortcut arms the pause slot (`HK_PAUSE`):
+    /// the arm is in the handler, and pressing it speaks on the status line
+    /// (no keyboard hook runs in the test, so it says why it cannot arm).
+    #[test]
+    fn the_pause_change_button_arms_the_pause_slot() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        assert!(
+            src.contains(
+                "ID_CHANGE_PAUSE if notify == BN_CLICKED => start_change(inner, HK_PAUSE),"
+            ),
+            "the Change button is not wired to HK_PAUSE"
+        );
+        with_open_window(|hwnd, _owner| {
+            let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
+            let before = get_text(status);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_CHANGE_PAUSE as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_ne!(get_text(status), before, "pressing Change said nothing");
+            stop_learning(unsafe {
+                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner)
+            });
+        });
+    }
+
+    /// The pause shortcut is a row on General: a label and a Change button.
     #[test]
     fn the_pause_shortcut_label_shows_the_staged_chord_or_not_set() {
         let mut hk = Config::default().hotkeys;

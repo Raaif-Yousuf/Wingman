@@ -4884,11 +4884,9 @@ impl App {
         let before = self.config.clone();
         apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
-            if which == HK_PAUSE {
-                hook.set_pause_chord(self.config.hotkeys.pause);
-            } else {
-                hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
-            }
+            // Only the two tray-armed slots reach here; the pause key is changed
+            // in Settings (#873).
+            hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
         }
         self.refresh_tray_labels();
 
@@ -5373,6 +5371,12 @@ impl App {
     /// `config.toml` stay, and no file work runs on this thread. The outcome
     /// comes back as `WM_APP_CONFIG_WRITTEN` (`on_config_written`).
     fn set_mode(&mut self, mode: Mode) {
+        self.set_mode_with(mode, false);
+    }
+
+    /// [`App::set_mode`]. `quiet`: the change came from the Settings window, so no
+    /// "saved" card goes over it (a failed write still gets its card).
+    fn set_mode_with(&mut self, mode: Mode, quiet: bool) {
         if self.config.mode == mode {
             return;
         }
@@ -5391,7 +5395,12 @@ impl App {
         self.tray.set_mode(mode);
         self.update_tooltip();
         self.sync_settings_window();
-        self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
+        let outcome = if quiet {
+            crate::config_writer::Outcome::quiet(mode.label())
+        } else {
+            crate::config_writer::Outcome::simple(mode.label())
+        };
+        self.persist_changes(outcome, vec![crate::config_writer::FieldChange::mode(mode)]);
         self.set_watch(true);
     }
 
@@ -5399,7 +5408,7 @@ impl App {
     /// runs the handler the tray menu item runs, so there is one path.
     fn on_settings_command(&mut self, command: SettingsCommand) {
         match command {
-            SettingsCommand::Mode(mode) => self.set_mode(mode),
+            SettingsCommand::Mode(mode) => self.set_mode_with(mode, true),
             SettingsCommand::Pause(choice) => self.pause_for(choice),
             SettingsCommand::Resume => self.resume(),
         }
@@ -5584,6 +5593,8 @@ impl App {
                     } else if shown == SavedCard::Keep {
                         // An answer that waited for Settings is on screen now;
                         // "Settings saved" must not replace it (#213).
+                    } else if outcome.quiet_ok {
+                        // Settings shows the change itself (#873).
                     } else if outcome.ok_setup {
                         self.show_setup_card(&outcome.ok_headline, &outcome.ok_detail);
                     } else {
@@ -9781,11 +9792,11 @@ mod tests {
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_COMMAND => {"), "no arm");
         let run = body_between(&src, "    fn on_settings_command(", "\n    }\n");
-        for call in ["self.set_mode(", "self.pause_for(", "self.resume()"] {
+        for call in ["self.set_mode_with(", "self.pause_for(", "self.resume()"] {
             assert!(run.contains(call), "{call} is not the tray's path:\n{run}");
         }
         for head in [
-            "    fn set_mode(&mut self, mode: Mode) {",
+            "    fn set_mode_with(&mut self, mode: Mode, quiet: bool) {",
             "    fn pause_for(&mut self, choice: PauseChoice) {",
             "    fn resume(&mut self) {",
             "    fn apply_config(&mut self) {",

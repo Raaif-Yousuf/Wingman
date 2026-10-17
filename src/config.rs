@@ -211,7 +211,7 @@ pub struct Hotkeys {
     /// alt = false
     /// win = false
     /// ```
-    /// The tray's "Set pause key" item (issue #202) learns and saves it, so
+    /// Settings, General (Change beside Pause shortcut) learns and saves it, so
     /// hand-editing is optional. `hotkey::HotkeyHook::set_pause_chord`
     /// is how the hook learns about it; see that method's doc comment for
     /// the lock-free packed-chord path.

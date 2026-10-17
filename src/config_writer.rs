@@ -648,6 +648,10 @@ pub struct Outcome {
     /// an answer already on screen, and a press of the Wingman key is refused until
     /// its answer has been applied.
     pub from_settings: bool,
+    /// Say nothing when the write works: something else on screen (the Settings
+    /// window's own controls) already shows the change. A failure still ends in a
+    /// card.
+    pub quiet_ok: bool,
 }
 
 impl Outcome {
@@ -662,6 +666,16 @@ impl Outcome {
             fail_headline: format!("Using {label}: not saved"),
             fail_note: "It will revert when you quit.".to_string(),
             from_settings: false,
+            quiet_ok: false,
+        }
+    }
+
+    /// [`Outcome::simple`] without the card on success (#873): a change made in
+    /// the Settings window must not put a card over it.
+    pub fn quiet(label: &str) -> Self {
+        Self {
+            quiet_ok: true,
+            ..Self::simple(label)
         }
     }
 
@@ -679,6 +693,7 @@ impl Outcome {
                         fixing this."
                 .to_string(),
             from_settings: true,
+            quiet_ok: false,
         }
     }
 }
@@ -2307,6 +2322,10 @@ x = 1
         let o = Outcome::settings_save();
         assert!(o.from_settings);
         assert!(!Outcome::simple("x").from_settings);
+        assert!(!Outcome::simple("x").quiet_ok);
+        let quiet = Outcome::quiet("x");
+        assert!(quiet.quiet_ok && !quiet.from_settings);
+        assert_eq!(quiet.fail_headline, Outcome::simple("x").fail_headline);
         assert!(o.fail_note.contains("not applied"), "{}", o.fail_note);
         assert!(o.fail_note.contains("key"), "{}", o.fail_note);
         assert!(!o.fail_note.contains('\u{2014}') && !o.ok_headline.contains('\u{2014}'));
