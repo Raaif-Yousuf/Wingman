@@ -349,13 +349,14 @@ pub(crate) fn post_late_key_refusal(owner: isize, headline: String, detail: Stri
     if owner == 0 {
         return false;
     }
+    let title = headline.clone();
     store_shell_open_failure(ShellOpenFailure {
         title: headline,
         detail,
         with_details: false,
         raw: String::new(),
     });
-    unsafe {
+    let posted = unsafe {
         windows::Win32::UI::WindowsAndMessaging::PostMessageW(
             Some(HWND(owner as *mut _)),
             WM_APP_SHELL_OPEN_DONE,
@@ -363,7 +364,33 @@ pub(crate) fn post_late_key_refusal(owner: isize, headline: String, detail: Stri
             LPARAM(0),
         )
         .is_ok()
+    };
+    if !posted {
+        // Nothing will come for it: it must not surface in a later, unrelated card.
+        retract_shell_open_failure(&title);
     }
+    posted
+}
+
+/// Takes back the newest queued failure titled `title`.
+pub(crate) fn retract_shell_open_failure(title: &str) {
+    let mut queue = SHELL_OPEN_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = queue.iter().rposition(|f| f.title == title) {
+        queue.remove(at);
+    }
+}
+
+/// The titles queued now, left in place (tests).
+#[cfg(test)]
+pub(crate) fn queued_shell_open_titles() -> Vec<String> {
+    SHELL_OPEN_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|f| f.title.clone())
+        .collect()
 }
 
 fn take_shell_open_failures() -> Vec<ShellOpenFailure> {
@@ -15595,6 +15622,20 @@ mod tests {
             failure.detail
         );
         assert!(!failure.with_details);
+    }
+
+    /// #1130: a refusal card whose post fails is taken back, so it cannot
+    /// appear inside an unrelated later card.
+    #[test]
+    fn a_late_key_refusal_that_cannot_be_posted_is_not_left_queued() {
+        let headline = "Gemini did not accept the key (post-failure test)".to_string();
+        // 0xDEAD is no window: the post fails.
+        assert!(!super::post_late_key_refusal(
+            0xDEAD,
+            headline.clone(),
+            "x".into()
+        ));
+        assert!(!super::queued_shell_open_titles().contains(&headline));
     }
 
     #[test]
