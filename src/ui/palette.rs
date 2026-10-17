@@ -300,6 +300,20 @@ fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
     }
 }
 
+/// The path of the query box's 1 px hairline in logical pixels, for Direct2D
+/// (#886). A stroke is centred on its path, so the path sits half a pixel in
+/// from the box's outer edge: the line then covers whole pixels at 100% scale
+/// instead of blurring across two rows, and lands where the GDI path's fills do.
+fn query_border_rect() -> D2D_RECT_F {
+    let (pad, o) = (PADDING as f32, QUERY_BORDER_OUTSET as f32);
+    D2D_RECT_F {
+        left: pad - o + 0.5,
+        top: pad - o + 0.5,
+        right: WINDOW_WIDTH as f32 - pad + o - 0.5,
+        bottom: pad + EDIT_HEIGHT as f32 + o - 0.5,
+    }
+}
+
 /// Extracts the signed `y` client coordinate from a mouse message's
 /// `lParam` (`GET_Y_LPARAM`, winuser.h) -- not re-exported by the `windows`
 /// crate for these messages, so spelled out here the same way this file
@@ -1329,6 +1343,10 @@ impl PaletteInner {
     fn apply_colors(&mut self) {
         self.colors = palette_colors(self.theme, &self.sys, live_accent(self.theme, &self.sys));
         self.drop_edit_brush();
+        // RedrawWindow with no window redraws the desktop.
+        if self.hwnd.0.is_null() {
+            return;
+        }
         unsafe {
             use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
             let _ = RedrawWindow(
@@ -1443,13 +1461,7 @@ impl PaletteInner {
             if let Ok(brush) = target
                 .CreateSolidColorBrush(&colorref_to_d2d(COLORREF(colors.border)) as *const _, None)
             {
-                let o = QUERY_BORDER_OUTSET as f32;
-                let rect = D2D_RECT_F {
-                    left: pad - o,
-                    top: pad - o,
-                    right: content_w - pad + o,
-                    bottom: pad + EDIT_HEIGHT as f32 + o,
-                };
+                let rect = query_border_rect();
                 target.DrawRectangle(&rect as *const _, &brush, 1.0, None);
             }
         }
@@ -2175,12 +2187,21 @@ mod tests {
             palette_colors(theme, &sys, live_accent(theme, &sys))
         }
 
+        /// Colours that can never equal the live ones, whatever theme this
+        /// machine runs: the background is not a valid COLORREF (#886).
+        fn stale_colors() -> PaletteColors {
+            PaletteColors {
+                background: 0x0100_0000,
+                ..live_colors()
+            }
+        }
+
         #[test]
         fn a_theme_message_makes_the_palette_read_the_system_again() {
             for msg in [WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
                 let mut p = Palette::new_for_test(instance()).unwrap();
                 // Stale colours, as if the theme had just changed.
-                p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+                p.inner.colors = stale_colors();
                 assert_ne!(p.inner.colors, live_colors(), "the setup must differ");
                 unsafe {
                     SendMessageW(p.hwnd(), msg, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -2192,7 +2213,7 @@ mod tests {
         #[test]
         fn a_theme_setting_change_makes_the_palette_read_the_system_again() {
             let mut p = Palette::new_for_test(instance()).unwrap();
-            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            p.inner.colors = stale_colors();
             let name = wide_z("ImmersiveColorSet");
             unsafe {
                 SendMessageW(
@@ -2204,7 +2225,7 @@ mod tests {
             }
             assert_eq!(p.inner.colors, live_colors());
             // An unrelated setting leaves it alone.
-            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            p.inner.colors = stale_colors();
             let other = wide_z("intl");
             unsafe {
                 SendMessageW(
@@ -2288,6 +2309,23 @@ mod tests {
             assert_eq!(text.0, colors.text);
         }
     }
+    // #886: a 1 px stroke is centred on its path, so a path on whole pixels
+    // blurs across two rows of pixels.
+    #[test]
+    fn the_query_border_path_sits_on_half_pixels_inside_the_outer_edge() {
+        let r = query_border_rect();
+        for v in [r.left, r.top, r.right, r.bottom] {
+            assert_eq!(v.fract(), 0.5, "{v}");
+        }
+        // The stroke fills the outermost pixel, like the GDI path's four fills.
+        let pad = PADDING as f32;
+        let o = QUERY_BORDER_OUTSET as f32;
+        assert_eq!(r.left - 0.5, pad - o);
+        assert_eq!(r.top - 0.5, pad - o);
+        assert_eq!(r.right + 0.5, WINDOW_WIDTH as f32 - pad + o);
+        assert_eq!(r.bottom + 0.5, pad + EDIT_HEIGHT as f32 + o);
+    }
+
     // #881: the query box centres its text and shows a placeholder.
     mod query_box_tests {
         use super::super::{
