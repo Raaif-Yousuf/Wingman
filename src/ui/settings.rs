@@ -2481,8 +2481,28 @@ fn annotate_accessible_names(hwnd: HWND) {
                 );
             }
         }
+        // A screen reader announces a live region change only for a control
+        // whose UIA LiveSetting is set, so the status lines say Polite.
+        let polite = windows::Win32::System::Variant::VARIANT::from(
+            windows::Win32::UI::Accessibility::Polite.0,
+        );
+        for id in LIVE_STATUS_IDS {
+            if let Some(line) = get_dlg_item(hwnd, id) {
+                let _ = service.SetHwndProp(
+                    line,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    windows::Win32::UI::Accessibility::LiveSetting_Property_GUID,
+                    &polite,
+                );
+            }
+        }
     });
 }
+
+/// The status lines that announce what they say: the footer's and the
+/// shortcut line's.
+const LIVE_STATUS_IDS: [i32; 2] = [ID_VALIDATION_MESSAGE, ID_HOTKEY_STATUS];
 
 /// Takes the names of [`annotate_accessible_names`] back as the window goes:
 /// the service keeps them by window handle, and Windows recycles handles, so a
@@ -2493,6 +2513,16 @@ fn clear_accessible_names(hwnd: HWND) {
         for (id, _) in ACCESSIBLE_NAMES {
             if let Some(button) = get_dlg_item(hwnd, id) {
                 let _ = service.ClearHwndProps(button, ACC_OBJID_CLIENT, 0, &[PROPID_ACC_NAME]);
+            }
+        }
+        for id in LIVE_STATUS_IDS {
+            if let Some(line) = get_dlg_item(hwnd, id) {
+                let _ = service.ClearHwndProps(
+                    line,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    &[windows::Win32::UI::Accessibility::LiveSetting_Property_GUID],
+                );
             }
         }
     });
@@ -10237,6 +10267,58 @@ mod tests {
             let heard = LIVE_EVENTS.with(|e| e.borrow().clone());
             assert!(heard.contains(&(line.0 as isize)), "heard {heard:?}");
             assert_eq!(get_text(line), "Saved: Card corner");
+        });
+    }
+
+    /// Narrator announces a live region change only for a control whose UIA
+    /// `LiveSetting` is set. Read back through real UI Automation (from a
+    /// second thread, as a screen reader is another process; this thread
+    /// pumps the window), both status lines say Polite. Without the annotation
+    /// the property reads 0 (Off) and this fails.
+    #[test]
+    fn the_status_lines_are_polite_uia_live_regions() {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+        use windows::Win32::UI::Accessibility::UIA_LiveSettingPropertyId;
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, PM_REMOVE};
+        with_window(Config::default(), |hwnd, _raw| {
+            let lines: Vec<isize> = LIVE_STATUS_IDS
+                .iter()
+                .map(|id| get_dlg_item(hwnd, *id).expect("status line").0 as isize)
+                .collect();
+            let reader = std::thread::spawn(move || unsafe {
+                let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+                let automation = crate::inputs::uia_automation::create_automation();
+                let out: Vec<i32> = match automation {
+                    Ok(a) => lines
+                        .iter()
+                        .map(|h| {
+                            a.ElementFromHandle(HWND(*h as *mut c_void))
+                                .and_then(|e| e.GetCurrentPropertyValue(UIA_LiveSettingPropertyId))
+                                .ok()
+                                .and_then(|v| i32::try_from(&v).ok())
+                                .unwrap_or(-1)
+                        })
+                        .collect(),
+                    Err(_) => vec![-1; lines.len()],
+                };
+                if init.is_ok() {
+                    CoUninitialize();
+                }
+                out
+            });
+            let mut m = MSG::default();
+            while !reader.is_finished() {
+                while unsafe { PeekMessageW(&mut m, None, 0, 0, PM_REMOVE) }.as_bool() {
+                    unsafe { DispatchMessageW(&m) };
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let got = reader.join().expect("reader thread");
+            assert_eq!(
+                got,
+                vec![1, 1],
+                "LiveSetting of the two status lines (1 = Polite)"
+            );
         });
     }
 
