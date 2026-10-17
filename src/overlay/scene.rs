@@ -79,11 +79,13 @@ pub fn to_local(r: ScreenRect, origin: ScreenRect) -> ScreenRect {
 }
 
 /// Plans the overlay for `annotations`, whose labels measure `sizes` (same
-/// order). `None` when no label found a place: there is then nothing to show
-/// and the summary card carries the result alone.
+/// order). `obstacles` are the boxes of the other text on screen, which a label
+/// keeps off when it can. `None` when no label found a place: there is then
+/// nothing to show and the summary card carries the result alone.
 pub fn plan(
     annotations: &[Annotation],
     sizes: &[(i32, i32)],
+    obstacles: &[ScreenRect],
     monitor: ScreenRect,
     metrics: &Metrics,
 ) -> Option<Scene> {
@@ -95,7 +97,7 @@ pub fn plan(
             size: sizes.get(i).copied().unwrap_or((0, 0)),
         })
         .collect();
-    let layout = place_labels(&requests, monitor, metrics.gap);
+    let layout = place_labels(&requests, obstacles, monitor, metrics.gap);
 
     let mut labels = Vec::new();
     let mut marks = Vec::new();
@@ -171,6 +173,25 @@ mod tests {
 
     fn note(rects: Vec<ScreenRect>) -> Annotation {
         Annotation::note(rects, "label").unwrap()
+    }
+
+    /// `plan` with no other text on the page.
+    fn plan(
+        annotations: &[Annotation],
+        sizes: &[(i32, i32)],
+        monitor: ScreenRect,
+        metrics: &Metrics,
+    ) -> Option<Scene> {
+        super::plan(annotations, sizes, &[], monitor, metrics)
+    }
+
+    #[test]
+    fn a_label_keeps_off_the_other_text_on_the_page() {
+        let a = note(vec![r(100, 200, 180, 216)]);
+        let above = r(90, 170, 200, 196);
+        let s = super::plan(&[a], &[(60, 20)], &[above], MONITOR, &M).unwrap();
+        let label = s.labels[0].rect;
+        assert_eq!(label, r(184, 200, 244, 220), "moved to the right");
     }
 
     #[test]

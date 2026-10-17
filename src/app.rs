@@ -3119,6 +3119,7 @@ impl App {
                 run,
                 annotations: found.annotations,
                 monitor: found.monitor,
+                obstacles: found.obstacles,
             });
             Ok(Answer {
                 headline,
@@ -4847,7 +4848,7 @@ impl App {
         self.overlay = None;
         let dpi = ui::dpi_near(ready.monitor);
         let look = ui::Look::current(dpi, self.config.ui.text_scale);
-        let frame = ui::render(&ready.annotations, ready.monitor, &look)?;
+        let frame = ui::render(&ready.annotations, &ready.obstacles, ready.monitor, &look)?;
         let window = match OverlayWindow::create(
             self.instance,
             frame.rect,

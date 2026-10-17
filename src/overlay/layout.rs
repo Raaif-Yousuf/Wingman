@@ -49,6 +49,13 @@ fn intersects(a: &ScreenRect, b: &ScreenRect) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
+/// Pixels two rects share (0 if they only touch or miss).
+fn overlap_area(a: &ScreenRect, b: &ScreenRect) -> i64 {
+    let w = i64::from(a.right.min(b.right)) - i64::from(a.left.max(b.left));
+    let h = i64::from(a.bottom.min(b.bottom)) - i64::from(a.top.max(b.top));
+    w.max(0) * h.max(0)
+}
+
 fn inside(inner: &ScreenRect, outer: &ScreenRect) -> bool {
     inner.left >= outer.left
         && inner.top >= outer.top
@@ -86,15 +93,23 @@ fn clamp_span(v: i32, len: i32, lo: i32, hi: i32) -> i32 {
 /// A candidate is taken if it is inside the monitor (moved inward along the
 /// anchor's edge first, so a label near a monitor edge is not lost), does not
 /// cover any annotation's anchor, and does not overlap a label already
-/// placed. Requests are served in order, so reading order wins a contested
-/// spot.
-pub fn place_labels(requests: &[Request], monitor: ScreenRect, gap: i32) -> Layout {
+/// placed. Of the spots that qualify, the one covering the least of
+/// `obstacles` (the page's other text) wins, the first on a tie: a spot
+/// touching no text beats any other, and text never costs a label its place.
+/// Requests are served in order, so reading order wins a contested spot.
+pub fn place_labels(
+    requests: &[Request],
+    obstacles: &[ScreenRect],
+    monitor: ScreenRect,
+    gap: i32,
+) -> Layout {
     let gap = gap.max(0);
     let all_anchors: Vec<ScreenRect> = requests
         .iter()
         .flat_map(|r| r.anchors.iter().copied())
         .filter(|r| !is_empty(r))
         .collect();
+    let text: Vec<ScreenRect> = obstacles.iter().copied().filter(|r| !is_empty(r)).collect();
     let mut placed: Vec<Placed> = Vec::new();
     let mut dropped = Vec::new();
     for (index, req) in requests.iter().enumerate() {
@@ -118,11 +133,16 @@ pub fn place_labels(requests: &[Request], monitor: ScreenRect, gap: i32) -> Layo
                 at(b.left.saturating_sub(gap).saturating_sub(size.0), y, size),
             ),
         ];
-        let pick = candidates.into_iter().find(|(_, c)| {
+        let free = |c: &ScreenRect| {
             inside(c, &monitor)
                 && !all_anchors.iter().any(|a| intersects(c, a))
                 && !placed.iter().any(|p| intersects(c, &p.rect))
-        });
+        };
+        // The free spot that covers the least other text; the first on a tie.
+        let pick = candidates
+            .into_iter()
+            .filter(|(_, c)| free(c))
+            .min_by_key(|(_, c)| text.iter().map(|o| overlap_area(c, o)).sum::<i64>());
         match pick {
             Some((side, rect)) => placed.push(Placed { index, rect, side }),
             None => dropped.push(index),
@@ -199,19 +219,19 @@ mod tests {
     }
 
     fn place(requests: &[Request], monitor: ScreenRect) -> Layout {
-        place_labels(requests, monitor, GAP_DESIGN_PX)
+        place_labels(requests, &[], monitor, GAP_DESIGN_PX)
     }
 
     #[test]
     fn the_gap_is_a_parameter_the_caller_scales() {
         let a = req(r(100, 100, 200, 120), 50, 20);
         // 200% scale: gap 8, so the label sits 8 px above, not 4.
-        let l = place_labels(std::slice::from_ref(&a), MON, 2 * GAP_DESIGN_PX);
+        let l = place_labels(std::slice::from_ref(&a), &[], MON, 2 * GAP_DESIGN_PX);
         assert_eq!(l.placed[0].rect, r(100, 72, 150, 92));
-        let l = place_labels(std::slice::from_ref(&a), MON, 0);
+        let l = place_labels(std::slice::from_ref(&a), &[], MON, 0);
         assert_eq!(l.placed[0].rect, r(100, 80, 150, 100));
         // A negative gap is read as 0, never as overlap.
-        let l = place_labels(&[a], MON, -50);
+        let l = place_labels(&[a], &[], MON, -50);
         assert_eq!(l.placed[0].rect, r(100, 80, 150, 100));
     }
 
@@ -260,6 +280,66 @@ mod tests {
         );
         assert_eq!(l.placed[0].side, Side::Left);
         assert_eq!(l.placed[0].rect, r(886, 5, 936, 25));
+    }
+
+    #[test]
+    fn a_label_moves_off_text_that_is_not_marked() {
+        let a = r(100, 100, 200, 120);
+        // An unmarked word sits where the label would go above.
+        let word_above = r(90, 70, 210, 98);
+        let l = place_labels(&[req(a, 50, 20)], &[word_above], MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].side, Side::Right);
+        assert!(!intersects(&l.placed[0].rect, &word_above));
+        // Without it the label stays above.
+        let l = place_labels(&[req(a, 50, 20)], &[], MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].side, Side::Above);
+    }
+
+    #[test]
+    fn it_skips_every_side_that_touches_text_in_order() {
+        let a = r(100, 100, 200, 120);
+        let above = r(100, 70, 200, 98);
+        let right = r(204, 100, 260, 120);
+        let l = place_labels(&[req(a, 50, 20)], &[above, right], MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].side, Side::Below);
+    }
+
+    #[test]
+    fn when_every_side_touches_text_the_old_order_still_places_it() {
+        let a = r(100, 100, 200, 120);
+        let around = [
+            r(100, 70, 200, 98),
+            r(204, 100, 260, 120),
+            r(100, 124, 200, 150),
+            r(40, 100, 96, 120),
+        ];
+        let l = place_labels(&[req(a, 50, 20)], &around, MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed.len(), 1, "a label over text beats no label");
+        assert_eq!(l.placed[0].side, Side::Above);
+    }
+
+    #[test]
+    fn when_every_side_touches_text_the_least_covered_one_wins() {
+        let a = r(100, 100, 200, 120);
+        // Above is covered a lot, Right only by a sliver.
+        let around = [
+            r(100, 70, 200, 98),
+            r(204, 100, 210, 120),
+            r(100, 124, 200, 150),
+            r(40, 100, 96, 120),
+        ];
+        let l = place_labels(&[req(a, 50, 20)], &around, MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].side, Side::Right);
+    }
+
+    #[test]
+    fn empty_and_wild_obstacles_are_harmless() {
+        let a = r(100, 100, 200, 120);
+        let wild = [r(5, 5, 5, 9), r(i32::MIN, i32::MIN, i32::MAX, i32::MAX)];
+        let l = place_labels(&[req(a, 50, 20)], &wild, MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].side, Side::Above, "all-covering falls back");
+        let l = place_labels(&[req(a, 50, 20)], &wild[..1], MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].side, Side::Above);
     }
 
     #[test]
