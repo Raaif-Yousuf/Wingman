@@ -150,7 +150,7 @@ mode = "auto"
 
 [[actions]]
 id = "table-to-csv"
-name = "Table to CSV"
+name = "Table to spreadsheet rows"
 group = "Work"
 inputs = [
     "selection",

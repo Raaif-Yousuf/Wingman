@@ -1,7 +1,7 @@
 //! "Chart to data table" (#114): read the values off a chart on screen and put
 //! them on the clipboard as a table.
 //!
-//! The model fills the same `table` proposal as "Table to CSV" (#69): a
+//! The model fills the same `table` proposal as "Table to spreadsheet rows" (#69): a
 //! label column, then one value column per series. Nothing printed on a chart
 //! is exact (a bar has no number on it), so what the model returns is an
 //! estimate and the action says so in two places. In code, every value column
