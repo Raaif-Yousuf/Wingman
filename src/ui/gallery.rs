@@ -1311,7 +1311,7 @@ mod driver {
                 },
                 ..Default::default()
             };
-            windows::Win32::Graphics::Gdi::GetDIBits(
+            let lines = windows::Win32::Graphics::Gdi::GetDIBits(
                 mem_dc,
                 bitmap,
                 0,
@@ -1325,6 +1325,11 @@ mod driver {
             let _ = DeleteDC(mem_dc);
             ReleaseDC(None, screen_dc);
             blit?;
+            // GetDIBits returns the scan lines it copied; fewer than asked
+            // for means the buffer is still zeroed and the PNG would be black.
+            if lines != height {
+                anyhow::bail!("GetDIBits copied {lines} of {height} lines for {path:?}");
+            }
             for px in buf.chunks_exact_mut(4) {
                 px.swap(0, 2);
                 px[3] = 255;

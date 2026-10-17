@@ -1009,7 +1009,7 @@ fn append_row(hmenu: HMENU, id: u32, rec: ItemRecord, enabled: bool) -> Result<(
 /// submenu. The menu is told the row's plain text as well as its item data,
 /// so Narrator and other screen readers can name it: an owner-drawn row
 /// otherwise has no name at all (checked with UI Automation, #825).
-fn insert_row(
+pub(crate) fn insert_row(
     hmenu: HMENU,
     id: Option<u32>,
     submenu: Option<HMENU>,
@@ -2212,13 +2212,41 @@ mod tests {
     fn the_menu_has_a_unique_letter_per_usable_row() {
         let rows = built_rows(|t| t.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K"));
         let top: Vec<&(usize, String, String)> = rows.iter().filter(|r| r.0 == 0).collect();
-        // Everything but the greyed version line has a letter.
-        for (_, label, _) in &top[1..] {
+        assert!(top.len() > 5, "the top level of the menu was not read");
+        // Everything but the greyed version line has a letter. That line is
+        // skipped by name, not by position.
+        let version = version_label();
+        let mut checked = 0;
+        for (_, label, _) in &top {
+            if tray_menu::strip_mnemonics(label) == version {
+                continue;
+            }
+            checked += 1;
             assert!(
                 tray_menu::mnemonic_of(label).is_some(),
                 "{label:?} has no mnemonic"
             );
         }
+        assert_eq!(
+            checked,
+            top.len() - 1,
+            "exactly the version line is skipped"
+        );
+    }
+
+    /// Names that are not ours (a user's action name) keep their ampersand and
+    /// get a mnemonic from a real letter, never from the `&`. The ampersand is
+    /// doubled once, by `menu_label`: doubling it again would show two.
+    #[test]
+    fn an_ampersand_in_a_dynamic_name_shows_once_and_is_no_mnemonic() {
+        let rows = built_rows(|t| t.set_export_actions(&[("x".into(), "A & B".into())]));
+        let hits: Vec<_> = rows
+            .iter()
+            .filter(|r| tray_menu::strip_mnemonics(&r.1) == "A & B")
+            .collect();
+        assert_eq!(hits.len(), 1, "the action row is in the menu once");
+        assert_ne!(tray_menu::mnemonic_of(&hits[0].1), Some('&'));
+        assert!(tray_menu::mnemonic_of(&hits[0].1).is_some());
     }
 
     /// #825: no two rows of the same menu share a mnemonic, in every menu of

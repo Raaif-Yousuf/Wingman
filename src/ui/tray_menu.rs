@@ -429,6 +429,12 @@ fn text_face() -> &'static str {
 /// DPI, the fonts and the background brush. The menu's own background is set
 /// to the surface colour by [`apply_background`].
 pub(crate) fn begin_track(theme: Theme, dpi: u32, sys: SysColors) -> TrackScope {
+    // One menu at a time: a nested track would replace the drawing context of
+    // the menu still on screen, and the first scope's drop would then clear it.
+    debug_assert!(
+        !TRACK_ACTIVE.with(|c| c.get()),
+        "begin_track while another menu is being tracked"
+    );
     let tokens = Tokens::for_theme(theme, &sys);
     let mut lf = LOGFONTW {
         lfHeight: type_height_px(TYPE_BODY_PX, dpi, 1.0),
@@ -654,7 +660,8 @@ unsafe fn paint_row(ctx: &Ctx, dis: &DRAWITEMSTRUCT, rec: &ItemRecord) {
     }
 
     let disabled = dis.itemState.0 & (ODS_DISABLED.0 | ODS_GRAYED.0) != 0;
-    let hot = dis.itemState.0 & ODS_SELECTED.0 != 0;
+    // A row that cannot be used gets no hover pill, even when the pointer is on it.
+    let hot = !disabled && dis.itemState.0 & ODS_SELECTED.0 != 0;
     let checked = dis.itemState.0 & windows::Win32::UI::Controls::ODS_CHECKED.0 != 0;
     let hide_prefix = dis.itemState.0 & ODS_NOACCEL.0 != 0;
 
@@ -964,6 +971,9 @@ mod tests {
     /// every name empty before this, #825).
     #[test]
     fn rows_carry_an_accessible_name() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreatePopupMenu, DestroyMenu, GetMenuItemInfoW, MENUITEMINFOW, MIIM_STRING,
+        };
         let name_of = |rec: ItemRecord| {
             let (_, ptr) = add_record(rec);
             let mut len = 0;
@@ -987,6 +997,46 @@ mod tests {
             name_of(ItemRecord::new("Tom && Jerry", Kind::Item)),
             "Tom & Jerry"
         );
+
+        // The same names, read back from a real HMENU: what Narrator and UI
+        // Automation get is the string the menu itself holds.
+        begin_build();
+        let menu_string = |hmenu, pos: u32| {
+            let mut info = MENUITEMINFOW {
+                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STRING,
+                ..Default::default()
+            };
+            // SAFETY: a first call with no buffer reports the length.
+            unsafe { GetMenuItemInfoW(hmenu, pos, true, &mut info) }.expect("string length");
+            let mut buf = vec![0u16; info.cch as usize + 1];
+            info.dwTypeData = windows::core::PWSTR(buf.as_mut_ptr());
+            info.cch += 1;
+            // SAFETY: `buf` holds `cch` code units plus the terminator.
+            unsafe { GetMenuItemInfoW(hmenu, pos, true, &mut info) }.expect("string");
+            String::from_utf16_lossy(&buf[..info.cch as usize])
+        };
+        let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        let sub = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
+        let mut ask = ItemRecord::new("Ask &now", Kind::Item);
+        ask.hint = "Win+Shift+F23".to_string();
+        crate::ui::tray::insert_row(hmenu, Some(1), None, ask, true).expect("insert ask");
+        let mut mode = ItemRecord::new("&Mode", Kind::Submenu);
+        mode.hint = "Local".to_string();
+        crate::ui::tray::insert_row(hmenu, None, Some(sub), mode, true).expect("insert mode");
+        crate::ui::tray::insert_row(
+            hmenu,
+            Some(2),
+            None,
+            ItemRecord::new("Tom && Jerry", Kind::Item),
+            false,
+        )
+        .expect("insert tom");
+        assert_eq!(menu_string(hmenu, 0), "Ask now\tWin+Shift+F23");
+        assert_eq!(menu_string(hmenu, 1), "Mode, Local");
+        assert_eq!(menu_string(hmenu, 2), "Tom & Jerry");
+        // Destroys the submenu with it.
+        let _ = unsafe { DestroyMenu(hmenu) };
     }
 
     #[test]
