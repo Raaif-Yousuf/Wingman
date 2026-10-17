@@ -55,8 +55,8 @@ use crate::provider::{
 };
 use crate::router;
 use crate::ui::card::{
-    Card, OptionRow, OptionsBehavior, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS,
-    WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
+    Card, OptionRow, OptionsBehavior, WM_APP_CARD_ACTION, WM_APP_CARD_COPY_DETAILS,
+    WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
 };
 use crate::ui::confirm;
 use crate::ui::overlay::{OverlayWindow, Win32Steps, OVERLAY_TIMER_ID, WM_APP_OVERLAY_INPUT};
@@ -709,6 +709,14 @@ struct App {
     /// then (and not while a model run is busy, whose cards are its own) is a
     /// Pending card the reload's to hide or replace; see `reload_owns_card`.
     reload_card: Option<u64>,
+    /// #699: the show serial of the PC check card that offers "Time a
+    /// request". Only a click on that very card starts a timing; a queued
+    /// click that outlived it is dropped.
+    machine_card: Option<u64>,
+    /// #699: a timed request is in flight. It holds `busy` so a key press
+    /// cannot start a model run on the same GPU, and its result card is not
+    /// held back by that busy flag.
+    machine_timing: bool,
     /// #870: writes handed to the writer thread whose reply has not come back.
     /// Only the last reply swaps in the loaded config; an earlier one was read
     /// before a later choice was made.
@@ -1101,6 +1109,8 @@ pub fn run() -> Result<()> {
         unsaved: Vec::new(),
         carried_reload: None,
         reload_card: None,
+        machine_card: None,
+        machine_timing: false,
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
         settings_save_starts: VecDeque::new(),
@@ -1778,6 +1788,28 @@ fn machine_check_card(card: crate::ui::card::CardState, busy: bool) -> MachineCh
         MachineCheckCard::Show
     }
 }
+/// #699: a timed result that cannot be shown still says so, in a short card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineResultCard {
+    Show,
+    /// A plain check result is dropped; the check is cheap to run again.
+    Hold,
+    /// A timed result took a while to get, so it is never dropped silently.
+    Notice,
+}
+
+fn machine_result_card(
+    card: crate::ui::card::CardState,
+    busy: bool,
+    timed: bool,
+) -> MachineResultCard {
+    match (machine_check_card(card, busy), timed) {
+        (MachineCheckCard::Show, _) => MachineResultCard::Show,
+        (MachineCheckCard::Hold, false) => MachineResultCard::Hold,
+        (MachineCheckCard::Hold, true) => MachineResultCard::Notice,
+    }
+}
+
 /// #723: whether a press still finds the app busy. A run flagged stuck is
 /// abandoned by the press, so the press can start a new one.
 fn busy_after_press(busy: bool, stuck: bool) -> bool {
@@ -5608,16 +5640,62 @@ impl App {
     /// socket), then `on_machine_check_result` shows the verdict. Nothing is
     /// kept and nothing polls.
     fn check_machine(&mut self) {
+        self.spawn_machine_check(None);
+    }
+
+    /// #699: the opt-in "Time a request" link on the PC check card. One small
+    /// request with a built-in image to the local model, on a worker thread,
+    /// then the same result path as the check itself. Still honours Pause
+    /// (it loads the GPU) and a run in flight.
+    fn time_machine_check(&mut self) {
+        // A click queued before the PC check card was replaced is stale.
+        let on_check_card = self.machine_card == Some(self.card.show_serial())
+            && self.card.state() != crate::ui::card::CardState::Hidden;
+        if !on_check_card {
+            return;
+        }
+        if self.busy_now() {
+            self.show_busy_card();
+            return;
+        }
+        if pause::is_paused_now() {
+            self.card.show_answer(
+                "Paused",
+                "Resume from the tray menu to time a request.",
+                3,
+                None,
+            );
+            return;
+        }
+        let model = self.config.providers.ollama.model.clone();
+        if self.spawn_machine_check(Some(model)) {
+            self.set_busy(true);
+            self.machine_timing = true;
+        }
+    }
+
+    /// Runs the check on a worker thread; with `Some(model)` it also sends the
+    /// one timed request to that model (#699).
+    /// Returns whether a worker was started.
+    fn spawn_machine_check(&mut self, time_model: Option<String>) -> bool {
         use std::sync::atomic::Ordering;
         if MACHINE_CHECK_RUNNING.swap(true, Ordering::SeqCst) {
-            return;
+            // One check at a time; say so rather than do nothing.
+            self.show_busy_card();
+            return false;
         }
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
         let target = self.hwnd_isize();
         let base_url = self.config.providers.ollama.base_url.clone();
         std::thread::spawn(move || {
-            let facts = crate::machine::gather(&base_url);
+            let mut facts = match &time_model {
+                Some(model) => crate::machine::gather_timed(&base_url, model),
+                None => crate::machine::gather(&base_url),
+            };
+            if let crate::machine::Measured::Failed(why) = &facts.measured {
+                facts.measured = crate::machine::Measured::Failed(humanize_error_chain(why));
+            }
             MACHINE_CHECK_RUNNING.store(false, Ordering::SeqCst);
             let payload = Box::into_raw(Box::new(facts));
             unsafe {
@@ -5634,17 +5712,45 @@ impl App {
                 }
             }
         });
+        true
     }
 
     fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        // #699: the timed request's own busy hold ends with its result.
+        let timed = std::mem::take(&mut self.machine_timing);
+        if timed {
+            self.set_busy(false);
+        }
         // #845: never cover a preview, an options card or a working card of a
-        // run in flight. The check is on demand and cheap, so it is run again.
-        if machine_check_card(self.card.state(), self.busy) == MachineCheckCard::Hold {
-            return;
+        // run in flight. A plain check is cheap, so it is run again; a timed
+        // one says it finished (#699).
+        match machine_result_card(self.card.state(), self.busy, timed) {
+            MachineResultCard::Hold => return,
+            MachineResultCard::Notice => {
+                self.card.show_answer(
+                    "Timing finished",
+                    "Another card was open, so the result was not shown. Time it again.",
+                    6,
+                    None,
+                );
+                return;
+            }
+            MachineResultCard::Show => {}
         }
         let verdict = crate::machine::verdict(facts);
-        self.card
-            .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+        if crate::machine::can_offer_timing(facts) {
+            self.card.show_answer_with_action(
+                &verdict.headline,
+                &verdict.detail(),
+                20,
+                crate::machine::TIMING_ACTION_LABEL,
+            );
+            self.machine_card = Some(self.card.show_serial());
+        } else {
+            self.card
+                .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+            self.machine_card = None;
+        }
     }
 
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
@@ -9395,6 +9501,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_CARD_COPY_DETAILS
         // #373: same treatment as "Copy details" above.
         | WM_APP_CARD_REPORT_PROBLEM
+        // #699: same again: a card link, no payload, and the card cannot be
+        // showing while Settings is modal-open.
+        | WM_APP_CARD_ACTION
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -10454,6 +10563,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.report_problem();
             LRESULT(0)
         }
+        WM_APP_CARD_ACTION => {
+            // #699: the PC check card's "Time a request" link. No payload.
+            app.time_machine_check();
+            LRESULT(0)
+        }
         WM_APP_CARD_COPY_DETAILS => {
             // Issue #425: a click/Enter on an expanded error card's "Copy
             // details" affordance. No payload.
@@ -10696,8 +10810,8 @@ mod tests {
     use crate::provider::Provider;
     use crate::router;
     use crate::ui::card::{
-        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM,
-        WM_APP_PREVIEW_DECIDED,
+        WM_APP_CARD_ACTION, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS,
+        WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
     };
     use crate::ui::confirm;
     use crate::ui::overlay::WM_APP_OVERLAY_INPUT;
@@ -11975,6 +12089,47 @@ mod tests {
             );
         }
     }
+    /// #699: a timed result never vanishes: held cards get a short notice,
+    /// while a plain check result is still just dropped.
+    #[test]
+    fn timed_machine_result_is_never_dropped_silently() {
+        use super::MachineResultCard::{Hold, Notice, Show};
+        use crate::ui::card::CardState;
+        for (state, busy, timed, expected) in [
+            (CardState::Pending, false, true, Show),
+            (CardState::Expanded, false, true, Show),
+            (CardState::Preview, false, true, Notice),
+            (CardState::Options, false, true, Notice),
+            (CardState::Pending, true, true, Notice),
+            (CardState::Preview, false, false, Hold),
+            (CardState::Pending, true, false, Hold),
+            (CardState::Pending, false, false, Show),
+        ] {
+            assert_eq!(
+                super::machine_result_card(state, busy, timed),
+                expected,
+                "{state:?} busy={busy} timed={timed}"
+            );
+        }
+    }
+
+    /// #699: the click handler must check the card is the PC check card and
+    /// hold busy for the run; the result handler must release it.
+    #[test]
+    fn timing_click_checks_the_card_and_holds_busy() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let click = body_between(&src, "    fn time_machine_check(", "\n    }\n");
+        assert!(
+            click.contains("self.machine_card == Some(self.card.show_serial())"),
+            "{click}"
+        );
+        assert!(click.contains("self.set_busy(true)"), "{click}");
+        assert!(click.contains("self.machine_timing = true"), "{click}");
+        let result = body_between(&src, "    fn on_machine_check_result(", "\n    }\n");
+        assert!(result.contains("self.set_busy(false)"), "{result}");
+        assert!(result.contains("MachineResultCard::Notice"), "{result}");
+    }
+
     // -- #307: the options card's choices ---------------------------------
 
     fn session(generation: u32, ids: &[&str]) -> super::OptionsSession {
@@ -13115,6 +13270,7 @@ mod tests {
             gpus: None,
             ollama: crate::machine::OllamaState::NotRunning,
             power: crate::machine::Power::Unknown,
+            measured: crate::machine::Measured::NotRun,
         }));
         assert!(super::free_boxed_payload(
             super::WM_APP_MACHINE_CHECK_RESULT,
@@ -14599,6 +14755,7 @@ mod tests {
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_CARD_REPORT_PROBLEM", WM_APP_CARD_REPORT_PROBLEM),
+        ("WM_APP_CARD_ACTION", WM_APP_CARD_ACTION),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
@@ -15590,6 +15747,7 @@ mod tests {
             WM_APP_CARD_OPEN_SETTINGS,
             WM_APP_CARD_COPY_DETAILS,
             WM_APP_CARD_REPORT_PROBLEM,
+            WM_APP_CARD_ACTION,
             WM_APP_OPTIONS_CHOICE,
             // #809: a hook-posted overlay click or key is stale once the menu has
             // taken the mouse; delivering it afterwards would act on a screen that
@@ -15844,6 +16002,11 @@ mod tests {
         (
             "WM_APP_CARD_REPORT_PROBLEM",
             WM_APP_CARD_REPORT_PROBLEM,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_CARD_ACTION",
+            WM_APP_CARD_ACTION,
             SettingsReentrancy::Ignore,
         ),
         (
