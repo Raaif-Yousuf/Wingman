@@ -741,6 +741,7 @@ mod driver {
             group: None,
             requires_model: false,
             effect: crate::ui::palette_model::Effect::None,
+            takes_text: false,
         })
         .collect()
     }
@@ -760,6 +761,7 @@ mod driver {
             group: None,
             requires_model: false,
             effect: crate::ui::palette_model::Effect::None,
+            takes_text: false,
         })
         .collect()
     }
@@ -794,6 +796,7 @@ mod driver {
                 group: Some("Answer".to_string()),
                 requires_model: true,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: "summarize".to_string(),
@@ -801,6 +804,7 @@ mod driver {
                 group: Some("Answer".to_string()),
                 requires_model: true,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: crate::ui::palette_model::CALCULATE_SELECTION_ACTION_ID.to_string(),
@@ -808,6 +812,7 @@ mod driver {
                 group: Some("Utilities".to_string()),
                 requires_model: false,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: crate::ui::palette_model::COPY_REGION_ACTION_ID.to_string(),
@@ -815,6 +820,7 @@ mod driver {
                 group: Some("Utilities".to_string()),
                 requires_model: false,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
         ]
     }

@@ -481,9 +481,11 @@ pub struct RequestPreview {
     pub images: Vec<RequestImagePreview>,
     pub system_text: String,
     pub user_text: String,
-    /// Always `0` today -- knowledge snippets are unbuilt Phase 3b work
-    /// (#85 onwards). Kept as a field so #85 only has to populate it.
-    pub snippet_count: usize,
+    /// One label per document excerpt in the request (`file#chunk 12:ab12cd34`,
+    /// never the text), empty when it carries none. Read from the sending
+    /// thread's [`crate::egress::KnowledgeScope`], the same labels the egress
+    /// row gets.
+    pub snippets: Vec<String>,
 }
 
 impl RequestPreview {
@@ -504,7 +506,7 @@ impl RequestPreview {
             images,
             system_text: req.system.clone(),
             user_text: req.user.clone(),
-            snippet_count: 0,
+            snippets: crate::egress::worker_knowledge_labels(),
         }
     }
 
@@ -560,14 +562,18 @@ impl RequestPreview {
 
         properties.insert(
             "snippets".to_string(),
-            serde_json::json!({"type": "string", "label": "Knowledge snippets"}),
+            serde_json::json!({
+                "type": "string",
+                "label": "Knowledge snippets",
+                "multiline": self.snippets.len() > 1,
+            }),
         );
         value.insert(
             "snippets".to_string(),
-            Value::String(if self.snippet_count == 0 {
+            Value::String(if self.snippets.is_empty() {
                 "none".to_string()
             } else {
-                self.snippet_count.to_string()
+                self.snippets.join("\n")
             }),
         );
 
@@ -1092,7 +1098,7 @@ mod request_preview_tests {
         assert_eq!(preview.system_text, "Be helpful.");
         assert_eq!(preview.user_text, "What is on screen?");
         assert!(preview.images.is_empty());
-        assert_eq!(preview.snippet_count, 0);
+        assert!(preview.snippets.is_empty());
     }
 
     #[test]
@@ -1181,7 +1187,7 @@ mod request_preview_tests {
     }
 
     #[test]
-    fn to_schema_and_value_shows_none_for_snippets_today() {
+    fn to_schema_and_value_shows_none_when_no_excerpts_are_attached() {
         let req = request_with("", "hi", vec![]);
         let preview = RequestPreview::from_request(&req);
         let (schema, value) = preview.to_schema_and_value();
@@ -1192,6 +1198,29 @@ mod request_preview_tests {
             .find(|f| f.name == "snippets")
             .unwrap();
         assert_eq!(snippets.value, "none");
+    }
+
+    #[test]
+    fn the_preview_lists_the_excerpt_labels_of_the_sending_thread() {
+        let req = request_with("", "hi", vec![]);
+        let _scope = crate::egress::KnowledgeScope::new(
+            vec![
+                "a.md#chunk 0:11111111".into(),
+                "b.md#chunk 4:22222222".into(),
+            ],
+            40,
+        );
+        let preview = RequestPreview::from_request(&req);
+        let (schema, value) = preview.to_schema_and_value();
+        let model = PreviewModel::from_schema(&schema, &value);
+        let f = model
+            .fields()
+            .iter()
+            .find(|f| f.name == "snippets")
+            .unwrap();
+        assert!(f.value.contains("a.md#chunk 0:11111111"), "{}", f.value);
+        assert!(f.value.contains("b.md#chunk 4:22222222"), "{}", f.value);
+        assert!(!f.value.contains("hi"));
     }
 
     #[test]
