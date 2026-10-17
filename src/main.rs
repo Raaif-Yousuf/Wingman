@@ -26,6 +26,7 @@ mod known_folder;
 mod machine;
 mod mode;
 mod ocr;
+mod options_keys;
 mod overlay;
 mod owner_acl;
 mod password_managers;
@@ -36,7 +37,6 @@ mod profile;
 mod provider;
 mod redact;
 mod remote_ollama;
-#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 mod router;
 mod secrets;
 mod single_instance;

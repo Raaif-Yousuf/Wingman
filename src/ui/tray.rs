@@ -236,6 +236,10 @@ pub mod cmd {
     /// this is appended after it per the uniqueness test's own convention
     /// (`fixed_cmd_ids_are_pairwise_unique`).
     pub const QUICK_ASK: u32 = 1024;
+    /// Issue #307: "What can I do here?" -- shows the options card: a short
+    /// list of one-click choices for what is on the screen. See
+    /// `App::show_options_card` in `app.rs`. Honors Pause like Quick Ask.
+    pub const WHAT_CAN_I_DO: u32 = 1050;
     /// Issue #38: runs the built-in "Review this email" action (Look,
     /// Propose, Confirm, Do). See `App::review_this_email` in `app.rs`. Same
     /// as `EXTRACT_TEXT` above: the Quick Ask palette (#25) also lists and
@@ -738,6 +742,14 @@ impl Tray {
         // #348: every action lives in one submenu. Quick Ask is first
         // because it is the palette that lists the rest.
         let actions = append_group(hmenu, "Actions")?;
+        // #307: the options card, offered first: it picks the action for you.
+        // Honors Pause like the other pickers.
+        append_item_state(
+            actions,
+            cmd::WHAT_CAN_I_DO,
+            "What can I do here?",
+            !self.paused,
+        )?;
         // #25: honors Pause the same way "Calculate selection" does below --
         // opening the palette to run an action defeats the point of pausing.
         append_item_state(
@@ -1921,6 +1933,7 @@ mod tests {
         let mut actions = direct_ids(find_sub(&tree, "Actions"));
         actions.sort_unstable();
         let mut want = vec![
+            cmd::WHAT_CAN_I_DO,
             cmd::QUICK_ASK,
             cmd::EXTRACT_TEXT,
             cmd::READ_QR,
@@ -2038,6 +2051,7 @@ mod tests {
         assert!(!checked(&running, cmd::USE_OPENAI));
         assert!(!grey(&running, cmd::SET_PAUSE));
         assert!(!grey(&running, cmd::QUICK_ASK));
+        assert!(!grey(&running, cmd::WHAT_CAN_I_DO));
 
         let paused = built_menu_tree(|t| t.set_paused(true));
         for id in [
@@ -2045,6 +2059,7 @@ mod tests {
             cmd::SET_SECONDARY,
             cmd::SET_PAUSE,
             cmd::QUICK_ASK,
+            cmd::WHAT_CAN_I_DO,
             cmd::CALCULATE_SELECTION,
         ] {
             assert!(grey(&paused, id), "{id} must be greyed while paused");
@@ -2423,6 +2438,7 @@ mod tests {
         ("COPY_REGION", cmd::COPY_REGION),
         ("ADD_TO_CALENDAR", cmd::ADD_TO_CALENDAR),
         ("QUICK_ASK", cmd::QUICK_ASK),
+        ("WHAT_CAN_I_DO", cmd::WHAT_CAN_I_DO),
         ("REVIEW_EMAIL", cmd::REVIEW_EMAIL),
         ("FILL_FORM", cmd::FILL_FORM),
         ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),

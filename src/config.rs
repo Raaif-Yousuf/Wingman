@@ -725,17 +725,18 @@ pub struct Forms {
     pub require_tick_for: RequireTickFor,
 }
 
-/// #24: settings for the Quick Ask palette's intent router.
+/// #24: settings for the intent router's confidence bar.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Palette {
-    /// Minimum `RouterOption::confidence` (0.0..=1.0) for the router's
-    /// suggestion to pre-select a row -- see `router::should_apply`, the one
-    /// place this value is actually consulted (`app.rs` reads it from
-    /// `Config` and passes it through). Kept as a plain `f64` rather than a
-    /// clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never
-    /// clears (or always clears) the threshold, which is a safe degradation,
-    /// not a crash.
+    /// INERT until #308: nothing reads this at runtime (the palette no longer
+    /// asks the router, #805), so changing it has no effect today. It is kept
+    /// so existing configs keep parsing and #308 can wire it.
+    ///
+    /// Minimum `RouterOption::confidence` (0.0..=1.0) for a router option to
+    /// be picked by a bare key press rather than by a click. Kept as a plain
+    /// `f64` rather than a clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never clears (or always clears) the
+    /// threshold, which is a safe degradation, not a crash.
     pub router_threshold: f64,
 }
 
@@ -759,6 +760,15 @@ pub struct Options {
     /// `palette.router_threshold`: the card exists to show alternatives, so
     /// it needs a lower bar than the palette's pre-select.
     pub min_confidence: f64,
+    /// #307: seconds the options card stays up before it closes by itself
+    /// (default 20). Also bounds how long the digit and Esc claim lasts.
+    /// Clamped to 5..=120 where it is used ([`Options::card_dismiss_secs`]).
+    pub auto_dismiss_secs: u32,
+    /// #307: whether the keyboard hook claims keys 1 to 4 and Esc while the
+    /// options card shows (default true). Off for someone who types digits
+    /// while the card is up, or whose IME uses digits to pick a candidate:
+    /// the options are then picked by click.
+    pub claim_keys: bool,
 }
 
 impl Default for Options {
@@ -766,13 +776,24 @@ impl Default for Options {
         Self {
             max_options: crate::router::DEFAULT_MAX_OPTIONS,
             min_confidence: crate::router::DEFAULT_MIN_CONFIDENCE,
+            auto_dismiss_secs: DEFAULT_OPTIONS_DISMISS_SECS,
+            claim_keys: true,
         }
     }
 }
 
+/// #307: how long the options card stays up by default.
+const DEFAULT_OPTIONS_DISMISS_SECS: u32 = 20;
+
 impl Options {
+    /// The auto-dismiss, clamped to 5..=120 seconds: a hand-edited `0` must
+    /// not mean "never" (the claim is bounded by it) and a huge value must not
+    /// leave the card up for hours.
+    pub fn card_dismiss_secs(&self) -> u32 {
+        self.auto_dismiss_secs.clamp(5, 120)
+    }
+
     /// The clamped limits the router validates a shortlist with.
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn router_limits(&self) -> crate::router::RouterLimits {
         crate::router::RouterLimits::new(self.min_confidence, self.max_options)
     }
@@ -1831,7 +1852,7 @@ impl Providers {
     /// router's own cheaper picked model instead of the configured one. A
     /// provider kind added to this match without a matching arm in that
     /// hand-copy silently made the router skip it forever, with no error
-    /// card by design (see `App::maybe_start_router`'s doc comment) --
+    /// card by design (see `App::show_options_card`'s doc comment) --
     /// exactly the `wired-to-nothing` skill's "hard-coded list" row. Now
     /// `app.rs`'s `provider_for_router` is a one-line call into this
     /// function with `model: Some(&target.model)`, so there is nowhere else
@@ -1905,7 +1926,6 @@ impl Providers {
     /// Empty for an unrecognized name or a `"compat:<name>"` entry with no
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
         match Self::known_provider_for(name) {
             Some(KnownProvider::Openai) => self.openai.models.clone(),
@@ -2219,6 +2239,47 @@ mod tests {
         );
         let cfg: Config =
             toml::from_str("[options]\nmax_options = 3\nmin_confidence = 0.5\n").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.options, cfg.options);
+    }
+
+    // -- options.auto_dismiss_secs and claim_keys (issue #307) ----------------
+
+    #[test]
+    fn options_card_defaults_match_the_spec() {
+        let o = Config::default().options;
+        assert_eq!(o.auto_dismiss_secs, 20);
+        assert!(o.claim_keys, "the digit and Esc claim is on by default");
+        assert_eq!(o.card_dismiss_secs(), 20);
+    }
+
+    #[test]
+    fn options_card_auto_dismiss_is_clamped_to_5_through_120() {
+        for (set, want) in [
+            (0u32, 5u32),
+            (1, 5),
+            (5, 5),
+            (20, 20),
+            (120, 120),
+            (9_999, 120),
+        ] {
+            let o = Options {
+                auto_dismiss_secs: set,
+                ..Options::default()
+            };
+            assert_eq!(o.card_dismiss_secs(), want, "auto_dismiss_secs = {set}");
+        }
+    }
+
+    #[test]
+    fn options_card_keys_can_be_switched_off_in_the_file() {
+        let cfg: Config =
+            toml::from_str("[options]\nclaim_keys = false\nauto_dismiss_secs = 30\n").unwrap();
+        assert!(!cfg.options.claim_keys);
+        assert_eq!(cfg.options.card_dismiss_secs(), 30);
+        // The older keys keep their defaults in a partial table.
+        assert_eq!(cfg.options.max_options, 4);
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.options, cfg.options);
