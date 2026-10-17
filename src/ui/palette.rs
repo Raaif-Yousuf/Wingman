@@ -1300,12 +1300,15 @@ fn fill_focus_line_d2d(
 
 /// Draws a paint list with GDI into `hdc`, whose client area is `client`:
 /// the `WM_PRINTCLIENT` picture, and the fallback when Direct2D is missing.
-/// Corners are GDI's `RoundRect`, as everywhere else in the app.
-fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
+/// Filled and stroked rounded shapes are anti-aliased (#989), except in high
+/// contrast, where they are GDI's plain `RoundRect` so every pixel is a system
+/// colour.
+fn paint_ops_gdi(hdc: HDC, dpi: u32, theme: Theme, client: RECT, ops: &[Op]) {
     use windows::Win32::Graphics::Gdi::{
         CombineRgn, CreateRectRgn, CreateRoundRectRgn, FillRgn, GetStockObject, DT_CENTER,
         NULL_BRUSH, RGN_AND, RGN_DIFF, RGN_ERROR,
     };
+    let smooth = theme != Theme::HighContrast;
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
         let body = gdi_font(dpi, FW_NORMAL.0 as i32);
@@ -1326,7 +1329,7 @@ fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
                     color,
                 } => {
                     // Smoothed corners: `RoundRect` has no anti-aliasing (#989).
-                    crate::ui::round_rect::paint(hdc, *rect, *radius, Some(*color), None);
+                    crate::ui::round_rect::paint(hdc, *rect, *radius, Some(*color), None, smooth);
                 }
                 Op::StrokeRound {
                     rect,
@@ -1334,7 +1337,14 @@ fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
                     width,
                     color,
                 } => {
-                    crate::ui::round_rect::paint(hdc, *rect, *radius, None, Some((*color, *width)));
+                    crate::ui::round_rect::paint(
+                        hdc,
+                        *rect,
+                        *radius,
+                        None,
+                        Some((*color, *width)),
+                        smooth,
+                    );
                 }
                 Op::FocusLine {
                     rect,
@@ -1860,7 +1870,7 @@ impl PaletteInner {
                 colors: &self.colors,
             },
         );
-        paint_ops_gdi(hdc, self.dpi, rc, &ops);
+        paint_ops_gdi(hdc, self.dpi, self.theme, rc, &ops);
     }
 
     fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -2160,7 +2170,7 @@ mod tests {
                 let mem = CreateCompatibleDC(Some(screen));
                 let bmp = CreateCompatibleBitmap(screen, w, h);
                 let old = SelectObject(mem, bmp.into());
-                paint_ops_gdi(mem, dpi, client, &ops);
+                paint_ops_gdi(mem, dpi, Theme::Dark, client, &ops);
                 for y in (b.bottom - radius)..b.bottom {
                     for x in b.left..(b.left + radius) {
                         if GetPixel(mem, x, y).0 == colors.focus_line {
@@ -3402,7 +3412,15 @@ mod tests {
     fn the_gdi_paint_smooths_a_rounded_row_corner() {
         // #989: GDI's RoundRect left stair steps at 250 percent. The corner
         // of a filled row must now hold pixels between the fill and the
-        // background.
+        // background, and in high contrast none: every pixel is a system
+        // colour there.
+        assert!(gdi_row_corner_has_blend(Theme::Dark));
+        assert!(!gdi_row_corner_has_blend(Theme::HighContrast));
+    }
+
+    /// Paints a filled row in `theme` and says whether any pixel on its
+    /// corner is neither the fill nor the background.
+    fn gdi_row_corner_has_blend(theme: Theme) -> bool {
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
         };
@@ -3433,7 +3451,7 @@ mod tests {
             let mem = CreateCompatibleDC(Some(screen));
             let bmp = CreateCompatibleBitmap(screen, 120, 80);
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
-            paint_ops_gdi(mem, dpi, client, &ops);
+            paint_ops_gdi(mem, dpi, theme, client, &ops);
             let mixed = (0..16).any(|d| {
                 let p = GetPixel(mem, 10 + d, 10 + (15 - d)).0;
                 p != bg && p != fill
@@ -3443,7 +3461,7 @@ mod tests {
             let _ = DeleteObject(HGDIOBJ(bmp.0));
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
-            assert!(mixed, "the corner has no blended pixel: steps");
+            mixed
         }
     }
 }

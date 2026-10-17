@@ -8,21 +8,26 @@
 //! under the shape into a 32-bit bitmap, blends there and copies it back, so it
 //! works on any device context and honours its clip region.
 
+use windows::Win32::Foundation::COLORREF;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HGDIOBJ, SRCCOPY,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush, DeleteDC,
+    DeleteObject, GetStockObject, RoundRect, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, HDC, HGDIOBJ, NULL_BRUSH, NULL_PEN, PS_INSIDEFRAME, SRCCOPY,
 };
 
 /// The largest side [`paint`] will blend, in pixels. A bigger shape (never a
-/// control or a row) is skipped rather than allocating a huge bitmap.
-const MAX_SIDE: i32 = 8192;
+/// control or a row) is drawn with plain GDI instead, so one shape cannot
+/// allocate a huge bitmap on the UI thread (2048 by 2048 is 16 MB).
+const MAX_SIDE: i32 = 2048;
 
 /// How much of the pixel centred at (`x`, `y`) lies inside a `w` by `h`
 /// rounded rectangle with corner radius `r`, whose top-left corner is the
 /// origin: 0.0 outside, 1.0 inside, in between on the edge.
 pub(crate) fn coverage(x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
-    let r = r.clamp(0.0, w.min(h) / 2.0);
+    // `min` then `max`, not `clamp`: `clamp` asserts min <= max, and a
+    // negative size would abort the process (panic = "abort").
+    let r = r.min(w.min(h) / 2.0).max(0.0);
     // Signed distance to the outline, negative inside.
     let (px, py) = ((x - w / 2.0).abs(), (y - h / 2.0).abs());
     let (qx, qy) = (px - (w / 2.0 - r), py - (h / 2.0 - r));
@@ -45,8 +50,10 @@ pub(crate) fn blend(dst: u32, src: u32, a: f32) -> u32 {
 /// Draws a rounded rectangle exactly covering `rect` (right and bottom
 /// excluded) on `hdc`: filled with `fill`, and outlined inside its edge with
 /// `stroke` (colour and width in pixels), either of which may be absent.
-/// Edges are smoothed. Nothing is drawn if the shape is empty or unreasonably
-/// large; every GDI object is freed on every path.
+/// With `smooth` the edges are anti-aliased; without it (high contrast, where
+/// every pixel must be a system colour, or a shape too large to blend) the
+/// shape is GDI's own `RoundRect`. Nothing is drawn if the shape is empty;
+/// every GDI object is freed on every path.
 ///
 /// # Safety
 /// `hdc` must be a live device context.
@@ -56,9 +63,14 @@ pub(crate) unsafe fn paint(
     radius: i32,
     fill: Option<u32>,
     stroke: Option<(u32, i32)>,
+    smooth: bool,
 ) {
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-    if w <= 0 || h <= 0 || w > MAX_SIDE || h > MAX_SIDE || (fill.is_none() && stroke.is_none()) {
+    if w <= 0 || h <= 0 || (fill.is_none() && stroke.is_none()) {
+        return;
+    }
+    if !smooth || w > MAX_SIDE || h > MAX_SIDE {
+        paint_plain(hdc, rect, radius, fill, stroke);
         return;
     }
     let mem = CreateCompatibleDC(Some(hdc));
@@ -94,7 +106,9 @@ pub(crate) unsafe fn paint(
         let px = std::slice::from_raw_parts_mut(bits as *mut u32, (w as usize) * (h as usize));
         let (wf, hf, r) = (w as f32, h as f32, radius as f32);
         let inner = stroke.map(|(_, width)| {
-            let width = width.max(0) as f32;
+            // At most half the shorter side, so the inner shape never has a
+            // negative size.
+            let width = width.clamp(0, w.min(h) / 2) as f32;
             (width, (r - width).max(0.0))
         });
         for y in 0..h {
@@ -128,6 +142,51 @@ pub(crate) unsafe fn paint(
     SelectObject(mem, old);
     let _ = DeleteObject(HGDIOBJ(dib.0));
     let _ = DeleteDC(mem);
+}
+
+/// The same shape with GDI's `RoundRect`: an inside-frame pen keeps it inside
+/// `rect`, so it covers the same pixels as [`paint`]. Every pixel it writes is
+/// `fill`, the stroke colour or what was there.
+unsafe fn paint_plain(
+    hdc: HDC,
+    rect: RECT,
+    radius: i32,
+    fill: Option<u32>,
+    stroke: Option<(u32, i32)>,
+) {
+    // A pen the colour of the fill when there is no stroke: an inside-frame
+    // pen of 1 keeps the fill's right and bottom edge, which `NULL_PEN` loses.
+    let (pen_color, pen_width) = match (stroke, fill) {
+        (Some((c, w)), _) => (Some(c), w.max(1)),
+        (None, Some(f)) => (Some(f), 1),
+        (None, None) => (None, 0),
+    };
+    let brush = fill.map(|c| CreateSolidBrush(COLORREF(c)));
+    let pen = pen_color.map(|c| CreatePen(PS_INSIDEFRAME, pen_width, COLORREF(c)));
+    let old_brush = SelectObject(
+        hdc,
+        match brush {
+            Some(b) => HGDIOBJ(b.0),
+            None => GetStockObject(NULL_BRUSH),
+        },
+    );
+    let old_pen = SelectObject(
+        hdc,
+        match pen {
+            Some(p) => HGDIOBJ(p.0),
+            None => GetStockObject(NULL_PEN),
+        },
+    );
+    let d = radius.max(0).saturating_mul(2);
+    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, d, d);
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    if let Some(p) = pen {
+        let _ = DeleteObject(HGDIOBJ(p.0));
+    }
+    if let Some(b) = brush {
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
 }
 
 /// Swaps the red and blue bytes of a `0x00BBGGRR` / `0x00RRGGBB` colour.
@@ -197,6 +256,23 @@ mod tests {
         }
     }
 
+    fn fill_surface(hdc: HDC, bg: u32) {
+        unsafe {
+            let brush = CreateSolidBrush(COLORREF(bg));
+            FillRect(
+                hdc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: 40,
+                    bottom: 40,
+                },
+                brush,
+            );
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+    }
+
     fn pixel(hdc: HDC, x: i32, y: i32) -> u32 {
         unsafe { GetPixel(hdc, x, y).0 }
     }
@@ -211,7 +287,7 @@ mod tests {
                 right: 36,
                 bottom: 36,
             };
-            paint(hdc, rect, 8, Some(fill), None);
+            paint(hdc, rect, 8, Some(fill), None, true);
             assert_eq!(pixel(hdc, 20, 20), fill, "inside");
             assert_eq!(pixel(hdc, 20, 4), fill, "straight edge");
             assert_eq!(pixel(hdc, 2, 20), bg, "outside");
@@ -235,7 +311,7 @@ mod tests {
                 right: 36,
                 bottom: 36,
             };
-            paint(hdc, rect, 6, Some(fill), Some((line, 2)));
+            paint(hdc, rect, 6, Some(fill), Some((line, 2)), true);
             assert_eq!(pixel(hdc, 20, 4), line, "outer row of the stroke");
             assert_eq!(pixel(hdc, 20, 5), line, "second row of the stroke");
             assert_eq!(pixel(hdc, 20, 6), fill, "fill starts inside the stroke");
@@ -244,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_huge_shape_draws_nothing_and_does_not_crash() {
+    fn an_empty_shape_draws_nothing_and_a_huge_one_does_not_crash() {
         let bg = 0x0012_3456;
         with_surface(bg, |hdc| unsafe {
             let empty = RECT {
@@ -253,14 +329,17 @@ mod tests {
                 right: 5,
                 bottom: 9,
             };
-            paint(hdc, empty, 4, Some(0), None);
+            paint(hdc, empty, 4, Some(0), None, true);
             let huge = RECT {
                 left: 0,
                 top: 0,
                 right: MAX_SIDE + 1,
                 bottom: 10,
             };
-            paint(hdc, huge, 4, Some(0), None);
+            // Too big to blend: drawn plain, still clipped to the surface.
+            paint(hdc, huge, 4, Some(0), None, true);
+            assert_eq!(pixel(hdc, 20, 5), 0, "huge shape falls back to plain GDI");
+            fill_surface(hdc, bg);
             paint(
                 hdc,
                 RECT {
@@ -272,8 +351,63 @@ mod tests {
                 4,
                 None,
                 None,
+                true,
             );
             assert_eq!(pixel(hdc, 6, 6), bg);
+        });
+    }
+
+    #[test]
+    fn a_stroke_wider_than_the_shape_does_not_panic() {
+        // 10 by 10 with a width of 6: the inner shape would be negative.
+        with_surface(0, |hdc| unsafe {
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 10,
+                bottom: 10,
+            };
+            paint(
+                hdc,
+                rect,
+                3,
+                Some(0x00FF_FFFF),
+                Some((0x0000_00FF, 6)),
+                true,
+            );
+            assert_eq!(pixel(hdc, 5, 5), 0x0000_00FF, "all stroke");
+        });
+        assert!(coverage(1.0, 1.0, -4.0, 10.0, 3.0).is_finite());
+    }
+
+    #[test]
+    fn plain_shapes_use_only_the_given_colours() {
+        // High contrast: every pixel is a system colour, never a blend.
+        let (bg, fill, line) = (0x0000_0000, 0x00FF_FFFF, 0x0000_FF00);
+        with_surface(bg, |hdc| unsafe {
+            let rect = RECT {
+                left: 4,
+                top: 4,
+                right: 36,
+                bottom: 36,
+            };
+            paint(hdc, rect, 8, Some(fill), Some((line, 1)), false);
+            for y in 0..40 {
+                for x in 0..40 {
+                    let p = pixel(hdc, x, y);
+                    assert!(p == bg || p == fill || p == line, "({x},{y}) = {p:06X}");
+                }
+            }
+            assert_eq!(pixel(hdc, 20, 20), fill, "inside");
+            assert_eq!(pixel(hdc, 20, 4), line, "top edge");
+            assert_eq!(pixel(hdc, 20, 35), line, "bottom edge is inside the rect");
+            assert_eq!(pixel(hdc, 35, 20), line, "right edge is inside the rect");
+            assert_eq!(pixel(hdc, 4, 4), bg, "corner");
+            // Fill only: the right and bottom edge are still painted.
+            fill_surface(hdc, bg);
+            paint(hdc, rect, 8, Some(fill), None, false);
+            assert_eq!(pixel(hdc, 35, 20), fill);
+            assert_eq!(pixel(hdc, 36, 20), bg);
         });
     }
 }
