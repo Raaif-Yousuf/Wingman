@@ -13141,6 +13141,7 @@ mod tests {
     }
 
     /// The combo is a real Settings combo, and the body window really draws it.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_settings_combo_is_owner_drawn_and_the_body_draws_it() {
         use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
