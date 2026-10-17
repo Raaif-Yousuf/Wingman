@@ -174,6 +174,21 @@ pub struct Config {
     pub egress_preview: EgressPreview,
     /// #101 daily cost budget. Default off.
     pub budget: Budget,
+    /// #81 the knowledge folder (`[knowledge]`). Default off.
+    pub knowledge: Knowledge,
+}
+
+/// #81: the knowledge folder (spec 2026-10-16-knowledge-and-memory-design).
+/// Until Settings can add folders, this one setting is how a folder is turned
+/// on. Empty (the default) means Knowledge is off: no thread starts and no file
+/// is read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Knowledge {
+    /// Absolute path of a folder whose .txt and .md files Wingman indexes at
+    /// start-up so they can be searched. The text stays on this PC. Wingman
+    /// never creates the folder. Empty: off.
+    pub folder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -5975,5 +5990,23 @@ mod egress_preview_tests {
         let mut o = order(&["ollama", "openai"]);
         assert!(!ActiveProvider::Ollama.move_to_front(&mut o));
         assert_eq!(o, order(&["ollama", "openai"]));
+    }
+}
+
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+
+    #[test]
+    fn the_knowledge_folder_is_off_by_default() {
+        assert_eq!(Config::default().knowledge.folder, "");
+    }
+
+    #[test]
+    fn a_knowledge_table_in_config_toml_is_read() {
+        let c: Config = toml::from_str("[knowledge]\nfolder = 'C:\\Notes'\n").unwrap();
+        assert_eq!(c.knowledge.folder, "C:\\Notes");
+        let none: Config = toml::from_str("mode = \"auto\"\n").unwrap();
+        assert_eq!(none.knowledge, Knowledge::default());
     }
 }
