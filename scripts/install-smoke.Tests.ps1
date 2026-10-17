@@ -64,14 +64,12 @@ Describe 'the zip file set' {
     }
 }
 
-Describe 'the pre-made certificate' {
-    It 'uses the same extensions as install.ps1, so install.ps1 will reuse it' {
+Describe 'the certificate step (#965)' {
+    It 'lets install.ps1 make and trust the certificate, so the elevated path is exercised' {
         $smoke = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''
-        $install = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\install.ps1') -Raw) -replace "`r", ''
-        $install | Should -Not -BeNullOrEmpty
-        $ext = "@('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')"
-        $install.Contains($ext) | Should -BeTrue
-        $smoke.Contains($ext) | Should -BeTrue
+        $smoke | Should -Not -BeNullOrEmpty
+        $smoke.Contains('New-SelfSignedCertificate') | Should -BeFalse
+        $smoke.Contains('Import-Certificate') | Should -BeFalse
     }
 }
 
