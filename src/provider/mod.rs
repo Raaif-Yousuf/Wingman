@@ -778,10 +778,11 @@ impl Chain {
         self
     }
 
-    /// #792: gives the chain a deadline. A call already in flight cannot be
-    /// interrupted (blocking HTTP), but once the deadline has passed the chain
-    /// starts no further provider and sends no repair request, so a hint
-    /// nobody is waiting for is never billed twice.
+    /// #792: gives the chain a deadline. Once it has passed the chain starts no
+    /// further provider and sends no repair request, so a hint nobody is
+    /// waiting for is never billed twice. #843: a call already in flight has
+    /// its HTTP timeout capped to what is left of it, and no retry starts
+    /// after it.
     pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.deadline = Some(deadline);
         self
@@ -1240,6 +1241,9 @@ fn attempt_provider<T>(
     parse: &mut impl FnMut(&Completion) -> anyhow::Result<T>,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<T> {
+    // #843: the deadline also caps the HTTP timeout of both the call and the
+    // repair request below, so neither outlives it by a provider's full timeout.
+    let _deadline = common::scope_call_deadline(deadline);
     let completion = provider.complete(req)?;
 
     match parse(&completion) {
