@@ -47,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// [`HK_PRIMARY`] or [`HK_SECONDARY`]; `lparam` is unused (0).
 pub const WM_APP_HOTKEY: u32 = WM_APP + 2;
 /// Posted to the target `HWND` when learn mode captures a key. `wparam` is
-/// the `which` value passed to [`HotkeyHook::start_learning`]; `lparam` is
+/// the `which` value passed to [`arm_learning`]; `lparam` is
 /// `Box::into_raw(Box::new(chord)) as isize` -- the receiver takes ownership
 /// and must reconstruct the `Box` (e.g. `Box::from_raw(lparam.0 as *mut
 /// Chord)`) to free it.
@@ -69,7 +69,7 @@ pub const WM_APP_PALETTE_TOGGLE: u32 = WM_APP + 10;
 pub const HK_PRIMARY: usize = 1;
 pub const HK_SECONDARY: usize = 2;
 /// Learn-mode slot for the pause-toggle chord (issue #202). Only ever used as
-/// the `which` of [`HotkeyHook::start_learning`] / [`WM_APP_LEARNED`]: the
+/// the `which` of [`arm_learning`] / [`WM_APP_LEARNED`]: the
 /// hook never posts it in [`WM_APP_HOTKEY`], because a pause press has its
 /// own message ([`WM_APP_PAUSE_TOGGLE`]).
 pub const HK_PAUSE: usize = 3;
@@ -554,13 +554,6 @@ impl HotkeyHook {
                 s.palette = chord;
             }
         }
-    }
-
-    /// Arm learn mode for binding slot `which`. The next non-modifier keydown
-    /// is captured instead of matched (see [`WM_APP_LEARNED`]). Expires after
-    /// 10 seconds if nothing is pressed.
-    pub fn start_learning(&self, which: usize) {
-        arm_learning(which);
     }
 
     /// Disarm learn mode without capturing anything.
