@@ -616,7 +616,8 @@ struct App {
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
     /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
     /// doc comment.
-    palette: Palette,
+    /// `None` when its window could not be created at startup (#1019).
+    palette: Option<Palette>,
     tray: Tray,
     hook: Option<HotkeyHook>,
     /// Global click watcher. Armed only while an answer is on screen, so a
@@ -852,6 +853,30 @@ pub fn run() -> Result<()> {
     // here when "Do it"/Cancel closes it -- see Card::set_owner's doc
     // comment.
     card.set_owner(hwnd);
+    // #1019: neither of these may end the process. The tray is added again
+    // on `TaskbarCreated`; without the palette only Quick Ask is gone.
+    let (tray, tray_error) = match Tray::new(hwnd, instance) {
+        Ok(tray) => (tray, None),
+        Err(e) => (Tray::without_icon(hwnd, instance), Some(format!("{e:#}"))),
+    };
+    // #25: pre-created hidden here (rule 5: zero work while hidden --
+    // App::toggle_palette only ever ShowWindow/HideWindow this, never
+    // re-creates it).
+    let (palette, palette_error) = match Palette::new(instance) {
+        Ok(mut palette) => {
+            palette.set_owner(hwnd);
+            (Some(palette), None)
+        }
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
+    for (piece, error) in [
+        ("tray icon", &tray_error),
+        ("Quick Ask palette", &palette_error),
+    ] {
+        if let Some(error) = error {
+            crate::diagnostics::note_warning(&format!("Could not create the {piece}: {error}"));
+        }
+    }
     // #175: a stored key that could not be read is never silently dropped
     // (rule 7) -- the card is the first thing to exist that can show it.
     // #237 shares the card: a lockless start must be visible too (rule 7).
@@ -862,16 +887,10 @@ pub fn run() -> Result<()> {
         create_failed
             .as_ref()
             .map(|(folder, error)| (folder.as_str(), error.as_str())),
+        degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
     ) {
         card.show_error(&headline, &detail);
     }
-    let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
-
-    // #25: pre-created hidden here (rule 5: zero work while hidden --
-    // App::toggle_palette only ever ShowWindow/HideWindow this, never
-    // re-creates it).
-    let mut palette = Palette::new(instance).context("creating the Quick Ask palette window")?;
-    palette.set_owner(hwnd);
 
     let mut app = Box::new(App {
         instance,
@@ -1036,6 +1055,7 @@ fn startup_card(
     lock_squatted: bool,
     config_problem: Option<&str>,
     create_failed: Option<(&str, &str)>,
+    degraded: Option<(String, String)>,
 ) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
@@ -1056,9 +1076,42 @@ fn startup_card(
     if lock_squatted {
         cards.push(squat);
     }
+    cards.extend(degraded);
     let mut cards = cards.into_iter();
     let (headline, mut detail) = cards.next()?;
     for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #1019: the card for a start that went ahead without its tray icon or its
+/// Quick Ask window. Pure. No em dash (rule 11).
+fn degraded_start_card(
+    tray_error: Option<&str>,
+    palette_error: Option<&str>,
+) -> Option<(String, String)> {
+    let tray = tray_error.map(|e| {
+        (
+            "Tray icon not added yet".to_string(),
+            format!(
+                "Windows did not accept the tray icon ({e}). This can happen right after \
+                 sign-in. Wingman keeps running and adds the icon as soon as the taskbar is \
+                 ready. The Copilot key works meanwhile."
+            ),
+        )
+    });
+    let palette = palette_error.map(|e| {
+        (
+            "Quick Ask unavailable".to_string(),
+            format!(
+                "The Quick Ask window could not be created ({e}). The rest of Wingman works. \
+                 Use the Copilot key."
+            ),
+        )
+    });
+    let (headline, mut detail) = tray.clone().or(palette.clone())?;
+    if let (Some(_), Some((h, d))) = (&tray, &palette) {
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
@@ -1933,8 +1986,15 @@ impl App {
     /// the screen is read only after the user picks an action or types
     /// something, by that action's own flow.
     fn toggle_palette(&mut self) {
-        if self.palette.is_visible() {
-            self.palette.hide();
+        let Some(palette) = self.palette.as_mut() else {
+            self.card.show_error(
+                "Quick Ask unavailable",
+                "Its window could not be created at startup. Restart Wingman to try again.",
+            );
+            return;
+        };
+        if palette.is_visible() {
+            palette.hide();
             return;
         }
         if pause::is_paused_now() {
@@ -1962,7 +2022,9 @@ impl App {
 
         // #339: asked BEFORE the palette takes the foreground.
         self.palette_password_manager = self.password_manager_now();
-        self.palette.show(catalogue, model_configured, footer);
+        if let Some(palette) = self.palette.as_mut() {
+            palette.show(catalogue, model_configured, footer);
+        }
     }
 
     /// The actions a picker (the palette, the options card) chooses from: the
@@ -9303,7 +9365,7 @@ mod tests {
                 "toggle_palette must not use {forbidden}"
             );
         }
-        assert!(body.contains("self.palette.show("));
+        assert!(body.contains("palette.show("));
     }
 
     /// The options card is reachable and answered: the tray item runs it, the
@@ -9835,7 +9897,7 @@ mod tests {
         let end = body.find("\n    }\n").expect("toggle_palette ends");
         let body = &body[..end];
         assert!(
-            body.contains("self.palette.show("),
+            body.contains("palette.show("),
             "the scan found the wrong body"
         );
         for forbidden in [
@@ -11437,12 +11499,12 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false, None, None), None);
-        let only_keys = super::startup_card(&keys, false, None, None).unwrap();
+        assert_eq!(super::startup_card(&[], false, None, None, None), None);
+        let only_keys = super::startup_card(&keys, false, None, None, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true, None, None).unwrap();
+        let only_squat = super::startup_card(&[], true, None, None, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true, None, None).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None, None, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
@@ -11454,13 +11516,14 @@ mod tests {
     #[test]
     fn startup_card_reports_a_config_file_that_did_not_parse() {
         let problem = "config.toml has an error at line 3, column 7";
-        let (headline, detail) = super::startup_card(&[], false, Some(problem), None).unwrap();
+        let (headline, detail) =
+            super::startup_card(&[], false, Some(problem), None, None).unwrap();
         assert!(headline.contains("Settings file"), "{headline}");
         assert!(detail.contains(problem), "{detail}");
         assert!(detail.contains("Reload settings"), "{detail}");
         assert!(!detail.contains('\u{2014}'));
         let (_, both) =
-            super::startup_card(&["openai".to_string()], true, Some(problem), None).unwrap();
+            super::startup_card(&["openai".to_string()], true, Some(problem), None, None).unwrap();
         assert!(
             both.contains(problem) && both.contains("startup lock"),
             "{both}"
@@ -11477,17 +11540,47 @@ mod tests {
             "C:\\Users\\x\\AppData\\Roaming\\Wingman",
             "Access is denied. (os error 5)",
         ));
-        let (headline, detail) = super::startup_card(&[], false, None, failed).unwrap();
+        let (headline, detail) = super::startup_card(&[], false, None, failed, None).unwrap();
         assert!(headline.contains("Settings file"), "{headline}");
         assert!(detail.contains("AppData\\Roaming\\Wingman"), "{detail}");
         assert!(detail.contains("Access is denied"), "{detail}");
         assert!(detail.contains("default settings"), "{detail}");
         assert!(!detail.contains('\u{2014}'));
-        let (_, both) = super::startup_card(&[], true, None, failed).unwrap();
+        let (_, both) = super::startup_card(&[], true, None, failed, None).unwrap();
         assert!(
             both.contains("Access is denied") && both.contains("startup lock"),
             "{both}"
         );
+    }
+
+    // #1019: a tray or palette that could not be created is a card, not an exit.
+    #[test]
+    fn degraded_start_names_each_missing_piece() {
+        assert_eq!(super::degraded_start_card(None, None), None);
+        let (h, d) = super::degraded_start_card(Some("NIM_ADD failed"), None).unwrap();
+        assert!(h.contains("Tray icon"), "{h}");
+        assert!(
+            d.contains("NIM_ADD failed") && d.contains("Copilot key"),
+            "{d}"
+        );
+        let (h, d) = super::degraded_start_card(None, Some("no window")).unwrap();
+        assert!(h.contains("Quick Ask"), "{h}");
+        assert!(d.contains("no window"), "{d}");
+        let (_, both) = super::degraded_start_card(Some("a"), Some("b")).unwrap();
+        assert!(
+            both.contains("Quick Ask") && both.contains("tray icon"),
+            "{both}"
+        );
+        assert!(!both.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn startup_card_keeps_the_degraded_start_note() {
+        let degraded = super::degraded_start_card(Some("x"), None);
+        let (headline, detail) =
+            super::startup_card(&["openai".to_string()], false, None, None, degraded).unwrap();
+        assert!(headline.contains("key"), "{headline}");
+        assert!(detail.contains("Tray icon"), "{detail}");
     }
 
     /// A long error (an `icacls` message) is capped, and a blank one still

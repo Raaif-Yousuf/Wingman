@@ -422,6 +422,13 @@ impl Tray {
         Ok(Self::with_icon(hwnd, instance, base_icon))
     }
 
+    /// #1019: a tray whose `NIM_ADD` was refused (Explorer not ready at
+    /// login). Holds no icon; [`Tray::readd`] on `TaskbarCreated` adds it.
+    /// Every other call on it is a harmless failed `NIM_MODIFY`.
+    pub fn without_icon(hwnd: HWND, instance: HINSTANCE) -> Self {
+        Self::with_icon(hwnd, instance, HICON::default())
+    }
+
     fn with_icon(hwnd: HWND, instance: HINSTANCE, base_icon: HICON) -> Self {
         Self {
             hwnd,
