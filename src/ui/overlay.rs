@@ -309,7 +309,14 @@ unsafe fn draw(
     ReleaseDC(None, screen);
     let bitmap = match bitmap {
         Ok(b) if !b.is_invalid() && !bits.is_null() && !dc.is_invalid() => b,
-        _ => {
+        other => {
+            // A bitmap that was made but cannot be used (no bits, or no dc to
+            // select it into) is still ours to free.
+            if let Ok(b) = other {
+                if !b.is_invalid() {
+                    let _ = DeleteObject(b.into());
+                }
+            }
             if !dc.is_invalid() {
                 let _ = DeleteDC(dc);
             }
@@ -481,6 +488,22 @@ impl OverlayWindow {
             exclude_from_capture
         };
         Self::create_with(instance, CLASS_NAME, rect, apply)
+    }
+
+    /// [`Self::create`] under the test-only class name (Hard Rule 9: tests
+    /// never register a production name).
+    #[cfg(test)]
+    fn create_for_test(
+        instance: HINSTANCE,
+        rect: ScreenRect,
+        capturable: bool,
+    ) -> Result<Self, &'static str> {
+        let apply: fn(HWND) -> bool = if capturable {
+            leave_capturable
+        } else {
+            exclude_from_capture
+        };
+        Self::create_with(instance, TEST_CLASS_NAME, rect, apply)
     }
 
     fn create_with(
@@ -794,6 +817,14 @@ impl Drop for Win32Steps {
         .flatten()
         {
             Self::unhook(h);
+        }
+        // The mouse and key claims and the age timer are not handles this
+        // struct owns, but a path that forgot to hide must not leave them
+        // armed either. All three are idempotent and cheap.
+        crate::dismiss::disarm_overlay();
+        crate::hotkey::disarm_overlay_keys();
+        unsafe {
+            let _ = KillTimer(Some(self.owner), OVERLAY_TIMER_ID);
         }
         OWNER.store(0, Ordering::Relaxed);
     }
@@ -1271,7 +1302,7 @@ mod tests {
     #[test]
     #[ignore]
     fn overlay_window_is_excluded_live() {
-        let w = OverlayWindow::create(instance(), r(0, 0, 50, 20), false).expect("window");
+        let w = OverlayWindow::create_for_test(instance(), r(0, 0, 50, 20), false).expect("window");
         assert_eq!(affinity_of(w.hwnd()), Some(WDA_EXCLUDEFROMCAPTURE));
     }
 
@@ -1387,7 +1418,8 @@ mod tests {
         );
         let frame = render(&[note(anchor, "Overlay capture check")], monitor, &look).unwrap();
         let count_in_capture = |capturable: bool| -> usize {
-            let w = OverlayWindow::create(instance(), frame.rect, capturable).expect("window");
+            let w =
+                OverlayWindow::create_for_test(instance(), frame.rect, capturable).expect("window");
             assert!(w.present(&frame));
             std::thread::sleep(std::time::Duration::from_millis(400));
             let shot = grab_raw_for("active", u32::MAX, u64::MAX, LookupWindow::None, &[]).unwrap();

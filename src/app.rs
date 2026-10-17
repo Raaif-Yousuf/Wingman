@@ -4970,14 +4970,17 @@ impl App {
             HideReason::Changed | HideReason::Age => true,
         };
         if rewrite {
-            let line = if reason == HideReason::Age {
-                "Marks timed out. Press the key to mark again"
-            } else {
-                "Marks hidden, the screen changed. Press the key to mark again"
-            };
-            self.card.show_answer(line, &findings, 8, None);
+            self.card
+                .show_answer(overlay_hidden_line(reason), &findings, 8, None);
             self.set_watch(true);
         }
+    }
+
+    /// #809: the overlay's one-shot age timer fired while a menu or dialog
+    /// was open (killed there), so its age is up: the marks go now, with the
+    /// card rewritten as for any age hide.
+    fn on_overlay_age_stale(&mut self) {
+        self.apply_overlay_input(crate::overlay::state::Input::AgeElapsed, None);
     }
 
     /// #809: the overlay's summary card (or the surface it belongs to) went
@@ -5664,6 +5667,9 @@ impl App {
         let stuck = self.saves_stuck(saves);
         match settings_hold_card(stops, saves, stuck) {
             Some((headline, detail)) => {
+                // #809: this card replaces an overlay's summary card, and the
+                // marks must not outlive the card they belong to.
+                self.drop_overlay();
                 self.card.show_answer(headline, detail, 3, None);
                 // #1013: a click in Settings (or anywhere) clears it, like any
                 // card that is waiting to be read.
@@ -5771,6 +5777,12 @@ impl App {
         // #901: after the replies above, so one that arrived meanwhile counts.
         if RELOAD_STUCK.with(|c| c.replace(false)) {
             self.on_reload_stuck();
+        }
+        // #809: an overlay whose age ran out, or that heard a click or key,
+        // behind a menu or dialog: its timer was killed and its input dropped
+        // there, so it is hidden now rather than left up with nothing to end it.
+        if OVERLAY_STALE.with(|c| c.replace(false)) {
+            self.on_overlay_age_stale();
         }
     }
 
@@ -8413,6 +8425,23 @@ thread_local! {
     /// cannot be touched there (see `SETTINGS_OPEN`), so the wait is
     /// forgotten by the next press, through `disarm_key_window`.
     static KEY_WINDOW_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// #809: the overlay's age timer fired, or an overlay input arrived, while
+    /// a menu or dialog was open. Neither can reach `App` there; the overlay
+    /// is hidden by `finish_modal_deferrals` once the modal is over.
+    static OVERLAY_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #809: the card's first line when the marks hide and the summary card stays
+/// up. A click inside the card is the user's own doing, so it never says the
+/// screen changed.
+fn overlay_hidden_line(reason: crate::overlay::state::HideReason) -> &'static str {
+    use crate::overlay::state::HideReason;
+    match reason {
+        HideReason::Age => "Marks timed out. Press the key to mark again",
+        HideReason::Click => "Marks hidden. Press the key to mark again",
+        _ => "Marks hidden, the screen changed. Press the key to mark again",
+    }
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -8879,9 +8908,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_ROUTER_RESULT
-        // #809: an overlay input needs no payload freed, and an overlay cannot
-        // be showing while Settings is modal-open (opening it takes a click,
-        // which hides the overlay first).
+        // #809: an overlay input needs no payload freed; the overlay is
+        // hidden once the modal is over (`OVERLAY_STALE`, set where the
+        // Ignore arm drops it).
         | WM_APP_OVERLAY_INPUT
         // #307: the options card is hidden whenever Settings opens (so its
         // key claim is already cleared), so a late choice has nothing to
@@ -9647,13 +9676,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             BUSY_STUCK.with(|c| c.set(true));
             return LRESULT(0);
         }
-        // #809: the overlay's age timer is one-shot too. Settings opens only
-        // through a click, which has already hidden the overlay, so this is
-        // belt and braces: kill it rather than let it repeat behind the modal.
+        // #809: the overlay's age timer is one-shot too (the tray menu does
+        // not hide the overlay, so it can fire behind the menu).
         if msg == WM_TIMER && wparam.0 == OVERLAY_TIMER_ID {
+            // A one-shot: killed at once so it cannot repeat behind the modal,
+            // and the overlay is hidden once the modal is over.
             unsafe {
                 let _ = KillTimer(Some(hwnd), OVERLAY_TIMER_ID);
             }
+            OVERLAY_STALE.with(|c| c.set(true));
             return LRESULT(0);
         }
         if msg == WM_POWERBROADCAST {
@@ -9684,6 +9715,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // WM_APP_REVIEW_RESULT and WM_APP_FORM_FILL_RESULT are all
                 // Defer, not Ignore -- issue #213/#40.)
                 free_boxed_payload(msg, lparam);
+                // #809: an overlay input behind a menu or dialog is not
+                // acted on (it was read against a screen the modal changed),
+                // but the overlay must not outlive it: hide it afterwards.
+                if msg == WM_APP_OVERLAY_INPUT {
+                    OVERLAY_STALE.with(|c| c.set(true));
+                }
                 return LRESULT(0);
             }
             SettingsReentrancy::Defer => {
@@ -14385,6 +14422,62 @@ mod tests {
         );
     }
 
+    /// #809: a click inside the card is the user's own doing, so its line
+    /// never claims the screen changed; an age hide and a real change keep
+    /// their own words.
+    #[test]
+    fn the_overlay_card_line_says_what_really_hid_the_marks() {
+        use crate::overlay::state::HideReason;
+        let click = super::overlay_hidden_line(HideReason::Click);
+        assert_eq!(click, "Marks hidden. Press the key to mark again");
+        assert!(!click.contains("screen changed"));
+        assert!(super::overlay_hidden_line(HideReason::Age).contains("timed out"));
+        assert!(super::overlay_hidden_line(HideReason::Changed).contains("screen changed"));
+    }
+
+    /// #809: behind a menu or dialog the overlay's timer is killed and its
+    /// input dropped; both must leave a flag that hides it afterwards, and a
+    /// Settings refusal replaces the summary card, so it drops the overlay.
+    #[test]
+    fn an_overlay_behind_a_modal_is_hidden_afterwards_and_a_refusal_drops_it() {
+        let src = lf(include_str!("app.rs"));
+        let timer = body_between(
+            &src,
+            "if msg == WM_TIMER && wparam.0 == OVERLAY_TIMER_ID {",
+            "\n        }\n",
+        );
+        assert!(
+            timer.contains("KillTimer(Some(hwnd), OVERLAY_TIMER_ID)"),
+            "{timer}"
+        );
+        assert!(
+            timer.contains("OVERLAY_STALE.with(|c| c.set(true))"),
+            "{timer}"
+        );
+        let ignore = body_between(
+            &src,
+            "            SettingsReentrancy::Ignore => {",
+            "\n            }\n",
+        );
+        assert!(ignore.contains("msg == WM_APP_OVERLAY_INPUT"), "{ignore}");
+        assert!(
+            ignore.contains("OVERLAY_STALE.with(|c| c.set(true))"),
+            "{ignore}"
+        );
+        let deliver = body_between(&src, "    fn deliver_deferred(", "\n    }\n");
+        assert!(
+            deliver.contains("OVERLAY_STALE.with(|c| c.replace(false))")
+                && deliver.contains("self.on_overlay_age_stale()"),
+            "{deliver}"
+        );
+        let refuse = body_between(&src, "    fn refuse_for_settings(", "\n    }\n");
+        let drop = refuse
+            .find("self.drop_overlay()")
+            .expect("a refusal keeps the marks");
+        let show = refuse.find("self.card.show_answer").expect("no card");
+        assert!(drop < show, "{refuse}");
+    }
+
     /// Every `SetTimer` id used on the main window must be distinct: two
     /// one-shot timers sharing an id would silently replace each other.
     /// (The card's own ids live on the card window and do not count.)
@@ -14438,7 +14531,8 @@ mod tests {
             WM_APP_OPTIONS_CHOICE,
             // #809: a hook-posted overlay click or key is stale once the menu has
             // taken the mouse; delivering it afterwards would act on a screen that
-            // has moved on. The overlay's own hooks still dismiss it on the next input.
+            // has moved on. The Ignore arm marks the overlay stale instead, and it
+            // is hidden when the menu closes.
             WM_APP_OVERLAY_INPUT,
         ];
         let mut ignored = 0;
