@@ -778,11 +778,12 @@ pub fn tally(
     result
 }
 
-/// The tooltip fragment for today, read from the store. Runs on the UI
-/// thread, so it never opens the store (#1010): before the start-up open has
-/// finished there is no spend part, and the next refresh shows it.
+/// The tooltip fragment for today, read from the store. Runs on a worker
+/// thread only (#1181), never the UI thread: it may wait for the start-up open
+/// and may touch the file (#1010), so the result is never `None` just because
+/// the store was still opening.
 pub fn tooltip_part() -> Option<String> {
-    let store = crate::store::global_if_ready()?.ok()?;
+    let store = crate::store::global().ok()?;
     let day = store.day_total(&local_date_today()).ok()??;
     format_tooltip_part(&day)
 }

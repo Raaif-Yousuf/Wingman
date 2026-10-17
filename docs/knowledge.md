@@ -69,6 +69,10 @@ shows a note, and keeps what was already indexed. Choose Reload settings once
 the folder is back. Nothing runs while the folder is quiet: the watch waits for
 Windows to report a change, with no timer.
 
+If Wingman's saved data is damaged while it runs and replaced by a fresh file
+(the card says so), the folder is read again into the fresh file by itself, a
+moment later. You do not need to restart.
+
 If some files could not be read, the next answer card says how many. A file that
 was open in another program is tried again a few times, then at the next
 change or start.
