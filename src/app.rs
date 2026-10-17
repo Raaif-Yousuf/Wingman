@@ -7729,7 +7729,7 @@ fn uia_fields_text(foreground_hwnd: isize) -> String {
     .join()
     .ok()
     .and_then(|r| r.ok())
-    .map(|snapshot| crate::inputs::uia::format_compact(&snapshot.fields))
+    .map(|snapshot| crate::inputs::uia::format_for_prompt(&snapshot))
     .unwrap_or_default()
 }
 
