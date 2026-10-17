@@ -399,7 +399,21 @@ impl Store {
                     Err(e) => return Heal::Stuck(e.to_string()),
                 }
             } else {
-                if !file_is_damaged(conn) {
+                let mut damaged = file_is_damaged(conn);
+                let fts_now = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
+                if damaged && self.fts_seen.load(Ordering::SeqCst) != fts_now {
+                    // The check failed, but the full-text index is derived
+                    // from the chunk table: rebuild just that before giving
+                    // up on the whole file, so usage and request history
+                    // stay (#1189). If the rebuild fails or the check still
+                    // fails, the file is moved aside as before.
+                    if recreate_fts_index(conn).is_ok() && !file_is_damaged(conn) {
+                        self.fts_seen.store(fts_now, Ordering::SeqCst);
+                        return Heal::Rebuilt;
+                    }
+                    damaged = file_is_damaged(conn);
+                }
+                if !damaged {
                     // The file passes, but the full-text index may disagree
                     // with its table (#1159): rebuild just that, so the user
                     // keeps history and documents. A rebuild that hits damage
@@ -513,6 +527,28 @@ fn fts_index_out_of_step(conn: &Connection) -> bool {
 fn rebuild_fts_index(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute("INSERT INTO chunk_fts (chunk_fts) VALUES ('rebuild')", [])
         .map(|_| ())
+}
+
+/// Drops the full-text index (and its shadow tables) and creates it again
+/// from the chunk table, in one savepoint: either the new index is complete
+/// or the old one is left as it was. `chunk_fts` holds only derived data; the
+/// chunk table it mirrors is never touched.
+fn recreate_fts_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "SAVEPOINT recreate_fts;
+         DROP TABLE IF EXISTS chunk_fts;
+         CREATE VIRTUAL TABLE chunk_fts USING fts5 (
+             text,
+             content = 'chunk',
+             content_rowid = 'id',
+             tokenize = 'unicode61 remove_diacritics 2'
+         );
+         INSERT INTO chunk_fts (chunk_fts) VALUES ('rebuild');
+         RELEASE recreate_fts;",
+    )
+    .inspect_err(|_| {
+        let _ = conn.execute_batch("ROLLBACK TO recreate_fts; RELEASE recreate_fts;");
+    })
 }
 
 /// How an index rebuild ended.
@@ -1698,7 +1734,8 @@ mod tests {
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Segment rows gone: 267 on read, and quick_check sees it too.
+        // Segment rows gone: 267 on read, and quick_check sees it too. Only
+        // derived index data is broken, so the index is rebuilt in place (#1189).
         let (s, dir) = store_with_indexed_chunks("fts-real-segments");
         {
             let conn = s.lock();
@@ -1713,8 +1750,45 @@ mod tests {
         let before = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
         assert!(s.search_chunks("C:/Notes", query, 10).is_err());
         assert_eq!(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst), before + 1);
+        assert!(s.day_total("2026-10-15").unwrap().is_some(), "history kept");
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 3, "index rebuilt");
+        assert_eq!(s.search_chunks("C:/Notes", query, 10).unwrap().len(), 3);
+        assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1189: when the index cannot be rebuilt in place (a shadow table is
+    /// gone) it is dropped and created again; history and chunks stay.
+    #[test]
+    fn a_broken_index_table_is_created_again_without_losing_history() {
+        let _serial = FTS_EVENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (s, dir) = store_with_indexed_chunks("fts-dropped-shadow");
+        {
+            let conn = s.lock();
+            conn.execute_batch("DROP TABLE chunk_fts_config;").unwrap();
+        }
+        let _ = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT_VTAB),
+            None,
+        ));
+        assert!(s.day_total("2026-10-15").unwrap().is_some(), "history kept");
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 3, "index rebuilt");
+        assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1189: damage outside the index still moves the whole file aside.
+    #[test]
+    fn damage_to_the_chunk_table_still_moves_the_file_aside() {
+        let _serial = FTS_EVENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (s, dir) = store_with_indexed_chunks("fts-chunk-damage");
+        s.damage_file_for_test();
+        // The first read runs into the garbage; the next lock heals.
+        let _ = s.day_total("2026-10-15");
         assert_eq!(s.day_total("2026-10-15").unwrap(), None, "history lost");
-        assert_eq!(damaged_copies(&dir), 1, "the whole file was moved aside");
+        assert_eq!(damaged_copies(&dir), 1);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
