@@ -276,14 +276,18 @@ impl Store {
 
     /// Overwrites this store's file with garbage while it stays open, so the
     /// next query reads it (#660). The checkpoint moves the data into the main
-    /// file and `shrink_memory` drops the page cache first.
+    /// file and `shrink_memory` drops the page cache first. The connection
+    /// stays locked until the overwrite is done: a read from another thread in
+    /// between would refill the cache from the good file, and the damage would
+    /// then never be read.
     #[cfg(test)]
     pub(crate) fn damage_file_for_test(&self) {
         let path = self.path.clone().expect("a file-backed store");
-        self.lock()
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+        let conn = self.lock();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
             .unwrap();
         std::fs::write(path, vec![b'x'; 8192]).unwrap();
+        drop(conn);
     }
 
     /// [`Store::open_at`], but a damaged file is moved aside to
@@ -1398,6 +1402,40 @@ mod tests {
         assert!(!s.heal_state.lock().unwrap().detached);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A busy thread (the knowledge watcher) reads the store while the test
+    /// damages it. The damage must still be seen by the next query: a read
+    /// that slips in between the cache drop and the overwrite would refill the
+    /// page cache from the good file, and the garbage would never be read.
+    #[test]
+    fn damage_for_test_is_seen_even_when_another_thread_is_reading() {
+        for round in 0..40 {
+            let dir = scratch(&format!("damage-busy-{round}"));
+            let s = Arc::new(Store::open_at(&dir.join("wingman.db")).unwrap());
+            s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+                .unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (s, stop) = (Arc::clone(&s), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let _ = s.day_total("2026-10-15");
+                    }
+                })
+            };
+            std::thread::sleep(Duration::from_millis(5));
+            s.damage_file_for_test();
+            // Let the reader (and nothing else) run into the garbage first.
+            std::thread::sleep(Duration::from_millis(20));
+            stop.store(true, Ordering::SeqCst);
+            reader.join().unwrap();
+            let _ = s.day_total("2026-10-15");
+            let _ = s.day_total("2026-10-15");
+            assert_eq!(damaged_copies(&dir), 1, "round {round}: damage not seen");
+            drop(s);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A dropped subscription is not called any more.
