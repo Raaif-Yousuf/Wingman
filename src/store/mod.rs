@@ -824,6 +824,20 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
+    /// #1095: the bundled SQLite is built without its JSON functions (about
+    /// 36 KB). No store SQL uses them; this fails if the flag in
+    /// `.cargo/config.toml` is dropped or stops reaching the build, and tells
+    /// the next slice that wants `json_extract` where to turn it back on.
+    #[test]
+    fn the_bundled_sqlite_has_no_json_functions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let r: rusqlite::Result<String> = conn.query_row("SELECT json('{}')", [], |r| r.get(0));
+        assert!(
+            r.is_err(),
+            "json() exists: -DSQLITE_OMIT_JSON is not applied"
+        );
+    }
+
     #[test]
     fn a_damaged_file_is_moved_aside_and_a_fresh_store_opens() {
         let dir = scratch("corrupt");
