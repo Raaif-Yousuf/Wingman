@@ -191,7 +191,7 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     let raw = Box::into_raw(inner);
 
     let class_name = wide_z(class);
-    let title = wide_z("Wingman settings");
+    let title = wide_z(SETTINGS_TITLE);
     // See `FREED_BY_WINDOW`: forget a stale answer before creating.
     FREED_BY_WINDOW.with(|c| c.set(0));
 
@@ -1370,6 +1370,14 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
     }
 }
 
+/// The Settings window's title (#828).
+const SETTINGS_TITLE: &str = "Wingman Settings";
+
+/// #828: the text scale as a percent ("125%"), the way Windows words it.
+fn text_scale_label(scale: f32) -> String {
+    format!("{}%", (clamp_text_scale(scale) * 100.0).round() as i32)
+}
+
 fn update_text_scale_label(hwnd: HWND) {
     let (Some(track), Some(label)) = (
         get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK),
@@ -1379,7 +1387,7 @@ fn update_text_scale_label(hwnd: HWND) {
     };
     let pos = unsafe { SendMessageW(track, TBM_GETPOS, None, None).0 as i32 };
     let scale = clamp_text_scale(pos as f32 / 100.0);
-    set_text(label, &format!("{scale:.2}x"));
+    set_text(label, &text_scale_label(scale));
 }
 
 // ---------------------------------------------------------------------------
@@ -7371,7 +7379,7 @@ fn build_ui_recorded(
     }
     ctx.create(
         WC_STATIC,
-        &format!("{:.2}x", clamp_text_scale(config.ui.text_scale)),
+        &text_scale_label(config.ui.text_scale),
         0,
         0,
         r.right() - TEXT_SCALE_LABEL_W + COL_GAP / 2,
@@ -12716,6 +12724,22 @@ mod tests {
     }
 
     // -- clamp_text_scale --------------------------------------------------
+
+    /// #828: the slider's value reads as a percent, like the rest of Windows.
+    #[test]
+    fn text_scale_label_is_a_percent() {
+        assert_eq!(text_scale_label(1.0), "100%");
+        assert_eq!(text_scale_label(1.25), "125%");
+        assert_eq!(text_scale_label(0.5), "50%");
+        assert_eq!(text_scale_label(9.0), "200%");
+        assert_eq!(text_scale_label(f32::NAN), "100%");
+    }
+
+    /// #828: a Windows title is "Settings" in title case.
+    #[test]
+    fn window_title_is_title_case() {
+        assert_eq!(SETTINGS_TITLE, "Wingman Settings");
+    }
 
     #[test]
     fn clamp_text_scale_within_range_is_unchanged() {
