@@ -648,6 +648,9 @@ struct App {
     /// #42: the action being dispatched right now. It becomes `last_action`
     /// only when its run starts ([`App::note_run_started`]), not on a refusal.
     pending_action: Option<String>,
+    /// #964: what started the action being dispatched right now, so a worker
+    /// it spawns can label its egress rows. Set around one dispatch, then cleared.
+    run_trigger: Option<Trigger>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -969,6 +972,7 @@ pub fn run() -> Result<()> {
         look_pressed_at: None,
         last_action: None,
         pending_action: None,
+        run_trigger: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -2517,7 +2521,7 @@ impl App {
         self.close_options_card();
         std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         self.palette_password_manager = false;
-        self.dispatch_palette_action(id);
+        self.dispatch_palette_action(id, Trigger::Options);
     }
 
     /// #308, #393: one press of the Wingman key. What it does follows what is
@@ -2688,7 +2692,7 @@ impl App {
             PrimaryDispatch::CheckMyWork => self.ask(trigger),
             PrimaryDispatch::Other(id) => {
                 self.palette_password_manager = false;
-                self.dispatch_palette_action(&id);
+                self.dispatch_palette_action(&id, trigger);
             }
             PrimaryDispatch::Unknown(id) => {
                 let (title, reason) = unknown_primary_action_text(&id);
@@ -2749,7 +2753,7 @@ impl App {
     /// corresponding tray item already calls; there is no second,
     /// palette-only code path. A `None` target (an id the palette itself
     /// never produces) is a no-op, not a panic (rule 7).
-    fn dispatch_palette_action(&mut self, action_id: &str) {
+    fn dispatch_palette_action(&mut self, action_id: &str, trigger: Trigger) {
         // A run posted before Settings opened, or while a save is applied.
         if self.refuse_for_settings() {
             return;
@@ -2759,7 +2763,9 @@ impl App {
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
         self.pending_action = Some(action_id.to_string());
+        self.run_trigger = Some(trigger);
         self.dispatch_palette_target(action_id);
+        self.run_trigger = None;
         self.pending_action = None;
         self.password_manager_hint = false;
     }
@@ -3011,8 +3017,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
@@ -3275,8 +3283,10 @@ impl App {
             } else {
                 (action.clone(), schema.clone())
             };
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
                     // #127 step 1: find the link, check it, and hand it back for
@@ -3892,8 +3902,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
@@ -4090,8 +4102,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 form_fill_worker(
@@ -8518,6 +8532,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         }
     }
     let _from_tray = TrayCommandScope::enter();
+    app.run_trigger = Some(Trigger::Tray);
     match decode(id) {
         MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
         MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
@@ -8571,6 +8586,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     }
     // Not after Quit: the window (and `app`) may already be gone.
     if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
+        app.run_trigger = None;
         app.password_manager_hint = false;
     }
     LRESULT(0)
@@ -9004,7 +9020,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // through the same dispatch table the palette's rows were built
             // from.
             let action_id = unsafe { *Box::from_raw(lparam.0 as *mut String) };
-            app.dispatch_palette_action(&action_id);
+            app.dispatch_palette_action(&action_id, Trigger::Palette);
             LRESULT(0)
         }
         WM_APP_FIRST_RUN => {
@@ -14503,6 +14519,55 @@ mod tests {
                     "edit_settings returns after a card without arming click-away"
                 );
             }
+        }
+    }
+
+    /// #964: every entry point that can start a model call says what started
+    /// it, and every worker that can write an egress row picks that up.
+    #[test]
+    fn every_entry_point_and_model_worker_names_its_trigger() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        // Entry points: the options card, the palette, a pinned primary action.
+        assert!(body_of("run_option").contains("dispatch_palette_action(id, Trigger::Options)"));
+        assert!(production.contains("app.dispatch_palette_action(&action_id, Trigger::Palette)"));
+        assert!(body_of("run_primary_action").contains("dispatch_palette_action(&id, trigger)"));
+        // The dispatch funnel holds the trigger for the length of the run.
+        let funnel = body_of("dispatch_palette_action");
+        assert!(
+            funnel.contains("self.run_trigger = Some(trigger)"),
+            "{funnel}"
+        );
+        assert!(funnel.contains("self.run_trigger = None"), "{funnel}");
+        // The tray menu does the same for its direct commands.
+        assert!(production.contains("app.run_trigger = Some(Trigger::Tray)"));
+        // Workers that call a model carry it into the thread.
+        for name in [
+            "add_event_from_screen",
+            "run_generic_action_with",
+            "review_this_email",
+            "fill_form_from_screen",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("let trigger = self.run_trigger;"),
+                "{name} does not capture the trigger"
+            );
+            let spawn = body.find("std::thread::spawn").expect("worker spawn");
+            assert!(
+                body[spawn..].contains("crate::activation::set_worker_trigger_opt(trigger)"),
+                "{name}'s worker does not set the trigger"
+            );
         }
     }
 
