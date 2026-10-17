@@ -808,6 +808,10 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
             &stopped,
         ) {
             Ok(busy) => {
+                // The tray shows this count; read here, off the UI thread.
+                if !stopped() {
+                    ingest::publish_indexed_files(&store, &root);
+                }
                 tries.retain(|rel, _| busy.contains(rel));
                 let now = Instant::now();
                 for rel in busy {

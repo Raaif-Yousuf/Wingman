@@ -291,6 +291,10 @@ pub mod cmd {
     /// it to actions.toml. See `App::import_action` in `app.rs`.
     pub const IMPORT_ACTION: u32 = 1034;
 
+    /// Issue #81: "Open knowledge folder (N files)", shown only while a
+    /// knowledge folder is set. See `App::open_knowledge_folder` in `app.rs`.
+    pub const OPEN_KNOWLEDGE: u32 = 1035;
+
     /// Base id for the OpenAI model submenu. The chosen model is
     /// `OPENAI_MODEL_BASE + index` into the slice passed to `set_models`.
     pub const OPENAI_MODEL_BASE: u32 = 2000;
@@ -392,6 +396,9 @@ pub struct Tray {
     shown: ShownModels,
     /// (id, menu label) of each action the user wrote, for "Export action".
     export_actions: Vec<(String, String)>,
+    /// #81: files indexed in the knowledge folder, `None` while no usable
+    /// folder is set (the menu entry is then left out).
+    knowledge_files: Option<usize>,
     ollama_labels: Vec<String>,
     ollama_current: Option<usize>,
     /// The icon loaded by [`add_icon`] (embedded resource or the
@@ -462,6 +469,7 @@ impl Tray {
             ollama_models: Vec::new(),
             shown: ShownModels::default(),
             export_actions: Vec::new(),
+            knowledge_files: None,
             ollama_labels: Vec::new(),
             ollama_current: None,
             anthropic_current: None,
@@ -489,6 +497,7 @@ impl Tray {
             &["claude-sonnet-5-5".to_string()],
             "claude-sonnet-5-5",
         );
+        tray.set_knowledge(Some(128));
         tray.mode = crate::mode::Mode::Local;
         tray.set_active_provider(Some(ActiveProvider::Anthropic));
         tray
@@ -694,6 +703,12 @@ impl Tray {
             .collect();
     }
 
+    /// #81: the indexed-file count for the "Open knowledge folder" entry, or
+    /// `None` to hide it. Only affects the next menu built.
+    pub fn set_knowledge(&mut self, files: Option<usize>) {
+        self.knowledge_files = files;
+    }
+
     /// Resolves a [`MenuChoice::ExportAction`] index to an action id, against
     /// the list the open menu was built from.
     pub fn export_action_at(&self, index: usize) -> Option<&str> {
@@ -858,6 +873,10 @@ impl Tray {
         append_item(actions, cmd::REVIEW_EMAIL, "Review this email")?;
         append_item(actions, cmd::FILL_FORM, "Fill this form")?;
         append_item(actions, cmd::RESTORE_LAST_FORM, "Restore last form")?;
+        if let Some(files) = self.knowledge_files {
+            append_separator(actions)?;
+            append_item(actions, cmd::OPEN_KNOWLEDGE, &knowledge_label(files))?;
+        }
 
         append_item_with(
             hmenu,
@@ -1001,6 +1020,15 @@ impl Drop for Tray {
 /// 0.1.0". Pure so it can be unit-tested without a real menu; `build.rs`
 /// does not currently embed a git hash (only `diagnostics.rs`'s
 /// `CARGO_PKG_VERSION` exists), so there is nothing to append yet.
+/// The knowledge entry's text: the folder it opens and how much is indexed.
+/// No em dash (rule 11).
+fn knowledge_label(files: usize) -> String {
+    format!(
+        "Open knowledge folder ({files} {})",
+        if files == 1 { "file" } else { "files" }
+    )
+}
+
 fn version_label() -> String {
     format!("Wingman {}", env!("CARGO_PKG_VERSION"))
 }
@@ -2043,6 +2071,21 @@ mod tests {
     }
 
     #[test]
+    fn the_knowledge_entry_shows_the_count_and_only_while_a_folder_is_set() {
+        assert_eq!(knowledge_label(0), "Open knowledge folder (0 files)");
+        assert_eq!(knowledge_label(1), "Open knowledge folder (1 file)");
+        assert_eq!(knowledge_label(128), "Open knowledge folder (128 files)");
+        let hidden = built_menu_tree(|_| {});
+        assert!(find_item(&hidden, cmd::OPEN_KNOWLEDGE).is_none());
+        let shown = built_menu_tree(|t| t.set_knowledge(Some(7)));
+        let item = find_item(&shown, cmd::OPEN_KNOWLEDGE).expect("entry while a folder is set");
+        assert_eq!(
+            item.label().map(tray_menu::strip_mnemonics).as_deref(),
+            Some("Open knowledge folder (7 files)")
+        );
+    }
+
+    #[test]
     fn menu_top_level_is_ten_entries_or_fewer_and_grouped() {
         let tree = built_menu_tree(|_| {});
         let top: Vec<&str> = tree.iter().filter_map(Node::label).collect();
@@ -2134,7 +2177,10 @@ mod tests {
     fn menu_tree_has_no_em_dashes_and_every_fixed_id_is_reachable() {
         let mut all = Vec::new();
         for paused in [false, true] {
-            let tree = built_menu_tree(|t| t.set_paused(paused));
+            let tree = built_menu_tree(|t| {
+                t.set_paused(paused);
+                t.set_knowledge(Some(2));
+            });
             fn labels(nodes: &[Node], out: &mut Vec<String>) {
                 for n in nodes {
                     if let Some(l) = n.label() {
@@ -2782,6 +2828,7 @@ mod tests {
         ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
         ("READ_QR", cmd::READ_QR),
         ("IMPORT_ACTION", cmd::IMPORT_ACTION),
+        ("OPEN_KNOWLEDGE", cmd::OPEN_KNOWLEDGE),
         ("VERSION_LABEL", cmd::VERSION_LABEL),
     ];
 
@@ -2828,6 +2875,8 @@ mod tests {
         .expect("CreateWindowExW");
 
         let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
+        // Entries that only show while a folder is set need one set (#81).
+        tray.set_knowledge(Some(3));
 
         let mut found = std::collections::HashSet::new();
         for paused in [false, true] {

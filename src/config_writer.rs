@@ -120,7 +120,23 @@ impl FieldChange {
         }
         let create = !matches!(self, FieldChange::Remove { .. });
         let mut table: &mut dyn TableLike = doc.as_table_mut();
-        for name in parents {
+        let mut parents = parents.iter().peekable();
+        while let Some(name) = parents.next() {
+            // A number after a list's name is a position in that list of
+            // tables (`providers.compat.1.api_key`): the one entry's field
+            // changes and its neighbours and comments stay.
+            if let Some(index) = parents.peek().and_then(|n| n.parse::<usize>().ok()) {
+                let list = table
+                    .get_mut(name)
+                    .and_then(Item::as_array_of_tables_mut)
+                    .with_context(|| format!("`{name}` in config.toml is not a list of tables"))?;
+                parents.next();
+                table = list
+                    .get_mut(index)
+                    .map(|t| t as &mut dyn TableLike)
+                    .with_context(|| format!("`{name}` in config.toml has no entry {index}"))?;
+                continue;
+            }
             if !table.contains_key(name) {
                 if !create {
                     return Ok(());
@@ -341,6 +357,68 @@ fn push_set(path: &[String], value: &toml::Value, out: &mut Vec<FieldChange>) {
     });
 }
 
+/// The changes that blank, in the file, the keys a load just moved into
+/// Credential Manager (#899): `before` is the config as the file read it,
+/// `after` the same once the import ran. A provider whose key went from set to
+/// empty is one `api_key = ""`; so is each compat entry, addressed by its
+/// position in the list, with a check that the entry there still has the same
+/// name (a list that changed meanwhile fails the write instead of blanking
+/// another entry's key). A key that could not be stored is not in the changes:
+/// it stays in the file and is imported on the next load rather than be lost.
+/// Comments and unknown keys, inside compat entries too, are untouched.
+pub fn blanked_key_changes(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
+    let tb = toml::Value::try_from(before).context("could not read the old settings")?;
+    let ta = toml::Value::try_from(after).context("could not read the new settings")?;
+    let mut out = Vec::new();
+    for provider in ["openai", "anthropic", "gemini"] {
+        let path = vec![
+            "providers".to_string(),
+            provider.to_string(),
+            "api_key".to_string(),
+        ];
+        let was = value_at(&tb, &path).is_some_and(|v| !is_blank_string(v));
+        let now = !value_at(&ta, &path).is_some_and(|v| !is_blank_string(v));
+        if was && now {
+            out.push(FieldChange::Set {
+                path,
+                value: toml::Value::String(String::new()),
+            });
+        }
+    }
+    let list = ["providers".to_string(), "compat".to_string()];
+    let (was, now) = (value_at(&tb, &list), value_at(&ta, &list));
+    if let (Some(toml::Value::Array(was)), Some(toml::Value::Array(now))) = (was, now) {
+        if was.len() != now.len() {
+            bail!("the compat list changed while its keys were imported");
+        }
+        for (i, (was, now)) in was.iter().zip(now).enumerate() {
+            let key = |v: &toml::Value| v.get("api_key").is_some_and(|k| !is_blank_string(k));
+            if !key(was) || key(now) {
+                continue;
+            }
+            let entry = |field: &str| -> Vec<String> {
+                let mut p = list.to_vec();
+                p.push(i.to_string());
+                p.push(field.to_string());
+                p
+            };
+            if let Some(name) = was.get("name") {
+                // Sets the name to what it is: a check that this is the entry.
+                out.push(FieldChange::SetIfUnchanged {
+                    path: entry("name"),
+                    expected: Some(name.clone()),
+                    value: name.clone(),
+                });
+            }
+            out.push(FieldChange::Set {
+                path: entry("api_key"),
+                value: toml::Value::String(String::new()),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Drops every change whose key is changed again later, keeping the later one
 /// ("latest wins") and the order of the survivors.
 pub fn coalesce(changes: Vec<FieldChange>) -> Vec<FieldChange> {
@@ -378,7 +456,7 @@ fn write_batch(path: &Path, jobs: &[&[FieldChange]]) -> Vec<Result<(), String>> 
 /// `config` with `changes` applied on top, for changes that could not be written
 /// to the file but are live until quit: a reload from disk would otherwise
 /// silently revert them. Load-time notes that are not part of the file
-/// (`unreadable_secrets`, `load_problem`) carry over.
+/// (`unreadable_secrets`, `keys_left_in_file`, `load_problem`) carry over.
 pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
     let mut value = toml::Value::try_from(config).context("could not read the settings")?;
     for change in changes {
@@ -388,6 +466,7 @@ pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
         .try_into()
         .context("could not apply the unsaved change")?;
     out.unreadable_secrets = config.unreadable_secrets.clone();
+    out.keys_left_in_file = config.keys_left_in_file.clone();
     out.load_problem = config.load_problem.clone();
     Ok(out)
 }
@@ -465,8 +544,12 @@ pub fn file_baseline(path: &Path) -> Option<Config> {
     }
 }
 
+/// The value at `path`; a number steps into a list by position.
 fn value_at<'a>(root: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
-    path.iter().try_fold(root, |at, key| at.get(key.as_str()))
+    path.iter().try_fold(root, |at, key| match at {
+        toml::Value::Array(list) => list.get(key.parse::<usize>().ok()?),
+        _ => at.get(key.as_str()),
+    })
 }
 
 /// Refuses a [`FieldChange::SetIfUnchanged`] whose key no longer holds what the
@@ -1220,6 +1303,59 @@ x = 1
         assert!(out.contains("card_seconds = 7 # keep"), "{out}");
     }
 
+    const COMPAT_WITH_COMMENTS: &str = "# top\n[[providers.compat]]\n# the lab box\nname = \"lab\"\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\nmystery = 7\napi_key = \"k-lab\" # old\n\n[[providers.compat]]\nname = \"home\"\nbase_url = \"http://127.0.0.1:2/v1\"\nmodel = \"m\"\napi_key = \"k-home\"\n";
+
+    fn two_compat(keys: [&str; 2]) -> Config {
+        let mut config: Config = toml::from_str(COMPAT_WITH_COMMENTS).unwrap();
+        for (entry, key) in config.providers.compat.iter_mut().zip(keys) {
+            entry.api_key = key.to_string();
+        }
+        config
+    }
+
+    #[test]
+    fn blanking_compat_keys_touches_only_the_key_fields() {
+        // #899: a comment or unknown key inside a compat entry survives.
+        let before = two_compat(["k-lab", "k-home"]);
+        let after = two_compat(["", ""]);
+        let changes = blanked_key_changes(&before, &after).unwrap();
+        let out = patched("blank-compat", COMPAT_WITH_COMMENTS, &changes);
+        assert!(!out.contains("k-lab") && !out.contains("k-home"), "{out}");
+        assert!(out.contains("# the lab box"), "{out}");
+        assert!(out.contains("mystery = 7"), "{out}");
+        assert!(out.contains("# top"), "{out}");
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert_eq!(loaded.providers.compat.len(), 2);
+        assert_eq!(loaded.providers.compat[1].name, "home");
+    }
+
+    #[test]
+    fn a_compat_key_that_was_not_stored_stays_in_the_file() {
+        // #899: only the entries whose key was stored are blanked.
+        let before = two_compat(["k-lab", "k-home"]);
+        let after = two_compat(["", "k-home"]);
+        let changes = blanked_key_changes(&before, &after).unwrap();
+        let out = patched("blank-one-compat", COMPAT_WITH_COMMENTS, &changes);
+        assert!(!out.contains("k-lab"), "{out}");
+        assert!(out.contains("api_key = \"k-home\""), "{out}");
+        assert!(out.contains("mystery = 7"), "{out}");
+    }
+
+    #[test]
+    fn blanking_a_compat_key_refuses_when_the_entry_moved() {
+        // The index is only a position: if the list changed under the load, the
+        // entry at that place is another one, so nothing is written.
+        let before = two_compat(["k-lab", "k-home"]);
+        let after = two_compat(["", ""]);
+        let changes = blanked_key_changes(&before, &after).unwrap();
+        let moved = "[[providers.compat]]\nname = \"home\"\nbase_url = \"http://127.0.0.1:2/v1\"\nmodel = \"m\"\napi_key = \"k-home\"\n\n[[providers.compat]]\nname = \"lab\"\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\napi_key = \"k-lab\"\n";
+        let path = scratch("blank-compat-moved");
+        std::fs::write(&path, moved).unwrap();
+        assert!(write_changes(&path, &changes).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), moved);
+        cleanup(&path);
+    }
+
     #[test]
     fn a_dotted_key_table_is_patched_too() {
         let text = "ui.card_seconds = 9 # dotted\nui.favourite = \"x\"\n";
@@ -1855,6 +1991,17 @@ x = 1
         let second = global_in(&cell, || Ok(path.clone()));
         assert!(second.is_ok(), "the second call must try again");
         cleanup(&path);
+    }
+
+    #[test]
+    fn reapply_keeps_the_keys_left_in_the_file() {
+        // #899: a load-time note, like `unreadable_secrets`, must survive.
+        let loaded = Config {
+            keys_left_in_file: vec!["openai".into()],
+            ..Default::default()
+        };
+        let out = reapply(&loaded, &[FieldChange::mode(Mode::Offline)]).unwrap();
+        assert_eq!(out.keys_left_in_file, vec!["openai".to_string()]);
     }
 
     #[test]
