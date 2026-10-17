@@ -7,6 +7,7 @@ pub(crate) mod file_dialog;
 pub mod gallery;
 pub mod palette;
 pub mod palette_model;
+mod palette_paint;
 pub(crate) mod pending_status;
 pub(crate) mod preview;
 pub mod region;
