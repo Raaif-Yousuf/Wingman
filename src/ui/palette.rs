@@ -98,8 +98,8 @@ use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
 use crate::ui::palette_paint::{
-    build_ops, ellipsizes, palette_colors, query_edit_rect, row_at, snap_rect, snap_stroke,
-    window_height, Face, Op, PaintInput, PaletteColors, SnappedRect, WINDOW_WIDTH,
+    build_ops, ellipsizes, focus_band_top, palette_colors, query_edit_rect, row_at, snap_rect,
+    snap_stroke, window_height, Face, Op, PaintInput, PaletteColors, SnappedRect, WINDOW_WIDTH,
 };
 use crate::ui::theme::{
     detect_theme, icon_font_face, setting_change_affects_theme, setting_change_name, SysColors,
@@ -114,6 +114,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
+    ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_COMBINE_MODE_EXCLUDE,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT,
@@ -832,6 +833,9 @@ unsafe extern "system" fn palette_edit_subclass(
 /// correctly `Resize`'d target does that scaling; see the module doc
 /// comment. Roughly matches `DEFAULT_GUI_FONT`'s visual size at 96 DPI.
 const D2D_FONT_FAMILY: &str = "Segoe UI";
+
+/// How closely Direct2D follows the curve of the focus line (the API default).
+const FOCUS_FLATTENING_TOLERANCE: f32 = 0.25;
 const D2D_FONT_SIZE_DIP: f32 = 14.0;
 /// `CreateTextFormat`'s locale -- matches `ocr.rs`'s recognizer language
 /// choice elsewhere in this crate rather than leaving it to the current
@@ -1169,6 +1173,7 @@ fn paint_ops_d2d(
             Op::Clear { color }
             | Op::FillRound { color, .. }
             | Op::StrokeRound { color, .. }
+            | Op::FocusLine { color, .. }
             | Op::Text { color, .. } => *color,
         };
         match op {
@@ -1223,7 +1228,73 @@ fn paint_ops_d2d(
                 };
                 unsafe { target.DrawRoundedRectangle(&shape as *const _, &brush, s.width, None) };
             }
+            Op::FocusLine {
+                rect,
+                radius,
+                width,
+                ..
+            } => fill_focus_line_d2d(target, &brush, dpi, *rect, *radius, *width),
         }
+    }
+}
+
+/// The focus line (#1039): the query box's shape less the same shape moved up
+/// by the line's width, cut to the band at the bottom. It follows the corner
+/// arcs and thins to nothing where they meet the sides. A failure to build
+/// the geometry leaves the line out and nothing else.
+fn fill_focus_line_d2d(
+    target: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    dpi: u32,
+    rect: RECT,
+    radius: i32,
+    width: i32,
+) {
+    let outer = snapped_rect_f(snap_rect(rect, dpi));
+    let w = snap_stroke(rect, radius, width, dpi).width;
+    let r = radius as f32;
+    let shape = |dy: f32| D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            top: outer.top - dy,
+            bottom: outer.bottom - dy,
+            ..outer
+        },
+        radiusX: r,
+        radiusY: r,
+    };
+    // As `focus_band_top`, in dp.
+    let band = D2D_RECT_F {
+        top: outer.bottom - r - w,
+        ..outer
+    };
+    unsafe {
+        let Ok(factory) = target.GetFactory() else {
+            return;
+        };
+        let (Ok(a), Ok(b), Ok(path)) = (
+            factory.CreateRoundedRectangleGeometry(&shape(0.0)),
+            factory.CreateRoundedRectangleGeometry(&shape(w)),
+            factory.CreatePathGeometry(),
+        ) else {
+            return;
+        };
+        let Ok(sink) = path.Open() else {
+            return;
+        };
+        let combined = a.CombineWithGeometry(
+            &b,
+            D2D1_COMBINE_MODE_EXCLUDE,
+            None,
+            FOCUS_FLATTENING_TOLERANCE,
+            &sink,
+        );
+        let closed = sink.Close();
+        if combined.is_err() || closed.is_err() {
+            return;
+        }
+        target.PushAxisAlignedClip(&band, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        target.FillGeometry(&path, brush, None);
+        target.PopAxisAlignedClip();
     }
 }
 
@@ -1232,7 +1303,8 @@ fn paint_ops_d2d(
 /// Corners are GDI's `RoundRect`, as everywhere else in the app.
 fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
     use windows::Win32::Graphics::Gdi::{
-        CreatePen, GetStockObject, RoundRect, DT_CENTER, NULL_BRUSH, PS_INSIDEFRAME,
+        CombineRgn, CreatePen, CreateRectRgn, CreateRoundRectRgn, FillRgn, GetStockObject,
+        RoundRect, DT_CENTER, NULL_BRUSH, PS_INSIDEFRAME, RGN_AND, RGN_DIFF, RGN_ERROR,
     };
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
@@ -1294,6 +1366,45 @@ fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
                     );
                     SelectObject(hdc, old_pen);
                     let _ = DeleteObject(pen.into());
+                }
+                Op::FocusLine {
+                    rect,
+                    radius,
+                    width,
+                    color,
+                } => {
+                    // The same shape as the Direct2D path, as regions: the
+                    // box less the box moved up, cut to the bottom band.
+                    // Every region is freed on every path.
+                    // A rounded-rectangle region leaves out its right and
+                    // bottom edge, `RoundRect` does not: one more to match.
+                    let d = radius * 2;
+                    let (right, bottom) = (rect.right + 1, rect.bottom + 1);
+                    let a = CreateRoundRectRgn(rect.left, rect.top, right, bottom, d, d);
+                    let b = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top - width,
+                        right,
+                        bottom - width,
+                        d,
+                        d,
+                    );
+                    let band = CreateRectRgn(
+                        rect.left,
+                        focus_band_top(rect.bottom, *radius, *width),
+                        rect.right,
+                        rect.bottom,
+                    );
+                    if CombineRgn(Some(a), Some(a), Some(b), RGN_DIFF) != RGN_ERROR
+                        && CombineRgn(Some(a), Some(a), Some(band), RGN_AND) != RGN_ERROR
+                    {
+                        let brush = CreateSolidBrush(COLORREF(*color));
+                        let _ = FillRgn(hdc, a, brush);
+                        let _ = DeleteObject(brush.into());
+                    }
+                    for region in [a, b, band] {
+                        let _ = DeleteObject(region.into());
+                    }
                 }
                 Op::Text {
                     rect,
@@ -2040,6 +2151,66 @@ mod tests {
         DispatchMessageW, GetMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG,
         PM_REMOVE,
     };
+
+    /// #1039: the GDI picture of the query box has the focus colour in the
+    /// bottom corners, not only on the straight run between them. Paints the
+    /// paint list into a memory bitmap and reads pixels back; the flat bar the
+    /// line used to be leaves the corner square without a single focus pixel.
+    #[test]
+    fn the_gdi_focus_line_follows_the_box_corners() {
+        use crate::ui::theme::HC_BLACK;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject,
+        };
+        for dpi in [96u32, 144, 240] {
+            let colors = palette_colors(Theme::Dark, &HC_BLACK, 0x00D4_7800);
+            let ops = build_ops(
+                dpi,
+                &PaintInput {
+                    rows: &[],
+                    offset: 0,
+                    selected: 0,
+                    hover: None,
+                    footer: "",
+                    colors: &colors,
+                },
+            );
+            let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            let b = box_rect(dpi);
+            let radius = crate::ui::palette_paint::px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+            let (mut corner, mut run) = (0, 0);
+            unsafe {
+                let screen = GetDC(None);
+                let mem = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, w, h);
+                let old = SelectObject(mem, bmp.into());
+                paint_ops_gdi(mem, dpi, client, &ops);
+                for y in (b.bottom - radius)..b.bottom {
+                    for x in b.left..(b.left + radius) {
+                        if GetPixel(mem, x, y).0 == colors.focus_line {
+                            corner += 1;
+                        }
+                    }
+                }
+                if GetPixel(mem, (b.left + b.right) / 2, b.bottom - 1).0 == colors.focus_line {
+                    run += 1;
+                }
+                SelectObject(mem, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+            }
+            assert_eq!(run, 1, "dpi {dpi}: the straight run is the focus colour");
+            assert!(corner > 0, "dpi {dpi}: no focus pixel in the corner square");
+        }
+    }
 
     fn instance() -> HINSTANCE {
         unsafe { GetModuleHandleW(None).unwrap().into() }
