@@ -120,7 +120,8 @@ fn is_corrupt(e: &rusqlite::Error) -> bool {
 
 /// Whether `e` is SQLite's "virtual table is damaged" (`SQLITE_CORRUPT_VTAB`,
 /// extended code 267, primary code 11): what a full-text index that disagrees
-/// with its table raises.
+/// with its table raises. MEASURED 2026-10-17: real damage to the index's own
+/// rows raises 267 (see `real_index_damage_raises_the_virtual_table_code`).
 fn is_fts_corrupt(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -151,6 +152,30 @@ pub struct Store {
     heal_state: Mutex<HealState>,
     /// How long a failed heal waits before the next try.
     retry_gap: Duration,
+    /// Called after the file was replaced (#1158).
+    replaced_hooks: Mutex<Vec<(u64, ReplacedHook)>>,
+    next_hook: AtomicU64,
+}
+
+/// What a subscriber runs after the store's file was replaced. It runs with
+/// the connection locked, so it must only signal (set an event, flip a flag)
+/// and never touch the store.
+pub type ReplacedHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Keeps a [`Store::on_replaced`] hook alive; dropping it removes the hook.
+pub struct ReplacedSubscription {
+    store: Arc<Store>,
+    id: u64,
+}
+
+impl Drop for ReplacedSubscription {
+    fn drop(&mut self) {
+        self.store
+            .replaced_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
 }
 
 /// What a store that could not finish healing remembers between locks.
@@ -210,7 +235,55 @@ impl Store {
             fts_seen: AtomicU64::new(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst)),
             heal_state: Mutex::new(HealState::default()),
             retry_gap: RETRY_GAP,
+            replaced_hooks: Mutex::new(Vec::new()),
+            next_hook: AtomicU64::new(0),
         }
+    }
+
+    /// Runs `hook` each time a damaged file is replaced by a fresh one while
+    /// Wingman runs (#1158): row ids kept from before the swap are then
+    /// stale. Event-driven, no polling. See [`ReplacedHook`] for the rule.
+    pub fn on_replaced(self: &Arc<Self>, hook: ReplacedHook) -> ReplacedSubscription {
+        let id = self.next_hook.fetch_add(1, Ordering::SeqCst);
+        self.replaced_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((id, hook));
+        ReplacedSubscription {
+            store: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn fire_replaced(&self) {
+        let hooks: Vec<ReplacedHook> = self
+            .replaced_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, h)| Arc::clone(h))
+            .collect();
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    /// A store over a file in a test directory, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: &Path) -> Result<Store, StoreError> {
+        Store::open_at(path)
+    }
+
+    /// Overwrites this store's file with garbage while it stays open, so the
+    /// next query reads it (#660). The checkpoint moves the data into the main
+    /// file and `shrink_memory` drops the page cache first.
+    #[cfg(test)]
+    pub(crate) fn damage_file_for_test(&self) {
+        let path = self.path.clone().expect("a file-backed store");
+        self.lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .unwrap();
+        std::fs::write(path, vec![b'x'; 8192]).unwrap();
     }
 
     /// [`Store::open_at`], but a damaged file is moved aside to
@@ -271,6 +344,7 @@ impl Store {
                 self.seen
                     .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
                 note_recovery(notice);
+                self.fire_replaced();
             }
             Heal::Stuck(why) => {
                 // `seen` stays behind, so a later lock tries again.
@@ -854,7 +928,9 @@ pub fn global() -> Result<Arc<Store>, StoreError> {
 /// and without waiting for an open that is under way: `None` means "not ready
 /// yet". For the UI thread (#1010), where the first open (an `icacls` spawn
 /// and SQLite) would stall the keyboard hook. [`open_in_background`] does the
-/// open at start-up.
+/// open at start-up. No caller right now (the tooltip read moved to a worker,
+/// #1181); kept for the next UI-thread reader.
+#[allow(dead_code)]
 pub fn global_if_ready() -> Option<Result<Arc<Store>, StoreError>> {
     ready_in(&GLOBAL)
 }
@@ -1267,6 +1343,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1158: whoever holds rows from the old file (the knowledge watcher keeps
+    /// a root id) is told when the file was replaced, and not before.
+    #[test]
+    fn a_replaced_store_tells_its_subscribers_once() {
+        let (s, dir) = store_damaged_while_open("runtime-subscribers");
+        let s = Arc::new(s);
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        let sub = s.on_replaced(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing replaced yet");
+
+        // Another test's corrupt error can make the first call heal already.
+        let _ = s.day_total("2026-10-15");
+        let _ = s.day_total("2026-10-15");
+        assert_eq!(damaged_copies(&dir), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(sub);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A store whose connection was swapped for the empty in-memory stand-in
     /// and never got a file connection back (#1165): what a failed undo leaves.
     fn detached_store(s: &Store) {
@@ -1296,6 +1396,24 @@ mod tests {
         assert!(s.day_total("2026-10-15").unwrap().is_some());
         assert_eq!(damaged_copies(&dir), 0, "a healthy file is not moved");
         assert!(!s.heal_state.lock().unwrap().detached);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dropped subscription is not called any more.
+    #[test]
+    fn a_dropped_subscription_is_not_called() {
+        let (s, dir) = store_damaged_while_open("runtime-unsubscribed");
+        let s = Arc::new(s);
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        drop(s.on_replaced(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        })));
+        let _ = s.day_total("2026-10-15");
+        let _ = s.day_total("2026-10-15");
+        assert_eq!(damaged_copies(&dir), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1423,6 +1541,101 @@ mod tests {
         assert!(matches!(rebuild_verdict(Ok(())), RebuildVerdict::Rebuilt));
     }
 
+    /// Real damage to the full-text index, one kind at a time.
+    fn store_with_indexed_chunks(name: &str) -> (Store, PathBuf) {
+        let (s, dir) = knowledge_store(name);
+        {
+            let conn = s.lock();
+            for (i, text) in [
+                "ledgerword in the notes",
+                "second page about ledgerword budgets",
+                "third unrelated paragraph",
+                "fourth ledgerword entry",
+            ]
+            .iter()
+            .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+                     VALUES (1, ?1, ?2, ?3, 4)",
+                    rusqlite::params![i as i64, text, format!("h{i}")],
+                )
+                .unwrap();
+            }
+            assert_eq!(fts_hits(&conn, "ledgerword"), 3);
+        }
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        (s, dir)
+    }
+
+    /// The extended code a query raised, or `None` when it ran.
+    fn extended_code(conn: &Connection, sql: &str) -> Option<i32> {
+        match conn.query_row(sql, [], |r| r.get::<_, i64>(0)) {
+            Ok(_) => None,
+            Err(rusqlite::Error::SqliteFailure(f, _)) => Some(f.extended_code),
+            Err(e) => panic!("not a SQLite failure: {e}"),
+        }
+    }
+
+    const MATCH_COUNT: &str = "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'ledgerword'";
+
+    /// MEASURED 2026-10-17 (SQLite bundled with rusqlite): real damage to the
+    /// full-text index raises extended code 267 (`SQLITE_CORRUPT_VTAB`), so
+    /// `is_fts_corrupt` recognises it, for the index's segment rows and for
+    /// its `docsize` rows. Only the `docsize` kind passes `quick_check`, so
+    /// only that one reaches the in-place rebuild. Damage to the segment rows
+    /// is also seen by `quick_check`, so the whole file is moved aside.
+    #[test]
+    fn real_index_damage_raises_the_virtual_table_code() {
+        let _serial = FTS_EVENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let query = "\"ledgerword\"";
+
+        // docsize rows gone: 267 on a ranked read, quick_check passes, index rebuilt.
+        let (s, dir) = store_with_indexed_chunks("fts-real-docsize");
+        {
+            let conn = s.lock();
+            conn.execute_batch("DELETE FROM chunk_fts_docsize;")
+                .unwrap();
+            assert_eq!(
+                extended_code(&conn, MATCH_COUNT),
+                None,
+                "a bare count does not read docsize"
+            );
+            assert!(!file_is_damaged(&conn), "quick_check passes");
+        }
+        let before = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
+        let err = s.search_chunks("C:/Notes", query, 10).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        assert_eq!(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst), before + 1);
+        assert!(s.day_total("2026-10-15").unwrap().is_some(), "history kept");
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 3, "index rebuilt");
+        assert_eq!(s.search_chunks("C:/Notes", query, 10).unwrap().len(), 3);
+        assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Segment rows gone: 267 on read, and quick_check sees it too.
+        let (s, dir) = store_with_indexed_chunks("fts-real-segments");
+        {
+            let conn = s.lock();
+            conn.execute_batch("DELETE FROM chunk_fts_data WHERE id > 10;")
+                .unwrap();
+            assert_eq!(
+                extended_code(&conn, MATCH_COUNT),
+                Some(rusqlite::ffi::SQLITE_CORRUPT_VTAB)
+            );
+            assert!(file_is_damaged(&conn), "quick_check sees this kind");
+        }
+        let before = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
+        assert!(s.search_chunks("C:/Notes", query, 10).is_err());
+        assert_eq!(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst), before + 1);
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None, "history lost");
+        assert_eq!(damaged_copies(&dir), 1, "the whole file was moved aside");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A corrupt error that did not come from the full-text index does not
     /// pay for the O(corpus) index check.
     #[test]
@@ -1484,6 +1697,34 @@ mod tests {
         assert!(path.exists());
         drop(state);
         drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1158: a file that went missing (not damaged) is replaced by an empty
+    /// one, so subscribers holding old row ids are told to start again.
+    #[test]
+    fn a_store_started_over_a_missing_file_tells_its_subscribers() {
+        let dir = scratch("missing-subscribers");
+        let path = dir.join("wingman.db");
+        let s = Arc::new(Store::open_at(&path).unwrap());
+        detached_store(&s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("wingman.db{suffix}")));
+        }
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        let sub = s.on_replaced(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None);
+        assert!(path.exists());
+        assert_eq!(damaged_copies(&dir), 0, "nothing was damaged");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(sub);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }

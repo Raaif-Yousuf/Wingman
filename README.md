@@ -295,8 +295,8 @@ in `config.toml`:
 An id that no action has is named on a card once. After that the key shows the
 options card.
 
-If the Copilot key does nothing, use **Set Copilot key...** (in **Providers and keys** in the tray menu)
-and press it once: whatever your firmware actually emits gets captured and
+If the Copilot key does nothing, open **Settings...** from the tray menu, choose **Change** beside
+the Copilot key and press it once: whatever your firmware actually emits gets captured and
 saved. Same for the secondary binding.
 
 A third, optional chord toggles Pause: running -> paused until resumed;
@@ -366,21 +366,19 @@ which one.
 - **Ask now (same as the key)**: trigger without the hotkey
 - **Actions ▸**: **Quick Ask (pick an action)** (a palette of every action)
   plus each action directly: copy text, read a QR code, copy a region,
-  calculate, add an event, review an email, fill a form, restore the last form
+  calculate, add an event, review an email, fill a form, restore the last form,
+  and import or export an action as a file
 - **Copy last answer**: headline and working to the clipboard
 - **Pause ▸**: 1 hour / until tomorrow / until resumed; shown as **Resume**
   instead while already paused
 - **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
-- **Providers and keys ▸**: **Provider** (which service answers),
-  **ChatGPT model** / **Claude model** / **Ollama model** (saved
-  immediately), and **Set
-  Copilot key...** / **Set secondary key...** to rebind by pressing the
-  key (the pause key is set in Settings, General)
+- **Models ▸**: **Provider** (which service answers) and
+  **ChatGPT model** / **Claude model** / **Gemini model** / **Ollama model**
+  (saved immediately). Keyboard shortcuts are set in Settings, General
 - **Settings...**: the settings window (left-clicking the tray icon opens
   this too)
-- **Help and diagnostics ▸**: open `config.toml`, import or export an action
-  as a file, reload settings, copy diagnostics, copy the egress log, check
-  this PC for local models
+- **Help and diagnostics ▸**: open `config.toml`, reload settings, copy
+  diagnostics, copy the egress log, check this PC for local models
 - **Quit**
 
 ## Settings worth knowing
