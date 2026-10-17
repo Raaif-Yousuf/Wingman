@@ -1030,7 +1030,7 @@ impl Chain {
 /// to a system prompt, after the action's own prompt and any rubric. Every
 /// request that sends the screenshot builds its system prompt through this,
 /// so none can be left without it.
-fn with_screen_note(system: &str) -> String {
+pub(crate) fn with_screen_note(system: &str) -> String {
     format!(
         "{system}\n\n{}",
         crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE
