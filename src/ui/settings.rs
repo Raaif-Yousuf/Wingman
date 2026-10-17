@@ -18608,13 +18608,13 @@ mod tests {
     #[test]
     fn a_key_refused_after_the_window_closed_saved_it_is_one_card() {
         with_open_window(|hwnd, owner| {
-            let release = gate_check(hwnd, "sk-bad-whole-key-1");
+            let release = gate_check(hwnd, "sk-bad-whole-key");
             drain_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE);
             while queued("OpenAI did not accept the key") > 0 {
                 crate::app::retract_shell_open_failure(&commit::late_refusal_card(0).0);
             }
             let before = CHECKS_DONE.load(Ordering::SeqCst);
-            type_key(hwnd, ID_OPENAI_KEY, "sk-bad-whole-key-1");
+            type_key(hwnd, ID_OPENAI_KEY, "sk-bad-whole-key");
             drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
             drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
@@ -18636,8 +18636,8 @@ mod tests {
     #[test]
     fn a_replaced_keys_refusal_is_not_a_late_card() {
         with_open_window(|hwnd, owner| {
-            let a = "sk-ant-bad-whole-key-a";
-            let b = "sk-ant-ok-whole-key-b";
+            let a = "sk-ant-bad-key";
+            let b = "sk-ant-ok-key";
             let release_a = gate_check(hwnd, a);
             let release_b = gate_check(hwnd, b);
             drain_posted(owner, crate::app::WM_APP_SHELL_OPEN_DONE);
@@ -18660,8 +18660,8 @@ mod tests {
     #[test]
     fn a_plain_destroy_with_a_key_check_out_counts_the_key_as_unsaved() {
         with_open_window(|hwnd, owner| {
-            let release = gate_check(hwnd, "sk-ok-whole-key-3");
-            type_key(hwnd, ID_OPENAI_KEY, "sk-ok-whole-key-3");
+            let release = gate_check(hwnd, "sk-ok-whole-key");
+            type_key(hwnd, ID_OPENAI_KEY, "sk-ok-whole-key");
             drain_posted(owner, crate::app::WM_APP_SETTINGS_SAVE);
             drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();

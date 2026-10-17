@@ -382,8 +382,9 @@ pub(crate) fn retract_shell_open_failure(title: &str) {
     }
 }
 
-/// The titles queued now, left in place (tests).
-#[cfg(test)]
+/// The titles queued now, left in place (tests). Not `cfg(test)`: the source-scanning
+/// tests split this file at its first test-only item.
+#[allow(dead_code)]
 pub(crate) fn queued_shell_open_titles() -> Vec<String> {
     SHELL_OPEN_FAILURES
         .lock()
