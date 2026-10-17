@@ -491,9 +491,29 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Test seam (#990): the thread whose test currently owns the process-wide
+/// budget state. While one is set, every other test thread's calls into this
+/// module leave that state alone, so a provider test that records or checks
+/// the budget mid-way cannot shift the totals or steal the notice.
+#[cfg(test)]
+static TEST_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+#[cfg(test)]
+fn foreign_to_test_owner() -> bool {
+    matches!(*lock(&TEST_OWNER), Some(id) if id != std::thread::current().id())
+}
+
+#[cfg(not(test))]
+fn foreign_to_test_owner() -> bool {
+    false
+}
+
 /// Publishes `[budget]` for the request path. A limit that is not a positive
 /// number turns the budget off. Called at startup and on every config reload.
 pub fn set_daily_budget(daily_usd: f64, warn_percent: u8) {
+    if foreign_to_test_owner() {
+        return;
+    }
     *lock(&BUDGET) = budget_from(daily_usd, warn_percent);
 }
 
@@ -543,6 +563,9 @@ pub fn check_budget_with(b: &Budget, spent: f64) -> Result<(), String> {
 /// used; when the store cannot be read, the total counted in memory for this
 /// run is used instead (#713), so the limit never switches itself off.
 pub fn check_budget() -> Result<(), String> {
+    if foreign_to_test_owner() {
+        return Ok(());
+    }
     let Some(b) = *lock(&BUDGET) else {
         return Ok(());
     };
@@ -664,6 +687,9 @@ fn budget_notice_for(
 
 /// Takes the pending budget notice, if any. `app.rs` adds it to the next card.
 pub fn take_budget_notice() -> Option<String> {
+    if foreign_to_test_owner() {
+        return None;
+    }
     lock(&BUDGET_NOTICE).take()
 }
 
@@ -691,6 +717,9 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     let date = local_date_today();
     let cost = request_cost(provider, model, &date, local, usage.as_ref());
     note_run_cost(cost);
+    if foreign_to_test_owner() {
+        return;
+    }
     // Always counted, so the budget has a total when the store is down. An
     // unpriced cloud response still costs something: count the last known
     // price for this model, else a flat guess, so the fallback never undercounts to zero.
@@ -1052,7 +1081,7 @@ mod tests {
     /// the in-memory total the budget falls back to.
     #[test]
     fn with_the_store_down_an_error_reply_still_counts_toward_the_budget() {
-        let (_scope, _guard) = down_scope(0.01);
+        let _scope = down_scope(0.01);
         assert!(check_budget().is_ok());
         for _ in 0..2 {
             let _ = tally(
@@ -1190,7 +1219,10 @@ mod tests {
     }
 
     /// Puts every global this test touches back, also when an assertion panics.
-    struct DownScope;
+    struct DownScope {
+        /// Released only after `drop` has put every global back.
+        _locks: DownGuards,
+    }
     impl Drop for DownScope {
         fn drop(&mut self) {
             set_daily_budget(0.0, 80);
@@ -1202,6 +1234,7 @@ mod tests {
             APPROX_NOTICED.store(false, std::sync::atomic::Ordering::SeqCst);
             *lock(&NOTIFIED) = None;
             let _ = take_budget_notice();
+            *lock(&TEST_OWNER) = None;
         }
     }
 
@@ -1210,7 +1243,7 @@ mod tests {
         std::sync::MutexGuard<'static, ()>,
     );
 
-    fn down_scope(limit: f64) -> (DownScope, DownGuards) {
+    fn down_scope(limit: f64) -> DownScope {
         // The tally lock first: no recording test may run while the store is
         // switched off.
         let guard = (
@@ -1219,16 +1252,17 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         );
-        let scope = DownScope;
+        let scope = DownScope { _locks: guard };
+        *lock(&TEST_OWNER) = Some(std::thread::current().id());
         set_daily_budget(limit, 80);
         STORE_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         *lock(&MEM_SPEND) = None;
-        (scope, guard)
+        scope
     }
 
     #[test]
     fn with_the_store_down_record_and_check_budget_still_stop_the_second_request() {
-        let (_scope, _guard) = down_scope(0.01);
+        let _scope = down_scope(0.01);
         // About $0.006 each.
         assert!(check_budget().is_ok());
         record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
@@ -1244,7 +1278,7 @@ mod tests {
     fn with_writes_failing_but_reads_fine_the_budget_still_trips() {
         // #794: the saved total stays put when writes fail; this run's own
         // spend must still count toward the cap.
-        let (_scope, _guard) = down_scope(0.01);
+        let _scope = down_scope(0.01);
         STORE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
         WRITES_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
         // The path under test needs a store that opens and reads; without
@@ -1269,9 +1303,31 @@ mod tests {
         assert!(notice.contains("approximate"), "{notice}");
     }
 
+    /// #990: another test thread's record, budget check, budget change or
+    /// notice take must not reach the state a scoped test is checking.
+    #[test]
+    fn another_thread_cannot_touch_the_state_a_scoped_test_owns() {
+        let _scope = down_scope(0.01);
+        let before = spent_today(&local_date_today()).0;
+        std::thread::spawn(|| {
+            record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+            record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+            assert!(check_budget().is_ok(), "a foreign check never refuses");
+            set_daily_budget(0.0, 80);
+            assert!(take_budget_notice().is_none());
+        })
+        .join()
+        .unwrap();
+        assert!(close(spent_today(&local_date_today()).0, before));
+        assert!(lock(&BUDGET).is_some(), "the owner's budget survives");
+        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
+        assert!(check_budget().is_err(), "the owner's own calls still count");
+    }
+
     #[test]
     fn an_unpriced_cloud_response_still_counts_in_the_fallback_total() {
-        let (_scope, _guard) = down_scope(0.015);
+        let _scope = down_scope(0.015);
         // No usage block: unpriced, counted at the flat guess.
         record("anthropic", "model-with-no-price", false, None);
         assert!(check_budget().is_ok());
@@ -1281,7 +1337,7 @@ mod tests {
 
     #[test]
     fn a_notice_already_waiting_is_joined_not_overwritten() {
-        let (_scope, _guard) = down_scope(0.0);
+        let _scope = down_scope(0.0);
         let _ = take_budget_notice();
         push_notice("first".to_string());
         push_notice("second".to_string());

@@ -23,8 +23,12 @@ fn instance() -> HINSTANCE {
     HINSTANCE(h.0)
 }
 
+/// Every card here stays open when another test's window takes the foreground
+/// (#991): these tests check the UIA tree, not click-away, and parallel card
+/// tests that expand take the foreground and would close this one.
 fn error_card() -> Card {
     let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+    card.stay_open_on_focus_loss();
     card.set_owner(card.hwnd());
     card.show_error_with_details("Couldn't add the event", "detail text");
     card.inner.try_expand();
@@ -33,6 +37,7 @@ fn error_card() -> Card {
 
 fn answer_card() -> Card {
     let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+    card.stay_open_on_focus_loss();
     card.set_owner(card.hwnd());
     card.show_model_answer("2 + 2 = 4", "You carried correctly.", 0, None);
     card.inner.try_expand();
@@ -169,6 +174,14 @@ fn with_live_client<R: Send + 'static>(
     (worker.join().expect("UIA client thread"), reported)
 }
 
+/// Held by every test here that has a card talking to UIA, from before the
+/// card exists until after it is dropped: the drop disconnects the provider,
+/// which is a UIA call too. Real UIA over COM fails when two tests use it at
+/// once (#208), so this is the lock the other UIA tests take.
+fn uia_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::inputs::lock_uia_test()
+}
+
 fn find_by_name(
     automation: &IUIAutomation,
     hwnd: isize,
@@ -185,38 +198,48 @@ fn find_by_name(
     }
 }
 
-/// Other card tests run on other threads of this process, and a card that
-/// takes the foreground closes this one (its `WM_KILLFOCUS`). A live check
-/// whose card was closed under it proves nothing, so it runs again on a fresh
-/// card; `attempt` returns `None` for such a run.
-fn retry<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..10 {
-        if let Some(done) = attempt() {
-            return done;
-        }
-    }
-    panic!("the card was closed by another test on every attempt");
+/// The card the live checks run on is still expanded: a card another test's
+/// window had closed would make the check below prove nothing.
+fn assert_still_expanded(card: &Card) {
+    assert_eq!(card.state(), CardState::Expanded, "the card was closed");
+}
+
+#[test]
+fn a_card_kept_open_survives_another_window_taking_the_focus() {
+    let mut card = error_card();
+    card.handle_message(WM_KILLFOCUS, WPARAM(0), LPARAM(0));
+    assert_eq!(card.state(), CardState::Expanded);
+}
+
+#[test]
+fn a_card_not_kept_open_still_closes_when_it_loses_the_focus() {
+    let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+    card.set_owner(card.hwnd());
+    card.show_error_with_details("Couldn't add the event", "detail text");
+    card.inner.try_expand();
+    card.handle_message(WM_KILLFOCUS, WPARAM(0), LPARAM(0));
+    assert_eq!(card.state(), CardState::Hidden);
 }
 
 #[test]
 fn live_uia_finds_each_error_card_link_by_name_with_its_role() {
-    let (details, report, read_aloud) = retry(|| {
-        let card = error_card();
-        let (found, _) = with_live_client(&card, |auto, hwnd| {
-            let d = find_by_name(&auto, hwnd, "Copy details").map(|e| unsafe {
-                (
-                    e.CurrentControlType().unwrap().0,
-                    e.CurrentBoundingRectangle().unwrap(),
-                    e.CurrentIsKeyboardFocusable().unwrap().as_bool(),
-                )
-            });
-            let r = find_by_name(&auto, hwnd, "Report a problem")
-                .map(|e| unsafe { e.CurrentControlType().unwrap().0 });
-            let m = find_by_name(&auto, hwnd, "Read aloud").is_some();
-            (d, r, m)
+    let _uia = uia_lock();
+    let card = error_card();
+    let (found, _) = with_live_client(&card, |auto, hwnd| {
+        let d = find_by_name(&auto, hwnd, "Copy details").map(|e| unsafe {
+            (
+                e.CurrentControlType().unwrap().0,
+                e.CurrentBoundingRectangle().unwrap(),
+                e.CurrentIsKeyboardFocusable().unwrap().as_bool(),
+            )
         });
-        (card.state() == CardState::Expanded).then_some(found)
+        let r = find_by_name(&auto, hwnd, "Report a problem")
+            .map(|e| unsafe { e.CurrentControlType().unwrap().0 });
+        let m = find_by_name(&auto, hwnd, "Read aloud").is_some();
+        (d, r, m)
     });
+    assert_still_expanded(&card);
+    let (details, report, read_aloud) = found;
     let (control, rect, focusable) = details.expect("Copy details is exposed");
     assert_eq!(control, UIA_ButtonControlTypeId.0);
     assert!(focusable);
@@ -227,57 +250,56 @@ fn live_uia_finds_each_error_card_link_by_name_with_its_role() {
 
 #[test]
 fn live_uia_reports_the_tab_focused_link_as_focused() {
-    let (focused, other) = retry(|| {
-        let mut card = error_card();
-        card.inner.move_footer_focus(false);
-        let (found, _) = with_live_client(&card, |auto, hwnd| {
-            let f = find_by_name(&auto, hwnd, "Copy details")
-                .map(|e| unsafe { e.CurrentHasKeyboardFocus().unwrap().as_bool() });
-            let o = find_by_name(&auto, hwnd, "Report a problem")
-                .map(|e| unsafe { e.CurrentHasKeyboardFocus().unwrap().as_bool() });
-            (f, o)
-        });
-        (card.state() == CardState::Expanded).then_some(found)
+    let _uia = uia_lock();
+    let mut card = error_card();
+    card.inner.move_footer_focus(false);
+    let (found, _) = with_live_client(&card, |auto, hwnd| {
+        let f = find_by_name(&auto, hwnd, "Copy details")
+            .map(|e| unsafe { e.CurrentHasKeyboardFocus().unwrap().as_bool() });
+        let o = find_by_name(&auto, hwnd, "Report a problem")
+            .map(|e| unsafe { e.CurrentHasKeyboardFocus().unwrap().as_bool() });
+        (f, o)
     });
+    assert_still_expanded(&card);
+    let (focused, other) = found;
     assert_eq!(focused, Some(true));
     assert_eq!(other, Some(false));
 }
 
 #[test]
 fn live_uia_invoke_runs_the_link() {
+    let _uia = uia_lock();
     // The observable: Invoke on "Report a problem" posts the same message a
     // click on it does. Wired to nothing, no message arrives.
-    let (invoked, reported) = retry(|| {
-        let card = error_card();
-        let (invoked, mut reported) = with_live_client(&card, |auto, hwnd| {
-            let Some(el) = find_by_name(&auto, hwnd, "Report a problem") else {
-                return false;
-            };
-            let pattern: IUIAutomationInvokePattern =
-                unsafe { el.GetCurrentPattern(UIA_InvokePatternId) }
-                    .expect("Invoke pattern")
-                    .cast()
-                    .expect("IUIAutomationInvokePattern");
-            unsafe { pattern.Invoke() }.is_ok()
-        });
-        // Invoke only posts to the card window; pump until that has run.
-        let started = std::time::Instant::now();
-        while invoked && !reported && started.elapsed() < std::time::Duration::from_secs(2) {
-            let mut msg = MSG::default();
-            while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-                if msg.message == WM_APP_CARD_REPORT_PROBLEM {
-                    reported = true;
-                    continue;
-                }
-                unsafe {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        (card.state() == CardState::Expanded).then_some((invoked, reported))
+    let card = error_card();
+    let (invoked, mut reported) = with_live_client(&card, |auto, hwnd| {
+        let Some(el) = find_by_name(&auto, hwnd, "Report a problem") else {
+            return false;
+        };
+        let pattern: IUIAutomationInvokePattern =
+            unsafe { el.GetCurrentPattern(UIA_InvokePatternId) }
+                .expect("Invoke pattern")
+                .cast()
+                .expect("IUIAutomationInvokePattern");
+        unsafe { pattern.Invoke() }.is_ok()
     });
+    // Invoke only posts to the card window; pump until that has run.
+    let started = std::time::Instant::now();
+    while invoked && !reported && started.elapsed() < std::time::Duration::from_secs(2) {
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            if msg.message == WM_APP_CARD_REPORT_PROBLEM {
+                reported = true;
+                continue;
+            }
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_still_expanded(&card);
     assert!(invoked, "the link was not found or Invoke failed");
     assert!(reported, "Invoke did not post WM_APP_CARD_REPORT_PROBLEM");
 }
@@ -303,6 +325,7 @@ fn shared_links(shared: &card_uia::Shared) -> usize {
 
 #[test]
 fn hiding_the_card_clears_the_links_uia_sees() {
+    let _uia = uia_lock();
     use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
     let mut card = error_card();
     let shared = attach_uia(&mut card);
@@ -315,6 +338,7 @@ fn hiding_the_card_clears_the_links_uia_sees() {
 
 #[test]
 fn destroying_the_card_leaves_an_empty_snapshot() {
+    let _uia = uia_lock();
     let mut card = error_card();
     let shared = attach_uia(&mut card);
     assert_eq!(shared_links(&shared), 2);

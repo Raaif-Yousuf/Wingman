@@ -230,6 +230,14 @@ impl Card {
         Card::create(instance, TEST_CLASS_NAME)
     }
 
+    /// #991: stops losing the focus from closing this card (see
+    /// `CardInner::close_on_focus_loss`). For tests that run in parallel with
+    /// others whose windows take the foreground.
+    #[cfg(test)]
+    pub(crate) fn stay_open_on_focus_loss(&mut self) {
+        self.inner.close_on_focus_loss = false;
+    }
+
     fn create(instance: HINSTANCE, class_name: &str) -> anyhow::Result<Self> {
         let theme = detect_theme();
         // A 96 DPI guess used only to build a first, throwaway set of fonts
@@ -282,6 +290,7 @@ impl Card {
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
             pending_stage: PendingStage::Working,
             animations_enabled: true,
+            close_on_focus_loss: true,
         });
         let raw = Box::into_raw(inner);
 
@@ -1660,6 +1669,10 @@ struct CardInner {
     /// it `false`, `paint_pending` draws a static glyph and `show_pending`
     /// never arms `TIMER_ANIM`.
     animations_enabled: bool,
+    /// #991: whether losing the keyboard focus closes an expanded card. Always
+    /// true live. A test card that checks something other than click-away turns
+    /// it off, so another test's window taking the foreground cannot close it.
+    close_on_focus_loss: bool,
 }
 
 impl CardInner {
@@ -3665,7 +3678,9 @@ impl CardInner {
                 Some(LRESULT(0))
             }
             WM_KILLFOCUS => {
-                self.close_expanded();
+                if self.close_on_focus_loss {
+                    self.close_expanded();
+                }
                 Some(LRESULT(0))
             }
             WM_CARD_SPEECH_END => {
