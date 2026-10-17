@@ -996,8 +996,9 @@ fn fluent_icons_installed() -> bool {
         && exists.as_bool()
 }
 
-/// The font the palette draws icon glyphs in.
-fn icon_face() -> &'static str {
+/// The font the palette (and the card's footer and error mark) draw icon
+/// glyphs in.
+pub(crate) fn icon_face() -> &'static str {
     static FLUENT: OnceLock<bool> = OnceLock::new();
     icon_font_face(*FLUENT.get_or_init(fluent_icons_installed))
 }

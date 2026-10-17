@@ -487,6 +487,8 @@ pub(crate) const FLUENT_ICON_FONT_FACE: &str = "Segoe Fluent Icons";
 pub(crate) const MDL2_ICON_FONT_FACE: &str = "Segoe MDL2 Assets";
 /// The magnifier glyph, the same code point in both icon fonts.
 pub(crate) const GLYPH_SEARCH: char = '\u{E721}';
+/// The error mark beside an error card's headline.
+pub(crate) const GLYPH_ERROR: char = '\u{E783}';
 /// Side of the square an icon glyph is drawn in, in dp.
 pub(crate) const ICON_BOX_DP: i32 = 16;
 /// Font size of an icon glyph in a text box or list row, in dp.
