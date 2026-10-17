@@ -93,7 +93,7 @@ $script:StubServerLoop = {
             $s.Write($payload, 0, $payload.Length)
             $s.Flush()
         }
-        catch { }
+        catch { Write-Verbose "stub: $_" }
         finally { if ($client) { $client.Close() } }
     }
 }
@@ -102,6 +102,8 @@ $script:StubServerLoop = {
 # Requests (a synchronized list the loop adds to) and what Stop-StubProvider
 # needs.
 function Start-StubProvider {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'A test helper that only starts and stops a loopback listener.')]
+    param()
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
@@ -130,9 +132,10 @@ function Start-StubProvider {
 }
 
 function Stop-StubProvider {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'A test helper that only starts and stops a loopback listener.')]
     param([Parameter(Mandatory)] $Stub)
     $Stub.Stop.Value = $true
-    try { $Stub.Listener.Stop() } catch { }
-    try { [void]$Stub.Shell.EndInvoke($Stub.Async) } catch { }
-    try { $Stub.Shell.Dispose(); $Stub.Runspace.Dispose() } catch { }
+    try { $Stub.Listener.Stop() } catch { Write-Verbose "stub: $_" }
+    try { [void]$Stub.Shell.EndInvoke($Stub.Async) } catch { Write-Verbose "stub: $_" }
+    try { $Stub.Shell.Dispose(); $Stub.Runspace.Dispose() } catch { Write-Verbose "stub: $_" }
 }
