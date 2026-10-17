@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 /// Every proposal kind [`schema_for`] answers for, so a test can walk them all.
 #[cfg(test)]
-pub(crate) const PROPOSAL_KINDS: [&str; 13] = [
+pub(crate) const PROPOSAL_KINDS: [&str; 14] = [
     "verdict",
     "calendar_event",
     "text_review",
@@ -43,6 +43,7 @@ pub(crate) const PROPOSAL_KINDS: [&str; 13] = [
     "screen_explanation",
     "time_list",
     "scam_check",
+    "contact_card",
 ];
 
 /// Looks up the JSON Schema for `proposal`. `rate_difficulty` only affects
@@ -96,6 +97,8 @@ pub fn schema_for(proposal: &str, rate_difficulty: bool) -> Option<Value> {
         "scam_check" => Some(scam_check_schema()),
         // #335: jargon terms with a plain meaning each, shown on the card.
         "jargon_terms" => Some(jargon_terms_schema()),
+        // #71: one contact read off a signature or contact block.
+        "contact_card" => Some(contact_card_schema()),
         _ => None,
     }
 }
@@ -223,6 +226,29 @@ fn jargon_terms_schema() -> Value {
             }
         },
         "required": ["terms"],
+        "additionalProperties": false
+    })
+}
+
+/// The `contact_card` proposal schema (#71): `name`, `email`, `phone`, `org`,
+/// `title`, `address`, all strings, all required (an empty string for what
+/// the screen does not show) and all editable, so a misread digit in a phone
+/// number is fixed on the card before "Do it". The order is the order a
+/// signature is read in; nothing here depends on one field being committed
+/// before another. The executor (`executors::contact_add`) writes exactly
+/// these six fields.
+fn contact_card_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "editable": true},
+            "email": {"type": "string", "editable": true},
+            "phone": {"type": "string", "editable": true},
+            "org": {"type": "string", "editable": true},
+            "title": {"type": "string", "editable": true},
+            "address": {"type": "string", "editable": true}
+        },
+        "required": ["name", "email", "phone", "org", "title", "address"],
         "additionalProperties": false
     })
 }
@@ -749,6 +775,22 @@ mod tests {
         assert_eq!(item["required"], json!(["term", "meaning"]));
         assert_eq!(item["additionalProperties"], false);
         assert_eq!(schema["required"], json!(["terms"]));
+    }
+
+    #[test]
+    fn contact_card_declares_the_six_fields_in_order_all_required_and_editable() {
+        let schema = schema_for("contact_card", false).expect("contact_card is registered");
+        let keys: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["name", "email", "phone", "org", "title", "address"]);
+        assert_eq!(
+            schema["required"],
+            json!(["name", "email", "phone", "org", "title", "address"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        for key in keys {
+            assert_eq!(schema["properties"][key]["type"], "string", "{key}");
+            assert_eq!(schema["properties"][key]["editable"], true, "{key}");
+        }
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub enum Effect {
 pub fn effect_for_executor(executor: &str) -> Effect {
     match executor {
         "none" => Effect::None,
-        "calendar_add" | "replace_text" | "fill_form" => Effect::Preview,
+        "calendar_add" | "replace_text" | "fill_form" | "contact_add" => Effect::Preview,
         _ => Effect::Clipboard,
     }
 }
@@ -577,7 +577,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 /// `claude-opus-4-8` -> `Claude Opus 4.8`, `gemini-3.8-flash` -> `Gemini 3.8
 /// Flash`. Anything unrecognised (Ollama tags, compat models) falls back to
 /// the model id without the provider prefix, or the raw string.
-fn friendly_model_name(provider_model: &str) -> String {
+pub(crate) fn friendly_model_name(provider_model: &str) -> String {
     let model = provider_model
         .split_once(':')
         .map(|(_, model)| model)
@@ -1139,6 +1139,7 @@ mod tests {
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
             crate::actions::jargon::ACTION_ID,
+            crate::actions::contact::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
@@ -1349,6 +1350,7 @@ mod tests {
         assert_eq!(effect_for_executor("image_clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("replace_text"), Effect::Preview);
         assert_eq!(effect_for_executor("calendar_add"), Effect::Preview);
+        assert_eq!(effect_for_executor("contact_add"), Effect::Preview);
         assert_eq!(effect_for_executor("fill_form"), Effect::Preview);
         assert_eq!(effect_for_executor("typo"), Effect::Clipboard);
         assert_eq!(effect_for_executor(""), Effect::Clipboard);

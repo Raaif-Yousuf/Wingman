@@ -9,6 +9,7 @@ pub mod action_items;
 pub mod calendar;
 pub mod chart_table;
 pub mod code_actions;
+pub mod contact;
 pub mod convert_times;
 pub mod dates;
 pub mod define_word;
@@ -429,6 +430,10 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   model-free. Finds phrases like "next Tuesday" or "in 3 days" in the
 ///   selection (else on screen) and lists the date each works out to
 ///   (`dates`), from today's local date.
+/// - `"contact-to-address-book"` (#71, `contact::builtin_action`): proposal
+///   `contact_card`, executor `contact_add`. Reads the signature or contact
+///   block on screen into a contact, confirms it on a card, then writes a
+///   `.vcf` (vCard 3.0) and opens it so Windows offers to add it.
 /// - `"explain-jargon"` (#335, `jargon::builtin_action`): proposal
 ///   `jargon_terms`, executor `none`. Lists the technical terms and acronyms in
 ///   the selection (else on screen) with a short plain meaning each, on the
@@ -495,6 +500,7 @@ pub fn builtin_actions() -> Vec<Action> {
         scam_check::builtin_action(),
         relative_dates::builtin_action(),
         jargon::builtin_action(),
+        contact::builtin_action(),
     ];
     actions.extend(code_actions::builtin_actions());
     actions.extend(rewrite_tone::builtin_actions());
