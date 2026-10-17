@@ -64,6 +64,17 @@ Describe 'the zip file set' {
     }
 }
 
+Describe 'the pre-made certificate' {
+    It 'uses the same extensions as install.ps1, so install.ps1 will reuse it' {
+        $smoke = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''
+        $install = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\install.ps1') -Raw) -replace "`r", ''
+        $install | Should -Not -BeNullOrEmpty
+        $ext = "@('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')"
+        $install.Contains($ext) | Should -BeTrue
+        $smoke.Contains($ext) | Should -BeTrue
+    }
+}
+
 Describe 'the safety rails' {
     It 'refuses to run off a CI runner' {
         $text = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''
