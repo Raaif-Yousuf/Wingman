@@ -266,6 +266,10 @@ pub enum GalleryState {
     /// #582: the General page with the Start with Windows checkbox ticked and
     /// holding the keyboard focus, to see the box, tick and focus frame together.
     SettingsCheckFocus,
+    /// #582: the General page with the Text scale trackbar holding the keyboard
+    /// focus (cue showing) and moved off its default, to see the rail, the
+    /// thumb and the focus mark together.
+    SettingsTrackFocus,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -337,6 +341,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsComboHover,
         SettingsComboOpen,
         SettingsCheckFocus,
+        SettingsTrackFocus,
         RegionOverlay,
         OverlayNotes,
         TrayMenu,
@@ -403,6 +408,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsComboHover => "settings-combo-hover",
         SettingsComboOpen => "settings-combo-open",
         SettingsCheckFocus => "settings-check-focus",
+        SettingsTrackFocus => "settings-track-focus",
         RegionOverlay => "region-overlay",
         OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
@@ -1214,6 +1220,7 @@ mod driver {
             | SettingsComboHover
             | SettingsComboOpen
             | SettingsCheckFocus
+            | SettingsTrackFocus
             | SettingsKeyChecking
             | SettingsKeyRejected => {
                 card.hide();
@@ -1246,6 +1253,7 @@ mod driver {
                     SettingsComboHover => w.hover_combo(crate::ui::settings::CARD_CORNER_COMBO),
                     SettingsComboOpen => w.open_combo_list(crate::ui::settings::CARD_CORNER_COMBO),
                     SettingsCheckFocus => w.focus_checked_autostart(),
+                    SettingsTrackFocus => w.focus_text_scale_track(),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1272,6 +1280,7 @@ mod driver {
             | SettingsComboHover
             | SettingsComboOpen
             | SettingsCheckFocus
+            | SettingsTrackFocus
             | SettingsKeyChecking
             | SettingsKeyRejected => settings
                 .as_ref()
@@ -1816,7 +1825,7 @@ mod tests {
             settings_states += usize::from(n.starts_with("settings-"));
         }
         assert_eq!(
-            settings_states, 16,
+            settings_states, 17,
             "the test must see every Settings state"
         );
     }
@@ -1953,8 +1962,8 @@ mod tests {
         // checked and refused (#876) = 52, + the Settings combo under the mouse
         // (#1109) = 53, + the same combo with its list open (#1125) = 54, + the long
         // button label (#828) = 55, + the focused checked checkbox
-        // (#582) = 56.
-        assert_eq!(states.len(), 56);
+        // (#582) = 56, + the focused trackbar (#582) = 57.
+        assert_eq!(states.len(), 57);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -2005,14 +2014,15 @@ mod tests {
             "settings-combo-hover",
             "settings-combo-open",
             "settings-check-focus",
+            "settings-track-focus",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 11,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) the open combo list (#1125) and the focused checkbox (#582)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 12,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) the open combo list (#1125) the focused checkbox and the focused trackbar (#582)"
         );
     }
 
