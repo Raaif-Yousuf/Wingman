@@ -515,7 +515,10 @@ pub fn run() -> Result<()> {
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.display().to_string()))
                 .unwrap_or_else(|| "the Wingman settings folder".to_string());
-            (config, Some((folder, format!("{e:#}"))))
+            (
+                config,
+                Some((folder, humanize_error_chain(&worker_error_chain_text(&e)))),
+            )
         }
     };
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
