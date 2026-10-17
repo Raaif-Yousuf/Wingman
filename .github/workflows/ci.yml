@@ -120,8 +120,14 @@ jobs:
         run: |
           $out = cargo bloat --release --crates -n 25 2>&1 | Out-String
           $out
+          # The biggest functions of the wingman crate, to see which of our
+          # own code grew (#1094). Reuses the build above, so it is quick.
+          $fns = cargo bloat --release -n 60 --filter wingman 2>&1 | Out-String
+          $fns
           "## Exe size by crate (unstripped build, informational)`n" +
-            '```' + "`n" + $out + "`n" + '```' |
+            '```' + "`n" + $out + "`n" + '```' + "`n`n" +
+            "## Biggest wingman functions (unstripped build, informational)`n" +
+            '```' + "`n" + $fns + "`n" + '```' |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
   supply-chain:

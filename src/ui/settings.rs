@@ -866,12 +866,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // #872: the rail draws itself through us.
         WM_DRAWITEM => {
-            draw_rail_item(lparam);
-            LRESULT(1)
+            if is_rail_draw_item(lparam) {
+                draw_rail_item(lparam);
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_MEASUREITEM => {
-            measure_rail_item(lparam, inner.dpi);
-            LRESULT(1)
+            let mis = &*(lparam.0 as *const windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+            if mis.CtlID == ID_RAIL as u32 {
+                measure_rail_item(lparam, inner.dpi);
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         // The rail's background is the window's, not the list box's white.
         WM_CTLCOLORLISTBOX => LRESULT(
@@ -1594,6 +1603,7 @@ const TBM_SETPAGESIZE: u32 = 0x0415;
 const TBM_SETLINESIZE: u32 = 0x0417;
 const CBS_DROPDOWNLIST: i32 = 0x0003;
 const CBS_HASSTRINGS: i32 = 0x0200;
+const CBS_OWNERDRAWFIXED: i32 = 0x0010;
 const ES_PASSWORD: i32 = 0x0020;
 const ES_MULTILINE: i32 = 0x0004;
 const ES_WANTRETURN: i32 = 0x1000;
@@ -2146,6 +2156,9 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
         } else {
             (x, y - pos)
         };
+        if is_combo(c.hwnd) {
+            set_combo_heights(c.hwnd, dpi);
+        }
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         // #1015: helper lines are set smaller than the labels.
         let font = if !new_hint_font.0.is_null() && is_hint_id(GetDlgCtrlID(c.hwnd)) {
@@ -2994,6 +3007,9 @@ unsafe extern "system" fn body_wndproc(
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
         }
+        // #854: the dropdown combos draw their own text.
+        WM_DRAWITEM if draw_combo_item(lparam) => LRESULT(1),
+        WM_MEASUREITEM if measure_combo_item(lparam, dpi_for(hwnd)) => LRESULT(1),
         // #824, #972: a helper line is secondary text, not the disabled grey.
         // Every other static keeps the default colours.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
@@ -3518,6 +3534,13 @@ impl Ctx {
     ) -> HWND {
         let class_w = wide_z(class);
         let text_w = wide_z(text);
+        // #854: every dropdown paints its own text, so it can sit 8 dp in from
+        // the border like a Windows 11 combo. The control keeps its role.
+        let style = if class == WC_COMBOBOX {
+            style | CBS_OWNERDRAWFIXED as u32
+        } else {
+            style
+        };
         let hwnd = unsafe {
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(ex_style),
@@ -3546,6 +3569,17 @@ impl Ctx {
                     Some(WPARAM(self.font.0 as usize)),
                     Some(LPARAM(1)),
                 );
+            }
+            if class == WC_COMBOBOX {
+                unsafe {
+                    set_combo_heights(hwnd, self.dpi);
+                    let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+                        hwnd,
+                        Some(combo_subclass),
+                        COMBO_SUBCLASS_ID,
+                        0,
+                    );
+                }
             }
             if class == WC_EDIT {
                 // #934: the frame of a Windows 11 text box.
@@ -6332,6 +6366,9 @@ const LBS_HASSTRINGS: u32 = 0x0040;
 const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
 const ODS_SELECTED: u32 = 0x0001;
 const ODS_FOCUS: u32 = 0x0010;
+const ODS_DISABLED: u32 = 0x0004;
+const ODS_COMBOBOXEDIT: u32 = 0x1000;
+const ODT_COMBOBOX: u32 = 3;
 const ODS_NOFOCUSRECT: u32 = 0x0200;
 const WC_LISTBOX: &str = "LISTBOX";
 
@@ -6620,12 +6657,192 @@ unsafe fn icon_font(dp: i32, dpi: u32) -> HFONT {
     CreateFontIndirectW(&lf)
 }
 
+/// The area a combo item's text is drawn in: the item's rect with
+/// `COMBO_TEXT_PAD_DP` kept clear on each side. Never inverted, however narrow
+/// the item.
+fn combo_text_rect(
+    rc: windows::Win32::Foundation::RECT,
+    dpi: u32,
+) -> windows::Win32::Foundation::RECT {
+    let pad = to_px(crate::ui::theme::COMBO_TEXT_PAD_DP, dpi);
+    let left = rc.left + pad;
+    windows::Win32::Foundation::RECT {
+        left,
+        top: rc.top,
+        right: (rc.right - pad).max(left),
+        bottom: rc.bottom,
+    }
+}
+
+const COMBO_SUBCLASS_ID: usize = 0x854;
+
+/// An owner-drawn combo loses the system's light themed frame, so the frame is
+/// put back after each paint in the text box's look (#934): the same border,
+/// corners and accent line, which also keeps a row of controls consistent.
+unsafe extern "system" fn combo_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    match msg {
+        WM_PAINT => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            paint_edit_frame(hwnd);
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(combo_subclass), COMBO_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The height of a dropdown's list items: a row less the frame.
+fn combo_item_h_px(dpi: u32) -> i32 {
+    to_px(ROW_H, dpi) - to_px(COMBO_FRAME_DP, dpi)
+}
+
+/// The frame a combo adds around its selection field, in dp, as a first guess;
+/// [`set_combo_heights`] measures the real one.
+const COMBO_FRAME_DP: i32 = 4;
+
+fn is_combo(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut buf = [0u16; 16];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n.min(buf.len())]).eq_ignore_ascii_case(WC_COMBOBOX)
+}
+
+/// Sets the item height of an owner-drawn combo: the list items (index 0) and
+/// the closed selection field (-1). The closed combo is its field plus a frame
+/// of the system's choosing, so the field is sized to leave the combo `ROW_H`
+/// tall, like the controls beside it.
+unsafe fn set_combo_heights(combo: HWND, dpi: u32) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_SETITEMHEIGHT;
+    let set = |index: usize, h: i32| {
+        SendMessageW(
+            combo,
+            CB_SETITEMHEIGHT,
+            Some(WPARAM(index)),
+            Some(LPARAM(h.max(1) as isize)),
+        );
+    };
+    let want = to_px(ROW_H, dpi);
+    set(0, combo_item_h_px(dpi));
+    // Measure the frame with a field of the wanted height, then take it off.
+    set(usize::MAX, want);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    let frame = if GetWindowRect(combo, &mut rc).is_ok() {
+        (rc.bottom - rc.top - want).clamp(0, want / 2)
+    } else {
+        to_px(COMBO_FRAME_DP, dpi)
+    };
+    set(usize::MAX, want - frame);
+}
+
+/// `WM_MEASUREITEM` for a combo. Returns false for anything else.
+unsafe fn measure_combo_item(lparam: LPARAM, dpi: u32) -> bool {
+    let mis = &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+    if mis.CtlType.0 != ODT_COMBOBOX {
+        return false;
+    }
+    mis.itemHeight = combo_item_h_px(dpi).max(1) as u32;
+    true
+}
+
+/// `WM_DRAWITEM` for a combo: the item (or the closed field) on the system
+/// colours, its text kept `COMBO_TEXT_PAD_DP` off the border. Returns false
+/// for anything else. Only system brushes and colours, so nothing to free and
+/// high contrast needs no special case.
+unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{
+        DrawTextW, FillRect, GetSysColor, GetSysColorBrush, SelectObject, SetBkMode, SetTextColor,
+        COLOR_3DFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+        COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        TRANSPARENT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{CB_GETLBTEXT, CB_GETLBTEXTLEN, WM_GETFONT};
+
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    if di.CtlType.0 != ODT_COMBOBOX {
+        return false;
+    }
+    let hdc = di.hDC;
+    let rc = di.rcItem;
+    let state = di.itemState.0;
+    let disabled = state & ODS_DISABLED != 0;
+    // Only a list item highlights. The closed field gets ODS_SELECTED while the
+    // combo has the focus, and keeps the window colours; the focus line the
+    // frame draws is its focus mark.
+    let in_field = state & ODS_COMBOBOXEDIT != 0;
+    let selected = state & ODS_SELECTED != 0 && !disabled && !in_field;
+    let (face, ink) = if disabled {
+        (COLOR_3DFACE, COLOR_GRAYTEXT)
+    } else if selected {
+        (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT)
+    } else {
+        (COLOR_WINDOW, COLOR_WINDOWTEXT)
+    };
+    FillRect(hdc, &rc, GetSysColorBrush(face));
+
+    // An empty combo asks to be drawn with item id -1: just the background.
+    let Ok(index) = usize::try_from(di.itemID as i32) else {
+        return true;
+    };
+    let len = SendMessageW(di.hwndItem, CB_GETLBTEXTLEN, Some(WPARAM(index)), None).0;
+    let Ok(len) = usize::try_from(len) else {
+        return true;
+    };
+    let mut text = vec![0u16; len + 1];
+    let got = SendMessageW(
+        di.hwndItem,
+        CB_GETLBTEXT,
+        Some(WPARAM(index)),
+        Some(LPARAM(text.as_mut_ptr() as isize)),
+    )
+    .0;
+    let Ok(got) = usize::try_from(got) else {
+        return true;
+    };
+    text.truncate(got.min(len));
+
+    let dpi = dpi_for(di.hwndItem);
+    let mut area = combo_text_rect(rc, dpi);
+    let font = SendMessageW(di.hwndItem, WM_GETFONT, None, None).0;
+    let old = (font != 0).then(|| SelectObject(hdc, HGDIOBJ(font as *mut c_void)));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(GetSysColor(ink)));
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut area,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+    if let Some(old) = old {
+        SelectObject(hdc, old);
+    }
+    true
+}
+
 /// `WM_MEASUREITEM`: every rail item is the same height.
 unsafe fn measure_rail_item(lparam: LPARAM, dpi: u32) {
     let mis = &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
     if mis.CtlID == ID_RAIL as u32 {
         mis.itemHeight = to_px(RAIL_ITEM_H_DP, dpi).max(1) as u32;
     }
+}
+
+/// Whether a `WM_DRAWITEM` is for the rail (the only owner-drawn control the
+/// main window itself hosts).
+unsafe fn is_rail_draw_item(lparam: LPARAM) -> bool {
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    di.CtlID == ID_RAIL as u32
 }
 
 /// `WM_DRAWITEM` for the rail: one item.
@@ -11737,6 +11954,239 @@ mod tests {
         );
     }
 
+    // -- combo text padding (#854) ----------------------------------------
+
+    #[test]
+    fn combo_text_keeps_the_standard_inner_padding_at_each_scale() {
+        use windows::Win32::Foundation::RECT;
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 20,
+        };
+        for (dpi, want) in [(96u32, 8), (144, 12), (192, 16), (240, 20)] {
+            let t = combo_text_rect(rc, dpi);
+            assert_eq!(t.left - rc.left, want, "left pad at {dpi} dpi");
+            assert_eq!(rc.right - t.right, want, "right pad at {dpi} dpi");
+        }
+    }
+
+    #[test]
+    fn combo_text_area_is_never_inverted() {
+        use windows::Win32::Foundation::RECT;
+        for w in [-5, 0, 3, 10, 17] {
+            let t = combo_text_rect(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: 20,
+                },
+                96,
+            );
+            assert!(t.right >= t.left, "width {w}");
+        }
+    }
+
+    /// Draws a combo's selected item through the real `draw_combo_item` into
+    /// a white bitmap and returns the first column with ink, and the width.
+    fn first_ink_column(dpi: u32, disabled: bool) -> (i32, i32) {
+        let (first, w, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
+        (first, w)
+    }
+
+    /// [`first_ink_column`] for any item state; also returns the item's
+    /// background colour (its top-left pixel as a `COLORREF`).
+    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32) {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, GdiFlush, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+        use windows::Win32::UI::WindowsAndMessaging::{CB_ADDSTRING, CB_SETCURSEL, WS_POPUP};
+        ensure_common_controls();
+        let class = wide_z(WC_COMBOBOX);
+        let name = wide_z("");
+        let combo = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                    WS_POPUP.0 | (CBS_DROPDOWNLIST | CBS_HASSTRINGS | CBS_OWNERDRAWFIXED) as u32,
+                ),
+                0,
+                0,
+                300,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("combo");
+        let item = wide_z("Fast");
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(item.as_ptr() as isize)),
+            );
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
+        }
+        let (w, h) = (300i32, 24i32);
+        let mut first = -1;
+        let back;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels: *mut c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut pixels, None, 0)
+                .expect("DIB");
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let dis = DRAWITEMSTRUCT {
+                CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(ODT_COMBOBOX),
+                itemID: 0,
+                itemState: windows::Win32::UI::Controls::ODS_FLAGS(state),
+                hwndItem: combo,
+                hDC: dc,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                ..Default::default()
+            };
+            FORCED_DPI.with(|f| f.set(Some(dpi)));
+            let drawn = draw_combo_item(LPARAM(&dis as *const DRAWITEMSTRUCT as isize));
+            FORCED_DPI.with(|f| f.set(None));
+            assert!(drawn, "a combo item is drawn by us");
+            let _ = GdiFlush();
+            let px = std::slice::from_raw_parts(pixels as *const u8, (w * h * 4) as usize);
+            let bg = [px[0], px[1], px[2]];
+            back = u32::from(px[2]) | u32::from(px[1]) << 8 | u32::from(px[0]) << 16;
+            'cols: for x in 0..w {
+                for y in 0..h {
+                    let i = ((y * w + x) * 4) as usize;
+                    if [px[i], px[i + 1], px[i + 2]] != bg {
+                        first = x;
+                        break 'cols;
+                    }
+                }
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            let _ = DestroyWindow(combo);
+        }
+        (first, w, back)
+    }
+
+    #[test]
+    fn a_focused_closed_combo_field_keeps_the_window_colours_but_a_list_item_highlights() {
+        use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT, COLOR_WINDOW};
+        let window = unsafe { GetSysColor(COLOR_WINDOW) } & 0x00FF_FFFF;
+        let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) } & 0x00FF_FFFF;
+        assert_ne!(window, highlight, "the check needs two different colours");
+        // The closed field, focused: the combo hands us ODS_SELECTED with it.
+        let (_, _, field) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
+        assert_eq!(field, window, "a focused field stays on the window colour");
+        // A list item under the pointer or cursor still highlights.
+        let (_, _, item) = probe_combo(96, ODS_SELECTED);
+        assert_eq!(item, highlight, "a selected list item highlights");
+    }
+
+    /// The combo is a real Settings combo, and the body window really draws it.
+    #[test]
+    fn a_settings_combo_is_owner_drawn_and_the_body_draws_it() {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, DRAWITEMSTRUCT_CTL_TYPE};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let w = GalleryWindow::open(HINSTANCE(h.0), Some(96)).expect("open");
+        let combo = get_dlg_item(w.hwnd(), ID_ACTIVE_PROVIDER).expect("active provider combo");
+        let style = unsafe { GetWindowLongPtrW(combo, GWL_STYLE) } as u32;
+        assert_ne!(style & CBS_OWNERDRAWFIXED as u32, 0, "owner-drawn");
+        let body = unsafe { GetParent(combo) }.expect("the body");
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let dis = DRAWITEMSTRUCT {
+                CtlType: DRAWITEMSTRUCT_CTL_TYPE(ODT_COMBOBOX),
+                CtlID: ID_ACTIVE_PROVIDER as u32,
+                itemID: 0,
+                hwndItem: combo,
+                hDC: dc,
+                rcItem: windows::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 20,
+                },
+                ..Default::default()
+            };
+            let handled = SendMessageW(
+                body,
+                WM_DRAWITEM,
+                Some(WPARAM(ID_ACTIVE_PROVIDER as usize)),
+                Some(LPARAM(&dis as *const DRAWITEMSTRUCT as isize)),
+            );
+            let _ = DeleteDC(dc);
+            assert_eq!(handled.0, 1, "the body answers a combo's WM_DRAWITEM");
+            // The main window draws rail items only: a list box with another
+            // id is left to the default handling.
+            let other = DRAWITEMSTRUCT {
+                CtlType: DRAWITEMSTRUCT_CTL_TYPE(2),
+                CtlID: ID_ACTIVE_PROVIDER as u32,
+                ..Default::default()
+            };
+            let r = SendMessageW(
+                w.hwnd(),
+                WM_DRAWITEM,
+                Some(WPARAM(ID_ACTIVE_PROVIDER as usize)),
+                Some(LPARAM(&other as *const DRAWITEMSTRUCT as isize)),
+            );
+            assert_ne!(r.0, 1, "not a rail item, so not handled as one");
+        }
+        drop(w);
+    }
+
+    #[test]
+    fn the_drawn_combo_text_starts_in_from_the_border_at_each_scale() {
+        for dpi in [96u32, 144, 192] {
+            let (first, _) = first_ink_column(dpi, false);
+            assert!(first >= 0, "text was drawn at {dpi} dpi");
+            let pad = to_px(crate::ui::theme::COMBO_TEXT_PAD_DP, dpi);
+            assert!(
+                first >= pad,
+                "text starts at {first}px, the padding is {pad}px at {dpi} dpi"
+            );
+            assert!(first <= pad + to_px(4, dpi), "and not far past it");
+        }
+    }
+
+    #[test]
+    fn a_disabled_combo_draws_its_text_in_from_the_border_too() {
+        let (first, _) = first_ink_column(96, true);
+        assert!(first >= 8, "starts at {first}px");
+    }
+
     // -- to_px --------------------------------------------------------
 
     #[test]
@@ -12113,7 +12563,12 @@ mod tests {
             let key = format!("sk-ant-api03-{}", "A".repeat(95));
             let field = get_dlg_item(hwnd, ID_ANTHROPIC_KEY).expect("anthropic key field");
             set_text(field, "");
-            if put_on_clipboard(hwnd, &key) {
+            // The real clipboard is the point of this check; put the user's
+            // own contents back afterwards (#1114).
+            crate::inputs::selection::with_real_clipboard_restored(|| {
+                if !put_on_clipboard(hwnd, &key) {
+                    return;
+                }
                 unsafe {
                     SendMessageW(field, WM_PASTE, None, None);
                 }
@@ -12126,7 +12581,7 @@ mod tests {
                     key.chars().count()
                 );
                 assert_eq!(got, key);
-            }
+            });
             set_text(field, "");
         }
 
