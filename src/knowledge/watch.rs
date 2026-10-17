@@ -712,6 +712,20 @@ fn report_ended(root: &Path, code: Option<u32>) {
     }
 }
 
+/// What a card says when the watch ends on a store error.
+fn store_ended_notice(e: &StoreError) -> String {
+    format!(
+        "Wingman stopped watching your knowledge folder because the store failed: {e}. Choose Reload settings to start watching again."
+    )
+}
+
+/// The watch ended on a store error (#1204). Goes through the scan's own
+/// queue: `store::report` keeps one text per run and would drop this one if
+/// any store notice had already been used.
+fn report_store_ended(e: &StoreError) {
+    notice::report(&store_ended_notice(e));
+}
+
 /// True while `folder` still resolves to the canonical `root` it was started
 /// with. Any failure to look (gone, no access) is false: the safe answer.
 fn root_unchanged(folder: &Path, root: &Path) -> bool {
@@ -781,7 +795,7 @@ fn watch(
     let mut root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
         Ok(id) => id,
         Err(e) => {
-            store::report(&e);
+            report_store_ended(&e);
             return;
         }
     };
@@ -805,7 +819,7 @@ fn watch(
             root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
                 Ok(id) => id,
                 Err(e) => {
-                    store::report(&e);
+                    report_store_ended(&e);
                     return;
                 }
             };
@@ -892,7 +906,7 @@ fn watch(
                     }
                     continue;
                 }
-                store::report(&e);
+                report_store_ended(&e);
                 return;
             }
         }
@@ -1685,6 +1699,36 @@ mod tests {
         assert!(start("").unwrap().is_none());
         assert!(start("Notes").unwrap().is_none(), "a relative path");
         assert!(start(r"C:\").unwrap().is_none(), "a whole drive");
+    }
+
+    /// #1204: a watch that ends on a store error must say so through its own
+    /// queue. `store::report` keeps only the first text per run, so when any
+    /// store notice had already been used the watch ended with no card.
+    #[test]
+    fn a_watch_ended_by_a_store_error_names_the_way_back() {
+        let text = store_ended_notice(&StoreError::Other("disk is full".to_string()));
+        assert!(text.contains("disk is full"), "{text}");
+        assert!(text.contains("stopped watching"), "{text}");
+        assert!(text.contains("Reload settings"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    #[test]
+    fn every_store_error_that_ends_the_watch_goes_through_its_own_queue() {
+        let src = include_str!("watch.rs").replace('\r', "");
+        let body = src
+            .split("\nfn watch(")
+            .nth(1)
+            .and_then(|b| b.split("\n/// Test-only: how many times").next())
+            .expect("the watch body exists");
+        assert!(
+            body.matches("report_store_ended(&e)").count() >= 3,
+            "all three store-error exits must queue a watch notice:\n{body}"
+        );
+        assert!(
+            !body.contains("store::report("),
+            "store::report drops the text once a store notice was used (#1204)"
+        );
     }
 
     #[test]
