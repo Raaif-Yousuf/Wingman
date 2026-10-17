@@ -63,30 +63,14 @@ pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> Stri
     format!("{state_name}--{theme_name}--{percent}.png")
 }
 
-/// Whether a state can be drawn under a simulated theme and DPI. The card
-/// states, the palette, the region overlay and the tray menu can. Settings
-/// follows the DPI only (see [`follows_dpi_only`]).
+/// Whether a state can be drawn under a simulated theme and DPI. Every state
+/// can: the card states, the palette, the region overlay, the tray menu and,
+/// since #582, Settings (its light and high contrast pictures are the stock
+/// controls, its dark one is the dark paint, which real windows keep off until
+/// the last slice).
 #[cfg(any(test, debug_assertions))]
-pub fn follows_variants(state: GalleryState) -> bool {
-    use GalleryState::*;
-    !matches!(
-        state,
-        SettingsGeneral
-            | SettingsModels
-            | SettingsModelsClaude
-            | SettingsModelsMoreProviders
-            | SettingsPrivacy
-            | SettingsActions
-            | SettingsAdvanced
-            | SettingsAdvancedPromptOpen
-            | SettingsSaved
-            | SettingsInvalid
-            | SettingsNotSaved
-            | SettingsKeyChecking
-            | SettingsKeyRejected
-            | SettingsComboHover
-            | SettingsComboOpen
-    )
+pub fn follows_variants(_state: GalleryState) -> bool {
+    true
 }
 
 /// Whether a state is captured by sending `WM_PRINT` instead of calling
@@ -126,32 +110,6 @@ pub fn draws_with_direct2d(state: GalleryState) -> bool {
 pub fn d2d_filename(gdi: &std::path::Path) -> PathBuf {
     let stem = gdi.file_stem().unwrap_or_default().to_string_lossy();
     gdi.with_file_name(format!("{stem}--d2d.png"))
-}
-
-/// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
-/// at a simulated scale, but it has no forced theme yet (issue #662), so
-/// `--matrix` draws it once per scale as `<state>--system--<percent>.png`.
-#[cfg(any(test, debug_assertions))]
-pub fn follows_dpi_only(state: GalleryState) -> bool {
-    use GalleryState::*;
-    matches!(
-        state,
-        SettingsGeneral
-            | SettingsModels
-            | SettingsModelsClaude
-            | SettingsModelsMoreProviders
-            | SettingsPrivacy
-            | SettingsActions
-            | SettingsAdvanced
-            | SettingsAdvancedPromptOpen
-            | SettingsSaved
-            | SettingsInvalid
-            | SettingsNotSaved
-            | SettingsKeyChecking
-            | SettingsKeyRejected
-            | SettingsComboHover
-            | SettingsComboOpen
-    )
 }
 
 /// The theme a `--theme` value names: `light`, `dark` or `high-contrast`
@@ -558,23 +516,6 @@ mod driver {
                                 &dir.join(name),
                             )?;
                         }
-                    }
-                } else if follows_dpi_only(*state) {
-                    for percent in MATRIX_SCALES {
-                        let variant = Variant {
-                            theme: None,
-                            dpi: dpi_from_arg(&percent.to_string()),
-                        };
-                        let name = matrix_filename(state_name(*state), "system", percent);
-                        shoot(
-                            &mut card,
-                            &mut palette,
-                            &mut settings,
-                            &mut region,
-                            variant,
-                            *state,
-                            &dir.join(name),
-                        )?;
                     }
                 } else {
                     // Tray menus and the like: once, at the monitor's own DPI,
@@ -1311,7 +1252,7 @@ mod driver {
             | SettingsKeyRejected => {
                 card.hide();
                 palette.hide();
-                let mut w = GalleryWindow::open(instance, variant.dpi)
+                let mut w = GalleryWindow::open_themed(instance, variant.dpi, variant.theme)
                     .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
                 w.show_page(settings_page(state));
                 w.set_advanced(matches!(state, SettingsAdvancedPromptOpen));
@@ -1903,16 +1844,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_settings_states_ignore_variants() {
+    fn every_state_follows_theme_and_scale_settings_included() {
         assert!(follows_variants(GalleryState::CardError));
         assert!(follows_variants(GalleryState::RegionOverlay));
         assert!(follows_variants(GalleryState::TrayMenu));
         assert!(follows_variants(GalleryState::TrayMenuSubmenu));
-        assert!(!follows_variants(GalleryState::SettingsGeneral));
+        let mut settings_states = 0;
         for state in gallery_states() {
             let n = state_name(state);
-            assert_eq!(follows_variants(state), !n.starts_with("settings-"), "{n}");
+            assert!(follows_variants(state), "{n}");
+            settings_states += usize::from(n.starts_with("settings-"));
         }
+        assert_eq!(
+            settings_states, 15,
+            "the test must see every Settings state"
+        );
     }
 
     /// #1007: the palette is drawn at every matrix theme and scale, so its
@@ -1923,7 +1869,7 @@ mod tests {
         for state in gallery_states() {
             let n = state_name(state);
             if n.starts_with("palette-") {
-                assert!(follows_variants(state) && !follows_dpi_only(state), "{n}");
+                assert!(follows_variants(state), "{n}");
                 palette_states += 1;
             }
         }
