@@ -835,7 +835,13 @@ pub fn run() -> Result<()> {
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
     // #81: index the knowledge folder once, on a background thread that ends
     // with the scan. An empty setting starts nothing.
-    let _ = crate::knowledge::ingest::start_scan(&config.knowledge.folder);
+    // #1054: a setting that cannot work and a thread that cannot start are known
+    // here, so they end on the start-up card below; a folder that is missing
+    // is only known on the scan thread and waits in its own notice queue.
+    let knowledge_setting_problem =
+        crate::knowledge::ingest::startup_problem(&config.knowledge.folder);
+    let knowledge_spawn_problem =
+        crate::knowledge::ingest::start_scan(&config.knowledge.folder).err();
     let chain = Arc::new(config.build_chain());
 
     // #105: every `Chain` built from here on asks the owner window to show
@@ -901,7 +907,13 @@ pub fn run() -> Result<()> {
         create_failed
             .as_ref()
             .map(|(folder, error)| (folder.as_str(), error.as_str())),
-        degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
+        merge_cards(
+            degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
+            knowledge_start_card(
+                knowledge_setting_problem.as_deref(),
+                knowledge_spawn_problem.as_deref(),
+            ),
+        ),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -1100,6 +1112,38 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #1054: the start-up card for a knowledge folder that will not be indexed
+/// this run for a reason known without reading the disk: the setting itself is
+/// unusable, or the scan's thread could not be created. `None` when both are
+/// fine. Pure. No em dash (rule 11).
+fn knowledge_start_card(
+    setting_problem: Option<&str>,
+    spawn_problem: Option<&str>,
+) -> Option<(String, String)> {
+    let detail = [setting_problem, spawn_problem]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if detail.is_empty() {
+        None
+    } else {
+        Some(("Knowledge folder not indexed".to_string(), detail))
+    }
+}
+
+/// Two optional start-up cards as one: the first leads, the second is joined
+/// under it, so neither is dropped. Pure.
+fn merge_cards(
+    first: Option<(String, String)>,
+    second: Option<(String, String)>,
+) -> Option<(String, String)> {
+    match (first, second) {
+        (Some((h, d)), Some((h2, d2))) => Some((h, format!("{d}\n\n{h2}. {d2}"))),
+        (one, None) | (None, one) => one,
+    }
 }
 
 /// #1019: the card for a start that went ahead without its tray icon or its
@@ -6456,6 +6500,9 @@ fn with_pending_notices(detail: &str) -> String {
         detail,
         [
             crate::store::take_notice(),
+            // #1054: the knowledge scan's own queue, so a scan notice never
+            // uses up the store's one-per-run slot.
+            crate::knowledge::notice::take(),
             crate::usage::take_budget_notice(),
             crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
@@ -12373,6 +12420,33 @@ mod tests {
         assert!(!both.contains('\u{2014}'));
     }
 
+    /// #1054: an unusable knowledge setting or a scan thread that could not
+    /// start ends on the start-up card, and neither hides the other or the
+    /// tray note it is merged with.
+    #[test]
+    fn knowledge_start_problems_end_on_the_start_card() {
+        assert_eq!(super::knowledge_start_card(None, None), None);
+        let (h, d) = super::knowledge_start_card(Some("must be a full path"), None).unwrap();
+        assert!(h.contains("Knowledge folder"), "{h}");
+        assert!(d.contains("full path"), "{d}");
+        let (_, both) =
+            super::knowledge_start_card(Some("bad setting"), Some("no thread")).unwrap();
+        assert!(
+            both.contains("bad setting") && both.contains("no thread"),
+            "{both}"
+        );
+        assert!(!h.contains('\u{2014}') && !both.contains('\u{2014}'));
+
+        let tray = super::degraded_start_card(Some("x"), None);
+        let know = super::knowledge_start_card(Some("bad setting"), None);
+        let (head, detail) = super::merge_cards(tray.clone(), know.clone()).unwrap();
+        assert!(head.contains("Tray icon"), "{head}");
+        assert!(detail.contains("bad setting"), "{detail}");
+        assert_eq!(super::merge_cards(tray.clone(), None), tray);
+        assert_eq!(super::merge_cards(None, know.clone()), know);
+        assert_eq!(super::merge_cards(None, None), None);
+    }
+
     #[test]
     fn startup_card_keeps_the_degraded_start_note() {
         let degraded = super::degraded_start_card(Some("x"), None);
@@ -13925,8 +13999,11 @@ mod tests {
     fn the_skipped_actions_notice_rides_on_the_pending_notices() {
         let src = include_str!("app.rs").replace('\r', "");
         let start = src.find("fn with_pending_notices(").expect("fn exists");
-        let body = &src[start..start + 400];
+        let body = &src[start..start + 600];
         assert!(body.contains("take_skipped_notice()"));
+        // #1054: the knowledge scan's queue is drained here too, apart from
+        // the store's one-per-run slot.
+        assert!(body.contains("knowledge::notice::take()"));
         let begin = src.find("fn begin_action<T>").expect("fn exists");
         assert!(src[begin..begin + 1500].contains("queue_skipped_from_disk()"));
     }

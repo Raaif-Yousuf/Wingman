@@ -532,12 +532,6 @@ pub fn report(e: &StoreError) {
     note(e.to_string());
 }
 
-/// Records a plain-words notice that is not a store failure (the knowledge
-/// scan could not read some files). Same rule as [`report`]: one per run.
-pub fn report_text(text: &str) {
-    note(text.to_string());
-}
-
 fn note(text: String) {
     if !NOTICE_USED.swap(true, Ordering::SeqCst) {
         *NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
