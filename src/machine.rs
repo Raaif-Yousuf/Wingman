@@ -506,6 +506,12 @@ pub fn run_timed(base_url: &str, model: &str) -> Measured {
     }
 }
 
+/// Ollama reads a name with no tag as `name:latest`, so `gemma3` finds an
+/// installed `gemma3:latest`.
+fn same_model(installed: &str, wanted: &str) -> bool {
+    installed == wanted || (!wanted.contains(':') && installed == format!("{wanted}:latest"))
+}
+
 fn try_timed(base_url: &str, model: &str) -> Result<Timing, String> {
     // Local Ollama only: never a remote host, and never `localhost`.
     if crate::mode::classify_host(base_url) != crate::mode::HostClass::Loopback {
@@ -516,7 +522,7 @@ fn try_timed(base_url: &str, model: &str) -> Result<Timing, String> {
     }
     let tags = ollama_admin::list_tags_with_timeout(base_url, Duration::from_secs(5))
         .map_err(|e| format!("Could not list Ollama's models: {e:#}"))?;
-    let Some(entry) = tags.iter().find(|m| m.name == model) else {
+    let Some(entry) = tags.iter().find(|m| same_model(&m.name, model)) else {
         return Err(format!(
             "{model} is not installed in Ollama. Pull it from Settings, then try again."
         ));
@@ -990,6 +996,15 @@ mod tests {
     }
 
     #[test]
+    fn a_model_name_without_a_tag_matches_its_latest_tag() {
+        assert!(same_model("gemma3:latest", "gemma3"));
+        assert!(same_model("gemma3:4b", "gemma3:4b"));
+        assert!(!same_model("gemma3:4b", "gemma3"));
+        assert!(!same_model("gemma3:latest", "gemma3:4b"));
+        assert!(!same_model("gemma3n:latest", "gemma3"));
+    }
+
+    #[test]
     fn middling_timing_is_slow() {
         // 8 tokens per second, 2 s to the first answer.
         let v = verdict(&timed(timing(0, 2000, 4000, 32)));
@@ -1079,7 +1094,7 @@ mod tests {
         assert!(body["keep_alive"].is_string());
         assert!(body["options"].get("keep_alive").is_none());
         // Same num_ctx as a real request, so timing does not reload the model.
-        assert_eq!(body["options"]["num_ctx"], 8192);
+        assert_eq!(body["options"]["num_ctx"], DEFAULT_NUM_CTX);
         assert!(body["options"]["num_predict"].as_u64().unwrap() <= 64);
         let images = body["messages"][0]["images"].as_array().expect("one image");
         assert_eq!(images.len(), 1);

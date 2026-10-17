@@ -6458,6 +6458,7 @@ mod tests {
         ]
         .map(FooterLink::uia_id);
         let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), ids.len(), "UIA ids must be distinct");
     }
