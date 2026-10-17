@@ -401,6 +401,10 @@ manifest slice, which is a deliberate light-mode change.
    is deleted in this slice and a source-scan test asserts the identifier no
    longer exists; and the "Theme" note in the module doc of `settings.rs` is
    rewritten to say what is true.
+   Built: the constant and its gate function are gone and a source-scan test
+   asserts it; the gallery pictures of every page at every theme and scale were
+   read. The Narrator, real high contrast and colour-mode-switch checks are
+   still to do by hand.
 
 ### Size budget
 

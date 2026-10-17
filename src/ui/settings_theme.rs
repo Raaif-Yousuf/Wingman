@@ -7,20 +7,6 @@
 
 use crate::ui::theme::{Theme, Tokens};
 
-/// Dark mode is built slice by slice; until the last slice it is off for real
-/// users, so nobody sees a half-dark window. The UI gallery draws it anyway
-/// (it forces a theme). The spec's last slice deletes this constant.
-pub(crate) const SETTINGS_DARK_ENABLED: bool = false;
-
-/// The theme a real window follows: the detected one, with dark turned back
-/// into light while `dark_enabled` is false. High contrast is never touched.
-pub(crate) fn gate(detected: Theme, dark_enabled: bool) -> Theme {
-    match detected {
-        Theme::Dark if !dark_enabled => Theme::Light,
-        other => other,
-    }
-}
-
 /// Whether Settings fills its own face and answers the colour messages. Only
 /// dark does for a real window. A forced high contrast (the gallery, which
 /// cannot switch the system theme) does too, so its picture shows the tokens.
@@ -91,15 +77,27 @@ mod tests {
     use super::*;
     use crate::ui::theme::{Theme::*, DARK, HC_BLACK, LIGHT};
 
+    /// #582 slice 6: the gate that kept dark off for real users is gone, so a
+    /// dark system draws a dark Settings window. A source scan, since the
+    /// window reads the theme through Win32. The candidate set must not be
+    /// empty, and the carriage return is dropped so CRLF checkouts scan the same text.
     #[test]
-    fn dark_is_off_for_real_users_until_the_last_slice() {
-        const { assert!(!SETTINGS_DARK_ENABLED) };
-        assert_eq!(gate(Dark, false), Light);
-        assert_eq!(gate(Dark, true), Dark);
-        assert_eq!(gate(Light, false), Light);
-        assert_eq!(gate(Light, true), Light);
-        assert_eq!(gate(HighContrast, false), HighContrast);
-        assert_eq!(gate(HighContrast, true), HighContrast);
+    fn the_dark_gate_no_longer_exists() {
+        let sources = [
+            include_str!("settings.rs"),
+            include_str!("settings_theme.rs"),
+        ];
+        let needle = concat!("SETTINGS_DARK", "_ENABLED");
+        let gate_fn = concat!("fn ", "gate(");
+        let mut scanned = 0;
+        for src in sources {
+            let src = src.replace('\r', "");
+            assert!(!src.is_empty());
+            scanned += 1;
+            assert!(!src.contains(needle), "the gate constant is back");
+            assert!(!src.contains(gate_fn), "the gate function is back");
+        }
+        assert_eq!(scanned, 2);
     }
 
     #[test]
