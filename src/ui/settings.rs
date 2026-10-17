@@ -8874,6 +8874,51 @@ fn track_mouse_leave(hwnd: HWND) {
     }
 }
 
+/// #582: where Settings paints its own face (dark), the system's light arrow
+/// button is painted over with the text box fill and a chevron in the text
+/// ink. Everywhere else the system's button stays, untouched. `onto` is the DC
+/// of a client print; `None` paints on the window's own client DC.
+unsafe fn paint_combo_arrow(hwnd: HWND, onto: Option<windows::Win32::Graphics::Gdi::HDC>) {
+    use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+    use windows::Win32::UI::Controls::COMBOBOXINFO;
+    use windows::Win32::UI::WindowsAndMessaging::CB_GETCOMBOBOXINFO;
+    let style = edit_style();
+    if !style.paints_face {
+        return;
+    }
+    let mut info = COMBOBOXINFO {
+        cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+        ..Default::default()
+    };
+    SendMessageW(
+        hwnd,
+        CB_GETCOMBOBOXINFO,
+        Some(WPARAM(0)),
+        Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+    );
+    let enabled = windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool();
+    let (fill, ink) = if enabled {
+        (style.colors.fill, style.colors.text)
+    } else {
+        (style.colors.disabled_fill, style.colors.disabled_text)
+    };
+    let hdc = onto.unwrap_or_else(|| GetDC(Some(hwnd)));
+    if hdc.is_invalid() {
+        return;
+    }
+    crate::ui::settings_combo::paint_arrow(
+        hdc,
+        &info.rcItem,
+        &info.rcButton,
+        dpi_for(hwnd),
+        fill,
+        ink,
+    );
+    if onto.is_none() {
+        ReleaseDC(Some(hwnd), hdc);
+    }
+}
+
 /// Gives the gallery a hovered combo: the state a mouse over it leaves.
 #[cfg(debug_assertions)]
 fn hover_combo_for_gallery(combo: HWND) {
@@ -8895,7 +8940,26 @@ unsafe extern "system" fn combo_subclass(
     match msg {
         WM_PAINT => {
             let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            // A print (`PrintWindow`) arrives as `WM_PAINT` with the DC to paint on.
+            let print_dc = (wparam.0 != 0)
+                .then_some(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void));
+            paint_combo_arrow(hwnd, print_dc);
             paint_edit_frame(hwnd);
+            result
+        }
+        // A print of the client area (`PrintWindow`, the gallery) carries its
+        // own DC; the arrow goes onto it the same way.
+        windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT => {
+            use windows::Win32::Graphics::Gdi::{RestoreDC, SaveDC, HDC};
+            let dc = HDC(wparam.0 as *mut c_void);
+            // The system's own print leaves the clip cut to its field, so it is
+            // put back before the arrow goes on.
+            let saved = SaveDC(dc);
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            if saved != 0 {
+                let _ = RestoreDC(dc, saved);
+            }
+            paint_combo_arrow(hwnd, Some(dc));
             result
         }
         // #1109: the mouse over the field hovers it; Windows says when it leaves.
@@ -9149,8 +9213,18 @@ unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     // A list row lies on the text box fill and its hover is a rounded pill, as
     // in Windows 11's own lists (#1169); the closed field and a disabled combo
     // keep the system colours.
-    let ink = if !in_field && !disabled {
-        let style = edit_style();
+    let style = edit_style();
+    let ink = if style.paints_face && (in_field || disabled) {
+        // #582: where Settings paints its own face the closed field and a
+        // disabled combo lie on the token fills too, not the system's light ones.
+        if disabled {
+            FillRect(hdc, &rc, style.disabled_brush);
+            style.colors.disabled_text
+        } else {
+            FillRect(hdc, &rc, style.brush);
+            style.colors.text
+        }
+    } else if !in_field && !disabled {
         FillRect(hdc, &rc, style.brush);
         if selected {
             draw_item_pill(hdc, rc, dpi_for(di.hwndItem), &style);
@@ -13157,6 +13231,12 @@ mod tests {
 
     /// The pixel at (`x`, `y`) of `hwnd`, as `PrintWindow` captures it.
     fn printed_pixel(hwnd: HWND, x: i32, y: i32) -> u32 {
+        printed_pixel_with(hwnd, x, y, 2)
+    }
+
+    /// [`printed_pixel`] with the `PrintWindow` flags given (1 is the
+    /// gallery's `PW_CLIENTONLY`).
+    fn printed_pixel_with(hwnd: HWND, x: i32, y: i32, flags: u32) -> u32 {
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetPixel, SelectObject,
         };
@@ -13164,10 +13244,12 @@ mod tests {
         unsafe {
             let screen = GetDC(None);
             let dc = CreateCompatibleDC(Some(screen));
-            let bitmap = CreateCompatibleBitmap(screen, 400, 80);
+            // The bitmap is the size of the window, so a print never clips.
+            let mut wr = windows::Win32::Foundation::RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let bitmap = CreateCompatibleBitmap(screen, wr.right - wr.left, wr.bottom - wr.top);
             let old = SelectObject(dc, bitmap.into());
-            // PW_RENDERFULLCONTENT
-            assert!(PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool());
+            assert!(PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(flags)).as_bool());
             let pixel = GetPixel(dc, x, y).0;
             SelectObject(dc, old);
             let _ = DeleteObject(bitmap.into());
@@ -13292,6 +13374,107 @@ mod tests {
             let ratio = contrast_ratio(relative_luminance(frame), relative_luminance(DARK.surface));
             assert!(ratio >= 3.0, "cue shown: the frame pixel is {frame:#08x}");
         });
+    }
+
+    /// #582 slice 3, wired-to-nothing check: with nothing wired, a dark
+    /// window's combo would be the stock one, a white field beside a light
+    /// arrow button. Captured with `PrintWindow`: the field, the gap and the
+    /// button are the text box fill token, and the chevron is the text token.
+    /// Light keeps the system's white field.
+    #[test]
+    fn a_dark_combo_is_drawn_from_the_tokens_and_light_stays_stock() {
+        use crate::ui::theme::DARK;
+        use windows::Win32::Graphics::Gdi::{ClientToScreen, GetSysColor, COLOR_WINDOW};
+        use windows::Win32::UI::Controls::COMBOBOXINFO;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, CB_GETCOMBOBOXINFO, SW_SHOWNA};
+        let probe = |theme: Theme| {
+            let _forced = Forced::new(theme);
+            let mut seen = (0u32, 0u32, 0u32, 0u32);
+            with_window(Config::default(), |hwnd, _raw| {
+                let combo = get_dlg_item(hwnd, ID_CARD_CORNER).expect("the Card corner combo");
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNA);
+                    let _ = ShowWindow(combo, SW_SHOWNA);
+                    // Paint for real first, so the print shows the combo's own paint.
+                    let _ = RedrawWindow(
+                        Some(hwnd),
+                        None,
+                        None,
+                        windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN
+                            | windows::Win32::Graphics::Gdi::RDW_UPDATENOW
+                            | RDW_INVALIDATE,
+                    );
+                }
+                let mut info = COMBOBOXINFO {
+                    cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                let mut top = windows::Win32::Foundation::POINT::default();
+                let mut origin = windows::Win32::Foundation::POINT::default();
+                unsafe {
+                    SendMessageW(
+                        combo,
+                        CB_GETCOMBOBOXINFO,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+                    );
+                    let _ = ClientToScreen(hwnd, &mut top);
+                    let _ = ClientToScreen(combo, &mut origin);
+                }
+                // The combo's client coordinates to the printed window's (client only, as
+                // the gallery prints).
+                let (dx, dy) = (origin.x - top.x, origin.y - top.y);
+                let mid = (info.rcButton.top + info.rcButton.bottom) / 2;
+                let field = printed_pixel_with(hwnd, info.rcItem.right - 4 + dx, mid + dy, 1);
+                // The arrow is painted over the system's after its own paint, so
+                // it is read from a client print of the combo onto a memory DC.
+                let (button, chevron, gap) = unsafe {
+                    use windows::Win32::Graphics::Gdi::{
+                        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel,
+                        ReleaseDC, SelectObject,
+                    };
+                    let screen = GetDC(None);
+                    let dc = CreateCompatibleDC(Some(screen));
+                    let bmp = CreateCompatibleBitmap(screen, 400, 80);
+                    let old = SelectObject(dc, HGDIOBJ(bmp.0));
+                    // The real route: a client print of the combo goes through
+                    // `combo_subclass`, which paints the arrow after the system.
+                    const PRF_CLIENT: isize = 0x4;
+                    SendMessageW(
+                        combo,
+                        windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT,
+                        Some(WPARAM(dc.0 as usize)),
+                        Some(LPARAM(PRF_CLIENT)),
+                    );
+                    let [_, vertex, _] =
+                        crate::ui::settings_combo::chevron_points(&info.rcButton, dpi_for(combo));
+                    let seen = (
+                        GetPixel(dc, info.rcButton.left + 2, info.rcButton.top + 3).0,
+                        GetPixel(dc, vertex.0, vertex.1).0,
+                        GetPixel(dc, info.rcButton.left - 1, mid - 5).0,
+                    );
+                    SelectObject(dc, old);
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    let _ = DeleteDC(dc);
+                    ReleaseDC(None, screen);
+                    seen
+                };
+                seen = (field, button, chevron, gap);
+            });
+            seen
+        };
+        let (field, button, chevron, gap) = probe(Theme::Dark);
+        assert_eq!(field, DARK.control_fill, "the closed field");
+        assert_eq!(button, DARK.control_fill, "the arrow button");
+        assert_eq!(gap, DARK.control_fill, "no light gap before the button");
+        assert_eq!(chevron, DARK.text, "the chevron");
+        let (light_field, light_button, _, _) = probe(Theme::Light);
+        let window = unsafe { GetSysColor(COLOR_WINDOW) };
+        assert_eq!(light_field, window, "light keeps the system field");
+        assert_ne!(
+            light_button, DARK.control_fill,
+            "light keeps the system button"
+        );
     }
 
     /// #582 slice 2: the manifest took effect in the process that runs
