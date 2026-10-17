@@ -678,6 +678,14 @@ const WM_CARD_SPEECH_END: u32 = WM_USER + 0x77;
 /// generation and is dropped instead of closing the new preview.
 const WM_CARD_PREVIEW_COMMAND: u32 = WM_USER + 0x78;
 
+/// #654: a screen reader's Invoke or SetFocus on a footer link, posted by the
+/// UIA provider thread to the card's own window (`wparam` the link id,
+/// `lparam` `card_uia::LINK_INVOKE` or `LINK_FOCUS`). Sits beside
+/// `WM_CARD_SPEECH_END` (`WM_USER + 0x77`) and `WM_CARD_PREVIEW_COMMAND`
+/// (`WM_USER + 0x78`): it never leaves this window, so it stays out of the
+/// `WM_APP_*` registry.
+pub(crate) const WM_CARD_UIA_LINK: u32 = WM_USER + 0x79;
+
 const CLASS_NAME: &str = "Wingman.Card.Window.7f3c1a9e";
 /// Rule 9: the preview state's real-Win32 test creates an actual `HWND` with
 /// real child controls, so it gets its own window class rather than sharing
@@ -752,8 +760,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         let result = inner.handle_message(msg, wparam, lparam);
         // #654: every change to the links repaints or shows or hides the
         // window, so this is where UI Automation catches up.
-        if msg == WM_PAINT || msg == WM_SHOWWINDOW {
-            inner.sync_uia();
+        // `IsWindowVisible` still holds the old state while WM_SHOWWINDOW is
+        // being handled, so take the new state from `wparam`.
+        if msg == WM_PAINT {
+            inner.sync_uia(None);
+        } else if msg == WM_SHOWWINDOW {
+            inner.sync_uia(Some(wparam.0 != 0));
         }
         if let Some(result) = result {
             return result;
@@ -2256,7 +2268,12 @@ impl CardInner {
     /// What UI Automation should show now: the links on an expanded, visible
     /// card (#654). Empty in every other state.
     fn uia_snapshot(&self) -> card_uia::Snapshot {
-        if self.state != CardState::Expanded || !card_uia::window_visible(self.hwnd) {
+        self.uia_snapshot_for(card_uia::window_visible(self.hwnd))
+    }
+
+    /// [`Self::uia_snapshot`] for a known visibility.
+    fn uia_snapshot_for(&self, visible: bool) -> card_uia::Snapshot {
+        if self.state != CardState::Expanded || !visible {
             return card_uia::Snapshot::default();
         }
         let links = self
@@ -2278,9 +2295,16 @@ impl CardInner {
     }
 
     /// Refreshes what UI Automation sees and announces a focus change.
-    /// Cheap and a no-op until a client has asked for the tree.
-    fn sync_uia(&mut self) {
-        let snap = self.uia_snapshot();
+    /// A no-op, with no allocation, until a client has asked for the tree.
+    /// `shown` is the new visibility when called from `WM_SHOWWINDOW`.
+    fn sync_uia(&mut self, shown: Option<bool>) {
+        if self.uia.is_none() {
+            return;
+        }
+        let snap = match shown {
+            Some(visible) => self.uia_snapshot_for(visible),
+            None => self.uia_snapshot(),
+        };
         let hwnd = self.hwnd;
         let Some(uia) = self.uia.as_mut() else {
             return;
@@ -2320,7 +2344,7 @@ impl CardInner {
             self.activate_focused_link();
         }
         self.invalidate();
-        self.sync_uia();
+        self.sync_uia(None);
     }
 
     /// #654: answers `WM_GETOBJECT` for the card's UIA tree.
@@ -2336,7 +2360,7 @@ impl CardInner {
                 root,
                 announced_focus: None,
             });
-            self.sync_uia();
+            self.sync_uia(None);
         }
         let root = self.uia.as_ref()?.root.clone();
         Some(unsafe { UiaReturnRawElementProvider(self.hwnd, wparam, lparam, &root) })
@@ -2345,6 +2369,9 @@ impl CardInner {
     /// #654: detaches the tree from UIA when the window goes away.
     fn uia_disconnect(&mut self) {
         if let Some(uia) = self.uia.take() {
+            // The HWND may be reused: leave nothing a late provider call
+            // could answer from or post to.
+            *uia.shared.lock().unwrap_or_else(|e| e.into_inner()) = card_uia::Snapshot::default();
             unsafe {
                 let _ = UiaReturnRawElementProvider(
                     self.hwnd,
@@ -3669,7 +3696,7 @@ impl CardInner {
                 Some(LRESULT(0))
             }
             WM_GETOBJECT => self.uia_get_object(wparam, lparam),
-            card_uia::WM_CARD_UIA_LINK => {
+            WM_CARD_UIA_LINK => {
                 self.uia_link_requested(wparam.0 as i32, lparam.0);
                 Some(LRESULT(0))
             }

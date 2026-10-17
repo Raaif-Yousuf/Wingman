@@ -12,17 +12,20 @@
 //! MSAA (`IAccessible` via `WM_GETOBJECT`) is the legacy path with the same
 //! amount of code and a weaker role and focus story. Real child controls
 //! would change the card's paint, focus and Tab model (#606) for no gain.
-//! A hand-written provider with the `windows` crate's `#[implement]` adds
-//! no dependency and only a few KB of code.
+//! A hand-written provider with the `windows` crate's `#[implement]` needs
+//! only `windows-core` (named directly in `Cargo.toml`, for the macro's
+//! generated code) and a few KB of code.
 //!
 //! Threading: UIA calls a server-side provider from its own threads. So the
 //! providers never touch `CardInner`. They read a [`Snapshot`] behind a
 //! mutex, which the card's UI thread refreshes after it paints, and
-//! Invoke or SetFocus only post [`WM_CARD_UIA_LINK`] to the card window,
+//! Invoke or SetFocus only post `WM_CARD_UIA_LINK` to the card window,
 //! where the UI thread runs the real action. Nothing here blocks the UI
 //! thread, and nothing runs until a client first sends `WM_GETOBJECT`.
 
 use std::ffi::c_void;
+
+use crate::ui::card::WM_CARD_UIA_LINK;
 use std::sync::{Arc, Mutex};
 
 use windows::core::{implement, ComObject, Error, IUnknown, Interface, Result, BSTR};
@@ -44,15 +47,10 @@ use windows::Win32::UI::Accessibility::{
     UIA_IsOffscreenPropertyId, UIA_NamePropertyId, UiaHostProviderFromHwnd, UiaRect,
     UIA_PATTERN_ID, UIA_PROPERTY_ID,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsWindowVisible, PostMessageW, WM_APP,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindowVisible, PostMessageW};
 
-/// Posted to the card window by a link's Invoke or SetFocus. `wparam` is the
-/// link's id ([`LinkInfo::id`]); `lparam` is [`LINK_INVOKE`] or
-/// [`LINK_FOCUS`]. Private to the card window, so it is not in `app.rs`'s
-/// main-window message registry.
-pub(crate) const WM_CARD_UIA_LINK: u32 = WM_APP + 26;
+// A link's Invoke or SetFocus posts `WM_CARD_UIA_LINK` (`wparam` the
+// link's id, `lparam` one of these).
 pub(crate) const LINK_INVOKE: isize = 0;
 pub(crate) const LINK_FOCUS: isize = 1;
 

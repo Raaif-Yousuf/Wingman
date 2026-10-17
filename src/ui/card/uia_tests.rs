@@ -281,3 +281,52 @@ fn live_uia_invoke_runs_the_link() {
     assert!(invoked, "the link was not found or Invoke failed");
     assert!(reported, "Invoke did not post WM_APP_CARD_REPORT_PROBLEM");
 }
+
+// -- snapshot lifetime ---------------------------------------------------
+
+/// What `uia_get_object` sets up, without a client.
+fn attach_uia(card: &mut Card) -> card_uia::Shared {
+    let shared = card_uia::Shared::default();
+    let root = card_uia::new_root(card.hwnd(), &shared);
+    card.inner.uia = Some(UiaState {
+        shared: shared.clone(),
+        root,
+        announced_focus: None,
+    });
+    card.inner.sync_uia(None);
+    shared
+}
+
+fn shared_links(shared: &card_uia::Shared) -> usize {
+    shared.lock().unwrap().links.len()
+}
+
+#[test]
+fn hiding_the_card_clears_the_links_uia_sees() {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    let mut card = error_card();
+    let shared = attach_uia(&mut card);
+    assert_eq!(shared_links(&shared), 2, "visible card exposes its links");
+    unsafe {
+        let _ = ShowWindow(card.hwnd(), SW_HIDE);
+    }
+    assert_eq!(shared_links(&shared), 0, "a hidden card exposes no links");
+}
+
+#[test]
+fn destroying_the_card_leaves_an_empty_snapshot() {
+    let mut card = error_card();
+    let shared = attach_uia(&mut card);
+    assert_eq!(shared_links(&shared), 2);
+    card.inner.uia_disconnect();
+    assert_eq!(shared_links(&shared), 0);
+    assert!(card.inner.uia.is_none());
+}
+
+#[test]
+fn sync_without_a_uia_client_builds_nothing() {
+    let mut card = error_card();
+    assert!(card.inner.uia.is_none());
+    card.inner.sync_uia(None);
+    assert!(card.inner.uia.is_none());
+}
