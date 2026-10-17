@@ -72,12 +72,15 @@ use crate::ui::card_placement::{
     card_origin, dpi_to_apply, resolve_monitor, sort_left_to_right, MonitorChoice,
 };
 use crate::ui::text::draw_text_line;
+/// `WM_DWMCOLORIZATIONCOLORCHANGED`: the accent or colourisation changed.
+const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
 use crate::ui::theme::{
-    contrast_ratio, detect_theme, relative_luminance, rgb, setting_change_affects_theme,
-    setting_change_name, type_height_px, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
-    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE,
-    GAP_DP, GLYPH_ERROR, ICON_BOX_DP, ICON_FONT_DP, MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE,
-    SPACE_SM_DP, TYPE_BODY_PX, TYPE_CAPTION_PX,
+    accent_fill, contrast_ratio, detect_theme, progress_ring_ink, read_accent_shades,
+    relative_luminance, rgb, setting_change_affects_theme, setting_change_name, type_height_px,
+    AccentShades, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT, BADGE_LOW,
+    BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE, GAP_DP, GLYPH_ERROR,
+    ICON_BOX_DP, ICON_FONT_DP, MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE, SPACE_SM_DP,
+    TYPE_BODY_PX, TYPE_CAPTION_PX,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -254,6 +257,9 @@ impl Card {
             dpi: 96,
             theme,
             sys: SysColors::read(),
+            accent_shades: read_accent_shades(),
+            #[cfg(test)]
+            accent_reads: 0,
             theme_forced: false,
             dpi_forced: false,
             fonts: Fonts::null(),
@@ -1541,6 +1547,15 @@ struct CardInner {
     /// The system colours high contrast paints with, read together with
     /// `theme` (and again on every theme message).
     sys: SysColors,
+    /// The user's accent shades, read at creation and again only when the
+    /// colours change (#973). The pending ring paints about 50 times a second
+    /// on the thread that hosts the keyboard hook, so it never reads the
+    /// registry itself.
+    accent_shades: AccentShades,
+    /// How many times `accent_shades` was read after creation, for the test
+    /// that proves paints do not read it.
+    #[cfg(test)]
+    accent_reads: u32,
     /// Set by the UI gallery's `--theme`: `theme` and `sys` are simulated
     /// and no theme message may replace them.
     theme_forced: bool,
@@ -2072,11 +2087,22 @@ impl CardInner {
         })
     }
 
+    /// Re-reads the accent shades (one registry read). Only the colour
+    /// messages call it, never a paint.
+    fn refresh_accent(&mut self) {
+        self.accent_shades = read_accent_shades();
+        #[cfg(test)]
+        {
+            self.accent_reads += 1;
+        }
+    }
+
     /// Re-reads the theme and the system colours, then repaints. Runs on
     /// every message that can change them. It repaints even when the theme
     /// is the same: switching between two high contrast schemes changes the
     /// colours and not the theme.
     fn refresh_theme(&mut self) {
+        self.refresh_accent();
         if self.theme_forced {
             return;
         }
@@ -3229,13 +3255,21 @@ impl CardInner {
         }
         let _ = DeleteObject(HGDIOBJ(ring_pen.0));
 
+        // #973: progress is the one place the accent shows on the card; high
+        // contrast uses the system highlight.
+        let ink = progress_ring_ink(
+            self.theme,
+            &self.sys,
+            accent_fill(self.theme, self.accent_shades, palette.bg),
+        );
+
         if pending_glyph_should_spin(self.animations_enabled) {
             // Bright sweeping arc on top. Prefer a geometric pen with round
             // end caps for a clean look; fall back to a plain cosmetic pen
             // if that ever fails (e.g. exotic display driver).
             let brush = LOGBRUSH {
                 lbStyle: BS_SOLID,
-                lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
+                lbColor: windows::Win32::Foundation::COLORREF(ink),
                 lbHatch: 0,
             };
             let mut arc_pen = ExtCreatePen(
@@ -3245,11 +3279,7 @@ impl CardInner {
                 None,
             );
             if arc_pen.0.is_null() {
-                arc_pen = CreatePen(
-                    PS_SOLID,
-                    stroke,
-                    windows::Win32::Foundation::COLORREF(palette.headline),
-                );
+                arc_pen = CreatePen(PS_SOLID, stroke, windows::Win32::Foundation::COLORREF(ink));
             }
             if !arc_pen.0.is_null() {
                 let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
@@ -3267,11 +3297,7 @@ impl CardInner {
             // of the dim outer one, so the state still reads as "in
             // progress" without any per-frame motion.
             let inner_radius = (radius * 3 / 5).max(1);
-            let inner_pen = CreatePen(
-                PS_SOLID,
-                stroke,
-                windows::Win32::Foundation::COLORREF(palette.headline),
-            );
+            let inner_pen = CreatePen(PS_SOLID, stroke, windows::Win32::Foundation::COLORREF(ink));
             if !inner_pen.0.is_null() {
                 let old_pen = SelectObject(hdc, HGDIOBJ(inner_pen.0));
                 let _ = Ellipse(
@@ -3858,6 +3884,13 @@ impl CardInner {
             // sends these to every top-level window as well.
             WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
                 self.refresh_theme();
+                Some(LRESULT(0))
+            }
+            // The accent colour changed (Settings > Personalization >
+            // Colors): the ring picks it up without a restart.
+            WM_DWMCOLORIZATIONCOLORCHANGED_MSG => {
+                self.refresh_accent();
+                self.repaint_for_theme();
                 Some(LRESULT(0))
             }
             WM_DPICHANGED if self.dpi_forced => Some(LRESULT(0)),
@@ -5717,6 +5750,24 @@ mod tests {
         let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
         assert!(handled.is_some());
         assert_eq!(card.state(), CardState::Expanded);
+    }
+
+    // -- the pending ring's accent is cached, not read per paint (#973) -----
+
+    #[test]
+    fn painting_the_pending_ring_never_rereads_the_accent() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_pending(PendingStage::Working);
+        let reads = card.inner.accent_reads;
+        for _ in 0..5 {
+            let _ = card.inner.handle_message(WM_PAINT, WPARAM(0), LPARAM(0));
+        }
+        assert_eq!(card.inner.accent_reads, reads, "paints use the cache");
+        // A colour change re-reads it exactly once.
+        let _ = card
+            .inner
+            .handle_message(WM_DWMCOLORIZATIONCOLORCHANGED_MSG, WPARAM(0), LPARAM(0));
+        assert_eq!(card.inner.accent_reads, reads + 1);
     }
 
     // -- glyph icons on the footer links and the error headline (#973) ------
