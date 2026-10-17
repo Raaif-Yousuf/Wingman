@@ -21,6 +21,7 @@ mod executors;
 mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
+mod knowledge;
 mod known_folder;
 mod machine;
 mod mode;
