@@ -13909,7 +13909,13 @@ mod tests {
         let net = offer
             .find("network_failure(")
             .unwrap_or_else(|| panic!("never offered to network_failure: {offer}"));
-        assert!(offer[net..].contains("show_error_with_details("), "{offer}");
+        let record = offer[net..]
+            .find("self.record_run_failure(&headline, &headline, chain)")
+            .unwrap_or_else(|| panic!("the raw chain is not recorded: {offer}"));
+        let card = offer[net..]
+            .find("show_error_with_details(")
+            .unwrap_or_else(|| panic!("no error card: {offer}"));
+        assert!(record < card, "{offer}");
     }
 
     #[test]
