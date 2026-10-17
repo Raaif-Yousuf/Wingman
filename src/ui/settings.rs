@@ -10451,8 +10451,9 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
     cfg.forms.require_tick_for =
         label_to_require_tick_for(&raw.require_tick_for).unwrap_or(original.forms.require_tick_for);
 
-    // #393: a hand-written key mode the combo cannot show ("PICK ", a typo)
-    // stays as written until the user picks a mode; a blank box keeps the number.
+    // #393: a hand-written key mode the combo cannot show (a typo such as
+    // "nope") stays as written until the user picks a mode; a blank box keeps
+    // the number. Unchanged picks write nothing, so "PICK " stays too.
     if let Some(mode) = label_to_key_mode(&raw.key_mode) {
         if mode != original.hotkeys.key_mode_value() {
             cfg.hotkeys.key_mode = mode.name().to_string();
@@ -17964,6 +17965,20 @@ mod tests {
             assert_eq!(label_to_key_mode(key_mode_label(mode)), Some(mode));
         }
         assert_eq!(KEY_MODE_LABELS.len(), 3);
+    }
+
+    /// A value `KeyMode::parse` does not know ("nope") survives as written when
+    /// another row changes, until a mode is picked. ("PICK " is not such a
+    /// value: parse trims and ignores case, so it reads as Pick.)
+    #[test]
+    fn build_config_keeps_an_unknown_key_mode_when_another_row_changes() {
+        let mut original = Config::default();
+        original.hotkeys.key_mode = "nope".to_string();
+        let mut raw = raw_from(&original);
+        raw.double_press_text = "300".to_string();
+        let built = build_config(&original, &raw);
+        assert_eq!(built.hotkeys.double_press_ms, 300);
+        assert_eq!(built.hotkeys.key_mode, "nope");
     }
 
     #[test]
