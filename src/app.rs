@@ -366,6 +366,17 @@ fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) 
     }
 }
 
+/// #42: the action a double press repeats: the last one the user ran, if the
+/// catalogue still knows it and its effect lets a bare key run it (never one
+/// that writes the clipboard, #859). Pure.
+fn repeat_target(last: Option<&str>, catalogue: &[palette_model::PaletteAction]) -> Option<String> {
+    let last = last?;
+    catalogue
+        .iter()
+        .find(|a| a.id == last && palette_model::key_pickable(a.effect))
+        .map(|a| a.id.clone())
+}
+
 /// #393: `phase` with what only the card and the clock know filled in. A
 /// press inside the window of the one that started a Look is the second tap
 /// of a double (`early`), and an answer, error or info card is `Answer`.
@@ -375,12 +386,20 @@ fn refine_key_phase(
     card_state: crate::ui::card::CardState,
     since_look_press: Option<Duration>,
     window: Option<Duration>,
+    can_repeat: bool,
 ) -> keypress::Phase {
     use crate::ui::card::CardState;
     match phase {
-        keypress::Phase::Looking { .. } => keypress::Phase::Looking {
-            early: matches!((since_look_press, window), (Some(d), Some(w)) if d < w),
-        },
+        keypress::Phase::Looking { .. } => {
+            let early = matches!((since_look_press, window), (Some(d), Some(w)) if d < w);
+            // #42: the second tap of a double repeats the last action when
+            // there is one; with none it is absorbed, as before.
+            if early && can_repeat {
+                keypress::Phase::Repeat
+            } else {
+                keypress::Phase::Looking { early }
+            }
+        }
         keypress::Phase::Other
             if matches!(card_state, CardState::Collapsed | CardState::Expanded) =>
         {
@@ -615,6 +634,10 @@ struct App {
     key_quiet_until: Option<Instant>,
     /// #393: when the press that started the current Look was made.
     look_pressed_at: Option<Instant>,
+    /// #42: the id of the last action run through the palette dispatch, kept
+    /// for this run only (a double press repeats it). Not saved: an id from an
+    /// earlier session could name an action that has since changed.
+    last_action: Option<String>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -934,6 +957,7 @@ pub fn run() -> Result<()> {
         key_pending: None,
         key_quiet_until: None,
         look_pressed_at: None,
+        last_action: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -2533,6 +2557,7 @@ impl App {
             self.card.state(),
             self.look_pressed_at.map(|t| now.duration_since(t)),
             window,
+            self.last_action.is_some(),
         )
     }
 
@@ -2556,10 +2581,26 @@ impl App {
                 }
             }
             keypress::KeyAction::Absorb => {}
+            keypress::KeyAction::Repeat => self.repeat_last_action(),
             keypress::KeyAction::Proceed => {
                 self.look_pressed_at = Some(now);
                 self.run_primary_action(trigger);
             }
+        }
+    }
+
+    /// #42: a double press with no card up runs the last action again on a
+    /// fresh look at the screen. The first tap's Look is closed (and settled)
+    /// first, so no card is in the screenshot. Only an action the key may run
+    /// ([`repeat_target`]) repeats: with none, or a clipboard one, the first
+    /// tap's options card simply stays, which is what a single press does.
+    /// Settings in front is refused by the dispatch, as for any run.
+    fn repeat_last_action(&mut self) {
+        let Some(catalogue) = self.load_catalogue(false) else {
+            return;
+        };
+        if let Some(id) = repeat_target(self.last_action.as_deref(), &catalogue) {
+            self.run_option(&id);
         }
     }
 
@@ -2656,6 +2697,7 @@ impl App {
         // sees whatever Windows re-activated. Honour what was in front when
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
+        self.last_action = Some(action_id.to_string());
         self.dispatch_palette_target(action_id);
         self.password_manager_hint = false;
     }
@@ -10094,6 +10136,67 @@ mod tests {
         assert_eq!(super::key_phase_of(None, Some(4)), Phase::Other);
     }
 
+    /// #42: the second tap repeats only when there is something to repeat.
+    #[test]
+    fn a_second_tap_repeats_only_with_a_last_action() {
+        use crate::keypress::Phase;
+        use crate::ui::card::CardState;
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        let looking = Phase::Looking { early: false };
+        assert_eq!(
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300), true),
+            Phase::Repeat
+        );
+        // Too late, or double press off: a cancel, never a repeat.
+        for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
+            assert_eq!(
+                super::refine_key_phase(looking, CardState::Options, since, win, true),
+                Phase::Looking { early: false }
+            );
+        }
+        // No card is not a Look: nothing becomes a repeat.
+        assert_eq!(
+            super::refine_key_phase(Phase::Other, CardState::Hidden, None, ms(300), true),
+            Phase::Other
+        );
+    }
+
+    /// #42: the repeated action is the last one run, and never a clipboard one.
+    #[test]
+    fn the_repeat_target_is_the_last_action_and_never_a_clipboard_one() {
+        use crate::ui::palette_model::{Effect, PaletteAction};
+        let act = |id: &str, effect| PaletteAction {
+            id: id.to_string(),
+            name: id.to_string(),
+            group: None,
+            requires_model: false,
+            effect,
+        };
+        let cat = [
+            act("a", Effect::None),
+            act("b", Effect::Preview),
+            act("c", Effect::Clipboard),
+        ];
+        assert_eq!(super::repeat_target(Some("a"), &cat).as_deref(), Some("a"));
+        assert_eq!(super::repeat_target(Some("b"), &cat).as_deref(), Some("b"));
+        assert_eq!(super::repeat_target(Some("c"), &cat), None, "clipboard");
+        assert_eq!(super::repeat_target(Some("gone"), &cat), None);
+        assert_eq!(super::repeat_target(None, &cat), None);
+    }
+
+    /// #42: the one dispatch every palette and options run goes through
+    /// remembers the action, and a Repeat reaches `repeat_last_action`.
+    #[test]
+    fn running_an_action_remembers_it_and_the_repeat_key_action_is_handled() {
+        let src = lf(include_str!("app.rs"));
+        let dispatch = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
+        assert!(dispatch.contains("self.last_action = Some("), "{dispatch}");
+        let apply = body_between(&src, "    fn apply_key_action(", "\n    }\n");
+        assert!(apply.contains("KeyAction::Repeat => self.repeat_last_action()"));
+        let rep = body_between(&src, "    fn repeat_last_action(", "\n    }\n");
+        assert!(rep.contains("run_option("), "{rep}");
+    }
+
     /// #393: what only the card and the clock know.
     #[test]
     fn the_key_phase_is_refined_by_the_card_state_and_the_clock() {
@@ -10103,26 +10206,26 @@ mod tests {
         let looking = Phase::Looking { early: false };
         // Inside the window of the press that started the Look: a second tap.
         assert_eq!(
-            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300)),
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300), false),
             Phase::Looking { early: true }
         );
         // Outside it, or with double press off, or no press recorded: a cancel.
         for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
             assert_eq!(
-                super::refine_key_phase(looking, CardState::Options, since, win),
+                super::refine_key_phase(looking, CardState::Options, since, win, false),
                 Phase::Looking { early: false }
             );
         }
         // An answer, error or info card is an Answer; nothing else is.
         for st in [CardState::Collapsed, CardState::Expanded] {
             assert_eq!(
-                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Answer
             );
         }
         for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
             assert_eq!(
-                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Other
             );
         }
@@ -10131,7 +10234,7 @@ mod tests {
             pickable: [true, true],
         };
         assert_eq!(
-            super::refine_key_phase(opts, CardState::Options, None, ms(300)),
+            super::refine_key_phase(opts, CardState::Options, None, ms(300), false),
             opts
         );
     }
