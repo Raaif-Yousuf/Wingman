@@ -1659,7 +1659,7 @@ mod tests {
         // nobody waits for).
         static SECOND_CALLS: AtomicU32 = AtomicU32::new(0);
         fn slow_failure() -> anyhow::Result<Completion> {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(450));
             Err(anyhow::anyhow!("slow provider failed"))
         }
         fn counted_ok() -> anyhow::Result<Completion> {
@@ -1679,7 +1679,7 @@ mod tests {
             result: counted_ok,
         };
         let chain = Chain::new(vec![Box::new(a), Box::new(b)])
-            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(400));
         let err = chain
             .complete_parsed(&req(), |c| parse_answer(&c.text))
             .unwrap_err();
@@ -1695,7 +1695,7 @@ mod tests {
     fn the_fallback_path_also_stops_at_the_deadline() {
         static SECOND_CALLS: AtomicU32 = AtomicU32::new(0);
         fn slow_failure() -> anyhow::Result<Completion> {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(450));
             Err(anyhow::anyhow!("slow provider failed"))
         }
         fn counted_ok() -> anyhow::Result<Completion> {
@@ -1705,7 +1705,7 @@ mod tests {
         let a = VisionAwareProvider::new("a", true, slow_failure);
         let b = VisionAwareProvider::new("b", true, counted_ok);
         let chain = Chain::new(vec![Box::new(a), Box::new(b)])
-            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(400));
         let result = chain.complete_parsed_with_fallback(
             &req(),
             || Ok(non_vision_inputs_for_test()),
@@ -1722,7 +1722,7 @@ mod tests {
         static CALLS: AtomicU32 = AtomicU32::new(0);
         fn slow_unparseable() -> anyhow::Result<Completion> {
             CALLS.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(450));
             Ok(Completion {
                 text: r#"{"not":"an answer"}"#.to_string(),
                 usage: None,
@@ -1736,7 +1736,7 @@ mod tests {
             result: slow_unparseable,
         };
         let chain = Chain::new(vec![Box::new(a)])
-            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(400));
         assert!(chain
             .complete_parsed(&req(), |c| parse_answer(&c.text))
             .is_err());
