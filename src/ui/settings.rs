@@ -10933,6 +10933,37 @@ impl GalleryWindow {
         unsafe { reveal_providers(inner) };
     }
 
+    /// Makes the window a third shorter, as on a small screen, so the body
+    /// overflows, then scrolls it to the end of its range, for the gallery
+    /// (#1246). At the full height every page fits and there is nothing to
+    /// scroll.
+    pub(crate) fn scroll_to_end(&mut self) {
+        let inner = unsafe { &mut *self.raw };
+        unsafe {
+            let mut r = windows::Win32::Foundation::RECT::default();
+            if GetWindowRect(inner.hwnd, &mut r).is_ok() {
+                let _ = SetWindowPos(
+                    inner.hwnd,
+                    None,
+                    0,
+                    0,
+                    r.right - r.left,
+                    (r.bottom - r.top) * 2 / 3,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            apply_layout(inner, false);
+            scroll_body_to(inner.body, i32::MAX / 2);
+        }
+    }
+
+    /// How far the body is scrolled, in pixels (a test reads it).
+    #[cfg(test)]
+    pub(crate) fn scroll_pos(&self) -> i32 {
+        let inner = unsafe { &*self.raw };
+        unsafe { body_scroll_info(inner.body).nPos }
+    }
+
     /// Expands or collapses the Advanced group (what its toggle does).
     pub fn set_advanced(&mut self, expanded: bool) {
         let inner = unsafe { &mut *self.raw };
@@ -16541,6 +16572,20 @@ mod tests {
     /// Debug builds only on purpose: it needs `GalleryWindow`, which release
     /// builds do not contain.
     #[cfg(debug_assertions)]
+    /// #1246: the gallery's scrolled state really moves the body: with every
+    /// provider shown, scrolling to the end leaves a position above zero.
+    #[test]
+    fn scroll_to_end_moves_a_body_that_overflows() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let mut w = GalleryWindow::open(HINSTANCE(h.0), Some(96)).expect("open");
+        w.show_page(Page::Models);
+        w.reveal_providers();
+        assert_eq!(w.scroll_pos(), 0, "starts at the top");
+        w.scroll_to_end();
+        assert!(w.scroll_pos() > 0, "the body must have scrolled");
+    }
+
     #[test]
     fn a_settings_combo_list_gets_the_list_subclass() {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
