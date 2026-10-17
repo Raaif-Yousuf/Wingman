@@ -643,6 +643,9 @@ unsafe fn register_class_named(instance: HINSTANCE, name: &str) -> bool {
 struct SettingsInner {
     hwnd: HWND,
     font: HFONT,
+    /// The smaller font of the helper lines (#1015); null until the first
+    /// layout, when they use `font`.
+    hint_font: HFONT,
     /// The window's current DPI; updated by `WM_DPICHANGED` (#233).
     dpi: u32,
     /// Every child with its design rect, for re-layout on a DPI change.
@@ -746,6 +749,7 @@ impl SettingsInner {
         SettingsInner {
             hwnd: HWND(std::ptr::null_mut()),
             font: HFONT(std::ptr::null_mut()),
+            hint_font: HFONT(std::ptr::null_mut()),
             dpi: 96,
             children: Vec::new(),
             content_top_dp: 0,
@@ -953,6 +957,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if inner.learning.take().is_some() {
                 let _ = KillTimer(Some(hwnd), LEARN_TIMER_ID);
                 disarm_learning();
+            }
+            if !inner.hint_font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
+                inner.hint_font = HFONT(std::ptr::null_mut());
             }
             if !inner.font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
@@ -2000,6 +2008,7 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     inner.body_dpi = dpi;
 
     let new_font = build_font(dpi);
+    let new_hint_font = build_hint_font(new_font, dpi);
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
@@ -2027,10 +2036,16 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
             (x, y - pos)
         };
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        // #1015: helper lines are set smaller than the labels.
+        let font = if !new_hint_font.0.is_null() && is_hint_id(GetDlgCtrlID(c.hwnd)) {
+            new_hint_font
+        } else {
+            new_font
+        };
         SendMessageW(
             c.hwnd,
             WM_SETFONT,
-            Some(WPARAM(new_font.0 as usize)),
+            Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
         );
     }
@@ -2042,6 +2057,10 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         let _ = DeleteObject(HGDIOBJ(inner.font.0));
     }
     inner.font = new_font;
+    if !inner.hint_font.0.is_null() {
+        let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
+    }
+    inner.hint_font = new_hint_font;
     // `win_h_dp` stays the baseline the recorded design rects were built
     // for, so every later change diffs against the same reference.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
@@ -3067,6 +3086,38 @@ fn build_font(dpi: u32) -> HFONT {
             f
         }
     }
+}
+
+/// #1015: the character height of a helper line's font, as a negative
+/// `lfHeight`, from the body font's `body_height` (negative) at `dpi`. The
+/// type ramp sets the caption at 12/14 of the body; the message font is
+/// already 12 px, so the result keeps a legible floor of 11 px (scaled) and is
+/// always at least a pixel under the body.
+fn hint_font_height(body_height: i32, dpi: u32) -> i32 {
+    use crate::ui::theme::{TYPE_BODY_PX, TYPE_CAPTION_PX};
+    let body = (body_height as i64).abs().max(2) as f32;
+    let ramp = (body * TYPE_CAPTION_PX as f32 / TYPE_BODY_PX as f32).round();
+    let floor = (11.0 * dpi as f32 / 96.0).round();
+    let h = ramp.max(floor).min(body - 1.0).max(1.0);
+    -(h as i32)
+}
+
+/// The helper-line font: the body font `body` with the smaller height of
+/// [`hint_font_height`]. Null when the body font cannot be read, so the caller
+/// keeps the body font. The caller deletes it.
+unsafe fn build_hint_font(body: HFONT, dpi: u32) -> HFONT {
+    use windows::Win32::Graphics::Gdi::GetObjectW;
+    let mut lf = LOGFONTW::default();
+    let got = GetObjectW(
+        HGDIOBJ(body.0),
+        std::mem::size_of::<LOGFONTW>() as i32,
+        Some(&mut lf as *mut LOGFONTW as *mut c_void),
+    );
+    if got <= 0 {
+        return HFONT(std::ptr::null_mut());
+    }
+    lf.lfHeight = hint_font_height(lf.lfHeight, dpi);
+    CreateFontIndirectW(&lf)
 }
 
 // ---------------------------------------------------------------------------
@@ -8786,6 +8837,44 @@ mod tests {
             assert_eq!(EDIT_STYLE_BUILDS.get(), builds + 1);
             unsafe { invalidate_edit_style() };
             assert!(EDIT_STYLE.get().is_none(), "the brushes are released");
+        });
+    }
+
+    /// #1015: a helper line is under the body height at every scale, never
+    /// below a legible floor, and never taller than the body.
+    #[test]
+    fn the_hint_font_is_smaller_than_the_body_font_but_legible() {
+        for dpi in [96u32, 120, 144, 192, 240] {
+            let body = -((12.0 * dpi as f32 / 96.0).round() as i32);
+            let hint = hint_font_height(body, dpi);
+            assert!(hint.abs() < body.abs(), "dpi {dpi}: {hint} vs {body}");
+            assert!(
+                hint.abs() as f32 >= (11.0 * dpi as f32 / 96.0).round() - 0.5,
+                "dpi {dpi}: {hint} is below the floor"
+            );
+        }
+        // A body already at the ramp's 14 px gets the ramp's 12 px caption.
+        assert_eq!(hint_font_height(-14, 96), -12);
+        // A degenerate body still gives a real font.
+        assert!(hint_font_height(0, 96) < 0);
+    }
+
+    /// #1015: in the real window every helper line is set in a smaller font
+    /// than a label, and freed fonts do not leak into a re-layout.
+    #[test]
+    fn helper_lines_are_set_smaller_than_the_labels() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { apply_dpi(inner) };
+            let label = font_height_of(get_dlg_item(hwnd, ID_REDACT).expect("label"));
+            for id in [ID_MODEL_LIST_HINT, ID_CAPTURE_DETAIL_HINT, ID_REDACT_HINT] {
+                let hint = font_height_of(get_dlg_item(hwnd, id).expect("hint"));
+                assert!(hint < label, "hint {id}: {hint} px vs label {label} px");
+            }
+            // Laid out again: still smaller, and the old hint font is gone.
+            unsafe { apply_dpi(inner) };
+            let hint = font_height_of(get_dlg_item(hwnd, ID_REDACT_HINT).expect("hint"));
+            assert!(hint < label);
         });
     }
 
