@@ -1480,6 +1480,9 @@ fn field_of_control(id: i32) -> Option<Field> {
         ID_GEMINI_MODEL => Field::GeminiModel,
         ID_GEMINI_EFFORT => Field::GeminiEffort,
         ID_OLLAMA_MODEL => Field::OllamaModel,
+        ID_KEY_MODE => Field::KeyMode,
+        ID_DOUBLE_PRESS => Field::DoublePressMs,
+        ID_CLICK_AWAY => Field::ClickAway,
         ID_AUTOSTART => Field::Autostart,
         ID_CARD_SECONDS => Field::CardSeconds,
         ID_TEXT_SCALE_TRACK => Field::TextScale,
@@ -1511,6 +1514,9 @@ fn control_of_field(field: Field) -> i32 {
         Field::PrimaryKey => ID_CHANGE_PRIMARY,
         Field::SecondaryKey => ID_CHANGE_SECONDARY,
         Field::PauseKey => ID_CHANGE_PAUSE,
+        Field::KeyMode => ID_KEY_MODE,
+        Field::DoublePressMs => ID_DOUBLE_PRESS,
+        Field::ClickAway => ID_CLICK_AWAY,
         Field::Autostart => ID_AUTOSTART,
         Field::CardSeconds => ID_CARD_SECONDS,
         Field::TextScale => ID_TEXT_SCALE_TRACK,
@@ -1542,7 +1548,7 @@ enum Trigger {
 fn trigger_of(field: Field) -> Trigger {
     match field {
         _ if field.is_text_box() => Trigger::Leave,
-        Field::Autostart | Field::Redact => Trigger::Click,
+        Field::Autostart | Field::Redact | Field::ClickAway => Trigger::Click,
         Field::TextScale => Trigger::Release,
         Field::PrimaryKey | Field::SecondaryKey | Field::PauseKey => Trigger::Capture,
         _ => Trigger::Select,
@@ -1580,6 +1586,7 @@ fn commit_focused(inner: &mut SettingsInner) {
 fn raw_text(raw: &RawForm, field: Field) -> &str {
     match field {
         Field::CardSeconds => &raw.card_seconds_text,
+        Field::DoublePressMs => &raw.double_press_text,
         _ => "",
     }
 }
@@ -2366,6 +2373,7 @@ fn undo_last(inner: &mut SettingsInner) {
 fn text_pending(field: Field, text: &str, applied: &Config) -> bool {
     match field {
         Field::CardSeconds => text.trim() != applied.ui.card_seconds.to_string(),
+        Field::DoublePressMs => text.trim() != applied.hotkeys.double_press_ms.to_string(),
         Field::Prompt => prompt_from_edit(text) != prompt_from_edit(&applied.ui.prompt),
         Field::OpenAiKey => text != key_field_display(&applied.providers.openai.api_key),
         Field::AnthropicKey => text != key_field_display(&applied.providers.anthropic.api_key),
@@ -2525,6 +2533,21 @@ fn show_field(inner: &mut SettingsInner, field: Field, cfg: &Config) {
         Field::PauseKey => {
             inner.hotkeys.pause = cfg.hotkeys.pause;
             set_hotkey_labels(hwnd, &inner.hotkeys);
+        }
+        Field::KeyMode => combo_show(
+            hwnd,
+            ID_KEY_MODE,
+            key_mode_label(cfg.hotkeys.key_mode_value()),
+        ),
+        Field::DoublePressMs => {
+            if let Some(edit) = get_dlg_item(hwnd, ID_DOUBLE_PRESS) {
+                set_text(edit, &cfg.hotkeys.double_press_ms.to_string());
+            }
+        }
+        Field::ClickAway => {
+            if let Some(box_) = get_dlg_item(hwnd, ID_CLICK_AWAY) {
+                set_checkbox(box_, cfg.options.click_away_dismiss);
+            }
         }
         Field::Autostart => start_autostart(inner, AutostartJob::Read),
         Field::CardSeconds => {
@@ -2805,6 +2828,12 @@ const ID_ROW_SEPARATOR: i32 = 161;
 const ID_OPEN_ACTIONS: i32 = 162;
 const ID_IMPORT_ACTION: i32 = 163;
 const ID_EXPORT_ACTION: i32 = 164;
+/// #393: the Wingman key's behaviour on a card (`hotkeys.key_mode`), its double
+/// press time (`hotkeys.double_press_ms`) and `options.click_away_dismiss`, in
+/// the key group on General. They apply at once like every other row.
+const ID_KEY_MODE: i32 = 165;
+const ID_DOUBLE_PRESS: i32 = 166;
+const ID_CLICK_AWAY: i32 = 167;
 const TB_ENDTRACK: u32 = 8;
 
 /// One cloud vendor's three rows on the Models page (#877): the ids of its
@@ -3074,6 +3103,9 @@ const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
             ID_PAUSE_LABEL,
             ID_CHANGE_PAUSE,
             ID_HOTKEY_STATUS,
+            ID_KEY_MODE,
+            ID_DOUBLE_PRESS,
+            ID_CLICK_AWAY,
             ID_AUTOSTART,
             ID_CARD_SECONDS,
             ID_TEXT_SCALE_TRACK,
@@ -3235,6 +3267,9 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_ESCAPE", ID_ESCAPE),
     ("ID_ROW_DESC", ID_ROW_DESC),
     ("ID_ROW_SEPARATOR", ID_ROW_SEPARATOR),
+    ("ID_KEY_MODE", ID_KEY_MODE),
+    ("ID_DOUBLE_PRESS", ID_DOUBLE_PRESS),
+    ("ID_CLICK_AWAY", ID_CLICK_AWAY),
 ];
 
 // ---------------------------------------------------------------------------
@@ -7841,6 +7876,54 @@ fn build_ui_recorded(
 
     r.ctl_w = CONTROL_W;
 
+    // #393: what the Wingman key does while a card is showing. Each row applies
+    // at once and the key reads the setting on every press, so no restart.
+    let g = ctx.begin_row(&mut r, "Wingman ke&y on a card", 0, 0);
+    let key_mode = ctx.create(
+        WC_COMBOBOX,
+        "",
+        combo_style,
+        0,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
+        ROW_H * 5,
+        ID_KEY_MODE,
+    );
+    for label in KEY_MODE_LABELS {
+        combo_add(key_mode, label);
+    }
+    combo_select(key_mode, key_mode_label(config.hotkeys.key_mode_value()));
+    ctx.end_row(&mut r, &g, None);
+
+    let g = ctx.begin_row(&mut r, DOUBLE_PRESS_LABEL, 0, 1);
+    ctx.create(
+        WC_EDIT,
+        &config.hotkeys.double_press_ms.to_string(),
+        (ES_NUMBER | ES_AUTOHSCROLL) as u32,
+        WS_EX_CLIENTEDGE,
+        r.control_x(),
+        g.control_y(),
+        CARD_SECONDS_EDIT_W,
+        ROW_H,
+        ID_DOUBLE_PRESS,
+    );
+    ctx.create(
+        WC_STATIC,
+        DOUBLE_PRESS_UNIT,
+        0,
+        0,
+        r.control_x() + CARD_SECONDS_EDIT_W + COL_GAP / 2,
+        g.control_y(),
+        CONTROL_W - CARD_SECONDS_EDIT_W - COL_GAP / 2,
+        ROW_H,
+        0,
+    );
+    ctx.end_row(&mut r, &g, Some((DOUBLE_PRESS_NOTE, ID_ROW_DESC)));
+
+    let click_away = ctx.check_row(&mut r, CLICK_AWAY_LABEL, ID_CLICK_AWAY, None, 0);
+    set_checkbox(click_away, config.options.click_away_dismiss);
+
     // Autostart state is owned by Windows, not by Config. The box starts
     // unchecked: the Run key is read by a worker once the window exists (#1105),
     // so the box can never disagree with reality for long.
@@ -8255,6 +8338,7 @@ fn build_ui_recorded(
         ID_UNDO,
         ID_AUTOSTART,
         ID_MODE,
+        ID_KEY_MODE,
     ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_GROUP.0);
@@ -8279,6 +8363,9 @@ fn build_ui_recorded(
         ID_MONITOR,
         ID_REDACT,
         ID_MODE,
+        ID_KEY_MODE,
+        ID_DOUBLE_PRESS,
+        ID_CLICK_AWAY,
         ID_CARD_SECONDS,
         ID_TEXT_SCALE_TRACK,
         ID_CARD_CORNER,
@@ -9343,6 +9430,11 @@ struct RawForm {
     card_monitor: String,
     /// #509: the redaction checkbox (capture.redact).
     redact: bool,
+    /// #393: the key-mode combo's text, the press-time box's text and the
+    /// click-away checkbox.
+    key_mode: String,
+    double_press_text: String,
+    click_away_dismiss: bool,
 }
 
 /// The Active provider combo's selection as `RawForm::provider_choice`. A
@@ -9409,6 +9501,15 @@ fn read_raw_form(inner: &SettingsInner) -> RawForm {
         } else {
             inner.original.capture.redact
         },
+        key_mode: combo_selected_text(hwnd, ID_KEY_MODE),
+        double_press_text: get_dlg_item(hwnd, ID_DOUBLE_PRESS)
+            .map(get_text)
+            .unwrap_or_default(),
+        click_away_dismiss: if get_dlg_item(hwnd, ID_CLICK_AWAY).is_some() {
+            checkbox_checked(hwnd, ID_CLICK_AWAY)
+        } else {
+            inner.original.options.click_away_dismiss
+        },
     }
 }
 
@@ -9443,7 +9544,12 @@ fn learn_unavailable_reason(paused: bool, hook_ready: bool) -> Option<&'static s
 /// this window.
 fn finalize_config(inner: &SettingsInner, raw: &RawForm) -> Config {
     let mut cfg = build_config(&inner.original, raw);
+    // The staged copy holds the chords learned here. The key mode and press time
+    // are rows of their own (#393): the form's values, never the staged copy's.
+    let (key_mode, double_press_ms) = (cfg.hotkeys.key_mode, cfg.hotkeys.double_press_ms);
     cfg.hotkeys = inner.hotkeys.clone();
+    cfg.hotkeys.key_mode = key_mode;
+    cfg.hotkeys.double_press_ms = double_press_ms;
     cfg
 }
 
@@ -9895,6 +10001,40 @@ fn label_to_card_corner(label: &str) -> Option<CardCorner> {
     .find(|&c| card_corner_label(c) == label)
 }
 
+/// #393: the three key modes in the Settings combo, in display order. Short
+/// enough for the control column; the row's note says the rest.
+const KEY_MODE_LABELS: [&str; 3] = [
+    "Picks an option or closes",
+    "Always picks an option",
+    "Always closes the card",
+];
+
+/// The label shown for a [`KeyMode`](crate::keypress::KeyMode). Inverse of
+/// [`label_to_key_mode`].
+fn key_mode_label(mode: crate::keypress::KeyMode) -> &'static str {
+    use crate::keypress::KeyMode;
+    match mode {
+        KeyMode::Dynamic => KEY_MODE_LABELS[0],
+        KeyMode::Pick => KEY_MODE_LABELS[1],
+        KeyMode::Close => KEY_MODE_LABELS[2],
+    }
+}
+
+/// Parses a combo selection back into a key mode. `None` for a blank or
+/// unrecognized selection, so callers keep the original config value.
+fn label_to_key_mode(label: &str) -> Option<crate::keypress::KeyMode> {
+    use crate::keypress::KeyMode;
+    [KeyMode::Dynamic, KeyMode::Pick, KeyMode::Close]
+        .into_iter()
+        .find(|&m| key_mode_label(m) == label)
+}
+
+/// The press-time row's title, unit and note, and the click-away row's title.
+const DOUBLE_PRESS_LABEL: &str = "Dou&ble press time";
+const DOUBLE_PRESS_UNIT: &str = "milliseconds";
+const DOUBLE_PRESS_NOTE: &str = "Two presses this close pick option 2. 0 is off.";
+const CLICK_AWAY_LABEL: &str = "Click away c&loses an answer or options card";
+
 const CARD_MONITOR_CURSOR_LABEL: &str = "Where the mouse is";
 const CARD_MONITOR_PRIMARY_LABEL: &str = "The main display";
 
@@ -10188,6 +10328,17 @@ fn build_config(original: &Config, raw: &RawForm) -> Config {
 
     cfg.forms.require_tick_for =
         label_to_require_tick_for(&raw.require_tick_for).unwrap_or(original.forms.require_tick_for);
+
+    // #393: a hand-written key mode the combo cannot show ("PICK ", a typo)
+    // stays as written until the user picks a mode; a blank box keeps the number.
+    if let Some(mode) = label_to_key_mode(&raw.key_mode) {
+        if mode != original.hotkeys.key_mode_value() {
+            cfg.hotkeys.key_mode = mode.name().to_string();
+        }
+    }
+    cfg.hotkeys.double_press_ms =
+        parse_u32_or(&raw.double_press_text, original.hotkeys.double_press_ms);
+    cfg.options.click_away_dismiss = raw.click_away_dismiss;
 
     cfg
 }
@@ -14711,6 +14862,9 @@ mod tests {
             card_corner: card_corner_label(original.ui.card_corner).to_string(),
             card_monitor: card_monitor_display(&original.ui.card_monitor, 2),
             redact: original.capture.redact,
+            key_mode: key_mode_label(original.hotkeys.key_mode_value()).to_string(),
+            double_press_text: original.hotkeys.double_press_ms.to_string(),
+            click_away_dismiss: original.options.click_away_dismiss,
         }
     }
 
@@ -17273,6 +17427,154 @@ mod tests {
         });
     }
 
+    /// #393, the observable: picking a key mode in the window sends exactly
+    /// `hotkeys.key_mode` to the writer, under its row's name, and the window's
+    /// picture of what is applied holds the mode the key reads. Wired to
+    /// nothing, the sink would hear nothing.
+    #[test]
+    fn picking_a_key_mode_sends_only_hotkeys_key_mode() {
+        use crate::keypress::KeyMode;
+        for (label, mode) in [
+            ("Always closes the card", KeyMode::Close),
+            ("Always picks an option", KeyMode::Pick),
+        ] {
+            with_window(Config::default(), |hwnd, raw| {
+                let seen = record_sink(raw);
+                set_text(get_dlg_item(hwnd, ID_DOUBLE_PRESS).unwrap(), "450");
+                pick(hwnd, ID_KEY_MODE, label);
+                assert_eq!(
+                    *seen.borrow(),
+                    vec![(
+                        "Wingman key on a card".to_string(),
+                        vec!["hotkeys.key_mode".to_string()]
+                    )]
+                );
+                let inner = unsafe { &*raw };
+                assert_eq!(inner.original.hotkeys.key_mode_value(), mode);
+                assert_eq!(inner.original.hotkeys.double_press_ms, 300);
+            });
+        }
+    }
+
+    /// The press time applies when the box is left, an out of range number is a
+    /// row error that sends nothing, and a blank box keeps the applied value.
+    #[test]
+    fn the_press_time_box_applies_on_leave_and_refuses_out_of_range() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            let field = get_dlg_item(hwnd, ID_DOUBLE_PRESS).unwrap();
+            set_text(field, " 450 ");
+            leave(hwnd, ID_DOUBLE_PRESS);
+            assert_eq!(
+                *seen.borrow(),
+                vec![(
+                    "Double press time".to_string(),
+                    vec!["hotkeys.double_press_ms".to_string()]
+                )]
+            );
+            assert_eq!(unsafe { &*raw }.original.hotkeys.double_press_ms, 450);
+            set_text(field, "50");
+            leave(hwnd, ID_DOUBLE_PRESS);
+            assert_eq!(seen.borrow().len(), 1, "an out of range time was sent");
+            assert_eq!(get_text(field), "50", "the text stays for fixing");
+            let line = status(hwnd);
+            assert!(line.starts_with("Error: Double press time."), "{line}");
+            assert!(!line.contains('\u{2014}'), "{line}");
+            set_text(field, "");
+            leave(hwnd, ID_DOUBLE_PRESS);
+            assert_eq!(seen.borrow().len(), 1, "a blank box wrote something");
+            assert_eq!(unsafe { &*raw }.original.hotkeys.double_press_ms, 450);
+        });
+    }
+
+    /// A press time written by hand outside the honoured range is not touched by
+    /// changing any other row, and the box shows it as written.
+    #[test]
+    fn a_hand_edited_press_time_and_key_mode_survive_another_rows_change() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.double_press_ms = 5000;
+        cfg.hotkeys.key_mode = "PICK ".to_string();
+        with_window(cfg, |hwnd, raw| {
+            let seen = record_sink(raw);
+            assert_eq!(
+                get_text(get_dlg_item(hwnd, ID_DOUBLE_PRESS).unwrap()),
+                "5000"
+            );
+            pick(hwnd, ID_CARD_CORNER, "Top left");
+            assert_eq!(seen.borrow().len(), 1);
+            assert_eq!(seen.borrow()[0].1, vec!["ui.card_corner".to_string()]);
+            let inner = unsafe { &*raw };
+            assert_eq!(inner.original.hotkeys.double_press_ms, 5000);
+            assert_eq!(inner.original.hotkeys.key_mode, "PICK ");
+        });
+    }
+
+    /// The click-away checkbox applies on a click and sends only its own key.
+    #[test]
+    fn the_click_away_checkbox_sends_options_click_away_dismiss() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            let box_ = get_dlg_item(hwnd, ID_CLICK_AWAY).unwrap();
+            assert!(checkbox_checked(hwnd, ID_CLICK_AWAY), "on by default");
+            set_checkbox(box_, false);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ID_CLICK_AWAY as usize | ((BN_CLICKED as usize) << 16),
+                    )),
+                    Some(LPARAM(box_.0 as isize)),
+                );
+            }
+            assert_eq!(
+                *seen.borrow(),
+                vec![(
+                    "Click away closes the card".to_string(),
+                    vec!["options.click_away_dismiss".to_string()]
+                )]
+            );
+            assert!(!unsafe { &*raw }.original.options.click_away_dismiss);
+        });
+        assert_eq!(
+            commit_trigger(ID_CLICK_AWAY, BN_CLICKED),
+            Some(Field::ClickAway)
+        );
+    }
+
+    #[test]
+    fn build_config_keeps_a_hand_written_key_mode_until_one_is_picked() {
+        use crate::keypress::KeyMode;
+        let mut original = Config::default();
+        original.hotkeys.key_mode = "PICK ".to_string();
+        let raw = raw_from(&original);
+        assert_eq!(build_config(&original, &raw).hotkeys.key_mode, "PICK ");
+        let mut raw = raw_from(&original);
+        raw.key_mode = key_mode_label(KeyMode::Close).to_string();
+        let picked = build_config(&original, &raw);
+        assert_eq!(picked.hotkeys.key_mode_value(), KeyMode::Close);
+        let mut raw = raw_from(&original);
+        raw.key_mode = String::new();
+        assert_eq!(build_config(&original, &raw).hotkeys.key_mode, "PICK ");
+        for mode in [KeyMode::Dynamic, KeyMode::Pick, KeyMode::Close] {
+            assert_eq!(label_to_key_mode(key_mode_label(mode)), Some(mode));
+        }
+        assert_eq!(KEY_MODE_LABELS.len(), 3);
+    }
+
+    #[test]
+    fn build_config_applies_the_press_time_and_click_away() {
+        let original = Config::default();
+        let mut raw = raw_from(&original);
+        raw.double_press_text = "420".to_string();
+        raw.click_away_dismiss = false;
+        let cfg = build_config(&original, &raw);
+        assert_eq!(cfg.hotkeys.double_press_ms, 420);
+        assert!(!cfg.options.click_away_dismiss);
+        raw.double_press_text = "abc".to_string();
+        assert_eq!(build_config(&original, &raw).hotkeys.double_press_ms, 300);
+    }
+
     /// A sink that cannot take the change puts the control back and says why
     /// (rule 7: never a dialog, never a silent no-op).
     #[test]
@@ -18019,8 +18321,9 @@ mod tests {
                 }
                 let target = changed(field, &base);
                 show_field(inner, field, &target);
-                let mut form = build_config(&base, &read_raw_form(inner));
-                form.hotkeys = inner.hotkeys.clone();
+                // The form the commit reads: the staged chords, and the key
+                // mode and press time from their own rows (#393).
+                let form = finalize_config(inner, &read_raw_form(inner));
                 assert!(
                     !commit::differs(field, &form, &target),
                     "{field:?} was not shown"
