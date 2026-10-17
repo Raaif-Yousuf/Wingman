@@ -30,6 +30,61 @@ pub(crate) fn chevron_points(button: &RECT, dpi: u32) -> [(i32, i32); 3] {
     [(cx - hw, cy - hh), (cx, cy + hh), (cx + hw, cy - hh)]
 }
 
+/// `STATE_SYSTEM_PRESSED` in `COMBOBOXINFO::stateButton`: set while the button
+/// is held down and while the list is dropped open.
+const STATE_SYSTEM_PRESSED: u32 = 0x0000_0008;
+
+/// How far the button's fill moves toward the text ink when the mouse is over
+/// it and when it is pressed or the list is open, in percent: the secondary
+/// push button's hover and pressed steps (`card_buttons::look`).
+const ARROW_HOT_PCT: u32 = 8;
+const ARROW_PRESSED_PCT: u32 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArrowState {
+    Normal,
+    Hot,
+    /// Held down, or the list is dropped open.
+    Pressed,
+}
+
+/// The look of the button: pressed (or dropped) wins over hot, and a disabled
+/// combo has neither.
+pub(crate) fn arrow_state(
+    enabled: bool,
+    hot: bool,
+    dropped: bool,
+    state_button: u32,
+) -> ArrowState {
+    if !enabled {
+        ArrowState::Normal
+    } else if dropped || state_button & STATE_SYSTEM_PRESSED != 0 {
+        ArrowState::Pressed
+    } else if hot {
+        ArrowState::Hot
+    } else {
+        ArrowState::Normal
+    }
+}
+
+/// The button's `(fill, ink)` in `state`. `highlight` is the system's
+/// highlight and its text, which a high contrast window uses for the two active
+/// states instead of a tint (no blended pixel is a system colour).
+pub(crate) fn arrow_colors(
+    state: ArrowState,
+    fill: u32,
+    ink: u32,
+    highlight: Option<(u32, u32)>,
+) -> (u32, u32) {
+    use crate::ui::card_buttons::blend;
+    match (state, highlight) {
+        (ArrowState::Normal, _) => (fill, ink),
+        (_, Some(pair)) => pair,
+        (ArrowState::Hot, None) => (blend(fill, ink, ARROW_HOT_PCT), ink),
+        (ArrowState::Pressed, None) => (blend(fill, ink, ARROW_PRESSED_PCT), ink),
+    }
+}
+
 /// The chevron's stroke in px: 1 dp, never thinner than one pixel.
 fn stroke_px(dpi: u32) -> i32 {
     scale_for_dpi(1, dpi).max(1)
@@ -105,6 +160,36 @@ mod tests {
             c.0 - a.0
         };
         assert!(at(192) > at(96), "it grows with the scale");
+    }
+
+    #[test]
+    fn the_button_reads_pressed_then_hot_and_a_disabled_combo_neither() {
+        use ArrowState::*;
+        assert_eq!(arrow_state(true, false, false, 0), Normal);
+        assert_eq!(arrow_state(true, true, false, 0), Hot);
+        assert_eq!(
+            arrow_state(true, true, false, STATE_SYSTEM_PRESSED),
+            Pressed
+        );
+        assert_eq!(arrow_state(true, false, true, 0), Pressed);
+        assert_eq!(arrow_state(false, true, true, STATE_SYSTEM_PRESSED), Normal);
+    }
+
+    #[test]
+    fn hot_and_pressed_step_away_from_the_resting_fill() {
+        use crate::ui::theme::DARK;
+        let (f, i) = (DARK.control_fill, DARK.text);
+        let rest = arrow_colors(ArrowState::Normal, f, i, None);
+        let hot = arrow_colors(ArrowState::Hot, f, i, None);
+        let down = arrow_colors(ArrowState::Pressed, f, i, None);
+        assert_eq!(rest, (f, i));
+        assert!(hot.0 != f && down.0 != hot.0 && down.0 != f);
+        assert_eq!((hot.1, down.1), (i, i));
+        // High contrast: the system highlight pair, no tint.
+        let pair = (0x00FF_0000, 0x0000_FF00);
+        let hc = Some(pair);
+        assert_eq!(arrow_colors(ArrowState::Hot, f, i, hc), pair);
+        assert_eq!(arrow_colors(ArrowState::Normal, f, i, hc), (f, i));
     }
 
     #[test]
