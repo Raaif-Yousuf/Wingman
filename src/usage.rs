@@ -776,11 +776,12 @@ pub fn tally(
     result
 }
 
-/// The tooltip fragment for today, read from the store.
+/// The tooltip fragment for today, read from the store. Runs on the UI
+/// thread, so it never opens the store (#1010): before the start-up open has
+/// finished there is no spend part, and the next refresh shows it.
 pub fn tooltip_part() -> Option<String> {
-    let day = crate::store::global()
-        .and_then(|s| s.day_total(&local_date_today()))
-        .ok()??;
+    let store = crate::store::global_if_ready()?.ok()?;
+    let day = store.day_total(&local_date_today()).ok()??;
     format_tooltip_part(&day)
 }
 
