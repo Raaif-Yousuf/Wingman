@@ -139,9 +139,6 @@ pub enum LookupWindow {
     /// one of Wingman's own (the tray menu, a card), the next visible window
     /// of another process behind it is asked about instead.
     Foreground,
-    /// A window remembered earlier (the router capture runs while Wingman's
-    /// own palette is in front). 0 means there is none: no fields.
-    Window(isize),
     /// No lookup: nothing in this request is redacted (the pixels stay on
     /// this machine, or redaction is off), so nobody would use the answer.
     None,
@@ -164,7 +161,6 @@ impl LookupWindow {
     fn resolve(self) -> Option<isize> {
         let hwnd = match self {
             Self::Foreground => unsafe { GetForegroundWindow() }.0 as isize,
-            Self::Window(h) => h,
             Self::None => return None,
         };
         Some(not_ours(hwnd))
@@ -1635,9 +1631,8 @@ mod tests {
     fn no_lookup_window_means_no_lookup_and_when_gates_it() {
         use super::LookupWindow::*;
         assert_eq!(None.resolve(), Option::None);
-        assert_eq!(Window(0).resolve(), Some(0));
         assert_eq!(super::LookupWindow::when(false, Foreground), None);
-        assert_eq!(super::LookupWindow::when(true, Window(5)), Window(5));
+        assert_eq!(super::LookupWindow::when(true, Foreground), Foreground);
     }
 
     // -- blit_into (issue #29's virtual-desktop compositing) -------------

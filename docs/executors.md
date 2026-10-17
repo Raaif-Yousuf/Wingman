@@ -72,7 +72,7 @@ string) and copies them as a Markdown checklist, one `- [ ] ` line per item.
 is an error and nothing is written to the clipboard.
 
 A plain `match` over the known names -- `"none"`, `"clipboard"`,
-`"calendar_add"`, `"image_clipboard"`, `"replace_text"`, `"fill_form"` --
+`"calendar_add"`, `"contact_add"`, `"image_clipboard"`, `"replace_text"`, `"fill_form"` --
 each constructing a fresh boxed executor. An unknown name (a typo in
 `actions.toml`, or an action naming an executor nobody has written yet) is a
 named `anyhow` error, never a panic (rule 7): "No executor named

@@ -12,8 +12,8 @@
 use crate::ui::theme::{accent_fill, read_accent_shades, Theme};
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, GetSysColor,
-    RoundRect, SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT,
+    CreatePen, CreateSolidBrush, DeleteObject, FillRect, GetStockObject, GetSysColor, RoundRect,
+    SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT,
     COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT,
     HGDIOBJ, NULL_BRUSH, PS_SOLID, TRANSPARENT,
 };
@@ -303,12 +303,13 @@ pub(crate) unsafe fn draw(
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(look.text));
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    let mut text_rc = rc;
-    DrawTextW(
+    // Through the shared guard: `DrawTextW` with an empty buffer crashes the
+    // process (see `ui::text`), and the options card (#307) draws its own
+    // label and passes no text here.
+    crate::ui::text::draw_text_line(
         hdc,
-        &mut wide,
-        &mut text_rc,
+        text,
+        rc,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
 
@@ -479,6 +480,39 @@ mod tests {
         assert_eq!((hover.fill, hover.text), (3, 4));
         let off = look(Role::Primary, State::Disabled, &SURFACE, ACCENT, Some(&hc));
         assert_eq!((off.text, off.border), (5, 5));
+    }
+
+    /// A button drawn with no text must not crash: `DrawTextW` with an empty
+    /// buffer is an access violation (see `ui::text`), and the options card
+    /// (#307) paints its own label over a text-less button.
+    #[test]
+    fn a_button_with_no_text_draws_without_crashing() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, ReleaseDC,
+        };
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 60,
+            bottom: 24,
+        };
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 60, 24);
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let dis = DRAWITEMSTRUCT {
+                hDC: dc,
+                rcItem: rc,
+                ..Default::default()
+            };
+            let look = look(Role::Secondary, State::Normal, &SURFACE, ACCENT, None);
+            draw(&dis, "", HFONT(std::ptr::null_mut()), &look, BG, 4, 1);
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+        }
     }
 
     #[test]

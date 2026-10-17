@@ -8,7 +8,7 @@
 //!
 //! # Rendering (issue #216)
 //!
-//! The row list, router summary line, and footer render through
+//! The row list and footer render through
 //! `ID2D1HwndRenderTarget` + `IDWriteTextFormat` (see [`PaletteRenderer`]
 //! below), not plain GDI `DrawTextW` -- #25's original body named
 //! DirectWrite as the expected renderer; the first cut used GDI to keep the
@@ -97,6 +97,10 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::ui::theme::{
+    detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
+    Theme, Tokens, SPACE_SM_DP,
+};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
@@ -112,8 +116,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -121,10 +125,11 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
-    CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, FW_SEMIBOLD, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
+    GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TEXTMETRICW,
+    TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -137,9 +142,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
-    WM_APP, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_PRINTCLIENT, WM_SETFONT, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+    WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     WS_TABSTOP, WS_VISIBLE,
 };
 
@@ -192,30 +198,75 @@ const EDIT_HEIGHT: i32 = 30;
 const ROW_HEIGHT: i32 = 26;
 const FOOTER_HEIGHT: i32 = 22;
 const PADDING: i32 = 8;
+/// Space between the selection bar and an action's text, so the bar is not drawn
+/// over the first letter.
+const ROW_TEXT_INSET: i32 = 12;
+/// How far the query box's hairline sits outside the edit control.
+const QUERY_BORDER_OUTSET: i32 = 3;
+/// Space between the query box's left and right edges and its text (#881), on
+/// top of the padding the box sits in.
+const QUERY_TEXT_INSET: i32 = SPACE_SM_DP;
+/// The placeholder in an empty query box (#881). No em dash (rule 11).
+const QUERY_CUE: &str = "Type to filter";
+/// Private message the query edit's subclass sends its parent to have the
+/// placeholder drawn into the DC it just painted (`wParam` is the HDC, `lParam`
+/// the edit). `WM_USER` range: private to this window class.
+const WM_PALETTE_DRAW_CUE: u32 = WM_USER + 1;
+/// `EM_GETMARGINS`: the low word of the result is the left margin.
+const EM_GETMARGINS: u32 = 0x00D4;
 /// #217: rows beyond `crate::ui::palette_model::MAX_VISIBLE_ROWS` are
 /// reachable by scrolling (keyboard: Up/Down/PageUp/PageDown drag the
 /// viewport via `PaletteState::offset`; mouse: `WM_MOUSEWHEEL` below) rather
 /// than being truncated -- that constant is the single source of truth for
 /// both the window's fixed height here and the palette-side viewport math in
 /// `palette_model.rs`.
-/// #24: height of the router's suggestion summary line, always reserved
-/// (never grows/shrinks the window -- rule 5's "pre-created, never
-/// re-created" applies to size too) between the query box and the row list;
-/// blank when [`PaletteInner::router_summary`] is `None`.
-const ROUTER_SUMMARY_HEIGHT: i32 = 18;
-
-/// #359: shown in the router summary band from the moment
-/// `App::maybe_start_router` actually starts a background request until the
-/// result (or a failure) replaces or clears it. No em dash (rule 11).
-const ROUTER_LOOKING_TEXT: &str = "Looking at your screen...";
-
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
 }
 
+/// Where the query `EDIT` goes, in client pixels (#881). A single-line EDIT
+/// draws its text from the top of its client area and cannot be told to centre
+/// it, so the control is exactly one text line high (`text_h`, from the font
+/// it uses) and sits in the middle of the box, inset from the box's left and
+/// right edges.
+fn query_edit_rect(window_w: i32, dpi: u32, text_h: i32) -> RECT {
+    let pad = scale(PADDING, dpi);
+    let inset = scale(QUERY_TEXT_INSET, dpi);
+    let box_h = scale(EDIT_HEIGHT, dpi);
+    let h = text_h.clamp(1, box_h.max(1));
+    let top = pad + (box_h - h) / 2;
+    RECT {
+        left: pad + inset,
+        top,
+        right: window_w - pad - inset,
+        bottom: top + h,
+    }
+}
+
+/// The height in pixels of one line of text in `font`, or the body line
+/// height at `dpi` when it cannot be measured.
+fn font_text_height(font: HFONT, dpi: u32) -> i32 {
+    let fallback = scale(crate::ui::theme::TYPE_BODY_LINE_PX, dpi);
+    if font.0.is_null() {
+        return fallback;
+    }
+    unsafe {
+        let dc = GetDC(None);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let mut tm = TEXTMETRICW::default();
+        let ok = GetTextMetricsW(dc, &mut tm).as_bool();
+        SelectObject(dc, old);
+        ReleaseDC(None, dc);
+        if ok && tm.tmHeight > 0 {
+            tm.tmHeight
+        } else {
+            fallback
+        }
+    }
+}
+
 fn window_height(dpi: u32) -> i32 {
     scale(PADDING * 2 + EDIT_HEIGHT, dpi)
-        + scale(ROUTER_SUMMARY_HEIGHT, dpi)
         + scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32
         + scale(FOOTER_HEIGHT, dpi)
 }
@@ -225,14 +276,14 @@ fn window_height(dpi: u32) -> i32 {
 /// and the real row count, returns the real row index (into
 /// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
 /// under that `y`, or `None` when `y` is above the list (still over the
-/// query box/padding/router-summary band), below the last real row, or below
+/// query box/padding), below the last real row, or below
 /// the whole painted viewport. Mirrors `on_paint`'s row-geometry math
 /// exactly (same constants, same order of additions) so a click always lands
 /// on the row it visually looks like it landed on -- see that function's `y`
 /// math, which this must never drift from.
 fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
     let pad = scale(PADDING, dpi);
-    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad + scale(ROUTER_SUMMARY_HEIGHT, dpi);
+    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad;
     let row_h = scale(ROW_HEIGHT, dpi);
     if row_h <= 0 || y < list_top {
         return None;
@@ -246,6 +297,20 @@ fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
         Some(idx)
     } else {
         None
+    }
+}
+
+/// The path of the query box's 1 px hairline in logical pixels, for Direct2D
+/// (#886). A stroke is centred on its path, so the path sits half a pixel in
+/// from the box's outer edge: the line then covers whole pixels at 100% scale
+/// instead of blurring across two rows, and lands where the GDI path's fills do.
+fn query_border_rect() -> D2D_RECT_F {
+    let (pad, o) = (PADDING as f32, QUERY_BORDER_OUTSET as f32);
+    D2D_RECT_F {
+        left: pad - o + 0.5,
+        top: pad - o + 0.5,
+        right: WINDOW_WIDTH as f32 - pad + o - 0.5,
+        bottom: pad + EDIT_HEIGHT as f32 + o - 0.5,
     }
 }
 
@@ -287,24 +352,30 @@ impl Palette {
     }
 
     fn create(instance: HINSTANCE, class_name: &str) -> anyhow::Result<Self> {
+        let theme = detect_theme();
+        let sys = SysColors::read();
         let inner = Box::new(PaletteInner {
             hwnd: HWND(std::ptr::null_mut()),
             edit_hwnd: HWND(std::ptr::null_mut()),
             owner: None,
             dpi: 96,
-            font: unsafe { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) },
+            // Made once the window (and so its DPI) exists.
+            font: HFONT(std::ptr::null_mut()),
             d2d: None,
             catalogue: Vec::new(),
             model_configured: true,
             footer_text: String::new(),
             state: crate::ui::palette_model::PaletteState::new(Vec::new()),
             visible: false,
-            router_generation: 0,
-            interacted: false,
-            router_summary: None,
             hover: None,
             tracking_leave: false,
             suppress_en_change: false,
+            theme,
+            sys,
+            colors: palette_colors(theme, &sys, live_accent(theme, &sys)),
+            theme_forced: false,
+            keep_open: false,
+            edit_brush: HBRUSH(std::ptr::null_mut()),
         });
         let raw = Box::into_raw(inner);
 
@@ -342,6 +413,7 @@ impl Palette {
         let inner_ref = unsafe { &mut *raw };
         inner_ref.hwnd = hwnd;
         inner_ref.dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        inner_ref.font = gdi_font(inner_ref.dpi, FW_NORMAL.0 as i32);
 
         // Best-effort rounded corners (Windows 11), as the card does (#361).
         // A square window on an older system is an acceptable degrade.
@@ -434,45 +506,6 @@ impl Palette {
         self.inner.hide();
     }
 
-    /// #24: the generation number stamped on THIS showing of the palette --
-    /// `app.rs`'s router hook reads this right after [`Palette::show`]
-    /// returns and carries it across the worker thread, so the eventual
-    /// result can be checked against whatever this returns AT DELIVERY time
-    /// (`crate::router::is_stale`). Bumped on every [`Palette::show`] and
-    /// every hide (Esc, lost focus, a dispatched Enter, or a second
-    /// `toggle_palette`), so a result from any earlier showing is always
-    /// stale by the time it arrives.
-    pub fn router_generation(&self) -> u64 {
-        self.inner.router_generation
-    }
-
-    /// #24: applies (or silently drops) a router result against the
-    /// showing identified by `generation`. See
-    /// [`PaletteInner::apply_router_suggestion`] for the full decision
-    /// chain (staleness, visibility, confidence vs. `threshold`, and
-    /// whether the user already typed or moved the selection) -- this is
-    /// pure Win32 glue over `crate::router`'s pure decisions and
-    /// `palette_model::preselect_action`'s pure state mutation.
-    pub fn apply_router_suggestion(
-        &mut self,
-        generation: u64,
-        result: &crate::router::RouterResult,
-        threshold: f64,
-    ) {
-        self.inner
-            .apply_router_suggestion(generation, result, threshold);
-    }
-
-    /// #359: see [`PaletteInner::set_router_pending`].
-    pub fn set_router_pending(&mut self, generation: u64) {
-        self.inner.set_router_pending(generation);
-    }
-
-    /// #359: see [`PaletteInner::clear_router_pending`].
-    pub fn clear_router_pending(&mut self, generation: u64) {
-        self.inner.clear_router_pending(generation);
-    }
-
     /// The palette's own window proc dispatches internally; this is the
     /// seam tests use to feed synthetic messages directly. Unused by this
     /// module's own tests today (they drive the palette through real posted
@@ -515,9 +548,35 @@ impl Palette {
         }
     }
 
+    /// The UI gallery's `--theme`: draws in `theme` whatever the system is
+    /// set to and ignores later theme messages. High contrast uses Windows'
+    /// high contrast black colours. Never touches the registry.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_theme_for_gallery(&mut self, theme: Theme) {
+        self.inner.theme = theme;
+        self.inner.sys = crate::ui::theme::HC_BLACK;
+        self.inner.theme_forced = true;
+        self.inner.apply_colors();
+    }
+
+    /// The UI gallery (#919): the palette hides itself when its query box
+    /// loses focus, so any other window taking the foreground during a run
+    /// hid it before the capture. With this set it stays up.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn keep_open_for_gallery(&mut self) {
+        self.inner.keep_open = true;
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_query_for_test(&mut self, query: &str) {
         self.inner.set_query(query);
+    }
+
+    /// The UI gallery's hovered row, as if the mouse were over it.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn set_hover_for_test(&mut self, row: Option<usize>) {
+        self.inner.hover = row;
+        self.inner.invalidate();
     }
 
     #[cfg(test)]
@@ -615,13 +674,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn create_query_edit(parent: HWND, instance: HINSTANCE, font: HFONT, dpi: u32) -> HWND {
     let class_w = wide_z(WC_EDIT);
     let text_w = wide_z("");
-    let pad = scale(PADDING, dpi);
-    let rect = RECT {
-        left: pad,
-        top: pad,
-        right: scale(WINDOW_WIDTH, dpi) - pad,
-        bottom: pad + scale(EDIT_HEIGHT, dpi),
-    };
+    let rect = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, font_text_height(font, dpi));
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -691,6 +744,25 @@ unsafe extern "system" fn palette_edit_subclass(
             return LRESULT(0);
         }
     }
+    // The placeholder (#881): the control paints itself, then the palette
+    // draws its cue over the empty box.
+    if msg == WM_PAINT || msg == WM_PRINTCLIENT {
+        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+        if GetWindowTextLengthW(hwnd) == 0 {
+            let own_dc = (msg == WM_PAINT).then(|| GetDC(Some(hwnd)));
+            let hdc = own_dc.unwrap_or(HDC(wparam.0 as *mut c_void));
+            SendMessageW(
+                parent,
+                WM_PALETTE_DRAW_CUE,
+                Some(WPARAM(hdc.0 as usize)),
+                Some(LPARAM(hwnd.0 as isize)),
+            );
+            if own_dc.is_some() {
+                ReleaseDC(Some(hwnd), hdc);
+            }
+        }
+        return result;
+    }
     if msg == WM_KILLFOCUS {
         let _ = PostMessageW(
             Some(parent),
@@ -734,8 +806,6 @@ struct PaletteRenderer {
     dwrite_factory: IDWriteFactory,
     target: Option<ID2D1HwndRenderTarget>,
     text_format: Option<IDWriteTextFormat>,
-    /// Semibold, for the router's suggestion (#361).
-    summary_format: Option<IDWriteTextFormat>,
 }
 
 impl PaletteRenderer {
@@ -753,7 +823,6 @@ impl PaletteRenderer {
             dwrite_factory,
             target: None,
             text_format: None,
-            summary_format: None,
         })
     }
 
@@ -792,11 +861,6 @@ impl PaletteRenderer {
         if self.target.is_some() && self.text_format.is_none() {
             self.text_format = self.build_text_format(DWRITE_FONT_WEIGHT_NORMAL);
         }
-        if self.target.is_some() && self.summary_format.is_none() {
-            self.summary_format = self.build_text_format(DWRITE_FONT_WEIGHT_SEMI_BOLD);
-        }
-        // The semibold format is a nicety: without it the summary uses the row
-        // format, and the palette stays on Direct2D.
         self.target.is_some() && self.text_format.is_some()
     }
 
@@ -865,7 +929,6 @@ impl PaletteRenderer {
     fn drop_target(&mut self) {
         self.target = None;
         self.text_format = None;
-        self.summary_format = None;
     }
 }
 
@@ -884,23 +947,81 @@ fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
     }
 }
 
-fn selected_row_color() -> COLORREF {
-    COLORREF(crate::ui::theme::rgb(0x3A, 0x44, 0x55))
+/// Every colour the palette draws, for one theme (#579). Built from the shared
+/// tokens in `theme.rs`, so there are no literal colours in this file and the
+/// palette follows light, dark and high contrast like the card does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaletteColors {
+    background: u32,
+    /// The hairline around the query box.
+    border: u32,
+    /// Action row text.
+    text: u32,
+    /// Group headers.
+    header: u32,
+    /// The "no matching actions" hint.
+    hint: u32,
+    footer: u32,
+    /// The placeholder in an empty query box. High contrast uses GrayText,
+    /// which Windows keeps readable on Window.
+    cue: u32,
+    /// The fill of a row the mouse is over: quieter than the selection's.
+    /// High contrast has no tints, so there it is the background and the row
+    /// gets `hover_outline` instead.
+    hover_fill: u32,
+    hover_outline: Option<u32>,
+    /// The fill of the selected row.
+    selected_fill: u32,
+    selected_text: u32,
+    /// The 3 px bar on the selected row.
+    bar: u32,
 }
 
-/// The palette's background.
-fn background_color() -> COLORREF {
-    COLORREF(0x0026_2626)
+/// The user's accent for the selection bar in `theme`, kept at 3:1 against the
+/// theme's surface (the same shade and fit the primary button uses). Read live,
+/// so call it when the theme or the accent changes, never per paint.
+fn live_accent(theme: Theme, sys: &SysColors) -> u32 {
+    crate::ui::card_buttons::system_accent(theme, Tokens::for_theme(theme, sys).surface)
 }
-
-/// The 3 px bar on the selected row.
-fn accent_color() -> COLORREF {
-    COLORREF(0x00FF_B080)
-}
-
-/// Action row text.
-fn row_text_color() -> COLORREF {
-    COLORREF(0x00E6_E6E6)
+/// The palette's colours in `theme`. High contrast uses the system colours
+/// only: the selected row is the system highlight, as in a Windows list.
+fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
+    use crate::ui::card_buttons::blend;
+    let t = Tokens::for_theme(theme, sys);
+    if theme == Theme::HighContrast {
+        return PaletteColors {
+            background: t.surface,
+            border: t.border,
+            text: t.text,
+            header: t.text,
+            hint: t.text,
+            footer: t.text,
+            cue: sys.gray_text,
+            hover_fill: t.surface,
+            hover_outline: Some(t.text),
+            selected_fill: sys.highlight,
+            selected_text: sys.highlight_text,
+            // The whole row is the highlight, so the bar is the same colour.
+            bar: sys.highlight,
+        };
+    }
+    // An accent from live_accent already clears 3:1; this keeps any other
+    // caller honest too.
+    let bar = ensure_contrast(accent, t.surface, 3.0);
+    PaletteColors {
+        background: t.surface,
+        border: t.border,
+        text: t.text,
+        header: t.text_dim,
+        hint: t.text_faint,
+        footer: t.text_faint,
+        cue: t.text_faint,
+        hover_fill: blend(t.surface, bar, 8),
+        hover_outline: None,
+        selected_fill: blend(t.surface, bar, 16),
+        selected_text: t.text,
+        bar,
+    }
 }
 
 /// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
@@ -919,7 +1040,7 @@ fn gdi_font(dpi: u32, weight: i32) -> HFONT {
     unsafe { CreateFontIndirectW(&lf) }
 }
 
-/// D2D/DirectWrite equivalent of ``draw_text_line`` (imported from
+/// D2D/DirectWrite equivalent of `draw_text_line` (imported from
 /// `crate::ui::text` for the GDI fallback path below): draws one line of
 /// `text` in `rect` (logical/DIP coordinates -- see the module doc comment)
 /// with `color`, or does nothing at all when `text` is empty. Unlike the GDI
@@ -978,24 +1099,6 @@ struct PaletteInner {
     footer_text: String,
     state: crate::ui::palette_model::PaletteState,
     visible: bool,
-    /// #24: bumped on every [`PaletteInner::show`] AND every
-    /// [`PaletteInner::hide`] -- see [`Palette::router_generation`]'s doc
-    /// comment for the full staleness story. `u64::wrapping_add` because
-    /// this is a long-running tray app's counter, not a value that should
-    /// ever panic on overflow (which would take longer than the app's
-    /// uptime to reach in practice regardless).
-    router_generation: u64,
-    /// #24: whether the user has typed into the query box or moved the
-    /// selection (Up/Down/PageUp/PageDown) since THIS showing -- reset by
-    /// [`PaletteInner::show`], set by the `EN_CHANGE`/movement handlers
-    /// below. `crate::router::should_apply` reads this to decide whether a
-    /// late-arriving suggestion may still take the selection.
-    interacted: bool,
-    /// #24: the router's one-line summary, shown as a subtle line between
-    /// the query box and the row list once a suggestion is applied (see
-    /// `on_paint`). `None` most of the time -- no router result yet, the
-    /// result didn't clear the threshold, or the user already interacted.
-    router_summary: Option<String>,
     /// #357: the row currently under the mouse cursor (real index into
     /// `state.rows`, same space as `state.selected`), or `None` when the
     /// mouse isn't over the list, isn't over an `Action` row, or hasn't
@@ -1016,11 +1119,35 @@ struct PaletteInner {
     /// a real-window test -- fires a real, synchronous `EN_CHANGE` for this
     /// edit control, not just user typing or `EM_REPLACESEL` as the old
     /// comment here assumed. While armed, `handle_message`'s `EN_CHANGE` arm
-    /// treats the notification as the programmatic clear it is: it skips
-    /// marking `interacted`/clearing `router_summary` (both already just set
-    /// by `show`) and skips the redundant `rebuild_state` (`show` already
-    /// calls it with the real, empty query right after).
+    /// treats the notification as the programmatic clear it is and skips the
+    /// redundant `rebuild_state` (`show` already calls it with the real,
+    /// empty query right after).
     suppress_en_change: bool,
+    /// #579: the theme the palette is drawn in, the system colours it was
+    /// built from, and the colours themselves. Read when the window is made and
+    /// again on every message that can change them (`refresh_theme`), never per
+    /// paint.
+    theme: Theme,
+    sys: SysColors,
+    colors: PaletteColors,
+    /// The gallery's --theme: later theme messages are ignored.
+    theme_forced: bool,
+    /// The gallery (#919): losing focus does not hide the palette.
+    keep_open: bool,
+    /// The brush WM_CTLCOLOREDIT returns for the query box, in the
+    /// background colour. Created on first use, dropped when the theme changes.
+    edit_brush: HBRUSH,
+}
+
+impl Drop for PaletteInner {
+    fn drop(&mut self) {
+        self.drop_edit_brush();
+        if !self.font.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
+    }
 }
 
 impl PaletteInner {
@@ -1033,20 +1160,12 @@ impl PaletteInner {
         self.catalogue = catalogue;
         self.model_configured = model_configured;
         self.footer_text = footer_text;
-        // #24: a fresh showing starts a fresh router session -- any result
-        // still in flight for the PREVIOUS showing (this bump changes what
-        // `router_generation()` returns) is now stale, and the user hasn't
-        // interacted with this one yet.
-        self.router_generation = self.router_generation.wrapping_add(1);
-        self.interacted = false;
-        self.router_summary = None;
         self.hover = None;
         self.tracking_leave = false;
         // #414: SetWindowTextW below fires a real, synchronous EN_CHANGE for
         // this edit control -- see `suppress_en_change`'s doc comment. Armed
-        // only around this one call, so a genuine keystroke that lands
-        // between `show` calls (impossible: this is all synchronous) or any
-        // later real typing still sets `interacted` normally.
+        // only around this one call, so any later real typing still
+        // rebuilds the rows normally.
         self.suppress_en_change = true;
         unsafe {
             let _ = SetWindowTextW(self.edit_hwnd, PCWSTR(wide_z("").as_ptr()));
@@ -1092,95 +1211,8 @@ impl PaletteInner {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.visible = false;
-        // #24: invalidates any router request still in flight for this
-        // showing -- see `router_generation`'s doc comment. Cheap and always
-        // safe to do even when nothing was in flight.
-        self.router_generation = self.router_generation.wrapping_add(1);
-        self.router_summary = None;
         self.hover = None;
         self.tracking_leave = false;
-    }
-
-    /// #24: see [`Palette::apply_router_suggestion`]'s doc comment for the
-    /// public entry point. Order matters: staleness and visibility are
-    /// checked before touching `crate::router::should_apply` at all, since
-    /// neither needs the confidence/threshold/interacted comparison to
-    /// already say no.
-    fn apply_router_suggestion(
-        &mut self,
-        generation: u64,
-        result: &crate::router::RouterResult,
-        threshold: f64,
-    ) {
-        if crate::router::is_stale(generation, self.router_generation) {
-            return;
-        }
-        if !self.visible {
-            return;
-        }
-        // #359: whatever happens from here, the "Looking at your screen..."
-        // placeholder this session's request started with must not survive
-        // the result -- either it becomes the real summary below, or this
-        // clears it back to None.
-        // #306: the palette pre-selects the top of the ranked shortlist; the
-        // alternatives are for the options card.
-        let Some(top) = result.options.first() else {
-            self.router_summary = None;
-            self.invalidate();
-            return;
-        };
-        let intent_id = top.intent.as_str();
-        if !crate::router::should_apply(Some(intent_id), top.confidence, threshold, self.interacted)
-        {
-            self.router_summary = None;
-            self.invalidate();
-            return;
-        }
-        if crate::ui::palette_model::preselect_action(&mut self.state, intent_id) {
-            self.router_summary = Some(result.summary.clone());
-        } else {
-            self.router_summary = None;
-        }
-        self.invalidate();
-    }
-
-    /// #359: called right when [`App::maybe_start_router`] actually starts a
-    /// background request (after the Paused/no-provider/capture-failure
-    /// checks all pass), so the reserved summary band shows something is
-    /// happening instead of sitting blank until the result arrives. Cleared
-    /// the same way a real summary is: by
-    /// [`PaletteInner::apply_router_suggestion`] on arrival,
-    /// [`PaletteInner::clear_router_pending`] on failure, or any of the
-    /// existing "user already interacted" paths above (`show`, `hide`,
-    /// `on_palette_key_command`'s Up/Down/PageUp/PageDown arm, `EN_CHANGE`).
-    /// No timer involved (rule 5): this only ever changes on those events.
-    fn set_router_pending(&mut self, generation: u64) {
-        if crate::router::is_stale(generation, self.router_generation) {
-            return;
-        }
-        if !self.visible {
-            return;
-        }
-        self.router_summary = Some(ROUTER_LOOKING_TEXT.to_string());
-        self.invalidate();
-    }
-
-    /// #359: the router's background request failed (or no provider ended up
-    /// ready by the time the worker thread ran) -- clears whatever
-    /// [`PaletteInner::set_router_pending`] showed rather than leaving it
-    /// stuck. A no-op if the user already interacted or hid the palette,
-    /// both of which already cleared it.
-    fn clear_router_pending(&mut self, generation: u64) {
-        if crate::router::is_stale(generation, self.router_generation) {
-            return;
-        }
-        if !self.visible {
-            return;
-        }
-        if self.router_summary.is_some() {
-            self.router_summary = None;
-            self.invalidate();
-        }
     }
 
     fn reposition_centered(&mut self) {
@@ -1220,17 +1252,57 @@ impl PaletteInner {
     /// handler can re-run the same layout after a DPI change without
     /// re-centering the window on the active monitor too.
     fn layout_edit_control(&self, w: i32) {
-        let pad = scale(PADDING, self.dpi);
+        let r = query_edit_rect(w, self.dpi, font_text_height(self.font, self.dpi));
         unsafe {
             let _ = SetWindowPos(
                 self.edit_hwnd,
                 None,
-                pad,
-                pad,
-                w - pad * 2,
-                scale(EDIT_HEIGHT, self.dpi),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
+        }
+    }
+
+    /// Draws the placeholder into `hdc`, which the query `edit` has just
+    /// painted (#881). Left-aligned with the text the user would type.
+    fn draw_query_cue(&self, hdc: HDC, edit: HWND) {
+        let mut rc = RECT::default();
+        unsafe {
+            if GetClientRect(edit, &mut rc).is_err() {
+                return;
+            }
+            let margins = SendMessageW(edit, EM_GETMARGINS, None, None).0 as u32 & 0xFFFF;
+            rc.left += margins as i32;
+            let old_font = SelectObject(hdc, HGDIOBJ(self.font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(self.colors.cue));
+            draw_text_line(
+                hdc,
+                QUERY_CUE,
+                rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old_font);
+        }
+    }
+
+    /// A new font for a new DPI, given to the query box (#881).
+    fn rebuild_font(&mut self) {
+        let old = self.font;
+        self.font = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+        unsafe {
+            SendMessageW(
+                self.edit_hwnd,
+                WM_SETFONT,
+                Some(WPARAM(self.font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+            if !old.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(old.0));
+            }
         }
     }
 
@@ -1271,23 +1343,51 @@ impl PaletteInner {
         }
     }
 
+    /// #579: reads the theme, the system colours and the accent again and
+    /// repaints. Runs on every message that can change them. It repaints even
+    /// when the theme is the same: switching between two high contrast
+    /// schemes, or picking a new accent, changes the colours and not the theme.
+    fn refresh_theme(&mut self) {
+        if self.theme_forced {
+            return;
+        }
+        self.theme = detect_theme();
+        self.sys = SysColors::read();
+        self.apply_colors();
+    }
+
+    fn apply_colors(&mut self) {
+        self.colors = palette_colors(self.theme, &self.sys, live_accent(self.theme, &self.sys));
+        self.drop_edit_brush();
+        // RedrawWindow with no window redraws the desktop.
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_ALLCHILDREN,
+            );
+        }
+    }
+
+    /// The cached query box brush holds the old background; the next
+    /// `WM_CTLCOLOREDIT` makes a new one.
+    fn drop_edit_brush(&mut self) {
+        if !self.edit_brush.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.edit_brush.0));
+            }
+            self.edit_brush = HBRUSH(std::ptr::null_mut());
+        }
+    }
+
     /// Takes the key-forwarded `WM_COMMAND` id, runs it through the pure
     /// state machine, and acts on the outcome: repaint, dispatch, or hide.
     fn on_palette_key_command(&mut self, key: crate::ui::palette_model::PaletteKey) {
-        // #24: moving the selection counts as "the user already chose" --
-        // `crate::router::should_apply` must never yank the selection back
-        // to a router suggestion after this. Also drops any summary line
-        // already shown, since it describes a selection the user just left.
-        if matches!(
-            key,
-            crate::ui::palette_model::PaletteKey::Up
-                | crate::ui::palette_model::PaletteKey::Down
-                | crate::ui::palette_model::PaletteKey::PageUp
-                | crate::ui::palette_model::PaletteKey::PageDown
-        ) {
-            self.interacted = true;
-            self.router_summary = None;
-        }
         match crate::ui::palette_model::handle_key(&mut self.state, key) {
             crate::ui::palette_model::PaletteOutcome::None => self.invalidate(),
             crate::ui::palette_model::PaletteOutcome::Hide => self.hide(),
@@ -1341,6 +1441,7 @@ impl PaletteInner {
     /// `D2DERR_RECREATE_TARGET` (device loss), in which case the target is
     /// dropped so the NEXT paint's `ensure_target` call rebuilds it fresh.
     fn try_paint_d2d(&mut self) -> bool {
+        let colors = self.colors;
         let Some(renderer) = &mut self.d2d else {
             return false;
         };
@@ -1361,41 +1462,25 @@ impl PaletteInner {
             .text_format
             .clone()
             .expect("ensure_target just confirmed Some");
-        let summary_format = renderer
-            .summary_format
-            .clone()
-            .unwrap_or_else(|| format.clone());
 
         let pad = PADDING as f32;
         let row_h = ROW_HEIGHT as f32;
         let content_w = WINDOW_WIDTH as f32;
         let content_h = window_height(96) as f32; // logical/DIP total height -- see the module doc comment
-        let mut y = pad + EDIT_HEIGHT as f32 + pad;
+        let y = pad + EDIT_HEIGHT as f32 + pad;
 
         unsafe {
             target.BeginDraw();
-            target.Clear(Some(&colorref_to_d2d(background_color()) as *const _));
+            target.Clear(Some(
+                &colorref_to_d2d(COLORREF(colors.background)) as *const _
+            ));
+            if let Ok(brush) = target
+                .CreateSolidColorBrush(&colorref_to_d2d(COLORREF(colors.border)) as *const _, None)
+            {
+                let rect = query_border_rect();
+                target.DrawRectangle(&rect as *const _, &brush, 1.0, None);
+            }
         }
-
-        // #24: the router summary band is always reserved (see
-        // ROUTER_SUMMARY_HEIGHT's doc comment) so the window never
-        // resizes; only its text is conditional.
-        if let Some(summary) = &self.router_summary {
-            let band_rect = D2D_RECT_F {
-                left: pad,
-                top: y,
-                right: content_w - pad,
-                bottom: y + ROUTER_SUMMARY_HEIGHT as f32,
-            };
-            draw_text_line_d2d(
-                &target,
-                &summary_format,
-                summary,
-                band_rect,
-                COLORREF(0x0080_B080),
-            );
-        }
-        y += ROUTER_SUMMARY_HEIGHT as f32;
 
         // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS) are
         // painted; `i` stays the row's real index into `state.rows` (what
@@ -1418,21 +1503,53 @@ impl PaletteInner {
             };
             match row {
                 crate::ui::palette_model::Row::Header(name) => {
-                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(0x0090_9090));
+                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(colors.header));
                 }
                 crate::ui::palette_model::Row::Hint(text) => {
-                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(0x0080_8080));
+                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    if i == self.state.selected || self.hover == Some(i) {
+                    // The selected row has the strong fill and the bar; a row
+                    // only hovered gets a quiet fill (an outline in high
+                    // contrast), so the two never look alike.
+                    if i == self.state.selected {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(selected_row_color()) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.selected_fill)) as *const _,
                                 None,
                             )
                         } {
                             unsafe {
                                 target.FillRectangle(&row_rect as *const _, &hl);
+                            }
+                        }
+                    } else if self.hover == Some(i) {
+                        if let Ok(fill) = unsafe {
+                            target.CreateSolidColorBrush(
+                                &colorref_to_d2d(COLORREF(colors.hover_fill)) as *const _,
+                                None,
+                            )
+                        } {
+                            unsafe {
+                                target.FillRectangle(&row_rect as *const _, &fill);
+                            }
+                        }
+                        if let Some(ink) = colors.hover_outline {
+                            if let Ok(outline) = unsafe {
+                                target.CreateSolidColorBrush(
+                                    &colorref_to_d2d(COLORREF(ink)) as *const _,
+                                    None,
+                                )
+                            } {
+                                let inset = D2D_RECT_F {
+                                    left: row_rect.left + 0.5,
+                                    top: row_rect.top + 0.5,
+                                    right: row_rect.right - 0.5,
+                                    bottom: row_rect.bottom - 0.5,
+                                };
+                                unsafe {
+                                    target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
+                                }
                             }
                         }
                     }
@@ -1446,7 +1563,7 @@ impl PaletteInner {
 
                         if let Ok(accent) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(accent_color()) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
                                 None,
                             )
                         } {
@@ -1455,7 +1572,21 @@ impl PaletteInner {
                             }
                         }
                     }
-                    draw_text_line_d2d(&target, &format, name, row_rect, row_text_color());
+                    let text_rect = D2D_RECT_F {
+                        left: row_rect.left + ROW_TEXT_INSET as f32,
+                        ..row_rect
+                    };
+                    draw_text_line_d2d(
+                        &target,
+                        &format,
+                        name,
+                        text_rect,
+                        COLORREF(if i == self.state.selected {
+                            colors.selected_text
+                        } else {
+                            colors.text
+                        }),
+                    );
                 }
             }
         }
@@ -1471,7 +1602,7 @@ impl PaletteInner {
             &format,
             &self.footer_text,
             footer_rect,
-            COLORREF(0x0080_8080),
+            COLORREF(colors.footer),
         );
 
         if let Err(e) = unsafe { target.EndDraw(None, None) } {
@@ -1493,11 +1624,12 @@ impl PaletteInner {
     /// tested as the path it replaces, not a second, thinner
     /// implementation.
     fn paint_gdi(&self, hdc: windows::Win32::Graphics::Gdi::HDC) {
+        let colors = self.colors;
         unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
 
-            let bg = CreateSolidBrush(background_color());
+            let bg = CreateSolidBrush(COLORREF(colors.background));
             FillRect(hdc, &rc, bg);
             let _ = DeleteObject(bg.into());
 
@@ -1508,33 +1640,48 @@ impl PaletteInner {
             let old_font = SelectObject(hdc, HGDIOBJ(normal.0));
 
             let pad = scale(PADDING, self.dpi);
-            let row_h = scale(ROW_HEIGHT, self.dpi);
-            let mut y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
 
-            // #24: the router summary band is always reserved (see
-            // ROUTER_SUMMARY_HEIGHT's doc comment) so the window never
-            // resizes; only its text is conditional.
-            if let Some(summary) = &self.router_summary {
-                let band_rect = RECT {
-                    left: pad,
-                    top: y,
-                    right: rc.right - pad,
-                    bottom: y + scale(ROUTER_SUMMARY_HEIGHT, self.dpi),
-                };
-                SetTextColor(hdc, COLORREF(0x0080_B080));
-                // Semibold, like the Direct2D path (#361), freed after the line.
-                let bold = gdi_font(self.dpi, FW_SEMIBOLD.0 as i32);
-                SelectObject(hdc, HGDIOBJ(bold.0));
-                draw_text_line(
-                    hdc,
-                    summary,
-                    band_rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                );
-                SelectObject(hdc, HGDIOBJ(normal.0));
-                let _ = DeleteObject(bold.into());
+            // The query box's hairline: four thin fills round the edit.
+            let line = scale(1, self.dpi).max(1);
+            let o = scale(QUERY_BORDER_OUTSET, self.dpi);
+            let (l, t, r, b) = (
+                pad - o,
+                pad - o,
+                rc.right - pad + o,
+                pad + scale(EDIT_HEIGHT, self.dpi) + o,
+            );
+            let border = CreateSolidBrush(COLORREF(colors.border));
+            for edge in [
+                RECT {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: t + line,
+                },
+                RECT {
+                    left: l,
+                    top: b - line,
+                    right: r,
+                    bottom: b,
+                },
+                RECT {
+                    left: l,
+                    top: t,
+                    right: l + line,
+                    bottom: b,
+                },
+                RECT {
+                    left: r - line,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+            ] {
+                FillRect(hdc, &edge, border);
             }
-            y += scale(ROUTER_SUMMARY_HEIGHT, self.dpi);
+            let _ = DeleteObject(border.into());
+            let row_h = scale(ROW_HEIGHT, self.dpi);
+            let y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
 
             // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS)
             // are painted; `i` stays the row's real index into `state.rows`
@@ -1558,7 +1705,7 @@ impl PaletteInner {
                 };
                 match row {
                     crate::ui::palette_model::Row::Header(name) => {
-                        SetTextColor(hdc, COLORREF(0x0090_9090));
+                        SetTextColor(hdc, COLORREF(colors.header));
                         draw_text_line(
                             hdc,
                             name,
@@ -1567,7 +1714,7 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Hint(text) => {
-                        SetTextColor(hdc, COLORREF(0x0080_8080));
+                        SetTextColor(hdc, COLORREF(colors.hint));
                         draw_text_line(
                             hdc,
                             text,
@@ -1576,13 +1723,42 @@ impl PaletteInner {
                         );
                     }
                     crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected || self.hover == Some(i) {
-                            let hl = CreateSolidBrush(selected_row_color());
+                        if i == self.state.selected {
+                            let hl = CreateSolidBrush(COLORREF(colors.selected_fill));
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
+                        } else if self.hover == Some(i) {
+                            let fill = CreateSolidBrush(COLORREF(colors.hover_fill));
+                            FillRect(hdc, &row_rect, fill);
+                            let _ = DeleteObject(fill.into());
+                            if let Some(ink) = colors.hover_outline {
+                                let outline = CreateSolidBrush(COLORREF(ink));
+                                let line = scale(1, self.dpi).max(1);
+                                for edge in [
+                                    RECT {
+                                        bottom: row_rect.top + line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        top: row_rect.bottom - line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        right: row_rect.left + line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        left: row_rect.right - line,
+                                        ..row_rect
+                                    },
+                                ] {
+                                    FillRect(hdc, &edge, outline);
+                                }
+                                let _ = DeleteObject(outline.into());
+                            }
                         }
                         if i == self.state.selected {
-                            let accent = CreateSolidBrush(accent_color());
+                            let accent = CreateSolidBrush(COLORREF(colors.bar));
                             let accent_rect = RECT {
                                 left: row_rect.left,
                                 top: row_rect.top,
@@ -1592,11 +1768,22 @@ impl PaletteInner {
                             FillRect(hdc, &accent_rect, accent);
                             let _ = DeleteObject(accent.into());
                         }
-                        SetTextColor(hdc, row_text_color());
+                        SetTextColor(
+                            hdc,
+                            COLORREF(if i == self.state.selected {
+                                colors.selected_text
+                            } else {
+                                colors.text
+                            }),
+                        );
+                        let text_rect = RECT {
+                            left: row_rect.left + scale(ROW_TEXT_INSET, self.dpi),
+                            ..row_rect
+                        };
                         draw_text_line(
                             hdc,
                             name,
-                            row_rect,
+                            text_rect,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                         );
                     }
@@ -1609,7 +1796,7 @@ impl PaletteInner {
                 right: rc.right - pad,
                 bottom: rc.bottom,
             };
-            SetTextColor(hdc, COLORREF(0x0080_8080));
+            SetTextColor(hdc, COLORREF(colors.footer));
             draw_text_line(
                 hdc,
                 &self.footer_text,
@@ -1638,6 +1825,36 @@ impl PaletteInner {
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)), // we paint the whole client area ourselves
+            // #579: without this the query box keeps the stock white
+            // background and black text whatever the theme.
+            WM_PALETTE_DRAW_CUE => {
+                self.draw_query_cue(HDC(wparam.0 as *mut c_void), HWND(lparam.0 as *mut c_void));
+                Some(LRESULT(0))
+            }
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wparam.0 as *mut c_void);
+                unsafe {
+                    SetTextColor(hdc, COLORREF(self.colors.text));
+                    SetBkColor(hdc, COLORREF(self.colors.background));
+                    if self.edit_brush.0.is_null() {
+                        self.edit_brush = CreateSolidBrush(COLORREF(self.colors.background));
+                    }
+                }
+                Some(LRESULT(self.edit_brush.0 as isize))
+            }
+            // #579: the light/dark switch, the high contrast switch and a new
+            // contrast scheme or accent. Windows sends these to every top-level
+            // window, hidden or not, so the palette hears them with no timer.
+            WM_SETTINGCHANGE => {
+                if setting_change_affects_theme(wparam.0, &unsafe { setting_change_name(lparam) }) {
+                    self.refresh_theme();
+                }
+                Some(LRESULT(0))
+            }
+            WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+                self.refresh_theme();
+                Some(LRESULT(0))
+            }
             WM_COMMAND => {
                 let wp = wparam.0 as u32;
                 let notify = (wp >> 16) & 0xFFFF;
@@ -1645,16 +1862,10 @@ impl PaletteInner {
                 if notify == EN_CHANGE && ctrl_id == QUERY_EDIT_ID && lparam.0 != 0 {
                     if self.suppress_en_change {
                         // #414: this is `show`'s own programmatic clear, not
-                        // real user typing -- `show` already reset
-                        // `interacted`/`router_summary` and will call
+                        // real user typing -- `show` will call
                         // `rebuild_state` itself right after.
                         return Some(LRESULT(0));
                     }
-                    // #24: real user typing -- the router's suggestion must
-                    // not steal the selection back from here on for this
-                    // showing.
-                    self.interacted = true;
-                    self.router_summary = None;
                     let query = self.current_query();
                     self.rebuild_state(&query);
                     self.invalidate();
@@ -1679,7 +1890,7 @@ impl PaletteInner {
                     ID_PALETTE_ESCAPE => {
                         self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Escape)
                     }
-                    ID_PALETTE_LOST_FOCUS => self.hide(),
+                    ID_PALETTE_LOST_FOCUS if !self.keep_open => self.hide(),
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -1802,6 +2013,7 @@ impl PaletteInner {
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
+                self.rebuild_font();
                 self.layout_edit_control(w);
                 if let Some(renderer) = &mut self.d2d {
                     renderer.set_dpi(self.dpi);
@@ -1836,9 +2048,8 @@ fn utf16(s: &str) -> Vec<u16> {
 // identical to `crate::ui::text::draw_text_line` (issue #221) -- see that
 // module's doc comment for the MEASURED empty-string crash and the guard's
 // reasoning, which applies unchanged to every row's text painted below
-// (`router_summary` from a live model's JSON response, `Row::Action`'s
-// `name`/`Row::Header`'s group name from a hand-editable `actions.toml`,
-// none of it validated non-empty at the source). Now imported instead of
+// (`Row::Action`'s `name`/`Row::Header`'s group name from a hand-editable
+// `actions.toml`, none of it validated non-empty at the source). Now imported instead of
 // duplicated; the regression coverage for the empty-string guard itself
 // lives in `ui::text`'s own tests.
 use crate::ui::text::draw_text_line;
@@ -1892,41 +2103,418 @@ mod tests {
     // #357: pure hit-test tests, written before `row_at` exists (RED first).
     // `dpi` is 96 throughout (logical == physical) so the expected pixel
     // values are the raw layout constants.
-    // #476: the accent bar carries "this row is selected" (3:1 against the
-    // background); the row text must stay readable on the selected fill (4.5:1).
+    // #476, #579: every colour the palette draws comes from the theme tokens.
+    // The bar carries "this row is selected" (3:1 against what it sits on);
+    // text must stay readable on every surface it is drawn on (4.5:1).
     mod colour_tests {
-        use super::super::{accent_color, background_color, row_text_color, selected_row_color};
-        use crate::ui::theme::{contrast_ratio, relative_luminance};
-        use windows::Win32::Foundation::COLORREF;
+        use super::super::{palette_colors, PaletteColors};
+        use crate::ui::theme::{contrast_ratio, relative_luminance, Theme, HC_BLACK, HC_WHITE};
 
-        fn ratio(a: COLORREF, b: COLORREF) -> f64 {
-            contrast_ratio(relative_luminance(a.0), relative_luminance(b.0))
+        fn ratio(a: u32, b: u32) -> f64 {
+            contrast_ratio(relative_luminance(a), relative_luminance(b))
+        }
+
+        /// Every theme, and accents from near-invisible to extreme, so no user
+        /// accent can make the bar or the text unreadable.
+        fn cases() -> Vec<(String, Theme, PaletteColors)> {
+            let accents = [
+                0x00D4_7800, // the Windows default blue
+                0x0000_F0FF, // pale yellow
+                0x0010_0808, // near black
+                0x00FF_FFFF, // white
+                0x0020_20C0, // red
+            ];
+            let mut out = Vec::new();
+            for (name, theme, sys) in [
+                ("light", Theme::Light, HC_BLACK),
+                ("dark", Theme::Dark, HC_BLACK),
+                ("hc-black", Theme::HighContrast, HC_BLACK),
+                ("hc-white", Theme::HighContrast, HC_WHITE),
+            ] {
+                for accent in accents {
+                    out.push((
+                        format!("{name} accent {accent:#08x}"),
+                        theme,
+                        palette_colors(theme, &sys, accent),
+                    ));
+                }
+            }
+            out
         }
 
         #[test]
-        fn accent_bar_has_at_least_3_to_1_contrast_with_background() {
-            let r = ratio(accent_color(), background_color());
-            assert!(r >= 3.0, "accent bar vs background is {r:.2}:1");
+        fn every_text_colour_has_at_least_4_5_to_1_on_the_background() {
+            let cases = cases();
+            assert_eq!(cases.len(), 20, "the test must look at every case");
+            for (name, _, c) in cases {
+                for (what, fg) in [
+                    ("text", c.text),
+                    ("header", c.header),
+                    ("hint", c.hint),
+                    ("footer", c.footer),
+                    ("cue", c.cue),
+                ] {
+                    let r = ratio(fg, c.background);
+                    assert!(r >= 4.5, "{name}: {what} is {r:.2}:1 on the background");
+                }
+            }
         }
 
         #[test]
-        fn row_text_has_at_least_4_5_to_1_contrast_on_the_selected_row() {
-            let r = ratio(row_text_color(), selected_row_color());
-            assert!(r >= 4.5, "row text vs selected row is {r:.2}:1");
+        fn row_text_has_at_least_4_5_to_1_on_the_selected_row() {
+            for (name, _, c) in cases() {
+                let r = ratio(c.selected_text, c.selected_fill);
+                assert!(r >= 4.5, "{name}: selected text is {r:.2}:1 on its row");
+            }
         }
 
         #[test]
-        fn selected_row_is_still_distinct_from_the_background() {
-            assert_ne!(selected_row_color(), background_color());
+        fn the_hovered_row_differs_from_the_selected_row_and_keeps_readable_text() {
+            for (name, theme, c) in cases() {
+                let r = ratio(c.text, c.hover_fill);
+                assert!(r >= 4.5, "{name}: text is {r:.2}:1 on a hovered row");
+                assert_ne!(c.hover_fill, c.selected_fill, "{name}");
+                if theme == Theme::HighContrast {
+                    // No fill in high contrast: an outline in the text colour.
+                    assert_eq!(c.hover_fill, c.background, "{name}");
+                    let o = c
+                        .hover_outline
+                        .expect("high contrast hovers with an outline");
+                    assert!(ratio(o, c.background) >= 3.0, "{name}: outline");
+                } else {
+                    // A quiet fill, lighter than the selection's.
+                    assert_ne!(c.hover_fill, c.background, "{name}");
+                    assert_eq!(c.hover_outline, None, "{name}");
+                    assert!(
+                        ratio(c.hover_fill, c.background) < ratio(c.selected_fill, c.background),
+                        "{name}: the hover fill is not quieter than the selection"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_bar_has_at_least_3_to_1_on_the_background() {
+            for (name, theme, c) in cases() {
+                // In high contrast the whole row is the system highlight and
+                // the bar is that colour: the row itself must stand out.
+                let (bar, under) = if theme == Theme::HighContrast {
+                    (c.selected_fill, c.background)
+                } else {
+                    (c.bar, c.background)
+                };
+                let r = ratio(bar, under);
+                assert!(r >= 3.0, "{name}: the selection is {r:.2}:1");
+            }
+        }
+
+        #[test]
+        fn the_selected_row_is_still_distinct_from_the_background() {
+            for (name, _, c) in cases() {
+                assert_ne!(c.selected_fill, c.background, "{name}");
+            }
+        }
+
+        #[test]
+        fn light_and_dark_differ_and_high_contrast_uses_the_system_colours() {
+            let light = palette_colors(Theme::Light, &HC_BLACK, 0x00D4_7800);
+            let dark = palette_colors(Theme::Dark, &HC_BLACK, 0x00D4_7800);
+            assert_ne!(light.background, dark.background);
+            assert!(relative_luminance(light.background) > relative_luminance(dark.background));
+            let hc = palette_colors(Theme::HighContrast, &HC_WHITE, 0x00D4_7800);
+            assert_eq!(hc.background, HC_WHITE.window);
+            assert_eq!(hc.text, HC_WHITE.window_text);
+            assert_eq!(hc.selected_fill, HC_WHITE.highlight);
+            assert_eq!(hc.selected_text, HC_WHITE.highlight_text);
         }
     }
+
+    // #579: the palette is a top-level window, so Windows broadcasts every
+    // theme change to it even while it is hidden.
+    mod live_theme_tests {
+        use super::*;
+        use crate::ui::theme::HC_BLACK;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetBkColor, GetDC, GetTextColor, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{WM_SYSCOLORCHANGE, WM_THEMECHANGED};
+
+        fn live_colors() -> PaletteColors {
+            let (theme, sys) = (detect_theme(), SysColors::read());
+            palette_colors(theme, &sys, live_accent(theme, &sys))
+        }
+
+        /// Colours that can never equal the live ones, whatever theme this
+        /// machine runs: the background is not a valid COLORREF (#886).
+        fn stale_colors() -> PaletteColors {
+            PaletteColors {
+                background: 0x0100_0000,
+                ..live_colors()
+            }
+        }
+
+        #[test]
+        fn a_theme_message_makes_the_palette_read_the_system_again() {
+            for msg in [WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
+                let mut p = Palette::new_for_test(instance()).unwrap();
+                // Stale colours, as if the theme had just changed.
+                p.inner.colors = stale_colors();
+                assert_ne!(p.inner.colors, live_colors(), "the setup must differ");
+                unsafe {
+                    SendMessageW(p.hwnd(), msg, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+                assert_eq!(p.inner.colors, live_colors(), "message {msg:#x}");
+            }
+        }
+
+        #[test]
+        fn a_theme_setting_change_makes_the_palette_read_the_system_again() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.inner.colors = stale_colors();
+            let name = wide_z("ImmersiveColorSet");
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_SETTINGCHANGE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(name.as_ptr() as isize)),
+                );
+            }
+            assert_eq!(p.inner.colors, live_colors());
+            // An unrelated setting leaves it alone.
+            p.inner.colors = stale_colors();
+            let other = wide_z("intl");
+            unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_SETTINGCHANGE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(other.as_ptr() as isize)),
+                );
+            }
+            assert_ne!(p.inner.colors, live_colors());
+        }
+
+        /// #919: the palette hides when its query box loses focus, so another
+        /// window taking the foreground hid it mid-run and `--matrix` stopped.
+        /// The gallery asks it to stay up; a normal palette still hides.
+        #[test]
+        fn a_gallery_palette_stays_up_when_focus_leaves_but_a_normal_one_hides() {
+            use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+            let lost_focus = |p: &Palette| unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_COMMAND,
+                    Some(WPARAM(ID_PALETTE_LOST_FOCUS as usize)),
+                    Some(LPARAM(0)),
+                );
+            };
+            let mut normal = Palette::new_for_test(instance()).unwrap();
+            normal.show(free_actions(), true, String::new());
+            lost_focus(&normal);
+            assert!(!unsafe { IsWindowVisible(normal.hwnd()) }.as_bool());
+
+            let mut gallery = Palette::new_for_test(instance()).unwrap();
+            gallery.keep_open_for_gallery();
+            gallery.show(free_actions(), true, String::new());
+            lost_focus(&gallery);
+            assert!(unsafe { IsWindowVisible(gallery.hwnd()) }.as_bool());
+            assert!(gallery.inner.visible);
+        }
+
+        #[test]
+        fn a_forced_theme_ignores_theme_messages() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            let forced = p.inner.colors;
+            assert_eq!(
+                forced,
+                palette_colors(Theme::Dark, &HC_BLACK, live_accent(Theme::Dark, &HC_BLACK))
+            );
+            unsafe {
+                SendMessageW(p.hwnd(), WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            assert_eq!(p.inner.colors, forced);
+        }
+
+        /// The query box is a child EDIT: without `WM_CTLCOLOREDIT` it keeps
+        /// the stock white background and black text in a dark palette.
+        #[test]
+        fn the_query_box_gets_the_palette_text_and_background_colours() {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            let (screen, hdc);
+            let result;
+            unsafe {
+                screen = GetDC(None);
+                hdc = CreateCompatibleDC(Some(screen));
+                result = SendMessageW(
+                    p.hwnd(),
+                    WM_CTLCOLOREDIT,
+                    Some(WPARAM(hdc.0 as usize)),
+                    Some(LPARAM(p.edit_hwnd().0 as isize)),
+                );
+            }
+            let colors = p.inner.colors;
+            let (bk, text) = unsafe { (GetBkColor(hdc), GetTextColor(hdc)) };
+            unsafe {
+                let _ = DeleteDC(hdc);
+                ReleaseDC(None, screen);
+            }
+            assert_ne!(result.0, 0, "WM_CTLCOLOREDIT must return a brush");
+            assert_eq!(bk.0, colors.background);
+            assert_eq!(text.0, colors.text);
+        }
+    }
+    // #886: a 1 px stroke is centred on its path, so a path on whole pixels
+    // blurs across two rows of pixels.
+    #[test]
+    fn the_query_border_path_sits_on_half_pixels_inside_the_outer_edge() {
+        let r = query_border_rect();
+        for v in [r.left, r.top, r.right, r.bottom] {
+            assert_eq!(v.fract(), 0.5, "{v}");
+        }
+        // The stroke fills the outermost pixel, like the GDI path's four fills.
+        let pad = PADDING as f32;
+        let o = QUERY_BORDER_OUTSET as f32;
+        assert_eq!(r.left - 0.5, pad - o);
+        assert_eq!(r.top - 0.5, pad - o);
+        assert_eq!(r.right + 0.5, WINDOW_WIDTH as f32 - pad + o);
+        assert_eq!(r.bottom + 0.5, pad + EDIT_HEIGHT as f32 + o);
+    }
+
+    // #881: the query box centres its text and shows a placeholder.
+    mod query_box_tests {
+        use super::super::{
+            query_edit_rect, scale, EDIT_HEIGHT, PADDING, QUERY_TEXT_INSET, WINDOW_WIDTH,
+        };
+
+        #[test]
+        fn the_text_line_is_centred_in_the_box_at_every_scale() {
+            for dpi in [96u32, 120, 144, 192, 240] {
+                let text_h = scale(20, dpi);
+                let r = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, text_h);
+                let box_top = scale(PADDING, dpi);
+                let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+                assert_eq!(r.bottom - r.top, text_h, "dpi {dpi}");
+                let (above, below) = (r.top - box_top, box_bottom - r.bottom);
+                assert!(above > 0 && (above - below).abs() <= 1, "dpi {dpi}");
+                // The text clears the box edge by the inset on both sides.
+                assert_eq!(r.left, scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi));
+                assert_eq!(
+                    scale(WINDOW_WIDTH, dpi) - r.right,
+                    scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi)
+                );
+            }
+        }
+
+        #[test]
+        fn a_font_taller_than_the_box_is_clamped_to_the_box() {
+            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 500);
+            assert_eq!(r.bottom - r.top, scale(EDIT_HEIGHT, 96));
+            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 0);
+            assert!(
+                r.bottom > r.top,
+                "a zero-height font still leaves a control"
+            );
+        }
+    }
+
+    // The placeholder is painted into the EDIT by the palette (a plain EDIT
+    // has no cue banner in the palette's colours), so these print the real
+    // control and look at its pixels.
+    mod query_cue_tests {
+        use super::*;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        /// How many pixels of the printed edit, at or right of `from_x`, are not
+        /// the background colour.
+        fn ink_right_of(p: &Palette, from_x: i32) -> usize {
+            let edit = p.edit_hwnd();
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetClientRect(edit, &mut rc);
+                let screen = GetDC(None);
+                let dc = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, rc.right, rc.bottom);
+                let old = SelectObject(dc, HGDIOBJ(bmp.0));
+                let bg = CreateSolidBrush(COLORREF(p.inner.colors.background));
+                FillRect(dc, &rc, bg);
+                let _ = DeleteObject(bg.into());
+                // PRF_CLIENT
+                SendMessageW(
+                    edit,
+                    WM_PRINTCLIENT,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(0x4)),
+                );
+                let mut n = 0;
+                for y in 0..rc.bottom {
+                    for x in from_x..rc.right {
+                        if GetPixel(dc, x, y).0 != p.inner.colors.background {
+                            n += 1;
+                        }
+                    }
+                }
+                SelectObject(dc, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+                ReleaseDC(None, screen);
+                n
+            }
+        }
+
+        fn shown() -> Palette {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            p.show(free_actions(), true, String::new());
+            p
+        }
+
+        #[test]
+        fn an_empty_query_box_shows_the_placeholder() {
+            let p = shown();
+            assert!(ink_right_of(&p, 0) > 0, "nothing is drawn in an empty box");
+        }
+
+        #[test]
+        fn typing_removes_the_placeholder() {
+            let mut p = shown();
+            let from = scale(60, p.inner.dpi);
+            assert!(
+                ink_right_of(&p, from) > 0,
+                "the placeholder is wider than 60 DIP"
+            );
+            p.set_query_for_test("a");
+            assert_eq!(ink_right_of(&p, from), 0, "the placeholder is still drawn");
+        }
+
+        #[test]
+        fn the_edit_is_one_text_line_high_and_centred_in_the_box() {
+            let p = shown();
+            let (mut er, mut pr) = (RECT::default(), RECT::default());
+            unsafe {
+                let _ = GetWindowRect(p.edit_hwnd(), &mut er);
+                let _ = GetWindowRect(p.hwnd(), &mut pr);
+            }
+            let dpi = p.inner.dpi;
+            let box_top = scale(PADDING, dpi);
+            let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+            let (top, bottom) = (er.top - pr.top, er.bottom - pr.top);
+            assert!(bottom - top < scale(EDIT_HEIGHT, dpi), "{top}..{bottom}");
+            assert!(((top - box_top) - (box_bottom - bottom)).abs() <= 1);
+        }
+    }
+
     mod row_at_tests {
         use super::super::row_at;
 
         const DPI: u32 = 96;
-        // list_top = PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT
-        //          = 8 + 30 + 8 + 18 = 64
-        const LIST_TOP: i32 = 64;
+        // list_top = PADDING + EDIT_HEIGHT + PADDING = 8 + 30 + 8 = 46
+        const LIST_TOP: i32 = 46;
         const ROW_H: i32 = 26;
 
         #[test]
@@ -2006,9 +2594,9 @@ mod tests {
             );
         }
         let pixel = |x: i32, y: i32| unsafe { GetPixel(mem as HDC, x, y) };
-        // Rows start below the edit and the summary band; the first action
+        // Rows start below the edit; the first action
         // row (after the group header) is the selected one.
-        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING + ROUTER_SUMMARY_HEIGHT, dpi);
+        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING, dpi);
         let selected_y = list_top + scale(ROW_HEIGHT, dpi) + scale(ROW_HEIGHT, dpi) / 2;
         let selected = pixel(w - scale(PADDING, dpi) - 4, selected_y);
         let empty = pixel(w / 2, h - scale(FOOTER_HEIGHT, dpi) - 4);
@@ -2016,9 +2604,65 @@ mod tests {
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
         }
-        assert_eq!(selected, selected_row_color(), "the selected row fill");
-        assert_eq!(empty, background_color(), "the palette background");
+        assert_eq!(
+            selected.0, p.inner.colors.selected_fill,
+            "the selected row fill"
+        );
+        assert_eq!(empty.0, p.inner.colors.background, "the palette background");
     }
+
+    /// #882: a row the mouse is over is filled lighter than the selected row,
+    /// so two rows never look selected. Prints the window and reads the
+    /// pixels of the hovered row and of the selected one.
+    #[test]
+    fn a_hovered_row_is_filled_lighter_than_the_selected_row() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject, HDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.force_theme_for_gallery(Theme::Dark);
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        // Rows: header, action (selected), header, action.
+        p.inner.hover = Some(3);
+        let dpi = p.inner.dpi;
+        let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+        let (screen, mem, bmp, old);
+        unsafe {
+            screen = GetDC(None);
+            mem = CreateCompatibleDC(Some(screen));
+            bmp = CreateCompatibleBitmap(screen, w, h);
+            old = SelectObject(mem, bmp.into());
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+        }
+        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING, dpi);
+        let row_y = |pos: i32| list_top + scale(ROW_HEIGHT, dpi) * pos + scale(ROW_HEIGHT, dpi) / 2;
+        let x = w - scale(PADDING, dpi) - 4;
+        let (selected, hovered) = unsafe {
+            (
+                GetPixel(mem as HDC, x, row_y(1)).0,
+                GetPixel(mem as HDC, x, row_y(3)).0,
+            )
+        };
+        unsafe {
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+        let c = p.inner.colors;
+        assert_eq!(selected, c.selected_fill);
+        assert_eq!(hovered, c.hover_fill, "the hovered row fill");
+        assert_ne!(hovered, selected);
+        assert_ne!(hovered, c.background);
+    }
+
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
@@ -2172,11 +2816,11 @@ mod tests {
         p.show(free_actions(), true, "mode: Auto".to_string());
         pump_pending(p.hwnd());
 
-        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING +
-        // ROUTER_SUMMARY_HEIGHT = 8 + 30 + 8 + 18 = 64; row 1's midpoint is
-        // list_top + ROW_HEIGHT + ROW_HEIGHT/2 = 64 + 26 + 13 = 103.
+        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING = 8 + 30 + 8 =
+        // 46; row 1's midpoint is list_top + ROW_HEIGHT + ROW_HEIGHT/2 =
+        // 46 + 26 + 13 = 85.
         let x: i16 = 50;
-        let y: i16 = 103;
+        let y: i16 = 85;
         let lparam = LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize);
 
         unsafe {
@@ -2267,22 +2911,19 @@ mod tests {
     /// #414: the fix for `show`'s programmatic clear must not also swallow
     /// genuine user typing -- a real `EN_CHANGE` from `set_query_for_test`
     /// (which drives the query through the real edit control, not by poking
-    /// `PaletteState` directly) must still mark `interacted`.
+    /// `PaletteState` directly) must still rebuild the rows.
     #[test]
-    fn real_typing_after_show_still_marks_interacted() {
+    fn real_typing_after_show_still_filters_the_rows() {
         let inst = instance();
         let mut p = Palette::new_for_test(inst).unwrap();
         p.show(free_actions(), true, "mode: Auto".to_string());
         pump_pending(p.hwnd());
-        assert!(
-            !p.inner.interacted,
-            "show() itself must not mark interacted"
-        );
+        let before = p.inner.state.rows.len();
         p.set_query_for_test("copy");
         pump_pending(p.hwnd());
         assert!(
-            p.inner.interacted,
-            "a real EN_CHANGE from user typing must mark interacted"
+            p.inner.state.rows.len() < before,
+            "a real EN_CHANGE from user typing must rebuild the rows"
         );
     }
 
@@ -2523,24 +3164,6 @@ mod tests {
         assert_eq!(pref, DWMWCP_ROUND);
     }
 
-    /// #361: the router's suggestion is a hint, so it is set in semibold and
-    /// reads as different from the rows and headers around it.
-    #[test]
-    fn the_router_summary_is_semibold_and_the_rows_are_not() {
-        use windows::Win32::Graphics::DirectWrite::{
-            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-        };
-        let p = Palette::new_for_test(instance()).unwrap();
-        let mut renderer = PaletteRenderer::new().expect("Direct2D factories");
-        assert!(renderer.ensure_target(p.hwnd(), 96, 560, 400));
-        let row = renderer.text_format.as_ref().unwrap();
-        let summary = renderer.summary_format.as_ref().unwrap();
-        assert_eq!(unsafe { row.GetFontWeight() }, DWRITE_FONT_WEIGHT_NORMAL);
-        assert_eq!(
-            unsafe { summary.GetFontWeight() },
-            DWRITE_FONT_WEIGHT_SEMI_BOLD
-        );
-    }
     // -- show latency (#25's Done-when: under 100 ms) -----------------------
 
     #[test]
@@ -2570,120 +3193,5 @@ mod tests {
             avg < 100.0,
             "#25's Done-when is under 100 ms; measured avg {avg:.2} ms"
         );
-    }
-
-    // -- #359: "Looking at your screen..." while the router works ----------
-
-    fn router_result(intent: Option<&str>, confidence: f64) -> crate::router::RouterResult {
-        crate::router::RouterResult {
-            summary: "Check my work".to_string(),
-            options: intent
-                .map(|id| crate::router::RouterOption {
-                    intent: id.to_string(),
-                    label: "Check my work".to_string(),
-                    confidence,
-                })
-                .into_iter()
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn set_router_pending_shows_the_looking_text() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        assert_eq!(p.inner.router_summary, None);
-        p.set_router_pending(generation);
-        assert_eq!(p.inner.router_summary.as_deref(), Some(ROUTER_LOOKING_TEXT));
-    }
-
-    #[test]
-    fn set_router_pending_is_a_noop_for_a_stale_generation() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let stale_generation = p.router_generation().wrapping_sub(1);
-        p.set_router_pending(stale_generation);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    /// #414: `show()`'s own programmatic `SetWindowTextW(edit_hwnd, "")`
-    /// clear must never look like real user input -- if it does, `interacted`
-    /// is `true` immediately after every `show()`, and
-    /// `crate::router::should_apply` (which refuses once `interacted`) means
-    /// the router's preselect (#24) can never apply in the real app. This
-    /// calls only `show()` then `apply_router_suggestion`, with no manual
-    /// `interacted` reset, unlike the tests below.
-    #[test]
-    fn show_does_not_mark_interacted_so_a_router_suggestion_still_applies() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
-        assert_eq!(
-            p.inner.router_summary.as_deref(),
-            Some("Check my work"),
-            "show()'s own programmatic text clear must not mark interacted, \
-             or a genuine above-threshold router suggestion can never apply"
-        );
-    }
-
-    #[test]
-    fn apply_router_suggestion_replaces_pending_text_with_the_real_summary() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.9), 0.5);
-        assert_eq!(
-            p.inner.router_summary.as_deref(),
-            Some("Check my work"),
-            "a successful, above-threshold result must replace the placeholder"
-        );
-    }
-
-    #[test]
-    fn apply_router_suggestion_below_threshold_clears_the_pending_text() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        // Confidence below the threshold: should_apply is false, so the
-        // placeholder must be cleared rather than left stuck.
-        p.apply_router_suggestion(generation, &router_result(Some("check-my-work"), 0.1), 0.5);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    #[test]
-    fn apply_router_suggestion_with_no_intent_clears_the_pending_text() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        p.apply_router_suggestion(generation, &router_result(None, 0.9), 0.5);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    #[test]
-    fn clear_router_pending_clears_the_looking_text_on_failure() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        p.clear_router_pending(generation);
-        assert_eq!(p.inner.router_summary, None);
-    }
-
-    #[test]
-    fn clear_router_pending_is_a_noop_for_a_stale_generation() {
-        let mut p = Palette::new_for_test(instance()).unwrap();
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        let generation = p.router_generation();
-        p.set_router_pending(generation);
-        // A new showing bumps the generation; the old request's eventual
-        // failure must not clear the NEW showing's (currently empty) band.
-        p.show(free_actions(), true, "mode: Auto".to_string());
-        p.clear_router_pending(generation);
-        assert_eq!(p.inner.router_summary, None);
     }
 }

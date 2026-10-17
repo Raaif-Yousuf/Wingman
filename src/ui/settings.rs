@@ -147,22 +147,26 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     let owner_raw = owner.0 as isize;
     inner.save_sink = Some(Box::new(move |original: &Config, edited: &Config| {
         let changes = crate::config_writer::diff(original, edited).map_err(|e| format!("{e:#}"))?;
-        crate::app::submit_config_job(
+        // A list changed here replaces the whole list in the file, so it is
+        // written only if the file's list is still the one this window opened
+        // with; a hand edit of a sibling entry is not silently dropped.
+        let changes = crate::config_writer::guard_whole_values(changes, original)
+            .map_err(|e| format!("{e:#}"))?;
+        crate::app::post_settings_save(
             owner_raw,
-            crate::config_writer::JobSpec {
+            crate::app::SettingsSave {
                 changes,
-                secrets: Some(edited.clone()),
-                saved: "Settings saved".to_string(),
-                failed: "Couldn't save settings".to_string(),
-                hint: String::new(),
+                original: original.clone(),
+                edited: edited.clone(),
             },
-        );
-        Ok(())
+        )
     }));
     let raw = Box::into_raw(inner);
 
     let class_name = wide_z(class);
     let title = wide_z("Wingman settings");
+    // See `FREED_BY_WINDOW`: forget a stale answer before creating.
+    FREED_BY_WINDOW.with(|c| c.set(0));
 
     // 96dpi guess for the very first CreateWindowExW call, before we have an
     // HWND to ask GetDpiForWindow about -- corrected immediately below, same
@@ -190,8 +194,13 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     let hwnd = match create_result {
         Ok(hwnd) => hwnd,
         Err(_) => {
-            unsafe {
-                drop(Box::from_raw(raw));
+            // Windows destroys a window whose creation failed after
+            // `WM_NCCREATE`, and `WM_NCDESTROY` has already freed the box then.
+            // Freeing it again here would be a double free.
+            if FREED_BY_WINDOW.with(|c| c.replace(0)) != raw as usize {
+                unsafe {
+                    drop(Box::from_raw(raw));
+                }
             }
             return false;
         }
@@ -339,6 +348,13 @@ pub fn close_now() {
 pub fn is_foreground() -> bool {
     let open = OPEN_HWND.load(Ordering::SeqCst);
     open != 0 && unsafe { GetForegroundWindow() }.0 as isize == open
+}
+
+thread_local! {
+    /// The address of the `SettingsInner` the window procedure freed in
+    /// `WM_NCDESTROY` (0: none). `open_impl` reads it when `CreateWindowExW`
+    /// fails, to know whether the window already took the box with it.
+    static FREED_BY_WINDOW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Process-wide guard: 0 when no settings window is open, else the open
@@ -622,6 +638,18 @@ struct SettingsInner {
 /// keeps the window open.
 type SaveSink = Box<dyn Fn(&Config, &Config) -> Result<(), String>>;
 
+/// Counts the `SettingsInner` values dropped, so a test can tell a double free
+/// from a single one.
+#[cfg(test)]
+static INNERS_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+impl Drop for SettingsInner {
+    fn drop(&mut self) {
+        INNERS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl SettingsInner {
     fn new(original: Config) -> Self {
         SettingsInner {
@@ -807,6 +835,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let result = DefWindowProcW(hwnd, msg, wparam, lparam);
             if owned {
                 // `inner` is not used again: this is the window's last message.
+                FREED_BY_WINDOW.with(|c| c.set(ptr as usize));
                 drop(Box::from_raw(ptr));
             }
             result
@@ -9782,6 +9811,110 @@ mod tests {
                 "closing must tell the owner, or a waiting card never shows"
             );
         });
+    }
+
+    /// #871 wired-to-nothing: Save in the real window posts the changed fields
+    /// (and only those) to the owner as `WM_APP_SETTINGS_SAVE`, then closes. If the
+    /// sink were not the production one, or the post were dropped, nothing would
+    /// reach the writer and no card would ever say "Settings saved".
+    #[test]
+    fn save_posts_only_the_changed_fields_to_the_owner_and_closes() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
+        with_open_window(|hwnd, owner| {
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            let posted = take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE)
+                .expect("Save must post the save to the owner window");
+            let save = unsafe { *Box::from_raw(posted.lParam.0 as *mut crate::app::SettingsSave) };
+            let paths: Vec<String> = save.changes.iter().map(|c| c.path().join(".")).collect();
+            assert_eq!(paths, vec!["ui.card_seconds"]);
+            assert_eq!(save.edited.ui.card_seconds, 42);
+            assert!(
+                !unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "Save closes the window"
+            );
+        });
+    }
+
+    /// #871 finding 7: Windows destroys a window whose creation fails after
+    /// `WM_NCCREATE`, and the window procedure already freed the state then. The
+    /// failure path must not free it a second time.
+    #[test]
+    fn a_window_that_fails_to_create_after_nccreate_frees_its_state_exactly_once() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::WM_CREATE;
+        const FAIL_CLASS: &str = "Wingman.Settings.Test.FailCreate.2c8e51d7";
+        unsafe extern "system" fn fail_create(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_CREATE {
+                return LRESULT(-1);
+            }
+            wndproc(hwnd, msg, wparam, lparam)
+        }
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let class = wide_z(FAIL_CLASS);
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(fail_create),
+                hInstance: instance,
+                lpszClassName: PCWSTR(class.as_ptr()),
+                ..Default::default()
+            };
+            assert!(unsafe { RegisterClassExW(&wc) } != 0);
+        });
+        let before = INNERS_DROPPED.load(Ordering::SeqCst);
+        let opened = open_impl(
+            instance,
+            HWND(std::ptr::null_mut()),
+            &Config::default(),
+            FAIL_CLASS,
+            false,
+        );
+        assert!(!opened, "the window cannot be created");
+        assert_eq!(
+            INNERS_DROPPED.load(Ordering::SeqCst) - before,
+            1,
+            "the window state must be freed once, not twice"
+        );
+        assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0, "no guard is left set");
+    }
+
+    /// The same failure before `WM_NCCREATE` (the class does not exist): the
+    /// window never saw the state, so `open_impl` frees it, once.
+    #[test]
+    fn a_window_that_fails_before_nccreate_is_freed_once_by_the_caller() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let before = INNERS_DROPPED.load(Ordering::SeqCst);
+        let opened = open_impl(
+            HINSTANCE(h.0),
+            HWND(std::ptr::null_mut()),
+            &Config::default(),
+            "Wingman.Settings.Test.NoSuchClass.91b4",
+            false,
+        );
+        assert!(!opened);
+        assert_eq!(INNERS_DROPPED.load(Ordering::SeqCst) - before, 1);
     }
 
     /// #871: Esc in the open window is taken by `pre_dispatch` and becomes a

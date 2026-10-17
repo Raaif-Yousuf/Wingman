@@ -46,6 +46,7 @@ use crate::hotkey::{
     WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
+use crate::options_keys::{self, Choice, WM_APP_OPTIONS_CHOICE};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::ollama_admin::{self, FirstRun};
 use crate::provider::{
@@ -54,7 +55,8 @@ use crate::provider::{
 };
 use crate::router;
 use crate::ui::card::{
-    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+    Card, OptionRow, OptionsBehavior, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS,
+    WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
 };
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
@@ -111,12 +113,10 @@ pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
 /// #24: posted by the intent router's worker thread when its classification
 /// call finishes (success or failure). `lparam` is
 /// `Box::into_raw(Box::new((u64, Result<router::RouterResult, String>)))` --
-/// the `u64` is the generation the request was built for
-/// (`Palette::router_generation()`, read right after `Palette::show`), so
-/// the handler can tell a result for an already-hidden-or-reshown palette
-/// from one for the session still on screen (`router::is_stale`, applied
-/// inside `Palette::apply_router_suggestion`). The receiver takes ownership
-/// and must reconstruct the `Box` to free it. `WM_APP + 14`: `+9` through
+/// the `u64` is the generation of the options card (#307) the request was
+/// started for, so the handler can tell a result for a card that is gone or
+/// replaced from one for the card still on screen (`App::on_router_result`).
+/// The receiver takes ownership and must reconstruct the `Box` to free it. `WM_APP + 14`: `+9` through
 /// `+13` are already `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/
 /// `WM_APP_PALETTE_RUN`/`WM_APP_REVIEW_RESULT`/`WM_APP_FORM_FILL_RESULT`.
 pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
@@ -163,19 +163,27 @@ pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
 
 /// #870: posted by the `settings-writer` thread (`config_writer`) when a change
 /// to `config.toml` has been written or refused. `lparam` is
-/// `Box::into_raw(Box::new(config_writer::WriteReply))`; the handler takes
-/// ownership, re-reads the file (so a hand edit made meanwhile is picked up) and
-/// shows the result. The file and `icacls` work runs off the message thread,
-/// which also hosts the keyboard hook. `WM_APP + 23`: `+22` is
+/// `Box::into_raw(Box::new(config_writer::Written))`; the handler takes
+/// ownership and swaps in the config the writer thread re-read from the file (so
+/// a hand edit made meanwhile is picked up) and shows the result. The file,
+/// Credential Manager and `icacls` work all runs off the message thread, which
+/// also hosts the keyboard hook. `WM_APP + 23`: `+22` is
 /// `WM_APP_EXECUTOR_DONE`.
-pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 23;
+pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 24;
 
 /// #871: posted by the Settings window to the owner window when it loses the
 /// foreground and when it closes. Settings is not modal any more, so nothing
 /// else tells `App` that a card which had to wait (a finished request, a press
-/// of the Wingman key) can now be shown. No payload. `WM_APP + 24`: `+23` is
-/// `WM_APP_CONFIG_WRITTEN`.
-pub const WM_APP_SETTINGS_LEFT: u32 = WM_APP + 24;
+/// of the Wingman key) can now be shown. No payload. `WM_APP + 26`: `+25` is
+/// `WM_APP_CARD_REPORT_PROBLEM`.
+pub const WM_APP_SETTINGS_LEFT: u32 = WM_APP + 26;
+
+/// #871: posted by the Settings window to the owner window when Save is pressed.
+/// `lparam` is `Box::into_raw(Box::new(SettingsSave))`; the handler takes
+/// ownership and hands the changes to the writer thread through the same path
+/// every tray change takes (`App::persist_changes_with`), so the count of writes
+/// in flight, the reload and the cards are all kept in one place. `WM_APP + 27`.
+pub const WM_APP_SETTINGS_SAVE: u32 = WM_APP + 27;
 
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
@@ -317,6 +325,109 @@ const PAUSE_TIMER_ID: usize = 1;
 /// the run has outlasted `provider::worst_case_run_secs` for its chain.
 const STUCK_TIMER_ID: usize = 4;
 
+/// #307: the options card on screen, as the app side knows it. The card holds
+/// the buttons; this holds what each one runs. Its `generation` must equal the
+/// card's own before anything the card says is acted on.
+struct OptionsSession {
+    generation: u32,
+    /// The action id each button runs, in order. Empty while the router works.
+    ids: Vec<String>,
+    /// The catalogue the router's answer is checked against and topped up from.
+    /// Only held while the router works.
+    catalogue: Vec<palette_model::PaletteAction>,
+}
+
+/// What an options-card choice message asks for, once checked against the card
+/// and the session it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptionsChoiceAction {
+    /// Stale, malformed, or nothing to run yet: do nothing.
+    Ignore,
+    /// Esc: close the card, run nothing.
+    Close,
+    /// Run this action id.
+    Run(String),
+}
+
+/// Decides what a `WM_APP_OPTIONS_CHOICE` (`wparam` choice, `lparam`
+/// generation) does. Pure, so the stale cases are tested without a window:
+/// a choice runs only when the card on screen and the session both carry the
+/// generation the choice was made on, and a pick names a button that exists.
+fn options_choice_action(
+    wparam: usize,
+    lparam: isize,
+    card_generation: Option<u32>,
+    session: Option<&OptionsSession>,
+) -> OptionsChoiceAction {
+    let generation = (lparam as u32) & options_keys::GENERATION_MASK;
+    let Some(choice) = Choice::from_wparam(wparam) else {
+        return OptionsChoiceAction::Ignore;
+    };
+    let Some(session) = session else {
+        return OptionsChoiceAction::Ignore;
+    };
+    if card_generation != Some(generation) || session.generation != generation {
+        return OptionsChoiceAction::Ignore;
+    }
+    match choice {
+        Choice::Dismiss => OptionsChoiceAction::Close,
+        Choice::Pick(n) => match session.ids.get(n.saturating_sub(1)) {
+            Some(id) => OptionsChoiceAction::Run(id.clone()),
+            // No buttons yet: the router is still working.
+            None => OptionsChoiceAction::Ignore,
+        },
+    }
+}
+
+/// The keyboard layout (`HKL`) of the thread that owns the foreground window,
+/// as an integer; `0` when there is no foreground window (not a CJK layout, so
+/// the claim stays as configured).
+fn foreground_keyboard_layout() -> usize {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return 0;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(fg, None) };
+    unsafe { GetKeyboardLayout(thread) }.0 as usize
+}
+
+/// The foreground window as an integer (`0` = none) and whether it belongs to
+/// this process (the card, the palette, Settings): the claim cannot follow
+/// either of those.
+fn foreground_window_and_ownership() -> (isize, bool) {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return (0, false);
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    (fg.0 as isize, pid == unsafe { GetCurrentProcessId() })
+}
+
+/// Whether a choice leaves the card up with its claim spent, so the claim must
+/// be put back. A choice that closes the card or runs an action ends the card
+/// and needs nothing.
+fn rearm_after(decided: &OptionsChoiceAction) -> bool {
+    matches!(decided, OptionsChoiceAction::Ignore)
+}
+
+/// #307: the card's buttons for a ranked shortlist: the action id each runs and
+/// the label it shows.
+fn option_rows(options: &[router::RouterOption]) -> Vec<OptionRow> {
+    options
+        .iter()
+        .take(options_keys::MAX_OPTIONS)
+        .map(|o| OptionRow {
+            id: o.intent.clone(),
+            label: o.label.clone(),
+        })
+        .collect()
+}
+
 struct App {
     /// Kept so the settings window can be created on demand.
     instance: HINSTANCE,
@@ -328,6 +439,21 @@ struct App {
     /// doc comment.
     taskbar_created_msg: u32,
     config: Config,
+    /// #870: changes made in memory whose write to `config.toml` failed. They
+    /// are live until quit; a reload after a later successful write puts them
+    /// back on the loaded config instead of silently reverting them.
+    unsaved: Vec<crate::config_writer::FieldChange>,
+    /// #870: writes handed to the writer thread whose reply has not come back.
+    /// Only the last reply swaps in the loaded config; an earlier one was read
+    /// before a later choice was made.
+    pending_writes: Arc<std::sync::atomic::AtomicU32>,
+    /// #871: Settings saves among those writes whose answer has not been applied
+    /// yet. Until it is, the running config is the one from before the save, so a
+    /// press of the Wingman key is refused (`settings_hold_card`) rather than run
+    /// on settings the user has just changed.
+    settings_saves: Arc<std::sync::atomic::AtomicU32>,
+    /// #870: the newest good load an earlier (not last) reply left unadopted.
+    skipped_mtime: Option<Option<std::time::SystemTime>>,
     /// #339: whether a password manager was in front before Wingman's own UI
     /// (the tray menu, the palette) took the foreground. Set only around a
     /// dispatch from that UI and cleared right after, so it never leaks into
@@ -336,10 +462,16 @@ struct App {
     password_manager_hint: bool,
     /// #567: the pulled Ollama models, refreshed off the UI thread.
     ollama_models: OllamaModelCache,
-    /// #339: the palette's own answer, taken in `toggle_palette` before it
-    /// showed. Read only when the palette runs an action, so a stale value
-    /// from an earlier session can never apply: every open overwrites it.
+    /// #339: the picker's own answer, taken in `toggle_palette` before the
+    /// palette showed. Read only when a picker (the palette, the options card)
+    /// runs an action, so a stale value from an earlier session can never
+    /// apply: every open overwrites it, and the options card clears it.
     palette_password_manager: bool,
+    /// #307: the options card on screen, if any. Checked against the card's
+    /// own generation before anything it says is acted on.
+    options: Option<OptionsSession>,
+    /// #307: the generation of the latest options card, bumped on every show.
+    options_generation: u32,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -516,7 +648,27 @@ pub fn run() -> Result<()> {
         .name("ics-startup-sweep".into())
         .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
 
-    let config = Config::load().unwrap_or_default();
+    // #831: read before `Config::load`, which creates the file on a first
+    // run. If the path cannot be found, say it existed: no welcome is the
+    // safe side.
+    let config_existed = Config::path().map(|p| p.exists()).unwrap_or(true);
+    // #924: a load that failed (the first-run file could not be written) runs
+    // on default settings (Auto mode, stored and env keys still loaded) and the
+    // card below says why.
+    let (config, create_failed) = match Config::load() {
+        Ok(config) => (config, None),
+        Err(e) => {
+            let config = Config::defaults_after_failed_load();
+            let folder = Config::path()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_else(|| "the Wingman settings folder".to_string());
+            (
+                config,
+                Some((folder, humanize_error_chain(&worker_error_chain_text(&e)))),
+            )
+        }
+    };
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
     // yet, but `--settings`'s `open_settings` path below can still save,
@@ -568,6 +720,9 @@ pub fn run() -> Result<()> {
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
         config.load_problem.as_deref(),
+        create_failed
+            .as_ref()
+            .map(|(folder, error)| (folder.as_str(), error.as_str())),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -583,6 +738,10 @@ pub fn run() -> Result<()> {
         instance,
         taskbar_created_msg,
         config,
+        unsaved: Vec::new(),
+        pending_writes: Arc::default(),
+        settings_saves: Arc::default(),
+        skipped_mtime: None,
         chain,
         card,
         palette,
@@ -592,6 +751,8 @@ pub fn run() -> Result<()> {
         password_manager_hint: false,
         ollama_models: OllamaModelCache::default(),
         palette_password_manager: false,
+        options: None,
+        options_generation: 0,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -679,6 +840,22 @@ pub fn run() -> Result<()> {
         app.card.show_error_with_details(&headline, &detail);
     }
 
+    // #831: after every startup problem card above, so it never replaces one.
+    // No model call: this is text only.
+    let opens_settings = crate::single_instance::first_launch_action(std::env::args())
+        == crate::single_instance::FirstLaunchAction::OpenSettings;
+    let other_card = !matches!(app.card.state(), crate::ui::card::CardState::Hidden);
+    let welcome = match (Config::path(), Config::old_path()) {
+        (Ok(path), Ok(old)) => {
+            should_show_welcome(&path, &old, config_existed, opens_settings, other_card)
+        }
+        _ => false,
+    };
+    if welcome {
+        let (headline, detail) = welcome_card(&chord_to_string(&app.config.hotkeys.secondary));
+        app.card.show_settings_needed(&headline, &detail);
+    }
+
     // Non-fatal: without it the card still auto-dismisses on its timer.
     app.watcher = ClickWatcher::install(hwnd).ok();
 
@@ -715,6 +892,7 @@ fn startup_card(
     unreadable: &[String],
     lock_squatted: bool,
     config_problem: Option<&str>,
+    create_failed: Option<(&str, &str)>,
 ) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
@@ -725,6 +903,9 @@ fn startup_card(
     let mut cards = Vec::new();
     if let Some(problem) = config_problem {
         cards.push(config_problem_card(problem));
+    }
+    if let Some((folder, error)) = create_failed {
+        cards.push(settings_create_failed_card(folder, error));
     }
     if !unreadable.is_empty() {
         cards.push(unreadable_secrets_card(unreadable));
@@ -740,6 +921,38 @@ fn startup_card(
     Some((headline, detail))
 }
 
+/// #831: whether to show the welcome card. A bare launch must not ask a
+/// model, and the login autostart is a bare launch too, so the only "first
+/// time" signal is the config file: absent before this start's
+/// `Config::load` AND present after it (this start created it, which is what
+/// remembers it). A folder that cannot be written leaves no file, so the card
+/// never repeats (#879). A leftover pre-rename `copilot-ask` config means a
+/// returning user whose migration did not finish. Also skipped when
+/// `--settings` is already opening Settings or a startup problem card shows.
+/// It reads only paths and flags, so a check that cannot run shows no card.
+fn should_show_welcome(
+    config_path: &std::path::Path,
+    old_path: &std::path::Path,
+    existed_before: bool,
+    opens_settings: bool,
+    other_card: bool,
+) -> bool {
+    !existed_before && config_path.exists() && !old_path.exists() && !opens_settings && !other_card
+}
+
+/// #831: the first-launch welcome card. `secondary` is the display form of
+/// the second hotkey. Shown through the settings-needed card, so a click
+/// opens Settings. No em dash (rule 11).
+pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
+    (
+        "Wingman is running".to_string(),
+        format!(
+            "Press the Copilot key or {secondary}. If you do not see the icon, look under Show hidden icons in the tray and \
+             drag it out to keep it in view. Click here to open Settings."
+        ),
+    )
+}
+
 /// #793: whether `mode` may be switched on while the config file's state is
 /// `load_problem`. A file that did not parse starts the run Offline with
 /// default (looser) settings; anything that sends data out must wait until it
@@ -747,6 +960,31 @@ fn startup_card(
 /// read, so the check cannot itself fail open.
 fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
     mode == Mode::Offline || load_problem.is_none()
+}
+
+/// #892: [`config_problem_card`] with where the file is, for the cards that
+/// replace a setup card: the user must be told which file to open.
+fn broken_file_card(problem: &str, config_path: &str) -> (String, String) {
+    let (headline, detail) = config_problem_card(problem);
+    (
+        headline,
+        format!("{detail}\n\nThe file is here (tray menu, Open config.toml):\n{config_path}"),
+    )
+}
+
+/// #892: [`App::readiness_gate`], except that when config.toml did not parse
+/// the blocked card names the file instead of the mode's setup text.
+fn setup_gate(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+    load_problem: Option<&str>,
+) -> Option<(String, String)> {
+    let blocked = App::readiness_gate(mode, providers, config_path)?;
+    Some(match load_problem {
+        Some(problem) => broken_file_card(problem, config_path),
+        None => blocked,
+    })
 }
 
 /// #711: config.toml exists but did not parse. Names the line and column
@@ -758,6 +996,26 @@ fn config_problem_card(problem: &str) -> (String, String) {
             "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
              computer) and will not save over your file. Fix it, then choose Reload settings \
              from the tray menu."
+        ),
+    )
+}
+
+/// #924: the first launch could not create config.toml (folder not writable,
+/// the permission step blocked). Names the folder and the cause, capped so a
+/// long `icacls` message cannot fill the card. No em dash (rule 11).
+fn settings_create_failed_card(folder: &str, error: &str) -> (String, String) {
+    let error: String = error.trim().chars().take(240).collect();
+    let cause = if error.is_empty() {
+        String::new()
+    } else {
+        format!(" ({error})")
+    };
+    (
+        "Settings file not created".to_string(),
+        format!(
+            "Wingman could not create its settings file in {folder}{cause}. It is using default \
+             settings (Auto mode) for this session, so a key you paste in Settings will not be kept. Fix the \
+             folder, then restart Wingman."
         ),
     )
 }
@@ -903,6 +1161,20 @@ fn first_run_adopted_card(
     ("Using Ollama on this PC".to_string(), detail)
 }
 
+/// #892: the detail the first-run card shows. The probe's Ollama text is only
+/// for a setup that is merely empty; when config.toml did not parse, the card
+/// is the broken-file one and must keep saying so.
+fn first_run_card_detail(
+    gate_detail: String,
+    found: &FirstRun,
+    load_problem: Option<&str>,
+) -> String {
+    if load_problem.is_some() {
+        return gate_detail;
+    }
+    first_run_detail(found).unwrap_or(gate_detail)
+}
+
 /// #133: the readiness card's detail when Ollama is running but has nothing
 /// that can read the screen; `None` leaves the usual card alone. The card
 /// already opens Settings, where the model can be downloaded.
@@ -935,9 +1207,11 @@ fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
     use crate::ui::card::CardState;
     match card {
         // Never cover a card the user may be reading, or one waiting on them.
-        CardState::Pending | CardState::Preview | CardState::Collapsed | CardState::Expanded => {
-            BusyPress::Leave
-        }
+        CardState::Pending
+        | CardState::Preview
+        | CardState::Collapsed
+        | CardState::Expanded
+        | CardState::Options => BusyPress::Leave,
         CardState::Hidden => BusyPress::ShowStillWorking,
     }
 }
@@ -1132,9 +1406,12 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let Some((headline, mut detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        else {
+        let Some((headline, mut detail)) = setup_gate(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        ) else {
             let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
             if should_hide_after_first_run(pending, self.busy) {
                 self.card.hide();
@@ -1146,31 +1423,44 @@ impl App {
             .providers
             .first_run_local_eligible(self.config.mode);
         if let (FirstRun::Found { model, kind }, true) = (&found, eligible) {
+            let before = self.config.clone();
             let base_url = ollama_admin::first_run_base_url(&self.config.providers.ollama.base_url)
                 .unwrap_or_else(|| self.config.providers.ollama.base_url.clone());
             self.config.providers.adopt_local_model(model, &base_url);
             self.chain = Arc::new(self.config.build_chain());
-            let saved = self.config.save();
             self.refresh_tray_labels();
             let (title, text) = first_run_adopted_card(model, *kind);
-            match saved {
-                Ok(()) => self.card.show_answer(&title, &text, 8, None),
-                Err(e) => {
-                    let headline = format!("{title}: not saved");
-                    let human = self.track_error(&headline, &format!("{e:#}"));
-                    self.card.show_error_with_details(
-                        &headline,
-                        &format!("It will revert when you quit.\n\n{human}"),
-                    );
-                }
-            }
+            let mut outcome = crate::config_writer::Outcome::simple(&title);
+            outcome.ok_detail = text;
+            outcome.ok_secs = 8;
+            outcome.fail_headline = format!("{title}: not saved");
+            self.persist_diff(&before, outcome);
             self.set_watch(true);
             return;
         }
-        if let Some(d) = first_run_detail(&found) {
-            detail = d;
+        detail = first_run_card_detail(detail, &found, self.config.load_problem.as_deref());
+        self.show_setup_card(&headline, &detail);
+    }
+
+    /// #806: the first press that would ask an Ollama that is not on this PC
+    /// shows a card saying where the screenshot goes, instead of sending it.
+    /// Returns `true` when it did (the caller must stop). The address is
+    /// remembered, so the next press goes through; 127.0.0.1 never shows it.
+    fn show_remote_ollama_notice(&mut self) -> bool {
+        let selected = self
+            .config
+            .providers
+            .selected_order_for_mode(self.config.mode, true);
+        if !crate::remote_ollama::notice_applies(self.config.mode, &selected) {
+            return false;
         }
-        self.card.show_settings_needed(&headline, &detail);
+        let Some((headline, detail)) =
+            crate::remote_ollama::take_notice(&self.config.providers.ollama.base_url)
+        else {
+            return false;
+        };
+        self.show_setup_card(&headline, &detail);
+        true
     }
 
     /// #339: a password manager is in front now, or was when Wingman's own
@@ -1247,6 +1537,11 @@ impl App {
         plan: BeginPlan,
         extra: impl FnOnce(&mut Self) -> Option<T>,
     ) -> Option<(Option<capture::RawShot>, isize, T)> {
+        // #871: never on settings that are about to change, and never over the
+        // window being typed in.
+        if self.refuse_for_settings() {
+            return None;
+        }
         match model_action_gate(self.busy_now(), pause::is_paused_now()) {
             ModelActionGate::Busy => {
                 self.show_busy_card();
@@ -1282,8 +1577,13 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-            .filter(|_| plan.require_provider);
+        let blocked = setup_gate(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        )
+        .filter(|_| plan.require_provider);
         if let Some((headline, detail)) = blocked {
             // #133: nothing is set up. Look for a local Ollama on a worker
             // (never here: this is the keyboard hook's thread), once per
@@ -1291,7 +1591,12 @@ impl App {
             if self.start_first_run_probe() {
                 return None;
             }
-            self.card.show_settings_needed(&headline, &detail);
+            self.show_setup_card(&headline, &detail);
+            return None;
+        }
+
+        // #806: before anything is captured or sent.
+        if plan.asks_model && self.show_remote_ollama_notice() {
             return None;
         }
 
@@ -1480,6 +1785,10 @@ impl App {
     /// is greyed while paused, but this guard is the one place both of
     /// those paths (plus any future caller) actually converge, so it stays
     /// here rather than trusting every caller to check first.
+    ///
+    /// #805: opening the palette sends nothing. No capture, no model request:
+    /// the screen is read only after the user picks an action or types
+    /// something, by that action's own flow.
     fn toggle_palette(&mut self) {
         if self.palette.is_visible() {
             self.palette.hide();
@@ -1489,25 +1798,9 @@ impl App {
             return;
         }
 
-        // #506: the window under the palette, read before the palette takes
-        // the foreground. The router's capture looks for password fields
-        // there, not in Wingman's own palette.
-        let underlying =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
-        let resolved = match actions::load_actions_report() {
-            Ok(report) => {
-                self.show_skipped_notice(&report);
-                report.actions
-            }
-            Err(e) => {
-                actions::queue_skipped(&[]);
-                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't load actions.toml", &detail);
-                return;
-            }
+        let Some(catalogue) = self.load_catalogue(true) else {
+            return;
         };
-        let catalogue = palette_model::catalogue(&resolved);
 
         // Same mode-aware, network-free "is anything configured" selection
         // `ask()`'s `readiness_gate` and `worker`'s downscale-limit lookup
@@ -1524,91 +1817,182 @@ impl App {
             self.first_provider_model_label().as_deref(),
         );
 
-        // #24: candidates are built from the SAME catalogue about to be
-        // shown, before it moves into `Palette::show` below.
-        let candidates = router::candidates_from_catalogue(&catalogue);
-        // #339: asked BEFORE the palette takes the foreground. The router
-        // sends a screenshot, so it must not run over a password manager.
-        let password_manager_in_front = self.password_manager_now();
-        self.palette_password_manager = password_manager_in_front;
+        // #339: asked BEFORE the palette takes the foreground.
+        self.palette_password_manager = self.password_manager_now();
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates, password_manager_in_front, underlying);
     }
 
-    /// #24: the intent router's hook, called right after
-    /// [`App::toggle_palette`]'s `Palette::show` -- the palette is already
-    /// visible and painted by the time this runs (`Palette::show` forces a
-    /// synchronous first paint), so nothing here can add to the palette's
-    /// own sub-100ms show latency; only the eventual card-free suggestion
-    /// arrives late. Mirrors `App::ask`'s own capture-on-main-thread-then-
-    /// spawn ordering.
+    /// The actions a picker (the palette, the options card) chooses from: the
+    /// built-ins and `actions.toml`, as `palette_model::catalogue` builds
+    /// them. A broken `actions.toml` shows its own card and returns `None`.
+    /// `notify` also shows the once-per-change "some actions were skipped"
+    /// card; the options card passes `false` so that card is not drawn over
+    /// by the options it is about to show, and the palette still shows it.
+    fn load_catalogue(&mut self, notify: bool) -> Option<Vec<palette_model::PaletteAction>> {
+        match actions::load_actions_report() {
+            Ok(report) => {
+                if notify {
+                    self.show_skipped_notice(&report);
+                }
+                Some(palette_model::catalogue(&report.actions))
+            }
+            Err(e) => {
+                actions::queue_skipped(&[]);
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
+                None
+            }
+        }
+    }
+
+    /// How the options card behaves, from `[options]`. One press of the key
+    /// does not run option 1 yet (the bare key still runs Check my work), so
+    /// no row is drawn as the default.
+    fn options_behavior(&self) -> OptionsBehavior {
+        // Read once: the claim follows this window for the card's whole life.
+        let (fg, fg_is_own) = foreground_window_and_ownership();
+        OptionsBehavior {
+            dismiss_secs: self.config.options.card_dismiss_secs(),
+            // Off under a CJK input method: its digits pick candidates, so
+            // the card must not eat them. Read on this thread, once, while
+            // the user's window is still in front.
+            claim_keys: options_keys::claim_enabled(
+                self.config.options.claim_keys,
+                foreground_keyboard_layout(),
+                options_keys::foreground_usable(fg, fg_is_own),
+            ),
+            key_runs_first: false,
+            foreground: fg,
+        }
+    }
+
+    /// #307: the options card, from the tray item "What can I do here?". The
+    /// screen is captured first (on this thread, small, before the card
+    /// exists, so the card is never in it), then the card shows at once as a
+    /// shell ("Looking at your screen") while the router works, and its
+    /// buttons drop in when the answer arrives. With no model ready the router
+    /// never runs and the card is the static list of actions that need none.
     ///
-    /// A silent no-op (never a card, never a hint) when: Paused; no
-    /// provider is ready at all (the cheap, optimistic "is anything
-    /// configured" check `ask`'s `readiness_gate` also uses); or the
-    /// screenshot capture fails. Issue #24's "skip entirely when no
-    /// provider is ready (no hint needed)" applies to every one of these --
-    /// the router is a background convenience, never something whose
-    /// failure the user is told about (rule 7's "every failure ends in a
-    /// card" is about the action the user actually asked for; the router
-    /// never was one).
-    fn maybe_start_router(
-        &mut self,
-        candidates: Vec<router::RouterCandidate>,
-        password_manager_in_front: bool,
-        underlying_window: isize,
-    ) {
-        if pause::is_paused_now() || password_manager_in_front {
+    /// Gates, in order: busy, paused, a password manager in front (the
+    /// capture-gate card is shown instead, and nothing is captured). A router
+    /// failure of any kind is not an error card: the card shows the floor.
+    /// Nothing runs until a row is picked ([`App::on_options_choice`]).
+    fn show_options_card(&mut self, trigger: Trigger) {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
+        }
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+            return;
+        }
+        // #339: before the card is touched and before anything is read.
+        if self.refuse_if_password_manager() {
+            return;
+        }
+        let Some(catalogue) = self.load_catalogue(false) else {
+            return;
+        };
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            self.set_watch(false);
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
-        let optimistic_ready = !providers
+        // The same optimistic, network-free "is anything configured" check
+        // `ask`'s readiness gate uses: configured, not reachable right now.
+        let model_ready = !providers
             .build_chain_for_mode(mode, true)
             .ready_provider_names()
             .is_empty();
-        if !optimistic_ready {
+        self.options_generation = options_keys::next_generation(self.options_generation);
+        let generation = self.options_generation;
+        let behavior = self.options_behavior();
+
+        if !model_ready {
+            let content = router::options_content(None, &catalogue, false);
+            let rows = option_rows(&content.options);
+            self.options = Some(OptionsSession {
+                generation,
+                ids: rows.iter().map(|r| r.id.clone()).collect(),
+                catalogue: Vec::new(),
+            });
+            self.card
+                .show_options(generation, &content.summary, &rows, behavior);
+            self.set_watch(true);
             return;
         }
 
-        // #24: a heavily downscaled capture -- see `router::ROUTER_IMAGE_LONG_EDGE`'s
-        // doc comment for why this is far smaller than the real action's
-        // capture. Runs on the MAIN thread (Win32 capture must not run on a
-        // worker thread, same constraint `ask` documents at its own capture
-        // call site); encoding to PNG happens below, on the worker thread,
-        // exactly like `ask` defers its own (more expensive) encode.
-        let mut raw = match capture::grab_raw_for(
+        // #918: the router sends the screenshot too, and does not go through
+        // `begin_action`, so it asks the same remote-Ollama question: the
+        // first time for an address that is not on this PC, show the card
+        // and send nothing.
+        if self.show_remote_ollama_notice() {
+            return;
+        }
+
+        // A heavily downscaled capture, see `router::ROUTER_IMAGE_LONG_EDGE`.
+        // Grabbed on the main thread (Win32 capture must not run on a worker);
+        // the PNG encode happens on the worker.
+        let raw = match capture::grab_raw_for(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
             capture::LookupWindow::when(
                 capture::needs_password_lookup(self.config.capture.redact, &providers, mode),
-                capture::LookupWindow::Window(underlying_window),
+                capture::LookupWindow::Foreground,
             ),
             &self.config.capture.extra_password_managers,
         ) {
             Ok(r) => r,
-            Err(_) => return,
+            Err(e) => {
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
+                return;
+            }
         };
 
-        let generation = self.palette.router_generation();
+        let candidates = router::candidates_from_catalogue(&catalogue);
+        self.options = Some(OptionsSession {
+            generation,
+            ids: Vec::new(),
+            catalogue,
+        });
+        self.card
+            .show_options(generation, router::LOOKING_SUMMARY, &[], behavior);
+        self.set_watch(true);
+        self.start_options_router(raw, candidates, generation, trigger);
+    }
+
+    /// Starts the router for the options card showing `generation`. The call
+    /// runs on its own thread so the wait can be capped: past
+    /// `ROUTER_WALL_CLOCK` the card gets the floor and a late answer is
+    /// dropped with the channel. The result always arrives as
+    /// `WM_APP_ROUTER_RESULT`, a failure included.
+    fn start_options_router(
+        &mut self,
+        mut raw: capture::RawShot,
+        candidates: Vec<router::RouterCandidate>,
+        generation: u32,
+        trigger: Trigger,
+    ) {
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
         let limits = self.config.options.router_limits();
 
-        // #359: a request is actually starting now (every earlier bail-out
-        // above -- Paused, no ready provider, capture failure -- must never
-        // reach this line), so show the placeholder instead of leaving the
-        // reserved summary band blank until the result arrives.
-        self.palette.set_router_pending(generation);
-
         std::thread::spawn(move || {
-            // The call runs on its own thread so the wait can be capped: past
-            // `ROUTER_WALL_CLOCK` the placeholder is cleared and the late
-            // answer, if any, is dropped with the channel.
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                // #236: the egress row this call writes names its trigger.
+                crate::activation::set_worker_trigger(trigger);
                 let result: std::result::Result<router::RouterResult, String> =
                     catch_worker(|| {
                         router_worker(&providers, mode, &mut raw, redact, &candidates, limits)
@@ -1629,7 +2013,7 @@ impl App {
                         "router: no answer within the wall-clock cap",
                     ))
                 });
-            let payload = Box::into_raw(Box::new((generation, result)));
+            let payload = Box::into_raw(Box::new((u64::from(generation), result)));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
@@ -1646,29 +2030,94 @@ impl App {
         });
     }
 
-    /// #24: applies (or drops) the router's result against the palette's
-    /// CURRENT session. `Palette::apply_router_suggestion` performs the
-    /// actual staleness/threshold/interacted decision (`crate::router`'s
-    /// pure functions) -- this method only unwraps the worker's `Result`
-    /// and reads the live threshold from config. An `Err` (the router
-    /// failed, or no provider ended up ready by the time the worker thread
-    /// ran) is silently dropped, never a card -- see `maybe_start_router`'s
-    /// doc comment for why.
+    /// The router answered for the options card showing `generation`: the
+    /// shell becomes the real card. A result for a card that is gone (hidden,
+    /// replaced, or a newer one showing) is dropped. A failure is not a card
+    /// of its own (the router is advisory): the card shows the floor, and the
+    /// reason goes to the diagnostics log.
     fn on_router_result(
         &mut self,
         generation: u64,
         result: std::result::Result<router::RouterResult, String>,
     ) {
-        match result {
-            Ok(result) => {
-                let threshold = self.config.palette.router_threshold;
-                self.palette
-                    .apply_router_suggestion(generation, &result, threshold);
-            }
-            // #359: the request that started the "Looking at your screen..."
-            // placeholder failed -- clear it rather than leaving it stuck.
-            Err(_) => self.palette.clear_router_pending(generation),
+        let Ok(generation) = u32::try_from(generation) else {
+            return;
+        };
+        let looking = self
+            .options
+            .as_ref()
+            .is_some_and(|s| s.generation == generation && s.ids.is_empty());
+        if !looking || self.card.options_generation() != Some(generation) {
+            return;
         }
+        let Some(session) = self.options.take() else {
+            return;
+        };
+        let routed = match result {
+            Ok(r) => Some(r),
+            Err(packed) => {
+                // The human half only: it carries no screen content or key.
+                crate::diagnostics::note_warning(&format!(
+                    "Options card: the router failed, showing the fallback options ({})",
+                    unpack_error(&packed).0
+                ));
+                None
+            }
+        };
+        let content = router::options_content(routed.as_ref(), &session.catalogue, true);
+        let rows = option_rows(&content.options);
+        if self.card.set_options(generation, &content.summary, &rows) {
+            self.options = Some(OptionsSession {
+                generation,
+                ids: rows.iter().map(|r| r.id.clone()).collect(),
+                catalogue: Vec::new(),
+            });
+        }
+    }
+
+    /// The user chose on the options card: a row picked by click or by a
+    /// claimed digit, or Esc. `lparam` is the generation of the card the
+    /// choice was made on; a choice for any other card runs nothing, so a
+    /// click that outlived its card (or a digit typed as the router's answer
+    /// replaced the buttons) cannot run the wrong thing.
+    ///
+    /// A pick hides the card first and lets it settle, exactly as the palette
+    /// does, so the card is never in the screenshot or the OCR input of the
+    /// action it chose, then runs the action through the one dispatch
+    /// ([`App::dispatch_palette_action`]). Everything that writes goes through
+    /// that action's own preview and waits for Enter.
+    fn on_options_choice(&mut self, wparam: usize, lparam: isize) {
+        let decided = options_choice_action(
+            wparam,
+            lparam,
+            self.card.options_generation(),
+            self.options.as_ref(),
+        );
+        match decided {
+            // The hook spent the claim taking this key, but the card is still
+            // up (stale generation, or the buttons were not there yet): put
+            // the claim back so the hint on the card stays true.
+            OptionsChoiceAction::Ignore => {
+                if rearm_after(&decided) {
+                    self.card.rearm_options_claim();
+                }
+            }
+            OptionsChoiceAction::Close => self.close_options_card(),
+            OptionsChoiceAction::Run(id) => {
+                self.close_options_card();
+                std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+                self.palette_password_manager = false;
+                self.dispatch_palette_action(&id);
+            }
+        }
+    }
+
+    /// Hides the options card and forgets it. The card's own `hide` stops the
+    /// key claim and the auto-dismiss.
+    fn close_options_card(&mut self) {
+        self.options = None;
+        self.card.hide();
+        self.set_watch(false);
     }
 
     /// `"<name>:<model>"` for the first entry `self.config.mode` would
@@ -1767,7 +2216,8 @@ impl App {
     /// network). Today's local date is read here, on the main thread, and
     /// handed to the worker.
     fn resolve_dates(&mut self) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
         let today = match local_today_and_utc_offset() {
@@ -2413,6 +2863,18 @@ impl App {
         if actions::action_items::is_empty_result(&action.proposal, &proposal) {
             self.card.show_answer(
                 actions::action_items::NO_ITEMS_HEADLINE,
+                &with_pending_notices(""),
+                0,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
+
+        // #71: no name, email or phone is an answer, not a blank preview.
+        if actions::contact::is_empty_result(&action.proposal, &proposal) {
+            self.card.show_answer(
+                actions::contact::NO_CONTACT_HEADLINE,
                 &with_pending_notices(""),
                 0,
                 None,
@@ -3424,8 +3886,7 @@ impl App {
                 let (headline, detail) = self.empty_chain_card_now();
                 let chain = unpack_error(packed).1.to_string();
                 let _ = self.record_last(Err(pack_error(&headline, &chain)));
-                self.card.show_settings_needed(&headline, &detail);
-                self.set_watch(true);
+                self.show_setup_card(&headline, &detail);
                 return;
             }
         }
@@ -3563,7 +4024,12 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        empty_chain_card(self.config.mode, &self.config.providers, &path)
+        empty_chain_card(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        )
     }
 
     /// #832: for the action result handlers. When the run failed only
@@ -3576,9 +4042,16 @@ impl App {
         }
         let (headline, detail) = self.empty_chain_card_now();
         self.record_run_failure(&headline, &headline, unpack_error(packed).1);
-        self.card.show_settings_needed(&headline, &detail);
-        self.set_watch(true);
+        self.show_setup_card(&headline, &detail);
         true
+    }
+
+    /// #893: the one way to show a setup card. It persists until dismissed, so
+    /// it also arms the click-away hook; a call site that showed it directly
+    /// could forget, and the card would then only go away by a click on it.
+    fn show_setup_card(&mut self, headline: &str, detail: &str) {
+        self.card.show_settings_needed(headline, detail);
+        self.set_watch(true);
     }
 
     fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
@@ -3657,6 +4130,36 @@ impl App {
                 self.card
                     .show_error_with_details("Couldn't copy details", &detail);
             }
+        }
+    }
+
+    /// #373: "Report a problem" on an error card. Opens the browser at a new
+    /// GitHub issue with the version, mode, provider kinds and error class
+    /// filled in (see `report_problem`). Wingman sends nothing: the user reads
+    /// the form and submits it, or closes it. A browser that will not open
+    /// ends in a card (AGENTS.md rule 7), never a silent no-op.
+    fn report_problem(&mut self) {
+        use crate::report_problem::{open_report, Outcome};
+        let chain = self.last_error.as_ref().map(|e| e.chain.as_str());
+        let outcome = open_report(
+            chain,
+            self.config.mode.label(),
+            &self.config.providers.order,
+            &crate::connectors::oauth::ShellBrowser,
+        );
+        match outcome {
+            Outcome::Opened => {}
+            Outcome::NothingToReport => self.card.show_answer(
+                "Nothing to report",
+                "No error details are available.",
+                4,
+                None,
+            ),
+            // Not `track_error`: the recorded error stays the one being
+            // reported, so Copy details and a second report still use it.
+            Outcome::OpenFailed(reason) => self
+                .card
+                .show_error("Couldn't open the browser", &human_error_detail(&reason)),
         }
     }
 
@@ -3857,6 +4360,7 @@ impl App {
             }
             LearnedVerdict::Apply => self.pending_conflict = None,
         }
+        let before = self.config.clone();
         apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
             if which == HK_PAUSE {
@@ -3865,23 +4369,14 @@ impl App {
                 hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
             }
         }
-        let saved = self.config.save();
         self.refresh_tray_labels();
 
         let name = chord_to_string(&chord);
-        match saved {
-            Ok(()) => self
-                .card
-                .show_answer(&format!("Bound to {name}"), "", 4, None),
-            Err(e) => {
-                let headline = format!("Bound to {name}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will work until you quit.\n\n{human}"),
-                );
-            }
-        }
+        let mut outcome = crate::config_writer::Outcome::simple(&format!("Bound to {name}"));
+        outcome.ok_secs = 4;
+        outcome.fail_headline = format!("Bound to {name}: not saved");
+        outcome.fail_note = "It will work until you quit.".to_string();
+        self.persist_diff(&before, outcome);
     }
 
     fn reload(&mut self) {
@@ -3898,6 +4393,9 @@ impl App {
                 // freshly loaded config is the one whose hydrate ran.
                 let unreadable = config.unreadable_secrets.clone();
                 self.config = config;
+                // The file is the truth again; an old failed write must not be
+                // re-applied over it later.
+                self.unsaved.clear();
                 self.apply_config();
                 if unreadable.is_empty() {
                     self.card.show_answer("Settings reloaded", "", 3, None);
@@ -3912,6 +4410,8 @@ impl App {
                     .show_error_with_details("Couldn't reload settings", &detail);
             }
         }
+        // Every card above but "Settings reloaded" persists.
+        self.set_watch(true);
     }
 
     /// Opens the Settings window (or brings the open one to the front).
@@ -3920,9 +4420,13 @@ impl App {
     /// loop of its own and `App` holds no borrow across it, so Quit, the tray,
     /// the pause key and the config writer's answers are all handled on arrival
     /// while it is open. The window saves by sending only the fields the user
-    /// changed to the writer thread (`submit_config_job`); the answer comes back
+    /// changed to the writer thread (`on_settings_save`); the answer comes back
     /// as `WM_APP_CONFIG_WRITTEN`. Cards that would land on the window wait for
     /// `WM_APP_SETTINGS_LEFT` (`on_settings_left`).
+    ///
+    /// Quit with the window open closes it without saving what was typed (the
+    /// same as the modal window did, #673); a Save already pressed is written
+    /// before the process exits (`WM_DESTROY`).
     fn open_settings(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
@@ -3938,8 +4442,10 @@ impl App {
     }
 
     /// Settings lost the foreground or closed (#871): show what waited for it,
-    /// in the order it arrived, then run a press of the Wingman key that came
-    /// in meanwhile. Does nothing while Settings is still in front.
+    /// in the order it arrived. A press of the Wingman key made meanwhile was
+    /// refused with a card at the time (`settings_hold_card`), not kept: running
+    /// it now would bill a request for a screen the user has since left.
+    /// Does nothing while Settings is still in front.
     fn on_settings_left(&mut self) {
         if settings::is_foreground() {
             return;
@@ -3948,8 +4454,39 @@ impl App {
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         self.deliver_deferred(pending);
         self.set_watch(true);
-        if ASK_WAITING_FOR_SETTINGS.with(|c| c.replace(false)) {
-            self.ask(Trigger::Hotkey);
+    }
+
+    /// The Settings window's Save (#871): only the fields the user changed, the
+    /// file patched on the writer thread, then a key (if one was typed) stored in
+    /// Credential Manager after the file write succeeded. Nothing here waits.
+    fn on_settings_save(&mut self, save: SettingsSave) {
+        let SettingsSave {
+            changes,
+            original,
+            edited,
+        } = save;
+        self.settings_saves
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.persist_changes_with(
+            crate::config_writer::Outcome::settings_save(),
+            changes,
+            Some((original, edited)),
+        );
+    }
+
+    /// The card that explains why a model action does not start because of the
+    /// Settings window (see [`settings_hold_card`]), shown now. True if it
+    /// refused.
+    fn refuse_for_settings(&mut self) -> bool {
+        let saves = self
+            .settings_saves
+            .load(std::sync::atomic::Ordering::SeqCst);
+        match settings_hold_card(settings::is_foreground(), saves) {
+            Some((headline, detail)) => {
+                self.card.show_answer(headline, detail, 3, None);
+                true
+            }
+            None => false,
         }
     }
 
@@ -4005,6 +4542,8 @@ impl App {
                 DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
                 DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
                 DeferredMessage::SettingsLeft => self.on_settings_left(),
+                DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
+                DeferredMessage::PauseToggle => self.toggle_pause(),
             }
         }
     }
@@ -4098,6 +4637,7 @@ impl App {
         let Ok(path) = Config::path() else {
             self.card
                 .show_error("Couldn't locate config.toml", "%APPDATA% is not readable.");
+            self.set_watch(true);
             return;
         };
         // Make sure the file exists before asking the shell to open it.
@@ -4116,6 +4656,7 @@ impl App {
                 let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't save settings", &detail);
+                self.set_watch(true);
             }
             return;
         }
@@ -4150,6 +4691,7 @@ impl App {
 
         let Some(model) = picked else { return };
 
+        let before = self.config.clone();
         let slot = if openai {
             &mut self.config.providers.openai.model
         } else {
@@ -4159,7 +4701,7 @@ impl App {
             return;
         }
         *slot = model.clone();
-        self.commit_model_pick(&model);
+        self.commit_model_pick(&before, &model);
     }
 
     /// #567: apply a model chosen from the tray's Ollama submenu. Same shape
@@ -4172,63 +4714,42 @@ impl App {
         if self.config.providers.ollama.model == model {
             return;
         }
+        let before = self.config.clone();
         self.config.providers.ollama.model = model.clone();
-        self.commit_model_pick(&model);
+        self.commit_model_pick(&before, &model);
     }
 
     /// The part of a tray model pick that comes after the config field is
     /// set: rebuild the chain so the pick is live, save, refresh the tray and
     /// say what happened on a card.
-    fn commit_model_pick(&mut self, model: &str) {
+    fn commit_model_pick(&mut self, before: &Config, model: &str) {
         self.chain = Arc::new(self.config.build_chain());
-        let saved = self.config.save();
         self.refresh_tray_labels();
-
-        match saved {
-            Ok(()) => self.card.show_answer(model, "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {model}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
-            }
-        }
-        self.set_watch(true);
+        self.persist_diff(before, crate::config_writer::Outcome::simple(model));
     }
 
     /// Move a provider to the front of `providers.order`, making it the one
     /// that answers. The other stays in the list as the fallback rather than
     /// being dropped, so switching never costs you the second provider.
     fn set_provider(&mut self, provider: ActiveProvider) {
+        let before = self.config.clone();
         if !provider.move_to_front(&mut self.config.providers.order) {
             return;
         }
 
         self.chain = Arc::new(self.config.build_chain());
-        let saved = self.config.save();
         self.refresh_tray_labels();
 
-        let name = provider.label();
-        match saved {
-            // Issue #569: a provider with no key would fail on the next
-            // press, so say so now and point at Settings.
-            Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
-                let (headline, detail) = missing_key_card(provider);
-                self.card.show_settings_needed(&headline, &detail);
-            }
-            Ok(()) => self.card.show_answer(name, "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {name}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
-            }
+        let mut outcome = crate::config_writer::Outcome::simple(provider.label());
+        // Issue #569: a provider with no key would fail on the next press, so
+        // say so now and point at Settings.
+        if provider_needs_key(provider, &self.config.providers, self.config.mode) {
+            let (headline, detail) = missing_key_card(provider);
+            outcome.ok_headline = headline;
+            outcome.ok_detail = detail;
+            outcome.ok_setup = true;
         }
-        self.set_watch(true);
+        self.persist_diff(&before, outcome);
     }
 
     /// Issue #19: switch `Mode`, publish it to the process-wide atomic the
@@ -4256,53 +4777,216 @@ impl App {
         mode::set_current(mode);
         self.tray.set_mode(mode);
         self.update_tooltip();
-        self.persist_mode(mode);
+        self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
         self.set_watch(true);
     }
 
-    /// Hands the new mode to the writer thread: one key, nothing else in the
-    /// file touched. Never blocks and never touches the disk here.
-    fn persist_mode(&self, mode: Mode) {
-        submit_config_job(
-            self.hwnd_isize(),
-            crate::config_writer::JobSpec {
-                changes: vec![crate::config_writer::FieldChange::mode(mode)],
-                secrets: None,
-                saved: mode.label().to_string(),
-                failed: format!("Using {}: not saved", mode.label()),
-                hint: "It will revert when you quit.".to_string(),
-            },
-        );
+    /// Hands one field change to the writer thread. `label` names it in the
+    /// card that reports the outcome. Never blocks and never touches the disk
+    /// here; if the writer cannot even be reached the failure is posted back
+    /// like any other, so it still ends in a card (rule 7).
+    fn persist_field(&mut self, label: &str, change: crate::config_writer::FieldChange) {
+        self.persist_changes(crate::config_writer::Outcome::simple(label), vec![change]);
     }
 
-    /// The writer thread's answer. On success the file is read again, so
-    /// whatever the user hand-edited meanwhile is applied too, and nothing
-    /// afterwards saves a stale copy over it. On failure nothing was written
-    /// and the card says why.
-    fn on_config_written(&mut self, reply: crate::config_writer::WriteReply) {
-        match reply.result {
-            Ok(()) => {
-                match Config::load() {
-                    Ok(config) if config.load_problem.is_none() => {
-                        self.config = config;
-                        self.apply_config();
-                    }
-                    // The file was edited into something unreadable after our
-                    // write: keep the settings already running, as Reload does.
-                    _ => {}
-                }
-                self.card.show_answer(&reply.saved, "", 3, None);
-            }
-            Err(reason) => {
-                let human = self.track_error(&reply.failed, &reason);
-                let detail = if reply.hint.is_empty() {
-                    human
-                } else {
-                    format!("{}\n\n{human}", reply.hint)
-                };
-                self.card.show_error_with_details(&reply.failed, &detail);
+    /// Writes whatever differs between `before` (the config before this tray
+    /// change) and the config now, through the writer thread. Replaces a
+    /// whole-file `config.save()`: the file keeps its comments and hand edits,
+    /// no disk work runs on this thread, and a failure is remembered in
+    /// `unsaved` instead of being undone by the next reload.
+    fn persist_diff(&mut self, before: &Config, outcome: crate::config_writer::Outcome) {
+        match crate::config_writer::diff(before, &self.config) {
+            Ok(changes) => self.persist_changes(outcome, changes),
+            Err(e) => {
+                let human = self.track_error(&outcome.fail_headline, &format!("{e:#}"));
+                self.card.show_error_with_details(
+                    &outcome.fail_headline,
+                    &format!("{}\n\n{human}", outcome.fail_note),
+                );
             }
         }
+    }
+
+    fn persist_changes(
+        &mut self,
+        outcome: crate::config_writer::Outcome,
+        changes: Vec<crate::config_writer::FieldChange>,
+    ) {
+        self.persist_changes_with(outcome, changes, None);
+    }
+
+    /// [`App::persist_changes`] for a Settings save, which may also carry the
+    /// config the window opened with and the one it saved: the keys that differ
+    /// are stored in Credential Manager on the writer thread, after the file write
+    /// has succeeded and before the config is read again (so the read sees them).
+    fn persist_changes_with(
+        &mut self,
+        outcome: crate::config_writer::Outcome,
+        changes: Vec<crate::config_writer::FieldChange>,
+        keys: Option<(Config, Config)>,
+    ) {
+        use crate::config_writer::{WriteReply, Written};
+        self.pending_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pending = Arc::clone(&self.pending_writes);
+        let saves = outcome
+            .from_settings
+            .then(|| Arc::clone(&self.settings_saves));
+        let target = self.hwnd_isize();
+        let label = outcome.ok_headline.clone();
+        let sent = changes.clone();
+        let sent_outcome = outcome;
+        let done = move |reply: WriteReply| {
+            // On the writer thread (or here, if the writer could not start). The
+            // keys and the reload are the slow part, so they happen here and not
+            // in the handler.
+            let key_error = match (&reply.result, &keys) {
+                (Ok(()), Some((was, now))) => crate::config_writer::store_changed_keys(was, now),
+                _ => None,
+            };
+            let loaded = (reply.result.is_ok() && !crate::config_writer::shutting_down())
+                .then(crate::config_writer::load_after_write);
+            let payload = Box::into_raw(Box::new(Written {
+                reply,
+                changes: sent,
+                outcome: sent_outcome,
+                loaded,
+                key_error,
+            }));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_CONFIG_WRITTEN,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here, and
+                    // settle the count its reply would have settled.
+                    free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
+                    crate::config_writer::finish(&pending);
+                    if let Some(saves) = &saves {
+                        crate::config_writer::finish(saves);
+                    }
+                }
+            }
+        };
+        match crate::config_writer::global() {
+            Ok(writer) => writer.submit(&label, changes, done),
+            Err(reason) => done(WriteReply {
+                label,
+                result: Err(reason),
+            }),
+        }
+    }
+
+    /// The writer thread's answer, with the file already read again (a hand edit
+    /// made meanwhile is applied too, and nothing afterwards saves a stale copy
+    /// over it). On failure the change is live until quit but not on disk, and
+    /// the card says so; it is remembered so a later reload does not quietly undo
+    /// it. While other writes are still in flight this reply's read is stale (a
+    /// later choice may already be live), so only the last reply swaps.
+    fn on_config_written(&mut self, written: crate::config_writer::Written) {
+        let crate::config_writer::Written {
+            reply,
+            changes,
+            outcome,
+            loaded,
+            key_error,
+        } = written;
+        let last = crate::config_writer::finish(&self.pending_writes);
+        if outcome.from_settings {
+            crate::config_writer::finish(&self.settings_saves);
+        }
+        let this_ok = match (&reply.result, &loaded) {
+            (
+                Ok(()),
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config),
+                    mtime,
+                }),
+            ) if config.load_problem.is_none() => Some(*mtime),
+            _ => None,
+        };
+        let (adopt, skipped) =
+            crate::config_writer::track_mtime(last, this_ok, self.skipped_mtime.take());
+        self.skipped_mtime = skipped;
+        if let Some(mtime) = adopt {
+            crate::config_writer::adopt_mtime(mtime);
+        }
+        let rewritten =
+            |c: &crate::config_writer::FieldChange| changes.iter().any(|n| n.path() == c.path());
+        self.unsaved.retain(|c| !rewritten(c));
+        match reply.result {
+            Ok(()) => match loaded {
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config), ..
+                }) if config.load_problem.is_none() => {
+                    if last {
+                        self.config = crate::config_writer::reapply(&config, &self.unsaved)
+                            .unwrap_or(*config);
+                        self.apply_config();
+                    }
+                    let card_idle = matches!(self.card.state(), crate::ui::card::CardState::Hidden);
+                    let shown = saved_card(outcome.from_settings, key_error.is_some(), card_idle);
+                    if shown == SavedCard::KeyFailed {
+                        // The other changes are saved; only the key is not.
+                        let why = key_error.unwrap_or_default();
+                        let headline = "Settings saved, but the key was not stored";
+                        let human = self.track_error(headline, &why);
+                        self.card.show_error_with_details(
+                            headline,
+                            &format!(
+                                "Enter the key again in Settings after fixing this.\n\n{human}"
+                            ),
+                        );
+                    } else if shown == SavedCard::Keep {
+                        // An answer that waited for Settings is on screen now;
+                        // "Settings saved" must not replace it (#213).
+                    } else if outcome.ok_setup {
+                        self.show_setup_card(&outcome.ok_headline, &outcome.ok_detail);
+                    } else {
+                        self.card.show_answer(
+                            &outcome.ok_headline,
+                            &outcome.ok_detail,
+                            outcome.ok_secs,
+                            None,
+                        );
+                    }
+                }
+                // The file was edited into something unreadable after our
+                // write: keep the settings already running, as Reload does, and
+                // say so.
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config), ..
+                }) => {
+                    let (headline, detail) =
+                        config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                    self.card.show_error(&headline, &detail);
+                }
+                Some(crate::config_writer::Loaded { config: Err(e), .. }) => {
+                    let detail = self.track_error("Couldn't reload settings", &e);
+                    self.card
+                        .show_error_with_details("Couldn't reload settings", &detail);
+                }
+                // The app is quitting.
+                None => {}
+            },
+            Err(reason) => {
+                // A refused Settings save changed nothing in memory, so there is
+                // nothing for a later reload to put back.
+                if !outcome.from_settings {
+                    self.unsaved.extend(changes);
+                }
+                let human = self.track_error(&outcome.fail_headline, &reason);
+                self.card.show_error_with_details(
+                    &outcome.fail_headline,
+                    &format!("{}\n\n{human}", outcome.fail_note),
+                );
+            }
+        }
+        self.set_watch(true);
     }
 
     /// #567: hand the tray the newest Ollama model list a background refresh
@@ -4972,7 +5656,7 @@ fn encode_for_upload(
 }
 
 /// #24: the intent router's worker-thread body, called from
-/// `App::maybe_start_router`'s spawned thread. Mirrors [`worker`]'s
+/// `App::start_options_router`'s spawned thread. Mirrors [`worker`]'s
 /// mode-aware chain construction (same Auto-mode Ollama probe, same
 /// "network I/O never happens on the main thread" reasoning), but picks the
 /// router's own cheapest ready provider/model
@@ -4980,8 +5664,8 @@ fn encode_for_upload(
 /// chain, and runs it through a single-provider [`Chain`] -- issue #99's
 /// one-shot repair pass still applies (a schema-invalid response gets one
 /// repair attempt), but there is no multi-provider fallback: the router
-/// only ever tries the one cheapest ready provider, and if that fails, this
-/// press simply gets no suggestion.
+/// only ever tries the one cheapest ready provider, and if that fails, the
+/// options card shows its fallback options.
 fn router_worker(
     providers: &Providers,
     mode: Mode,
@@ -5007,11 +5691,11 @@ fn router_worker(
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
     let shot = encode_for_upload(raw, providers, mode, redact)?;
-    // #105: the router runs by itself when the palette opens, so it never
+    // #105: the router runs by itself when the options card opens, so it never
     // shows the send preview; with the toggle on, a cloud request is refused
-    // by the send guard instead and the press simply gets no suggestion.
+    // by the send guard instead and the card shows its fallback options.
     // #792: and it stops starting calls (the repair request included) once
-    // the palette has stopped waiting.
+    // the card has stopped waiting.
     let chain = router::router_chain(provider, started);
     let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, limits, || {
@@ -5023,7 +5707,7 @@ fn router_worker(
 /// -- OCR text of the router's own downscaled capture, and NO UIA snapshot.
 /// Unlike `worker`/`calendar_worker`/`review_worker`/`form_fill_worker`, the
 /// router has no `foreground_hwnd` handy at this call site (it runs off
-/// `App::maybe_start_router`'s own capture, not `App::ask`'s), and its
+/// `App::show_options_card`'s own capture, not `App::ask`'s), and its
 /// schema (`router::router_schema`) never asks about editable-field
 /// contents the way `fill_form` does -- so paying for a second COM
 /// apartment thread just to snapshot UIA fields the router would never use
@@ -5031,7 +5715,7 @@ fn router_worker(
 /// `non_vision_inputs` (surfaced as a named skip reason to
 /// `Chain::complete_parsed_with_fallback`'s caller); router failures are
 /// silent by the time they reach the user regardless (see
-/// `App::maybe_start_router`'s doc comment), so this never becomes a card.
+/// `App::show_options_card`'s doc comment), so this never becomes a card.
 fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
     let ocr_output = crate::ocr::recognize(
         &raw.rgba,
@@ -6239,13 +6923,6 @@ thread_local! {
     /// not merely deferred -- see the `wnd_proc` guard that sets this flag.
     static PAUSE_REEVALUATE_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
-    /// #871: the Wingman key was pressed while Settings had the foreground. The
-    /// ask waits (a card over the window being typed in is what #213 was
-    /// written to avoid) and runs when Settings loses the foreground or closes.
-    /// One flag: a second press while waiting changes nothing.
-    static ASK_WAITING_FOR_SETTINGS: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-
     /// #723: the run generation currently in flight, mirrored from
     /// `App::run_generation` so `wnd_proc` can drop a stale worker result
     /// before it forms `&mut App`.
@@ -6296,10 +6973,18 @@ enum DeferredMessage {
     ExecutorDone(std::result::Result<ExecDone, String>),
     /// `WM_APP_CONFIG_WRITTEN` (#870): a failed write must still end in a card
     /// when Settings was open at the time.
-    ConfigWritten(crate::config_writer::WriteReply),
+    ConfigWritten(crate::config_writer::Written),
     /// `WM_APP_SETTINGS_LEFT` (#871), when it arrives during a tray menu or a
-    /// file dialog: the flush it asks for happens once that loop has ended.
+    /// file dialog, or Settings is in front: the flush it asks for happens
+    /// once that is over.
     SettingsLeft,
+    /// `WM_APP_SETTINGS_SAVE` (#871), when it arrives during a tray menu or a
+    /// file dialog: the save is handed to the writer once that loop has ended.
+    SettingsSave(Box<SettingsSave>),
+    /// `WM_APP_PAUSE_TOGGLE` pressed while Settings is in front: applied when it
+    /// is not, so no "Paused" card lands on the window being typed in. Nothing
+    /// can start a request meanwhile (`settings_hold_card`).
+    PauseToggle,
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -6340,7 +7025,17 @@ fn is_no_providers(packed: &str) -> bool {
 /// cannot probe Ollama, so it lets an Ollama-only setup through; when the
 /// worker then finds nothing answering, this says what to do. Any other
 /// setup gets the gate's own card.
-fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+pub(crate) fn empty_chain_card(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+    load_problem: Option<&str>,
+) -> (String, String) {
+    // #892: the defaults standing in for an unreadable file are not what the
+    // user needs to hear about.
+    if let Some(problem) = load_problem {
+        return broken_file_card(problem, config_path);
+    }
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
@@ -6419,8 +7114,8 @@ enum SettingsReentrancy {
     /// dropped, not queued), and the two palette messages (#25: the palette
     /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s
     /// boxed `String` payload is freed rather than leaked, same as
-    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the palette a
-    /// router suggestion belongs to cannot be visible while Settings is
+    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the options
+    /// card a router suggestion belongs to cannot be visible while Settings is
     /// modal-open either, so there is nothing left to apply it to -- a
     /// router suggestion is advisory, unlike a finished action's own
     /// result, so rule 7 does not require it to survive Settings the way
@@ -6499,7 +7194,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_GENERIC_ACTION_RESULT
         | WM_APP_EXECUTOR_DONE
         | WM_APP_CONFIG_WRITTEN
-        | WM_APP_SETTINGS_LEFT => SettingsReentrancy::Defer,
+        | WM_APP_SETTINGS_LEFT
+        | WM_APP_SETTINGS_SAVE => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -6520,6 +7216,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #347's WM_APP_CARD_OPEN_SETTINGS above already relies on), so
         // there is nothing left for a deferred copy to act on either.
         | WM_APP_CARD_COPY_DETAILS
+        // #373: same treatment as "Copy details" above.
+        | WM_APP_CARD_REPORT_PROBLEM
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -6535,6 +7233,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_ROUTER_RESULT
+        // #307: the options card is hidden whenever Settings opens (so its
+        // key claim is already cleared), so a late choice has nothing to
+        // act on. No payload to free.
+        | WM_APP_OPTIONS_CHOICE
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
@@ -6580,46 +7282,47 @@ fn missing_key_card(provider: ActiveProvider) -> (String, String) {
     )
 }
 
-/// Queues `spec` on the settings writer thread. Its answer comes back to the
-/// owner window `owner` as `WM_APP_CONFIG_WRITTEN` (`App::on_config_written`).
-/// Called from the UI thread and never waits: the file, `icacls` and Credential
-/// Manager work all happen on the writer thread. If the writer cannot even be
-/// reached the failure is posted back the same way, so it still ends in a card
-/// (rule 7).
-pub(crate) fn submit_config_job(owner: isize, spec: crate::config_writer::JobSpec) {
-    use crate::config_writer::WriteReply;
-    let done = move |reply: WriteReply| {
-        let payload = Box::into_raw(Box::new(reply));
-        unsafe {
-            if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                Some(HWND(owner as *mut _)),
-                WM_APP_CONFIG_WRITTEN,
-                WPARAM(0),
-                LPARAM(payload as isize),
-            )
-            .is_err()
-            {
-                // Window gone: nobody will take the box, so free it here.
-                free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
-            }
-        }
+/// What the Settings window sends the owner window on Save (#871): the fields
+/// it changed (`config_writer::diff` of the two configs, whole values made
+/// conditional by `guard_whole_values`) and the two configs, from which the keys
+/// that changed are worked out and stored once the file write has succeeded.
+pub(crate) struct SettingsSave {
+    pub changes: Vec<crate::config_writer::FieldChange>,
+    /// What the window opened with.
+    pub original: Config,
+    /// What it saved.
+    pub edited: Config,
+}
+
+/// Posts a Settings save to the owner window `owner` (`WM_APP_SETTINGS_SAVE`).
+/// Never waits and never touches the disk: the file, `icacls` and Credential
+/// Manager work all happen on the writer thread, and the answer comes back as
+/// `WM_APP_CONFIG_WRITTEN`. An `Err` is a plain sentence for the window to show
+/// (the owner is gone, so nothing will answer).
+pub(crate) fn post_settings_save(owner: isize, save: SettingsSave) -> Result<(), String> {
+    let payload = Box::into_raw(Box::new(save));
+    let posted = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(owner as *mut _)),
+            WM_APP_SETTINGS_SAVE,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        )
     };
-    match crate::config_writer::global() {
-        Ok(writer) => writer.submit(spec, done),
-        Err(reason) => done(WriteReply {
-            saved: spec.saved,
-            failed: spec.failed,
-            hint: spec.hint,
-            result: Err(reason),
-        }),
+    if posted.is_err() {
+        // Nobody will take the box, so free it here.
+        free_boxed_payload(WM_APP_SETTINGS_SAVE, LPARAM(payload as isize));
+        return Err("Wingman's main window is not running".to_string());
     }
+    Ok(())
 }
 
 /// Takes ownership of the payload a deferrable message carries and returns it
-/// as a [`DeferredMessage`]. Only called for ids the reentrancy policies mark
-/// `Defer`.
-fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> DeferredMessage {
-    match msg {
+/// as a [`DeferredMessage`]. `None` for an id that cannot be deferred, whose
+/// payload (if any) the caller frees: never a panic, this runs in the window
+/// procedure.
+fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMessage> {
+    Some(match msg {
         WM_APP_RESULT => DeferredMessage::Result(unsafe {
             *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>)
         }),
@@ -6659,13 +7362,15 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> DeferredMessage {
             *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
         }),
         WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
-            *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply)
+            *Box::from_raw(lparam.0 as *mut crate::config_writer::Written)
         }),
         WM_APP_SETTINGS_LEFT => DeferredMessage::SettingsLeft,
-        _ => {
-            unreachable!("the reentrancy policies only return Defer for the ids above")
+        WM_APP_SETTINGS_SAVE => {
+            DeferredMessage::SettingsSave(unsafe { Box::from_raw(lparam.0 as *mut SettingsSave) })
         }
-    }
+        WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
+        _ => return None,
+    })
 }
 
 /// Free the boxed payload a `WM_APP_*` message carries, if `msg` is one that
@@ -6703,9 +7408,8 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_EXECUTOR_DONE => drop(Box::from_raw(
                 p as *mut std::result::Result<ExecDone, String>,
             )),
-            WM_APP_CONFIG_WRITTEN => {
-                drop(Box::from_raw(p as *mut crate::config_writer::WriteReply))
-            }
+            WM_APP_CONFIG_WRITTEN => drop(Box::from_raw(p as *mut crate::config_writer::Written)),
+            WM_APP_SETTINGS_SAVE => drop(Box::from_raw(p as *mut SettingsSave)),
             _ => return false,
         }
     }
@@ -6722,16 +7426,91 @@ fn take_close_request() -> bool {
     CLOSE_AFTER_SETTINGS.with(|c| c.replace(false))
 }
 
-/// #871: the messages that show a card or run something visible, and so are
-/// held while Settings has the foreground. The same group the nested loops
-/// defer, except the writer's answer: that one applies the setting at once.
-fn waits_while_settings_is_in_front(msg: u32) -> bool {
-    msg != WM_APP_CONFIG_WRITTEN
-        && msg != WM_APP_SETTINGS_LEFT
-        && matches!(
-            settings_reentrancy_policy(msg, 0),
-            SettingsReentrancy::Defer
-        )
+/// Which card follows a write that went through (#871).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedCard {
+    /// The outcome's own card ("Settings saved", a setup card).
+    Show,
+    /// None: a Settings save does not replace an answer that is already on screen,
+    /// such as one that waited for the window (#213). The save worked and the
+    /// settings are in force; the answer is worth more than the confirmation.
+    Keep,
+    /// The file was written but the key was not stored: always said.
+    KeyFailed,
+}
+
+fn saved_card(from_settings: bool, key_failed: bool, card_idle: bool) -> SavedCard {
+    if key_failed {
+        SavedCard::KeyFailed
+    } else if from_settings && !card_idle {
+        SavedCard::Keep
+    } else {
+        SavedCard::Show
+    }
+}
+
+/// What happens to a message that arrives while the Settings window is the
+/// foreground window (#871). Settings is modeless, so nothing nests and most
+/// messages are handled on arrival; these are the ones that would put a card, a
+/// preview or a request on top of the window the user is typing in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForegroundPolicy {
+    /// Keep it, in arrival order, and handle it when Settings is left
+    /// (`on_settings_left`).
+    Hold,
+    /// Drop it and free its payload: advisory, and what it would update is not
+    /// on screen while Settings is.
+    Drop,
+    /// Handle it now.
+    Pass,
+}
+
+fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
+    match msg {
+        // A finished request's card, a preview's answer, a Pause toggle: each
+        // shows a card. A worker blocked on a send preview waits for it.
+        WM_APP_RESULT
+        | WM_APP_CALENDAR_RESULT
+        | WM_APP_REVIEW_RESULT
+        | WM_APP_FORM_FILL_RESULT
+        | WM_APP_GENERIC_ACTION_RESULT
+        | WM_APP_EXECUTOR_DONE
+        | WM_APP_PREVIEW_DECIDED
+        | WM_APP_SEND_PREVIEW
+        | WM_APP_PAUSE_TOGGLE => ForegroundPolicy::Hold,
+        // Advisory updates for cards, the palette and the options card, none
+        // of which is showing while Settings is.
+        WM_APP_PENDING_STAGE
+        | WM_APP_FIRST_RUN
+        | WM_APP_ROUTER_RESULT
+        | WM_APP_PALETTE_TOGGLE
+        | WM_APP_PALETTE_RUN
+        | WM_APP_MACHINE_CHECK_RESULT
+        | WM_APP_OPTIONS_CHOICE => ForegroundPolicy::Drop,
+        // The writer's answer and the save apply the setting at once; the Wingman
+        // key and activation are refused with a card (`settings_hold_card`);
+        // Quit, the tray and the card's own clicks work as always.
+        _ => ForegroundPolicy::Pass,
+    }
+}
+
+/// The card that says why a model action did not start, for what the Settings
+/// window is doing (#871): `None` when it may. A press made while the window is in
+/// front is refused, not queued (it would run later on another window and bill a
+/// request). One made while a save is still being applied is refused too, because
+/// the running settings are still the old ones until that answer lands: the
+/// privacy-relevant case is an Offline switch that must not be ignored once.
+fn settings_hold_card(
+    settings_in_front: bool,
+    saves_in_flight: u32,
+) -> Option<(&'static str, &'static str)> {
+    if settings_in_front {
+        Some(("Settings is open", "Close it, then press the key again."))
+    } else if saves_in_flight > 0 {
+        Some(("Saving your settings", "Try again in a moment."))
+    } else {
+        None
+    }
 }
 
 /// Issue #302: `DestroyWindow` discards messages still queued for the window,
@@ -6770,13 +7549,21 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
             was_menu = true;
             SETTINGS_OPEN.with(|c| c.set(true));
             TRAY_MENU_OPEN.with(|c| c.set(true));
+            // #307: Esc closes the menu, so the options card must not hold it.
+            options_keys::clear();
             let chosen = menu.track();
             TRAY_MENU_OPEN.with(|c| c.set(false));
             SETTINGS_OPEN.with(|c| c.set(false));
+            // #307: the menu cleared the options card's key claim. Whatever
+            // was chosen, the card (if it is still up) gets it back first, so
+            // its hint stays true; a command that hides the card clears it
+            // again. A no-op when the card is gone or the claim has lapsed.
+            unsafe { &mut *ptr }.card.rearm_options_claim();
             match chosen {
                 Some(id) => id,
                 None => {
-                    unsafe { &mut *ptr }.finish_modal_deferrals();
+                    let app = unsafe { &mut *ptr };
+                    app.finish_modal_deferrals();
                     return LRESULT(0);
                 }
             }
@@ -6814,6 +7601,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
         MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
         MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
+        MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card(Trigger::Tray),
         MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
         MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
         MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
@@ -6931,8 +7719,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // carries (none, for WM_APP_PREVIEW_DECIDED) and queue it;
                 // `open_settings` delivers every queued message, in this
                 // same push order, once `show_modal` returns.
-                let deferred = take_deferred(msg, wparam, lparam);
-                PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
+                match take_deferred(msg, wparam, lparam) {
+                    Some(deferred) => PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred)),
+                    None => {
+                        free_boxed_payload(msg, lparam);
+                    }
+                }
                 return LRESULT(0);
             }
             SettingsReentrancy::DeferTaskbarCreated => {
@@ -6958,14 +7750,21 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     // on top of the window the user is typing in: it is held until Settings
     // loses the foreground or closes (`WM_APP_SETTINGS_LEFT`).
     if settings::is_foreground() {
-        if waits_while_settings_is_in_front(msg) {
-            let deferred = take_deferred(msg, wparam, lparam);
-            PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred));
-            return LRESULT(0);
-        }
-        if msg == WM_APP_HOTKEY {
-            ASK_WAITING_FOR_SETTINGS.with(|c| c.set(true));
-            return LRESULT(0);
+        match settings_foreground_policy(msg) {
+            ForegroundPolicy::Hold => {
+                match take_deferred(msg, wparam, lparam) {
+                    Some(deferred) => PENDING_MESSAGES.with(|c| c.borrow_mut().push_back(deferred)),
+                    None => {
+                        free_boxed_payload(msg, lparam);
+                    }
+                }
+                return LRESULT(0);
+            }
+            ForegroundPolicy::Drop => {
+                free_boxed_payload(msg, lparam);
+                return LRESULT(0);
+            }
+            ForegroundPolicy::Pass => {}
         }
     }
 
@@ -6994,7 +7793,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // that it cancels a waiting send preview (#105). Any process can
             // post this message (#236), so unlike the hotkey it is rate
             // limited, and a refusal is counted for the diagnostics report.
-            if !app.cancel_pending_send_preview() {
+            if app.refuse_for_settings() {
+                // The card says why; no allowance is spent.
+            } else if !app.cancel_pending_send_preview() {
                 // The limiter is only consulted when an ask would really run:
                 // busy and paused make `ask` a no-op (or a Paused card), and
                 // must not cost the user an allowance.
@@ -7065,13 +7866,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_CONFIG_WRITTEN => {
-            let reply =
-                unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::WriteReply) };
-            app.on_config_written(reply);
+            let written = unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::Written) };
+            app.on_config_written(written);
             LRESULT(0)
         }
         WM_APP_SETTINGS_LEFT => {
             app.on_settings_left();
+            LRESULT(0)
+        }
+        WM_APP_SETTINGS_SAVE => {
+            let save = unsafe { *Box::from_raw(lparam.0 as *mut SettingsSave) };
+            app.on_settings_save(save);
             LRESULT(0)
         }
         WM_APP_MACHINE_CHECK_RESULT => {
@@ -7098,6 +7903,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_CARD_OPEN_SETTINGS => {
             // Issue #347: a click on a "settings needed" card. No payload.
             app.open_settings();
+            LRESULT(0)
+        }
+        WM_APP_CARD_REPORT_PROBLEM => {
+            // #373: a click on "Report a problem". No payload.
+            app.report_problem();
             LRESULT(0)
         }
         WM_APP_CARD_COPY_DETAILS => {
@@ -7146,6 +7956,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // #133: take ownership of the probe's answer.
             let found = unsafe { *Box::from_raw(lparam.0 as *mut FirstRun) };
             app.on_first_run_result(wparam.0 as u64, found);
+            LRESULT(0)
+        }
+        WM_APP_OPTIONS_CHOICE => {
+            // #307: a row clicked, a claimed digit, or Esc on the options
+            // card. No payload; `lparam` is the card's generation.
+            app.on_options_choice(wparam.0, lparam.0);
             LRESULT(0)
         }
         WM_APP_ROUTER_RESULT => {
@@ -7206,9 +8022,34 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
         }
         WM_DESTROY => {
-            // #871: Settings is a top-level window of its own now, so it does
-            // not go away with this one. Close it first.
+            // #871: a Save pressed just before Quit is still in the queue, and
+            // would be thrown away with it: hand it to the writer first, so the
+            // flush below waits for it. What was typed but not saved is dropped
+            // with the window, as it was when Settings was modal (#673).
+            let mut queued = MSG::default();
+            while unsafe {
+                PeekMessageW(
+                    &mut queued,
+                    Some(hwnd),
+                    WM_APP_SETTINGS_SAVE,
+                    WM_APP_SETTINGS_SAVE,
+                    PM_REMOVE,
+                )
+            }
+            .as_bool()
+            {
+                let save = unsafe { *Box::from_raw(queued.lParam.0 as *mut SettingsSave) };
+                app.on_settings_save(save);
+            }
+            // Settings is a top-level window of its own, so it does not go away
+            // with this one. Close it.
             settings::close_now();
+            // #870: a settings write still queued must reach the file before the
+            // process exits. Bounded, so a stuck disk cannot hang Quit.
+            // The keyboard hook goes first: while it is installed, every key in
+            // the system waits on this thread.
+            app.hook = None;
+            crate::config_writer::flush_global(std::time::Duration::from_secs(2));
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -7269,12 +8110,12 @@ mod tests {
     use super::BeginPlan;
     use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_FIRST_RUN;
-    use super::WM_APP_SETTINGS_LEFT;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
     };
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
+    use super::{SettingsSave, WM_APP_SETTINGS_LEFT, WM_APP_SETTINGS_SAVE};
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
@@ -7289,11 +8130,13 @@ mod tests {
         WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
     };
     use crate::mode::Mode;
+    use crate::options_keys::WM_APP_OPTIONS_CHOICE;
     use crate::provider::ollama_admin::FirstRun;
     use crate::provider::Provider;
     use crate::router;
     use crate::ui::card::{
-        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM,
+        WM_APP_PREVIEW_DECIDED,
     };
     use crate::ui::confirm;
     use crate::ui::palette::WM_APP_PALETTE_RUN;
@@ -7383,12 +8226,13 @@ mod tests {
 
     // -- Settings is modeless (#871) ---------------------------------------
 
-    /// Only what would put a card on the Settings window waits for it. The
-    /// writer's answer applies at once (the setting must not lag), and the
-    /// "left" notice is what releases the rest.
+    /// What the foreground policy does with each kind of message (#871): what
+    /// would put a card on the window waits, advisory updates are dropped, and
+    /// the writer's answer, the save, Quit, the tray and the keys are handled at
+    /// once.
     #[test]
-    fn what_waits_while_settings_is_in_front_is_the_result_group_only() {
-        use super::{waits_while_settings_is_in_front, WM_APP_PREVIEW_DECIDED};
+    fn the_foreground_policy_holds_cards_drops_advisories_and_passes_the_rest() {
+        use super::{settings_foreground_policy, ForegroundPolicy as P, WM_APP_PREVIEW_DECIDED};
         for id in [
             WM_APP_RESULT,
             WM_APP_CALENDAR_RESULT,
@@ -7397,41 +8241,252 @@ mod tests {
             WM_APP_GENERIC_ACTION_RESULT,
             WM_APP_EXECUTOR_DONE,
             WM_APP_PREVIEW_DECIDED,
+            WM_APP_SEND_PREVIEW,
+            WM_APP_PAUSE_TOGGLE,
         ] {
-            assert!(waits_while_settings_is_in_front(id), "{id}");
+            assert_eq!(settings_foreground_policy(id), P::Hold, "{id}");
+        }
+        for id in [
+            WM_APP_PENDING_STAGE,
+            WM_APP_FIRST_RUN,
+            WM_APP_ROUTER_RESULT,
+            WM_APP_PALETTE_TOGGLE,
+            WM_APP_PALETTE_RUN,
+            WM_APP_MACHINE_CHECK_RESULT,
+            WM_APP_OPTIONS_CHOICE,
+        ] {
+            assert_eq!(settings_foreground_policy(id), P::Drop, "{id}");
         }
         for id in [
             WM_APP_CONFIG_WRITTEN,
             WM_APP_SETTINGS_LEFT,
+            WM_APP_SETTINGS_SAVE,
             WM_APP_TRAY,
             WM_CLOSE,
             WM_DESTROY,
-            WM_APP_PAUSE_TOGGLE,
             WM_APP_LEARNED,
+            WM_APP_HOTKEY,
+            WM_APP_ACTIVATE,
+            WM_APP_DISMISS,
         ] {
-            assert!(!waits_while_settings_is_in_front(id), "{id}");
+            assert_eq!(settings_foreground_policy(id), P::Pass, "{id}");
         }
     }
 
+    /// Everything the policy holds must be something `take_deferred` can take, or
+    /// the message would be freed and silently lost (a held answer with no card).
     #[test]
-    fn a_deferred_settings_left_and_a_deferred_writer_answer_keep_their_payloads() {
-        use super::{take_deferred, DeferredMessage};
+    fn every_held_message_has_a_deferred_form() {
+        use super::{settings_foreground_policy, ForegroundPolicy as P};
+        let src = lf(include_str!("app.rs"));
+        let take = body_between(&src, "fn take_deferred(", "\n}\n");
+        let mut held = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            if settings_foreground_policy(*id) == P::Hold {
+                held += 1;
+                assert!(
+                    take.contains(name),
+                    "{name} is held but take_deferred has no arm"
+                );
+            }
+        }
+        assert!(held >= 9, "the scan found {held} held ids: the list moved");
+    }
+
+    #[test]
+    fn a_deferred_message_keeps_its_payload_and_an_unknown_one_is_refused() {
+        use super::{take_deferred, DeferredMessage, SettingsSave};
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         assert!(matches!(
             take_deferred(WM_APP_SETTINGS_LEFT, WPARAM(0), LPARAM(0)),
-            DeferredMessage::SettingsLeft
+            Some(DeferredMessage::SettingsLeft)
         ));
-        let reply = crate::config_writer::WriteReply {
-            saved: "Settings saved".into(),
-            failed: "Couldn't save settings".into(),
-            hint: String::new(),
-            result: Err("disk full".into()),
+        assert!(matches!(
+            take_deferred(WM_APP_PAUSE_TOGGLE, WPARAM(0), LPARAM(0)),
+            Some(DeferredMessage::PauseToggle)
+        ));
+        // Not a panic: this runs in the window procedure.
+        assert!(take_deferred(WM_APP_TRAY, WPARAM(0), LPARAM(0)).is_none());
+
+        let written = crate::config_writer::Written {
+            reply: crate::config_writer::WriteReply {
+                label: "Settings saved".into(),
+                result: Err("disk full".into()),
+            },
+            changes: Vec::new(),
+            outcome: crate::config_writer::Outcome::settings_save(),
+            loaded: None,
+            key_error: None,
         };
-        let raw = Box::into_raw(Box::new(reply.clone()));
+        let raw = Box::into_raw(Box::new(written));
         match take_deferred(WM_APP_CONFIG_WRITTEN, WPARAM(0), LPARAM(raw as isize)) {
-            DeferredMessage::ConfigWritten(got) => assert_eq!(got, reply),
+            Some(DeferredMessage::ConfigWritten(got)) => {
+                assert_eq!(got.reply.result, Err("disk full".to_string()));
+                assert!(got.outcome.from_settings);
+            }
             _ => panic!("the writer's answer lost its payload"),
         }
+
+        let save = SettingsSave {
+            changes: vec![crate::config_writer::FieldChange::mode(Mode::Offline)],
+            original: crate::config::Config::default(),
+            edited: crate::config::Config::default(),
+        };
+        let raw = Box::into_raw(Box::new(save));
+        match take_deferred(WM_APP_SETTINGS_SAVE, WPARAM(0), LPARAM(raw as isize)) {
+            Some(DeferredMessage::SettingsSave(got)) => assert_eq!(got.changes.len(), 1),
+            _ => panic!("the save lost its payload"),
+        }
+    }
+
+    /// #871 finding 1 and 2: a press made while the window is in front, or while
+    /// a save is still being applied, is refused with a card. It is never kept to
+    /// run later, on stale settings or on another window, and billed.
+    #[test]
+    fn a_press_is_refused_while_settings_is_in_front_or_a_save_is_being_applied() {
+        use super::settings_hold_card;
+        let open = settings_hold_card(true, 0).expect("refused while open");
+        assert_eq!(open.0, "Settings is open");
+        let saving = settings_hold_card(false, 1).expect("refused while saving");
+        assert_eq!(saving.0, "Saving your settings");
+        assert!(settings_hold_card(true, 2).is_some());
+        assert_eq!(settings_hold_card(false, 0), None);
+        for (headline, detail) in [open, saving] {
+            assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+        }
+    }
+
+    /// The gate is in the one place every model action starts, before the
+    /// busy/paused check and any capture, and nothing keeps a press for later.
+    #[test]
+    fn the_settings_gate_sits_in_front_of_every_model_action_and_keeps_nothing() {
+        let src = lf(include_str!("app.rs"));
+        let begin = body_between(&src, "    fn begin_action<T>(", "\n    }\n");
+        let gate = begin
+            .find("self.refuse_for_settings()")
+            .expect("begin_action never asks whether Settings holds the action");
+        let busy = begin
+            .find("model_action_gate(")
+            .expect("begin_action lost its busy/paused gate");
+        assert!(gate < busy, "the gate must come first");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(
+            !code.contains("ASK_WAITING_FOR_SETTINGS"),
+            "a press must not be kept while Settings is open"
+        );
+        let left = body_between(&src, "    fn on_settings_left(&mut self) {", "\n    }\n");
+        assert!(
+            !left.contains(".ask("),
+            "leaving Settings must not run an ask:\n{left}"
+        );
+        assert!(left.contains("self.deliver_deferred(pending)"), "{left}");
+        // The activation path counts against a rate limit, so it asks first.
+        let proc_src = wnd_proc_body(&src);
+        let act = proc_src
+            .find("WM_APP_ACTIVATE => {")
+            .expect("no WM_APP_ACTIVATE arm");
+        let tail = &proc_src[act..];
+        let refuse = tail
+            .find("app.refuse_for_settings()")
+            .expect("activation ungated");
+        let limiter = tail.find("check_activation_now").expect("limiter moved");
+        assert!(refuse < limiter, "refuse before spending an allowance");
+    }
+
+    /// #213: the "Settings saved" card gives way to an answer on screen, a failed
+    /// key is always said, and an idle card shows the confirmation.
+    #[test]
+    fn settings_saved_does_not_replace_an_answer_but_a_key_failure_always_shows() {
+        use super::{saved_card, SavedCard};
+        assert_eq!(saved_card(true, false, true), SavedCard::Show);
+        assert_eq!(saved_card(true, false, false), SavedCard::Keep);
+        assert_eq!(saved_card(true, true, false), SavedCard::KeyFailed);
+        assert_eq!(saved_card(true, true, true), SavedCard::KeyFailed);
+        // A tray change is not a Settings save: its card is its own.
+        assert_eq!(saved_card(false, false, false), SavedCard::Show);
+    }
+
+    /// A refused Settings save changes nothing in memory, so it is not kept for a
+    /// reload to put back; a failed tray change is.
+    #[test]
+    fn only_a_tray_change_is_kept_in_unsaved_when_its_write_fails() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let guard = handler
+            .find("if !outcome.from_settings")
+            .expect("the Settings case is not told apart");
+        let keep = handler
+            .find("self.unsaved.extend(changes)")
+            .expect("unsaved moved");
+        assert!(guard < keep, "{handler}");
+    }
+
+    #[test]
+    fn the_settings_save_reaches_the_writer_through_persist_changes_with() {
+        let src = lf(include_str!("app.rs"));
+        let save = body_between(&src, "    fn on_settings_save(", "\n    }\n");
+        assert!(save.contains("self.persist_changes_with("), "{save}");
+        assert!(save.contains("Outcome::settings_save()"), "{save}");
+        assert!(save.contains("self.settings_saves"), "{save}");
+        // The keys are stored on the writer thread, after the file write and
+        // before the reload that reads them back.
+        let persist = body_between(&src, "    fn persist_changes_with(", "\n    }\n");
+        let push = persist
+            .find("store_changed_keys")
+            .expect("keys never stored");
+        let wrote = persist.find("reply.result").expect("no write check");
+        let load = persist.find("load_after_write").expect("no reload");
+        assert!(wrote < push && push < load, "{persist}");
+        // A reply that cannot be posted must not leave asks refused for good.
+        assert!(persist.contains("finish(saves)"), "{persist}");
+    }
+
+    /// Quit: a Save that is still queued is handed to the writer and flushed, the
+    /// window is closed before the App is dropped, and the queue is drained.
+    #[test]
+    fn quit_flushes_a_queued_save_and_closes_settings() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        let destroy = proc_src
+            .find("        WM_DESTROY => {")
+            .expect("wnd_proc has no WM_DESTROY arm");
+        let tail = &proc_src[destroy..];
+        let queued = tail
+            .find("WM_APP_SETTINGS_SAVE")
+            .expect("a queued Save is lost");
+        let close = tail
+            .find("settings::close_now()")
+            .expect("Settings is left open");
+        let flush = tail.find("flush_global(").expect("no flush");
+        let drop_app = tail
+            .find("Box::from_raw(ptr)")
+            .expect("App is never dropped");
+        assert!(
+            queued < flush && close < drop_app && flush < drop_app,
+            "{tail}"
+        );
+    }
+
+    #[test]
+    fn a_failed_settings_post_frees_its_payload_and_a_dropped_one_is_freed() {
+        // The owner is gone: the box is freed here and the window is told.
+        let save = SettingsSave {
+            changes: Vec::new(),
+            original: crate::config::Config::default(),
+            edited: crate::config::Config::default(),
+        };
+        let nobody = 1isize;
+        assert!(super::post_settings_save(nobody, save).is_err());
+        // Dropped unhandled (quit): free_boxed_payload knows the id.
+        let raw = Box::into_raw(Box::new(SettingsSave {
+            changes: Vec::new(),
+            original: crate::config::Config::default(),
+            edited: crate::config::Config::default(),
+        }));
+        assert!(super::free_boxed_payload(
+            WM_APP_SETTINGS_SAVE,
+            windows::Win32::Foundation::LPARAM(raw as isize)
+        ));
     }
 
     /// The body of `fn <name>` as written in app.rs (LF-normalised): from its
@@ -7469,46 +8524,24 @@ mod tests {
     }
 
     #[test]
-    fn the_wingman_key_waits_for_settings_and_runs_when_it_leaves() {
+    fn the_foreground_gate_runs_before_any_app_borrow() {
         let src = lf(include_str!("app.rs"));
         let proc_src = wnd_proc_body(&src);
         let gate = proc_src
-            .find("settings::is_foreground()")
-            .expect("wnd_proc never asks whether Settings is in front");
+            .find("settings_foreground_policy(msg)")
+            .expect("wnd_proc never applies the foreground policy");
         let bind = proc_src
             .find("let app: &mut App")
             .expect("wnd_proc binds no app");
         assert!(gate < bind, "the gate must precede any App borrow");
-        assert!(proc_src.contains("ASK_WAITING_FOR_SETTINGS.with(|c| c.set(true))"));
-        let left = body_between(&src, "    fn on_settings_left(&mut self) {", "\n    }\n");
-        assert!(left.contains("settings::is_foreground()"), "{left}");
-        assert!(
-            left.contains("ASK_WAITING_FOR_SETTINGS.with(|c| c.replace(false))"),
-            "{left}"
-        );
-        assert!(left.contains("self.ask(Trigger::Hotkey)"), "{left}");
-        assert!(left.contains("self.deliver_deferred(pending)"), "{left}");
     }
 
     #[test]
-    fn the_owner_window_handles_settings_left_and_closes_settings_on_destroy() {
+    fn the_owner_window_handles_settings_left_and_save_arms() {
         let src = lf(include_str!("app.rs"));
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_LEFT => {"));
-        let destroy = proc_src
-            .find("        WM_DESTROY => {")
-            .expect("wnd_proc has no WM_DESTROY arm");
-        let tail = &proc_src[destroy..];
-        let close = tail
-            .find("settings::close_now()")
-            .expect("Settings is left open");
-        let drop_app = tail
-            .find("Box::from_raw(ptr)")
-            .expect("App is never dropped");
-        assert!(
-            close < drop_app,
-            "Settings must close before App is dropped"
-        );
+        assert!(proc_src.contains("WM_APP_SETTINGS_SAVE => {"));
     }
 
     // -- readiness_gate (issue #192) ---------------------------------------
@@ -7580,9 +8613,278 @@ mod tests {
             (CardState::Hidden, super::BusyPress::ShowStillWorking),
             (CardState::Collapsed, super::BusyPress::Leave),
             (CardState::Expanded, super::BusyPress::Leave),
+            // #307: a card the user is choosing from is never covered.
+            (CardState::Options, super::BusyPress::Leave),
         ] {
             assert_eq!(super::busy_press_card(state), expected, "{state:?}");
         }
+    }
+
+    // -- #307: the options card's choices ---------------------------------
+
+    fn session(generation: u32, ids: &[&str]) -> super::OptionsSession {
+        super::OptionsSession {
+            generation,
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+            catalogue: Vec::new(),
+        }
+    }
+
+    fn choose(
+        wparam: usize,
+        lparam: isize,
+        card: Option<u32>,
+        s: Option<&super::OptionsSession>,
+    ) -> super::OptionsChoiceAction {
+        super::options_choice_action(wparam, lparam, card, s)
+    }
+
+    #[test]
+    fn a_pick_runs_the_action_at_that_position() {
+        use super::OptionsChoiceAction::Run;
+        let s = session(7, &["check-my-work", "explain-screen", "translate"]);
+        assert_eq!(choose(1, 7, Some(7), Some(&s)), Run("check-my-work".into()));
+        assert_eq!(
+            choose(2, 7, Some(7), Some(&s)),
+            Run("explain-screen".into())
+        );
+        assert_eq!(choose(3, 7, Some(7), Some(&s)), Run("translate".into()));
+    }
+
+    #[test]
+    fn esc_closes_the_card_and_runs_nothing() {
+        let s = session(7, &["a", "b"]);
+        assert_eq!(
+            choose(0, 7, Some(7), Some(&s)),
+            super::OptionsChoiceAction::Close
+        );
+    }
+
+    #[test]
+    fn a_choice_made_on_another_card_runs_nothing() {
+        use super::OptionsChoiceAction::Ignore;
+        let s = session(7, &["a", "b"]);
+        // The card on screen is a newer one, or none, or the session is gone.
+        assert_eq!(choose(1, 7, Some(8), Some(&s)), Ignore);
+        assert_eq!(choose(1, 7, None, Some(&s)), Ignore);
+        assert_eq!(choose(1, 7, Some(7), None), Ignore);
+        // The click was made on an older card than the one showing.
+        assert_eq!(choose(1, 6, Some(7), Some(&s)), Ignore);
+        assert_eq!(choose(0, 6, Some(7), Some(&s)), Ignore, "a stale Esc too");
+    }
+
+    #[test]
+    fn a_pick_with_no_button_there_runs_nothing() {
+        use super::OptionsChoiceAction::Ignore;
+        // Still looking: no ids yet, so a digit cannot name an action.
+        let looking = session(3, &[]);
+        assert_eq!(choose(1, 3, Some(3), Some(&looking)), Ignore);
+        // Past the last of two buttons.
+        let two = session(3, &["a", "b"]);
+        assert_eq!(choose(3, 3, Some(3), Some(&two)), Ignore);
+        assert_eq!(choose(4, 3, Some(3), Some(&two)), Ignore);
+    }
+
+    #[test]
+    fn a_malformed_choice_runs_nothing() {
+        let s = session(3, &["a", "b", "c", "d"]);
+        for w in [5usize, 6, 99, usize::MAX] {
+            assert_eq!(
+                choose(w, 3, Some(3), Some(&s)),
+                super::OptionsChoiceAction::Ignore,
+                "wparam {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generation_is_compared_within_24_bits() {
+        // A card generation is 24 bits; the message carries it in a wider
+        // word, so stray high bits must not make a live card look stale, and
+        // must not make a stale one look live.
+        let s = session(0x00AB_CDEF, &["a"]);
+        let live = 0x00AB_CDEFisize;
+        assert!(matches!(
+            choose(1, live, Some(0x00AB_CDEF), Some(&s)),
+            super::OptionsChoiceAction::Run(_)
+        ));
+        assert_eq!(
+            choose(1, live + 1, Some(0x00AB_CDEF), Some(&s)),
+            super::OptionsChoiceAction::Ignore
+        );
+    }
+
+    #[test]
+    fn option_rows_carry_the_id_and_label_and_cap_at_four() {
+        let options: Vec<router::RouterOption> = (0..6)
+            .map(|n| router::RouterOption {
+                intent: format!("id{n}"),
+                label: format!("Label {n}"),
+                confidence: 0.5,
+            })
+            .collect();
+        let rows = super::option_rows(&options);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            (rows[0].id.as_str(), rows[0].label.as_str()),
+            ("id0", "Label 0")
+        );
+        assert_eq!(rows[3].id, "id3");
+        assert!(super::option_rows(&[]).is_empty());
+    }
+
+    /// The body of the `impl App` method `name`, from its signature to its
+    /// closing brace (`    }` at the method indent). CRLF-normalised.
+    fn app_method_body(name: &str) -> String {
+        let src = lf(include_str!("app.rs"));
+        let sig = format!("\n    fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("app.rs has no method {name}"));
+        let rest = &src[start + 1..];
+        let end = rest.find("\n    }\n").expect("method has no end");
+        let body = rest[..end].to_string();
+        assert!(!body.is_empty(), "scanned an empty body for {name}");
+        body
+    }
+
+    /// The one dispatch (spec "Implementation shape"): picking an option runs
+    /// the action through `dispatch_palette_action`, with no second `match` on
+    /// action ids that could drift from the palette's.
+    #[test]
+    fn an_option_runs_through_the_one_palette_dispatch() {
+        let body = app_method_body("on_options_choice");
+        assert!(body.contains("self.dispatch_palette_action("), "{body}");
+        for second in [
+            "dispatch_palette_target",
+            "dispatch_target_for",
+            "DispatchTarget",
+            "self.ask(",
+            "self.extract_text(",
+        ] {
+            assert!(!body.contains(second), "a second dispatch: {second}");
+        }
+        // And the card is gone, and settled, before the action captures.
+        let close = body
+            .find("self.close_options_card()")
+            .expect("never closes");
+        let settle = body.find("CARD_SETTLE_MS").expect("never settles");
+        let run = body.find("self.dispatch_palette_action(").unwrap();
+        assert!(close < settle && settle < run);
+    }
+
+    /// #805: opening the palette sends nothing. It reads no screen and starts
+    /// no model request: the action the user picks or types does that later.
+    #[test]
+    fn opening_the_palette_captures_and_sends_nothing() {
+        let body = app_method_body("toggle_palette");
+        for forbidden in [
+            "grab_raw",
+            "capture::",
+            "router::",
+            "router_worker",
+            "start_options_router",
+            "show_options_card",
+            "thread::spawn",
+            "WM_APP_ROUTER_RESULT",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "toggle_palette must not use {forbidden}"
+            );
+        }
+        assert!(body.contains("self.palette.show("));
+    }
+
+    /// The options card is reachable and answered: the tray item runs it, the
+    /// window procedure routes its choices and the router's reply to it.
+    #[test]
+    fn the_options_card_is_wired_to_the_tray_and_the_window_procedure() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        let arm = proc_src
+            .split("WM_APP_OPTIONS_CHOICE => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_OPTIONS_CHOICE arm");
+        let arm = &arm[..arm.find("LRESULT(0)").expect("arm has no end")];
+        assert!(arm.contains("app.on_options_choice("), "{arm}");
+        let reply = proc_src
+            .split("WM_APP_ROUTER_RESULT => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_ROUTER_RESULT arm");
+        let reply = &reply[..reply.find("LRESULT(0)").expect("arm has no end")];
+        assert!(reply.contains("app.on_router_result("), "{reply}");
+        assert!(
+            src.contains("MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card("),
+            "the tray item must open the options card"
+        );
+    }
+
+    /// An ignored choice (stale generation, or no buttons yet) leaves the card
+    /// up with its claim spent, so it must be put back; a choice that closes
+    /// the card or runs an action must not be.
+    #[test]
+    fn only_an_ignored_choice_puts_the_claim_back() {
+        use super::{options_choice_action, rearm_after, OptionsChoiceAction, OptionsSession};
+        let session = OptionsSession {
+            generation: 5,
+            ids: vec!["a".to_string(), "b".to_string()],
+            catalogue: Vec::new(),
+        };
+        // A digit made on an older card: ignored, card still up.
+        let stale = options_choice_action(1, 4, Some(5), Some(&session));
+        assert_eq!(stale, OptionsChoiceAction::Ignore);
+        assert!(rearm_after(&stale));
+        // A digit naming no button yet: ignored.
+        let none_yet = options_choice_action(3, 5, Some(5), Some(&session));
+        assert_eq!(none_yet, OptionsChoiceAction::Ignore);
+        assert!(rearm_after(&none_yet));
+        // A real pick and Esc end the card.
+        let pick = options_choice_action(2, 5, Some(5), Some(&session));
+        assert_eq!(pick, OptionsChoiceAction::Run("b".to_string()));
+        assert!(!rearm_after(&pick));
+        let esc = options_choice_action(0, 5, Some(5), Some(&session));
+        assert_eq!(esc, OptionsChoiceAction::Close);
+        assert!(!rearm_after(&esc));
+    }
+
+    /// The tray menu clears the claim; it is put back right after the menu
+    /// ends, before the chosen command is dispatched, and not only when
+    /// nothing was chosen. (The window procedure needs a live window, so this
+    /// one pins the order in the source; the card's own behaviour is tested in
+    /// `ui::card::options`.)
+    #[test]
+    fn the_tray_menu_puts_the_options_claim_back_before_dispatching() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("no handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        let track = body.find(".track()").expect("the menu is never tracked");
+        let rearm = body
+            .find("rearm_options_claim()")
+            .expect("the claim is never put back");
+        let dispatch = body.find("match chosen {").expect("no dispatch on chosen");
+        assert!(track < rearm && rearm < dispatch, "wrong order");
+        assert_eq!(body.matches("rearm_options_claim()").count(), 1);
+    }
+
+    /// The tray menu loop runs a nested message loop, and Esc closes a menu:
+    /// the options card must not hold the key while it runs.
+    #[test]
+    fn the_tray_menu_releases_the_options_key_claim_before_it_runs() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("app.rs has no fn handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        let clear = body
+            .find("options_keys::clear()")
+            .expect("the menu never releases the claim");
+        let track = body.find(".track()").expect("the menu is never tracked");
+        assert!(clear < track);
     }
 
     /// #723: a run flagged stuck is abandoned by the next press; a healthy
@@ -7637,6 +8939,39 @@ mod tests {
         assert!(seen >= 7, "expected the result post sites, found {seen}");
     }
 
+    /// #805: opening the palette sends nothing. The router's request (a
+    /// screenshot to a model) used to start at the end of `toggle_palette`;
+    /// it now belongs to the key press and the options card. Scans the body
+    /// of `toggle_palette` for anything that captures the screen or starts a
+    /// model request.
+    #[test]
+    fn opening_the_palette_sends_no_model_request() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("    fn toggle_palette(&mut self) {")
+            .expect("toggle_palette exists");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("toggle_palette ends");
+        let body = &body[..end];
+        assert!(
+            body.contains("self.palette.show("),
+            "the scan found the wrong body"
+        );
+        for forbidden in [
+            "show_options_card",
+            "router_worker",
+            "capture::",
+            "grab_raw",
+            "thread::spawn",
+            "set_router_pending",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "toggle_palette starts a request again: {forbidden}"
+            );
+        }
+    }
+
     /// #723: the stuck bound covers every provider in a chain at its own
     /// wall clock, so a healthy run is never called stuck.
     #[test]
@@ -7665,6 +9000,16 @@ mod tests {
             seen += 1;
         }
         assert!(seen >= 3, "expected the busy gates, found {seen}");
+        // The raw flag must not gate a press either: it skips the stuck-run
+        // abandon and returns with no card.
+        let raw = "if self.".to_owned() + "busy {";
+        for (i, _) in src.match_indices(&raw) {
+            let after = src.get(i..i + 120).unwrap_or(&src[i..]);
+            assert!(
+                after.contains("self.card.show_answer(") || after.contains("self.show_busy_card()"),
+                "a raw busy check returns without a card: {after}"
+            );
+        }
         let gate = src
             .find("ModelActionGate::Busy => {")
             .expect("begin_action has no Busy arm");
@@ -8105,6 +9450,54 @@ mod tests {
         }
     }
 
+    // -- #831: the welcome card on the very first launch -------------------
+
+    #[test]
+    fn welcome_decision_against_a_scratch_folder() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("wingman-test-welcome-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.toml");
+        let old = dir.join("old-config.toml");
+        let show = |existed, settings, other| {
+            super::should_show_welcome(&cfg, &old, existed, settings, other)
+        };
+
+        // Unwritable folder: load could not create the file, so no card.
+        assert!(!show(false, false, false));
+
+        // Fresh start: absent before, created by this start.
+        fs::write(&cfg, "").unwrap();
+        assert!(show(false, false, false));
+
+        // Every later launch (and autostart): the file existed before.
+        assert!(!show(true, false, false));
+        // install.ps1's `--settings` launch already opens Settings.
+        assert!(!show(false, true, false));
+        // A startup problem card must not be replaced.
+        assert!(!show(false, false, true));
+
+        // Unfinished copilot-ask migration: a returning user.
+        fs::write(&old, "").unwrap();
+        assert!(!show(false, false, false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn welcome_card_names_the_keys_and_the_tray_icon() {
+        let (headline, detail) = super::welcome_card("Ctrl+Shift+/");
+        assert!(headline.starts_with("Wingman is running"), "{headline}");
+        assert!(detail.contains("Copilot key"), "{detail}");
+        assert!(detail.contains("Ctrl+Shift+/"), "{detail}");
+        assert!(detail.contains("tray"), "{detail}");
+        assert!(detail.contains("Click here"), "{detail}");
+        // #936: the overflow button by its Windows name, not a typed caret.
+        assert!(detail.contains("Show hidden icons"), "{detail}");
+        assert!(!detail.contains('^'), "{detail}");
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+    }
+
     // -- #832: an empty chain at run time ends in the setup card ----------
 
     #[test]
@@ -8142,11 +9535,56 @@ mod tests {
     #[test]
     fn empty_chain_card_says_ollama_is_not_running_when_only_ollama_is_listed() {
         let (headline, detail) =
-            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml");
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml", None);
         assert_eq!(headline, "Ollama is not running");
         assert!(detail.contains("Start Ollama"), "{detail}");
         assert!(detail.contains("Settings"), "{detail}");
         assert!(!detail.contains("Try again"), "{detail}");
+    }
+
+    /// #892: a config.toml that did not parse starts the run on default
+    /// providers; the setup card must name the file, not tell the user to
+    /// edit `providers.order` in the file Wingman could not read.
+    #[test]
+    fn a_file_that_did_not_parse_is_named_by_the_gate_and_the_empty_chain_card() {
+        let problem = Some("config.toml has an error at line 3, column 1");
+        let path = "C:\\Users\\me\\config.toml";
+        let providers = nothing_configured_providers();
+        let cards = [
+            super::setup_gate(Mode::Offline, &providers, path, problem).expect("blocked"),
+            super::empty_chain_card(Mode::Offline, &providers, path, problem),
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), path, problem),
+        ];
+        for (headline, detail) in cards {
+            assert_eq!(headline, "Settings file not read");
+            assert!(detail.contains("line 3, column 1"), "{detail}");
+            assert!(detail.contains(path), "{detail}");
+            assert!(detail.contains("Open config.toml"), "{detail}");
+            assert!(!detail.contains("providers.order"), "{detail}");
+            assert!(!detail.contains('\u{2014}'));
+        }
+        // No problem: the old cards, unchanged. A ready provider still passes.
+        assert_eq!(
+            super::setup_gate(Mode::Offline, &providers, path, None),
+            App::readiness_gate(Mode::Offline, &providers, path)
+        );
+        assert!(super::setup_gate(Mode::Cloud, &cloud_ready_providers(), path, problem).is_none());
+    }
+
+    #[test]
+    fn a_broken_file_card_keeps_its_detail_whatever_the_ollama_probe_found() {
+        let broken = "The file is here".to_string();
+        for found in [FirstRun::NoVisionModel, FirstRun::VisionUnknown] {
+            assert_eq!(
+                super::first_run_card_detail(broken.clone(), &found, Some("line 3")),
+                broken
+            );
+            assert_ne!(
+                super::first_run_card_detail(broken.clone(), &found, None),
+                broken,
+                "without a load problem the probe's detail still applies"
+            );
+        }
     }
 
     #[test]
@@ -8156,7 +9594,8 @@ mod tests {
             Some(super::empty_chain_card(
                 Mode::Auto,
                 &providers,
-                "config.toml"
+                "config.toml",
+                None
             )),
             App::readiness_gate(Mode::Auto, &providers, "config.toml")
         );
@@ -8165,7 +9604,8 @@ mod tests {
     #[test]
     fn empty_chain_cards_have_no_em_dash() {
         for providers in [ollama_only_providers(), nothing_configured_providers()] {
-            let (headline, detail) = super::empty_chain_card(Mode::Auto, &providers, "c.toml");
+            let (headline, detail) =
+                super::empty_chain_card(Mode::Auto, &providers, "c.toml", None);
             assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         }
     }
@@ -8586,6 +10026,7 @@ mod tests {
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
+        ("WM_APP_CARD_REPORT_PROBLEM", WM_APP_CARD_REPORT_PROBLEM),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
@@ -8593,6 +10034,8 @@ mod tests {
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
         ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
         ("WM_APP_SETTINGS_LEFT", WM_APP_SETTINGS_LEFT),
+        ("WM_APP_SETTINGS_SAVE", WM_APP_SETTINGS_SAVE),
+        ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -8695,13 +10138,14 @@ mod tests {
             + count_declarations(include_str!("hotkey.rs"))
             + count_declarations(include_str!("ui/tray.rs"))
             + count_declarations(include_str!("ui/card.rs"))
-            + count_declarations(include_str!("ui/palette.rs"));
+            + count_declarations(include_str!("ui/palette.rs"))
+            + count_declarations(include_str!("options_keys.rs"));
 
         assert_eq!(
             declared,
             ALL_WM_APP_IDS.len(),
             "found {declared} `pub const WM_APP_* = WM_APP + n;` declarations across \
-             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs/ui/palette.rs but \
+             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs/ui/palette.rs/options_keys.rs but \
              ALL_WM_APP_IDS lists {}; add the new constant to ALL_WM_APP_IDS too",
             ALL_WM_APP_IDS.len()
         );
@@ -9112,12 +10556,12 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false, None), None);
-        let only_keys = super::startup_card(&keys, false, None).unwrap();
+        assert_eq!(super::startup_card(&[], false, None, None), None);
+        let only_keys = super::startup_card(&keys, false, None, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true, None).unwrap();
+        let only_squat = super::startup_card(&[], true, None, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
@@ -9129,12 +10573,13 @@ mod tests {
     #[test]
     fn startup_card_reports_a_config_file_that_did_not_parse() {
         let problem = "config.toml has an error at line 3, column 7";
-        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        let (headline, detail) = super::startup_card(&[], false, Some(problem), None).unwrap();
         assert!(headline.contains("Settings file"), "{headline}");
         assert!(detail.contains(problem), "{detail}");
         assert!(detail.contains("Reload settings"), "{detail}");
         assert!(!detail.contains('\u{2014}'));
-        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        let (_, both) =
+            super::startup_card(&["openai".to_string()], true, Some(problem), None).unwrap();
         assert!(
             both.contains(problem) && both.contains("startup lock"),
             "{both}"
@@ -9143,6 +10588,37 @@ mod tests {
         assert!(both.contains("Offline"), "{both}");
     }
 
+    /// #924: a first-run config file that could not be written is a card
+    /// (rule 7) naming the folder and the error, and it joins the others.
+    #[test]
+    fn startup_card_reports_a_settings_file_that_could_not_be_created() {
+        let failed = Some((
+            "C:\\Users\\x\\AppData\\Roaming\\Wingman",
+            "Access is denied. (os error 5)",
+        ));
+        let (headline, detail) = super::startup_card(&[], false, None, failed).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains("AppData\\Roaming\\Wingman"), "{detail}");
+        assert!(detail.contains("Access is denied"), "{detail}");
+        assert!(detail.contains("default settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&[], true, None, failed).unwrap();
+        assert!(
+            both.contains("Access is denied") && both.contains("startup lock"),
+            "{both}"
+        );
+    }
+
+    /// A long error (an `icacls` message) is capped, and a blank one still
+    /// reads as a sentence.
+    #[test]
+    fn settings_create_failed_card_caps_and_tidies_the_error() {
+        let long = "x".repeat(2000);
+        let (_, detail) = super::settings_create_failed_card("C:\\f", &long);
+        assert!(detail.chars().count() < 600, "{}", detail.chars().count());
+        let (_, blank) = super::settings_create_failed_card("C:\\f", "  ");
+        assert!(blank.contains("C:\\f") && !blank.contains("()"), "{blank}");
+    }
     /// #237: the owner window must exist before the single-instance name is
     /// taken, or a duplicate arriving in the gap finds the name held and no
     /// window to poke. Source scan over `run`'s body, so it needs no window.
@@ -9332,6 +10808,11 @@ mod tests {
             SettingsReentrancy::Ignore,
         ),
         (
+            "WM_APP_CARD_REPORT_PROBLEM",
+            WM_APP_CARD_REPORT_PROBLEM,
+            SettingsReentrancy::Ignore,
+        ),
+        (
             "WM_APP_SEND_PREVIEW",
             WM_APP_SEND_PREVIEW,
             SettingsReentrancy::Ignore,
@@ -9364,6 +10845,16 @@ mod tests {
         (
             "WM_APP_SETTINGS_LEFT",
             WM_APP_SETTINGS_LEFT,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_OPTIONS_CHOICE",
+            WM_APP_OPTIONS_CHOICE,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_SETTINGS_SAVE",
+            WM_APP_SETTINGS_SAVE,
             SettingsReentrancy::Defer,
         ),
     ];
@@ -10354,7 +11845,7 @@ mod tests {
 
         // Rendered directly at ROUTER_IMAGE_LONG_EDGE (not a larger canvas
         // downscaled afterward): this is the actual pixel budget
-        // `App::maybe_start_router` sends in production, so a passing
+        // `App::show_options_card` sends in production, so a passing
         // result here is real evidence for -- and a failing one real
         // evidence against -- `router::ROUTER_IMAGE_LONG_EDGE`'s doc
         // comment's THEORY that 512 stays legible enough for this kind of
@@ -10574,6 +12065,44 @@ mod tests {
         assert!(src[begin..begin + 1500].contains("queue_skipped_from_disk()"));
     }
 
+    /// #806: the remote-Ollama notice is checked in `begin_action`, before the
+    /// screen is captured, so the screenshot is never grabbed for a press the
+    /// notice replaces. Without that call the module would be wired to nothing.
+    #[test]
+    fn begin_action_shows_the_remote_ollama_notice_before_capture() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let begin = src.find("fn begin_action<T>").expect("fn exists");
+        let rest = &src[begin..];
+        let end = rest.find("\n    fn ").expect("a later fn");
+        let body = &rest[..end];
+        let notice = body
+            .find("show_remote_ollama_notice()")
+            .expect("begin_action must call the notice");
+        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        assert!(notice < capture, "the notice must come before the capture");
+        assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
+    }
+
+    /// #918: the intent router builds its own chain and never passes through
+    /// `begin_action`, so it must ask the same remote-Ollama question itself,
+    /// before it captures or sends anything.
+    #[test]
+    fn the_router_shows_the_remote_ollama_notice_before_capture() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let begin = src
+            .find("fn show_options_card(")
+            .expect("show_options_card exists");
+        let rest = &src[begin..];
+        let end = rest.find("\n    fn ").expect("a later fn");
+        let body = &rest[..end];
+        let notice = body
+            .find("show_remote_ollama_notice()")
+            .expect("the router must call the notice");
+        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        // The worker that sends is started by a later fn, after the capture.
+        assert!(notice < capture, "the notice must come before the capture");
+    }
+
     /// #541: every handler that ends a run on a result card must consult the
     /// pending notices through `with_pending_notices`, so a new path cannot
     /// quietly forget them.
@@ -10600,6 +12129,52 @@ mod tests {
             );
         }
     }
+    /// #893: a setup card is persistent, so showing one must also arm the
+    /// click-away hook. That happens in `show_setup_card`, the only place
+    /// outside startup (the watcher is not installed yet there) that calls
+    /// `Card::show_settings_needed`; `reload` and `edit_settings` arm their own
+    /// persistent cards.
+    #[test]
+    fn setup_cards_are_shown_through_the_one_helper_that_arms_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        // Split on the real test module: a bare "#[cfg(test)]" also appears in
+        // doc comments and on test-only items well before it.
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        assert!(
+            production.contains("fn show_setup_card("),
+            "production not scanned"
+        );
+        assert!(production.contains("fn wnd_proc("), "production cut short");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let direct = production.matches("card.show_settings_needed(").count();
+        // The helper itself and the startup welcome card.
+        assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
+        assert!(body_of("show_setup_card").contains("set_watch(true)"));
+        assert!(body_of("reload").contains("set_watch(true)"));
+        // Every early return in edit_settings that follows a card arms it.
+        let edit = body_of("edit_settings");
+        let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
+        assert!(returns.len() >= 2, "edit_settings candidates not found");
+        for at in returns {
+            let before = &edit[at.saturating_sub(120)..at];
+            if before.contains(".show_error") {
+                assert!(
+                    before.contains("set_watch(true)"),
+                    "edit_settings returns after a card without arming click-away"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
         let _g = ATTRIBUTION_TEST_LOCK

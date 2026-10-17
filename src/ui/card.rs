@@ -152,6 +152,16 @@ pub const WM_APP_CARD_OPEN_SETTINGS: u32 = WM_APP + 15;
 /// `count_declarations` file list -- see that test's doc comment.
 pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 
+/// Posted to the card's owner window when the user activates "Report a
+/// problem" on an expanded error card (#373). Carries no payload: like
+/// [`WM_APP_CARD_COPY_DETAILS`], the facts come from `App`, not the card.
+/// `App::report_problem` opens the browser at a prefilled new-issue page.
+/// Registered in `app.rs`'s `ALL_WM_APP_IDS` (issue #163).
+pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 25;
+
+mod options;
+pub use options::{OptionRow, OptionsBehavior};
+
 use crate::provider::Difficulty;
 pub use crate::ui::pending_status::PendingStage;
 use crate::ui::pending_status::{pending_glyph_should_spin, pending_status_text};
@@ -173,6 +183,10 @@ pub enum CardState {
     /// undo -- Esc or a click elsewhere dismiss it instead. See
     /// [`Card::show_preview`].
     Preview,
+    /// The options card (#307): a summary and 2 to 4 one-click choices for
+    /// what is on screen. Never takes focus; nothing has run until a row is
+    /// picked. See [`Card::show_options`].
+    Options,
 }
 
 /// A single owned notification-card window.
@@ -237,11 +251,13 @@ impl Card {
             scroll_page: 0,
             ex_noactivate_removed: false,
             preview: None,
+            options: None,
             last_confirmed: None,
             owner: None,
             open_settings_on_click: false,
             copy_details_available: false,
             copy_details_rect: None,
+            report_rect: None,
             copy_available: false,
             focus_link: None,
             copy_rect: None,
@@ -425,8 +441,8 @@ impl Card {
     /// up yet", "Local mode needs Ollama configured") -- the actionable next
     /// step for those is Settings, not more text to read.
     pub fn show_settings_needed(&mut self, headline: &str, detail: &str) {
-        self.inner.show_collapsed(headline, detail, 0, None);
-        self.inner.open_settings_on_click = true;
+        self.inner
+            .show_collapsed_with(headline, detail, 0, None, true);
     }
 
     pub fn hide(&mut self) {
@@ -595,12 +611,13 @@ impl Card {
         self.inner.move_footer_focus(false);
     }
 
-    /// The UI gallery's preview error title: puts `message` where the
-    /// preview's title goes, as a rejected edit does.
+    /// The UI gallery's preview error: shows `message` under the preview's
+    /// title, as a rejected edit does.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_preview_error_for_gallery(&mut self, message: &str) {
         if let Some(preview) = self.inner.preview.as_mut() {
             preview.error = Some(message.to_string());
+            self.inner.relayout_current_state();
             self.inner.invalidate();
         }
     }
@@ -619,6 +636,9 @@ impl Drop for Card {
         // delivered (and handled by our WNDPROC via the still-valid raw
         // pointer) before DestroyWindow returns, so this is safe to do while
         // `self.inner` is still alive.
+        // #307: a card dropped while the options show must not leave the
+        // keyboard hook claiming keys for a card that no longer exists.
+        self.inner.leave_options_if_active();
         unsafe {
             if !self.inner.hwnd.0.is_null() {
                 let _ = DestroyWindow(self.inner.hwnd);
@@ -1077,6 +1097,9 @@ const CARD_WIDTH_DP: i32 = 384;
 /// never silently `DT_END_ELLIPSIS`'d. (The card is as wide as it is so
 /// the larger type keeps the 50-character budget the prompts promise.)
 pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
+/// #885: the most lines of detail a setup card shows; the rest ends in an
+/// ellipsis, so a long config path cannot make the card taller than the screen.
+const SETUP_DETAIL_MAX_LINES: i32 = 6;
 /// Characters that fit on one collapsed headline line once the chevron's
 /// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
@@ -1157,6 +1180,7 @@ fn scroll_target_for_key(vk: u16, offset: i32, max: i32, line: i32, page: i32) -
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FooterLink {
     CopyDetails,
+    Report,
     ReadAloud,
     Copy,
 }
@@ -1183,7 +1207,43 @@ fn next_footer_focus(
     Some(links[next])
 }
 
-/// The title line of a preview that rejected an edit. High contrast has one
+/// Draws a solid frame `thickness` px wide just inside `rect`, in `color`.
+unsafe fn frame_rect(hdc: HDC, rect: &RECT, thickness: i32, color: u32) {
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
+    let t = thickness.max(1);
+    let edges = [
+        RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.top + t,
+        },
+        RECT {
+            left: rect.left,
+            top: rect.bottom - t,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+        RECT {
+            left: rect.left,
+            top: rect.top + t,
+            right: rect.left + t,
+            bottom: rect.bottom - t,
+        },
+        RECT {
+            left: rect.right - t,
+            top: rect.top + t,
+            right: rect.right,
+            bottom: rect.bottom - t,
+        },
+    ];
+    for edge in &edges {
+        FillRect(hdc, edge, brush);
+    }
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+/// The message of a preview that rejected an edit. High contrast has one
 /// ink for everything (#648), so the message says it is an error in words.
 fn preview_error_title(message: &str, theme: Theme) -> String {
     if theme == Theme::HighContrast && !message.starts_with("Error") {
@@ -1201,13 +1261,13 @@ fn preview_error_title(message: &str, theme: Theme) -> String {
 /// of margin around it.
 const BADGE_EDGE_MARGIN_DP: i32 = 8;
 /// Horizontal/vertical text inset inside the badge shape.
-const BADGE_PAD_X_DP: i32 = 5;
+const BADGE_PAD_X_DP: i32 = 8;
 const BADGE_PAD_Y_DP: i32 = 3;
 /// Floor on both badge dimensions so a single-digit label (e.g. "1") still
 /// reads as a deliberate shape rather than a sliver -- this also makes
 /// single-character badges come out as circles (width == height) while
 /// two-character ones ("10") and "U" come out as pills.
-const BADGE_MIN_DIAMETER_DP: i32 = 18;
+const BADGE_MIN_DIAMETER_DP: i32 = 20;
 /// Minimum clearance kept between the badge and any headline text next to
 /// it, on top of the badge's own width.
 const BADGE_TEXT_GAP_DP: i32 = 6;
@@ -1407,6 +1467,10 @@ struct CardInner {
     /// see `leave_preview_if_active`, the single choke point every path out
     /// of Preview goes through.
     preview: Option<PreviewUi>,
+    /// Live state for `CardState::Options` (#307), `None` in every other
+    /// state. `Some` for exactly as long as the row buttons exist, see
+    /// `leave_options_if_active`.
+    options: Option<options::OptionsUi>,
     /// The `Confirmed<Value>` from the most recent "Do it" / Enter, read
     /// (and cleared) by `Card::take_confirmed`. Deliberately NOT stored
     /// inside `PreviewUi`: `preview_do_it` closes the preview (via
@@ -1457,6 +1521,10 @@ struct CardInner {
     /// math. `None` whenever there is nothing to show (not an error card,
     /// or not Expanded yet); recomputed by every `layout_expanded` call.
     copy_details_rect: Option<RECT>,
+    /// #373: the "Report a problem" link beside "Copy details", on the same
+    /// cards and in the same coordinates. Shown whenever
+    /// `copy_details_available` is, because both read the same recorded error.
+    report_rect: Option<RECT>,
     /// Issue #77: `true` while the card is an answer card (set only by
     /// [`Card::show_answer`]), i.e. one with a "Read aloud" footer to offer
     /// once Expanded. Mutually exclusive with `copy_details_available`:
@@ -1554,6 +1622,7 @@ impl CardInner {
     /// directly at `AskingModel`.
     fn show_pending(&mut self, stage: PendingStage) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         self.reset_activation_and_timers();
         // `headline`/`detail` stay unused by Pending (issue #354's status
         // line is driven by `pending_stage`/`pending_status_text`, painted
@@ -1667,7 +1736,21 @@ impl CardInner {
         auto_dismiss_secs: u32,
         difficulty: Option<Difficulty>,
     ) {
+        self.show_collapsed_with(headline, detail, auto_dismiss_secs, difficulty, false);
+    }
+
+    /// `open_settings` must be known before the layout runs: a setup card
+    /// shows its detail line (#885), so its height depends on it.
+    fn show_collapsed_with(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        difficulty: Option<Difficulty>,
+        open_settings: bool,
+    ) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         self.reset_activation_and_timers();
         self.headline = headline.to_string();
         self.detail = detail.to_string();
@@ -1679,17 +1762,23 @@ impl CardInner {
         // reasoning as `set_window_text_for_pending_stage` (#354) -- covers
         // show_answer, show_error, show_error_with_details and
         // show_settings_needed, every one of which funnels through here.
-        self.set_window_text(headline);
+        // #885: a setup card's detail is on screen, so Narrator reads it too.
+        if open_settings && !detail.is_empty() {
+            self.set_window_text(&format!("{headline}. {detail}"));
+        } else {
+            self.set_window_text(&answer_accessible_name(headline, difficulty));
+        }
         // Issue #347: every ordinary show_answer/show_error call starts a
         // plain card, not a "click to open Settings" prompt -- only
         // `Card::show_settings_needed` sets this, right after this call
-        // returns.
-        self.open_settings_on_click = false;
+        // returns (through `show_collapsed_with`).
+        self.open_settings_on_click = open_settings;
         // Issue #425: same reasoning -- only `Card::show_error` sets this,
         // right after this call returns, so an answer card never inherits a
         // "Copy details" affordance for an error it isn't.
         self.copy_details_available = false;
         self.copy_details_rect = None;
+        self.report_rect = None;
         // Issue #77: likewise, only `Card::show_answer` turns "Read aloud"
         // on, right after this call returns.
         self.read_aloud_available = false;
@@ -1718,6 +1807,7 @@ impl CardInner {
 
     fn hide(&mut self) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         self.stop_reading();
         self.kill_timers();
         self.copy_feedback = CopyFeedback::None;
@@ -1972,6 +2062,29 @@ impl CardInner {
         }
     }
 
+    /// #373: `true` when `(x, y)` lands on the "Report a problem" link.
+    fn point_hits_report(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.report_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// #373: click, Tab then Enter or Space on "Report a problem". Only
+    /// notifies the owner, which builds the link from what it recorded.
+    fn report_activated(&mut self) {
+        if let Some(owner) = self.owner {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(owner),
+                    WM_APP_CARD_REPORT_PROBLEM,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
     /// Issue #77: `true` when `(x, y)` (client-window coordinates) lands on
     /// the pinned "Read aloud" footer; `false` when there is no such footer.
     fn point_hits_read_aloud(&self, x: i32, y: i32) -> bool {
@@ -2057,6 +2170,7 @@ impl CardInner {
     fn footer_links(&self) -> Vec<FooterLink> {
         [
             (FooterLink::CopyDetails, self.copy_details_rect),
+            (FooterLink::Report, self.report_rect),
             (FooterLink::ReadAloud, self.read_aloud_rect),
             (FooterLink::Copy, self.copy_rect),
         ]
@@ -2081,6 +2195,7 @@ impl CardInner {
         let shown = self.footer_links();
         match self.focus_link.filter(|l| shown.contains(l)) {
             Some(FooterLink::CopyDetails) => self.copy_details_activated(),
+            Some(FooterLink::Report) => self.report_activated(),
             Some(FooterLink::ReadAloud) => self.read_aloud_activated(),
             Some(FooterLink::Copy) => self.copy_activated(),
             None => return false,
@@ -2091,6 +2206,7 @@ impl CardInner {
     /// The pinned footer row's rect, whichever footer the card has.
     fn footer_rect(&self) -> Option<RECT> {
         self.copy_details_rect
+            .or(self.report_rect)
             .or(self.read_aloud_rect)
             .or(self.copy_rect)
     }
@@ -2321,7 +2437,13 @@ impl CardInner {
 
         // No affordance line: the card is just the headline. Clicking it
         // still expands when there is detail to show.
-        let height = padding * 2 + headline_h;
+        let mut height = padding * 2 + headline_h;
+        // #885: a setup card also shows its detail, measured the same way
+        // `paint_collapsed` draws it.
+        if self.shows_setup_detail() {
+            let gap = self.scale(GAP_DP);
+            height += gap + self.setup_detail_height(content_width);
+        }
 
         self.place_bottom_right(work, width, height);
     }
@@ -2384,7 +2506,19 @@ impl CardInner {
         };
         // Issue #77: the one pinned footer row is "Copy details" on an error
         // card and "Read aloud" on an answer card, never both.
-        self.copy_details_rect = footer.filter(|_| self.copy_details_available);
+        // #373: an error card splits the row between "Copy details" and
+        // "Report a problem", laid out the way an answer card's links are.
+        self.copy_details_rect = None;
+        self.report_rect = None;
+        if let Some(f) = footer.filter(|_| self.copy_details_available) {
+            let body = self.fonts.caption;
+            let details_w = self.measure_label(body, "Copy details").0;
+            let report_w = self.measure_label(body, "Report a problem").0;
+            let gap = self.scale(FOOTER_LINK_GAP_DP);
+            let (details, report) = footer_links_layout(f, Some(details_w), report_w, gap);
+            self.copy_details_rect = details;
+            self.report_rect = rect_has_area(report).then_some(report);
+        }
         // Issue #531: an answer card splits that row between "Read aloud" and
         // "Copy". Each link is sized for its widest label so the row does not
         // shift when "Read aloud" becomes "Stop reading" or "Copy" "Copied".
@@ -2432,6 +2566,7 @@ impl CardInner {
                 self.layout_preview();
                 self.reposition_preview_controls();
             }
+            CardState::Options => self.relayout_options(),
         }
         self.invalidate();
     }
@@ -2531,8 +2666,9 @@ impl CardInner {
         let pad_x = self.scale(BADGE_PAD_X_DP);
         let pad_y = self.scale(BADGE_PAD_Y_DP);
         let min_d = self.scale(BADGE_MIN_DIAMETER_DP);
-        let w = (tw + pad_x * 2).max(min_d);
         let h = (th + pad_y * 2).max(min_d);
+        // Never narrower than tall: a single character is a circle.
+        let w = (tw + pad_x * 2).max(min_d).max(h);
         (w, h)
     }
 
@@ -2567,10 +2703,26 @@ impl CardInner {
         (content_w - self.badge_reserve(self.difficulty) - self.chevron_reserve()).max(1)
     }
 
+    /// #885: a collapsed click-to-open-Settings card draws its detail line
+    /// under the headline, because a click opens Settings, not the detail.
+    fn shows_setup_detail(&self) -> bool {
+        self.state == CardState::Collapsed && self.open_settings_on_click && !self.detail.is_empty()
+    }
+
+    /// Height of the setup card's detail: measured, capped at
+    /// [`SETUP_DETAIL_MAX_LINES`] lines. Layout and paint both use it.
+    fn setup_detail_height(&self, content_w: i32) -> i32 {
+        let cap = self.line_height(self.fonts.caption).max(1) * SETUP_DETAIL_MAX_LINES;
+        self.measure_wrapped(self.fonts.caption, &self.detail, content_w)
+            .min(cap)
+    }
+
     /// Space kept free at the right of a collapsed headline for the "click
     /// for more" chevron (#353); zero when there is nothing more to show.
     fn chevron_reserve(&self) -> i32 {
-        if card_has_more_to_show(self.state, self.detail.is_empty()) {
+        // A setup card shows its detail itself and a click opens Settings,
+        // so a "click for more" chevron would promise the wrong thing (#885).
+        if card_has_more_to_show(self.state, self.detail.is_empty()) && !self.shows_setup_detail() {
             self.scale(CHEVRON_RESERVE_DP)
         } else {
             0
@@ -2662,6 +2814,7 @@ impl CardInner {
                 CardState::Collapsed => self.paint_collapsed(hdc, rc, padding, &palette),
                 CardState::Expanded => self.paint_expanded(hdc, rc, padding, gap, &palette),
                 CardState::Preview => self.paint_preview(hdc, &palette),
+                CardState::Options => self.paint_options(hdc, &palette),
             }
         }
     }
@@ -2731,9 +2884,19 @@ impl CardInner {
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
         // Dim full ring underneath (also the whole glyph when static).
+        // High contrast has one ink, so the track and the arc would be the
+        // same line: the track goes hairline so the thick arc still shows
+        // progress (#817).
+        let track_stroke = if self.theme == Theme::HighContrast
+            && pending_glyph_should_spin(self.animations_enabled)
+        {
+            1
+        } else {
+            stroke
+        };
         let ring_pen = CreatePen(
             PS_SOLID,
-            stroke,
+            track_stroke,
             windows::Win32::Foundation::COLORREF(palette.border),
         );
         if !ring_pen.0.is_null() {
@@ -2836,6 +2999,24 @@ impl CardInner {
             let cx = headline_rect.right + self.chevron_reserve() / 2;
             let cy = headline_rect.top + headline_line_h / 2;
             self.draw_chevron(hdc, cx, cy, palette.hint);
+        }
+
+        if self.shows_setup_detail() {
+            let top = headline_rect.bottom + self.scale(GAP_DP);
+            let detail_rect = RECT {
+                left: rc.left + padding,
+                top,
+                right: rc.left + padding + content_w,
+                bottom: top + self.setup_detail_height(content_w),
+            };
+            SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+            draw_text_line(
+                hdc,
+                &self.detail,
+                detail_rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
         }
 
         self.paint_difficulty_badge(hdc, rc);
@@ -2946,6 +3127,7 @@ impl CardInner {
         // draws within it unless the clip is reset, so reset it first).
         let links = [
             (self.copy_details_rect, "Copy details"),
+            (self.report_rect, "Report a problem"),
             (self.read_aloud_rect, self.read_aloud_label()),
             (self.copy_rect, self.copy_label()),
         ];
@@ -2962,23 +3144,32 @@ impl CardInner {
                 );
             }
         }
-        // #606: the system focus rectangle round the link Tab has reached.
-        // It inverts what is under it, so it shows in light, dark and high
-        // contrast alike.
+        // #606, #817: a 2 px solid ring round the link Tab has reached, in the
+        // text ink with a thin ring of the surface inside it, so it shows on
+        // the card in light, dark and high contrast alike.
         if let Some(rect) = self.focus_link.and_then(|l| self.link_rect(l)) {
             let ring = RECT {
-                left: rect.left - 2,
-                top: rect.top - 1,
-                right: rect.right + 2,
-                bottom: rect.bottom + 1,
+                left: rect.left - 3,
+                top: rect.top - 2,
+                right: rect.right + 3,
+                bottom: rect.bottom + 2,
             };
-            let _ = windows::Win32::Graphics::Gdi::DrawFocusRect(hdc, &ring);
+            let thickness = self.scale(2).max(2);
+            frame_rect(hdc, &ring, thickness, palette.headline);
+            let inner = RECT {
+                left: ring.left + thickness,
+                top: ring.top + thickness,
+                right: ring.right - thickness,
+                bottom: ring.bottom - thickness,
+            };
+            frame_rect(hdc, &inner, 1, palette.bg);
         }
     }
 
     fn link_rect(&self, link: FooterLink) -> Option<RECT> {
         match link {
             FooterLink::CopyDetails => self.copy_details_rect,
+            FooterLink::Report => self.report_rect,
             FooterLink::ReadAloud => self.read_aloud_rect,
             FooterLink::Copy => self.copy_rect,
         }
@@ -3068,7 +3259,11 @@ impl CardInner {
                 Some(LRESULT(self.edit_bg_brush.0 as isize))
             }
             WM_DRAWITEM => {
-                self.draw_preview_button(lparam);
+                if self.state == CardState::Options {
+                    self.draw_option_button(lparam);
+                } else {
+                    self.draw_preview_button(lparam);
+                }
                 Some(LRESULT(1))
             }
             WM_PAINT => {
@@ -3145,6 +3340,8 @@ impl CardInner {
                     let (x, y) = crate::dismiss::unpack_point(lparam.0 as u32);
                     if self.point_hits_copy_details(x, y) {
                         self.copy_details_activated();
+                    } else if self.point_hits_report(x, y) {
+                        self.report_activated();
                     } else if self.point_hits_read_aloud(x, y) {
                         self.read_aloud_activated();
                     } else if self.point_hits_copy(x, y) {
@@ -3247,9 +3444,11 @@ impl CardInner {
                 Some(LRESULT(0))
             }
             WM_COMMAND => {
+                let id = (wparam.0 & 0xFFFF) as i32;
                 if self.state == CardState::Preview {
-                    let id = (wparam.0 & 0xFFFF) as i32;
                     self.run_preview_command(id);
+                } else if self.state == CardState::Options {
+                    self.options_command(id);
                 }
                 Some(LRESULT(0))
             }
@@ -3342,6 +3541,7 @@ impl CardInner {
         note: Option<&str>,
     ) {
         self.leave_preview_if_active();
+        self.leave_options_if_active();
         // Issue #77: the preview replaces whatever was showing, including an
         // answer being read aloud.
         self.stop_reading();
@@ -3465,6 +3665,8 @@ impl CardInner {
                     let _ = SetFocus(Some(hwnd));
                 }
             }
+            // The message takes a line of its own, so the card grows.
+            self.relayout_current_state();
             unsafe {
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
             }
@@ -3852,6 +4054,27 @@ impl CardInner {
         };
         y += title_h + gap;
 
+        // #817: a rejected edit keeps the title and shows its message on a
+        // line of its own under it, instead of replacing the title.
+        let error_rect = self
+            .preview
+            .as_ref()
+            .and_then(|p| p.error.as_deref())
+            .map(|message| {
+                let text = preview_error_title(message, self.theme);
+                let h = self
+                    .measure_wrapped(self.fonts.body, &text, content_width)
+                    .max(self.line_height(self.fonts.body).max(1));
+                let rect = RECT {
+                    left: content_left,
+                    top: y,
+                    right: content_right,
+                    bottom: y + h,
+                };
+                y += h + gap;
+                rect
+            });
+
         // The row is also an editable field's box: at least the design
         // height, and always the text line plus the padding above and below
         // (a larger text scale must not squeeze the padding away, #811).
@@ -3867,35 +4090,60 @@ impl CardInner {
         // cannot squeeze the value column away.
         let label_min_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
         let label_max_w = ((content_width as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
+        let full_label_w: Vec<i32> = fields
+            .iter()
+            .map(|f| self.measure_label(self.fonts.body, &f.label).0)
+            .collect();
+        // A multi-line field, or a label too long for even the widest
+        // column, stacks (label above value) and so must not widen the
+        // label column of the other rows (#813).
         let measured_label_w: Vec<i32> = fields
             .iter()
-            .map(|f| {
-                // A multi-line field puts its label on its own line, so it
-                // must not widen the label column of the other rows.
-                if f.multiline {
-                    0
-                } else {
-                    self.measure_label(self.fonts.body, &f.label).0
-                }
-            })
+            .zip(full_label_w.iter())
+            .map(|(f, &w)| if f.multiline || w > label_max_w { 0 } else { w })
             .collect();
         let label_w = label_column_width(&measured_label_w, label_min_w, label_max_w);
         let value_x = content_left + label_w + self.scale(6);
         let value_w = (content_right - value_x).max(1);
-
+        // The text column of a read-only value: the same inset the paint
+        // applies, so "fits" here means "fits on screen".
+        let value_text_w = (value_w - self.scale(FIELD_PAD_X_DP)).max(1);
         let mut rows = Vec::with_capacity(fields.len());
-        for (field, &measured_w) in fields.iter().zip(measured_label_w.iter()) {
-            if field.multiline {
-                // #105: the label on its own line, then the value wrapped
-                // across the full width, capped so a long OCR dump cannot
-                // push the buttons off the screen (the last visible line
-                // ends in an ellipsis when the text is longer).
+        for (field, &full_w) in fields.iter().zip(full_label_w.iter()) {
+            let stacked = row_is_stacked(
+                field.multiline,
+                full_w,
+                label_max_w,
+                (!field.editable).then(|| self.measure_label(self.fonts.body, &field.value).0),
+                value_text_w,
+            );
+            if stacked {
+                // #105, #813: the label on its own line (wrapped when it is
+                // wider than the card), then the value across the full
+                // width. A multi-line or read-only value wraps, capped so a
+                // long OCR dump cannot push the buttons off the screen (the
+                // last visible line ends in an ellipsis when the text is
+                // longer); a one-line editable field keeps its one-line box.
                 let line_h = self.line_height(self.fonts.body).max(1);
-                let wrapped_h = self.measure_wrapped(self.fonts.body, &field.value, content_width);
+                let label_wrapped = full_w > content_width;
+                let label_h = if label_wrapped {
+                    // Top-aligned lines get the air a centred single line has.
+                    self.measure_wrapped(self.fonts.body, &field.label, content_width)
+                        + (row_h - line_h).max(0) / 2
+                } else {
+                    row_h
+                };
+                let wrapped_h = self.measure_wrapped(
+                    self.fonts.body,
+                    &field.value,
+                    content_width - self.scale(FIELD_PAD_X_DP) * 2,
+                );
                 let text_h = wrapped_h.clamp(line_h, line_h * PREVIEW_MULTILINE_MAX_LINES);
                 // An editable field is a framed box, so its text needs room
                 // inside the frame (#811).
-                let value_h = if field.editable {
+                let value_h = if field.editable && !field.multiline {
+                    row_h
+                } else if field.editable {
                     text_h + 2 * self.scale(FIELD_PAD_Y_DP)
                 } else {
                     text_h
@@ -3904,22 +4152,24 @@ impl CardInner {
                     left: content_left,
                     top: y,
                     right: content_right,
-                    bottom: y + row_h,
+                    bottom: y + label_h,
                 };
                 let value_rect = RECT {
                     left: content_left,
-                    top: y + row_h,
+                    top: y + label_h,
                     right: content_right,
-                    bottom: y + row_h + value_h,
+                    bottom: y + label_h + value_h,
                 };
                 rows.push(PreviewRowMetrics {
                     label_rect,
                     value_rect,
-                    label_wrapped: false,
+                    label_wrapped,
+                    value_stacked: true,
                 });
-                y += row_h + value_h + row_gap;
+                y += label_h + value_h + row_gap;
                 continue;
             }
+            let measured_w = full_w;
             // A label that still does not fit the (clamped) column wraps to
             // a second line rather than ellipsizing, per #355's "Done
             // when": the whole label must be visible, not just wider.
@@ -3950,6 +4200,7 @@ impl CardInner {
                 label_rect,
                 value_rect,
                 label_wrapped,
+                value_stacked: false,
             });
             y += row_content_h + row_gap;
         }
@@ -4008,6 +4259,7 @@ impl CardInner {
             width,
             window_h,
             title_rect,
+            error_rect,
             note_rect,
             rows,
             buttons: PreviewButtonMetrics { do_it, edit },
@@ -4085,18 +4337,22 @@ impl CardInner {
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        if preview.error.is_some() {
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
-        }
         draw_text_line(
             hdc,
-            &preview.error.as_deref().map_or_else(
-                || preview.title.clone(),
-                |e| preview_error_title(e, self.theme),
-            ),
+            &preview.title,
             title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
+        if let (Some(rect), Some(message)) = (metrics.error_rect, preview.error.as_deref()) {
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
+            draw_text_line(
+                hdc,
+                &preview_error_title(message, self.theme),
+                rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+            );
+        }
 
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
             let label_rect = row.label_rect;
@@ -4124,12 +4380,12 @@ impl CardInner {
                 value_rect.left += self.scale(FIELD_PAD_X_DP);
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
                 SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-                let value_format = if field.multiline {
-                    DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
-                } else {
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
-                };
-                draw_text_line(hdc, &field.value, value_rect, value_format);
+                draw_text_line(
+                    hdc,
+                    &field.value,
+                    value_rect,
+                    value_draw_format(row.value_stacked),
+                );
             }
         }
 
@@ -4172,6 +4428,31 @@ const PREVIEW_LABEL_MAX_FRACTION: f32 = 0.45;
 /// text) may take before it ends in an ellipsis.
 const PREVIEW_MULTILINE_MAX_LINES: i32 = 10;
 
+/// How a read-only value is drawn (#813): a stacked value wraps from the top
+/// of its box (the box is as tall as the wrapped text), a beside-the-label
+/// value is one centred line.
+fn value_draw_format(stacked: bool) -> windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT {
+    if stacked {
+        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
+    } else {
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+    }
+}
+
+/// Whether a preview row puts its label above its value instead of beside
+/// it (#813): a multi-line field always does, and so does a label too wide
+/// for even the widest label column, or a read-only one-line value
+/// (`value_w`, `None` for an editable field) wider than the value column,
+/// so the note the user needs to see ("(from profile)") is never cut off.
+fn row_is_stacked(
+    multiline: bool,
+    label_w: i32,
+    label_max_w: i32,
+    value_w: Option<i32>,
+    value_col_w: i32,
+) -> bool {
+    multiline || label_w > label_max_w || value_w.is_some_and(|w| w > value_col_w)
+}
 /// Sizes the preview label column from the widest measured label (#355),
 /// clamped between `min_w` (the old fixed 84dp floor) and `max_w` (45% of
 /// the content width). Pure and DPI-agnostic: callers scale `measured`,
@@ -4287,6 +4568,9 @@ struct PreviewRowMetrics {
     /// so it must be drawn wrapped (`DT_WORDBREAK`) instead of ellipsized
     /// on one line (#355).
     label_wrapped: bool,
+    /// The value sits under its label on the full width (#813), and is
+    /// drawn wrapped from the top, not on one centred line.
+    value_stacked: bool,
 }
 
 struct PreviewButtonMetrics {
@@ -4299,6 +4583,8 @@ struct PreviewLayoutMetrics {
     width: i32,
     window_h: i32,
     title_rect: RECT,
+    /// #817: where a rejected edit's message goes, `None` when there is none.
+    error_rect: Option<RECT>,
     /// #228: where the footer note goes, `None` when there is none.
     note_rect: Option<RECT>,
     /// Same length and order as the `fields` slice `compute_preview_layout`
@@ -4664,6 +4950,16 @@ fn create_preview_button(
     }
 }
 
+/// The card's accessible name for an answer (#815): the headline, then what
+/// the difficulty badge says when one is shown, so the rating is not lost to
+/// anyone who cannot see its colour.
+fn answer_accessible_name(headline: &str, difficulty: Option<Difficulty>) -> String {
+    match difficulty {
+        Some(d) => format!("{headline}. {}", d.accessible_name()),
+        None => headline.to_string(),
+    }
+}
+
 /// `GetWindowTextW` into an owned `String`, `""` for a null/invalid handle
 /// rather than a panic -- mirrors `ui::settings::get_text`.
 fn window_text(hwnd: HWND) -> String {
@@ -4885,6 +5181,50 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_needed_card_is_taller_for_its_detail_and_has_no_chevron() {
+        // #885: the detail of a click-to-open-Settings card is drawn on the
+        // collapsed card, so the window must have room for it.
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let height = |card: &Card| {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut r);
+            }
+            r.bottom - r.top
+        };
+        let detail = "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.";
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_settings_needed("No AI model set up yet", "");
+        let headline_only = height(&card);
+        assert_eq!(card.inner.chevron_reserve(), 0);
+        card.show_settings_needed("No AI model set up yet", detail);
+        assert!(height(&card) > headline_only, "detail must add height");
+        assert!(card.inner.shows_setup_detail());
+        assert_eq!(
+            card.inner.chevron_reserve(),
+            0,
+            "a click opens Settings, so no expand chevron"
+        );
+        // Narrator reads the detail too (the window text is the accessible name).
+        assert!(window_text(card.hwnd()).contains("paste an API key"));
+        // A very long detail is capped, not taller than a few lines.
+        let normal = height(&card);
+        card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
+        let long = height(&card);
+        let line = card.inner.line_height(card.inner.fonts.caption);
+        assert!(long > normal);
+        assert!(
+            long <= normal + line * SETUP_DETAIL_MAX_LINES,
+            "{long} vs {normal}"
+        );
+        // An ordinary answer card with the same text is unchanged: it keeps
+        // the chevron and shows no detail until expanded.
+        card.show_answer("No AI model set up yet", detail, 0, None);
+        assert!(!card.inner.shows_setup_detail());
+        assert!(card.inner.chevron_reserve() > 0);
+    }
+
+    #[test]
     fn clicking_a_settings_needed_card_opens_settings_instead_of_expanding() {
         // Issue #347: the old "No API key: open Edit settings" card named a
         // menu item that no longer exists. The fix is that the card's own
@@ -5008,6 +5348,65 @@ mod tests {
             card.inner.copy_details_rect.is_none(),
             "an answer card must not show \"Copy details\""
         );
+    }
+
+    #[test]
+    fn answer_accessible_name_adds_the_difficulty_only_when_there_is_one() {
+        assert_eq!(answer_accessible_name("x = 3", None), "x = 3");
+        assert_eq!(
+            answer_accessible_name("x = 3", Some(Difficulty::Level(5))),
+            "x = 3. Difficulty 5 of 10"
+        );
+        assert_eq!(
+            answer_accessible_name("x = 3", Some(Difficulty::Ultra)),
+            "x = 3. Difficulty ultra, harder than 10"
+        );
+    }
+
+    #[test]
+    fn a_setup_card_window_name_is_still_headline_and_detail() {
+        // #885 must survive the difficulty name: no badge on a setup card.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_settings_needed("Set up Wingman", "Add a key in Settings.");
+        assert_eq!(
+            window_text(card.hwnd()),
+            "Set up Wingman. Add a key in Settings."
+        );
+    }
+
+    #[test]
+    fn the_card_window_name_carries_the_difficulty() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "", 0, Some(Difficulty::Level(10)));
+        assert_eq!(window_text(card.hwnd()), "2 + 2 = 4. Difficulty 10 of 10");
+        card.show_answer("2 + 2 = 4", "", 0, None);
+        assert_eq!(window_text(card.hwnd()), "2 + 2 = 4");
+    }
+
+    #[test]
+    fn the_badge_is_wide_enough_that_ten_has_clear_space_at_every_scale() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        for dpi in [96u32, 144, 192] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let (w, h) = card.inner.badge_size(Difficulty::Level(10));
+            let (tw, _) = card
+                .inner
+                .measure_label(card.inner.fonts.caption, Difficulty::Level(10).label());
+            // The ends are half circles, so the text needs at least a
+            // quarter of the height of room on each side.
+            assert!(
+                (w - tw) / 2 >= h / 4,
+                "dpi {dpi}: 10 is {tw}px in a {w}x{h} badge"
+            );
+            let (w1, h1) = card.inner.badge_size(Difficulty::Level(1));
+            assert!(
+                w1 >= h1,
+                "dpi {dpi}: a single digit is never narrower than tall"
+            );
+        }
     }
 
     #[test]
@@ -5641,6 +6040,67 @@ mod tests {
         assert!(!queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
     }
 
+    // -- Report a problem (#373) ---------------------------------------------
+
+    #[test]
+    fn a_tracked_error_card_shows_report_a_problem_beside_copy_details() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let details = card.inner.copy_details_rect.expect("Copy details");
+        let report = card.inner.report_rect.expect("Report a problem");
+        assert!(report.left >= details.right, "the links must not overlap");
+        assert!(rect_has_area(report));
+        // An untracked error has neither: there is nothing to report from.
+        card.show_error("Hotkeys unavailable", "detail text");
+        card.inner.try_expand();
+        assert!(card.inner.report_rect.is_none());
+        // Nor does an answer card.
+        card.show_answer("2 + 2 = 4", "ok", 0, None);
+        card.inner.try_expand();
+        assert!(card.inner.report_rect.is_none());
+    }
+
+    #[test]
+    fn clicking_report_a_problem_posts_its_message_and_not_copy_details() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let r = card.inner.report_rect.expect("Report a problem");
+        let lparam = LPARAM(crate::dismiss::pack_point(
+            (r.left + r.right) / 2,
+            (r.top + r.bottom) / 2,
+        ) as isize);
+        card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(!queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_REPORT_PROBLEM));
+    }
+
+    #[test]
+    fn tab_twice_then_space_runs_report_a_problem() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.focus_link, Some(FooterLink::Report));
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(0));
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_REPORT_PROBLEM));
+    }
+
+    #[test]
+    fn enter_on_an_error_card_still_copies_details_not_report() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(!queue_contains(card.hwnd(), WM_APP_CARD_REPORT_PROBLEM));
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
+    }
+
     #[test]
     fn a_focused_link_that_is_no_longer_shown_is_not_activated() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
@@ -5663,6 +6123,34 @@ mod tests {
         assert!(card.inner.focus_link.is_some());
         card.show_model_answer("next", "detail", 0, None);
         assert_eq!(card.inner.focus_link, None);
+    }
+
+    #[test]
+    fn a_rejected_edit_keeps_the_title_and_adds_a_message_line_below_it() {
+        // #817: the message used to replace the title.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let fields = card.inner.preview.as_ref().unwrap().model.fields().to_vec();
+        let plain = card.inner.compute_preview_layout(&fields, false);
+        assert!(plain.error_rect.is_none());
+
+        card.set_preview_error_for_gallery("Start must be a time, like 09:00.");
+        let with_error = card.inner.compute_preview_layout(&fields, false);
+        let err = with_error.error_rect.expect("an error row");
+        assert_eq!(with_error.title_rect.top, plain.title_rect.top);
+        assert!(err.top >= with_error.title_rect.bottom, "under the title");
+        assert!(
+            with_error.rows[0].label_rect.top >= err.bottom,
+            "above the fields"
+        );
+        assert!(with_error.window_h > plain.window_h, "the card grows");
+        assert_eq!(
+            card.inner.preview.as_ref().unwrap().title,
+            "Add to calendar",
+            "the title text is untouched"
+        );
     }
 
     #[test]
@@ -7262,6 +7750,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn row_is_stacked_for_multiline_long_label_or_long_read_only_value() {
+        assert!(row_is_stacked(true, 10, 100, None, 100));
+        assert!(row_is_stacked(false, 101, 100, None, 100));
+        assert!(row_is_stacked(false, 10, 100, Some(101), 100));
+        assert!(!row_is_stacked(false, 100, 100, Some(100), 100));
+        // An editable field (no measured value) scrolls inside its box.
+        assert!(!row_is_stacked(false, 10, 100, None, 100));
+    }
+
+    #[test]
+    fn preview_long_read_only_value_is_shown_whole_below_its_label() {
+        // #813: "742 Evergreen Terrace, Apt 4B (from profile)" must not be
+        // cut to "742 Evergreen Terrace..." beside its label.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        for dpi in [96u32, 144] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let value = "742 Evergreen Terrace, Apt 4B (from profile)";
+            let fields = vec![Field {
+                name: "addr".to_string(),
+                label: "Mailing address, including apartment or unit number".to_string(),
+                value: value.to_string(),
+                editable: false,
+                required: false,
+                multiline: false,
+            }];
+            let m = card.inner.compute_preview_layout(&fields, false);
+            let row = &m.rows[0];
+            assert!(
+                row.value_rect.top >= row.label_rect.bottom,
+                "dpi {dpi}: value must sit below its label"
+            );
+            assert!(row.value_stacked, "dpi {dpi}");
+            let format = value_draw_format(row.value_stacked);
+            assert!(
+                format.0 & DT_WORDBREAK.0 != 0 && format.0 & DT_SINGLELINE.0 == 0,
+                "dpi {dpi}: the value must be drawn wrapped, not on one cut line"
+            );
+            assert!(format.0 & DT_VCENTER.0 == 0, "dpi {dpi}: top aligned");
+            // The box holds the wrapped text.
+            let box_w = row.value_rect.right - row.value_rect.left;
+            let wrapped = card
+                .inner
+                .measure_wrapped(card.inner.fonts.body, value, box_w);
+            assert!(row.value_rect.bottom - row.value_rect.top >= wrapped);
+        }
+    }
+
+    #[test]
+    fn preview_rows_keep_an_even_gap() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let mk = |name: &str, label: &str, value: &str, editable: bool| Field {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: value.to_string(),
+            editable,
+            required: false,
+            multiline: false,
+        };
+        for dpi in [96u32, 144] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let fields = vec![
+                mk(
+                    "a",
+                    "Employer-provided legal first and middle name",
+                    "Jordan Alexander (from profile)",
+                    false,
+                ),
+                mk(
+                    "b",
+                    "Mailing address, including apartment or unit number",
+                    "742 Evergreen Terrace, Apt 4B (from profile)",
+                    false,
+                ),
+                mk(
+                    "c",
+                    "Social security number (last four digits only) (sensitive, clear to skip)",
+                    "6789",
+                    true,
+                ),
+            ];
+            let m = card.inner.compute_preview_layout(&fields, false);
+            let gap = card.inner.scale(PREVIEW_ROW_GAP_DP);
+            for pair in m.rows.windows(2) {
+                let prev_bottom = pair[0].label_rect.bottom.max(pair[0].value_rect.bottom);
+                assert_eq!(pair[1].label_rect.top - prev_bottom, gap, "dpi {dpi}");
+            }
+        }
+    }
     #[test]
     fn preview_without_edit_keeps_do_it_right_aligned_with_no_cancel_slot() {
         // #392 supersedes #352's Cancel-placement Done-when: Cancel no

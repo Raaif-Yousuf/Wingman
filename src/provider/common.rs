@@ -137,6 +137,22 @@ pub(crate) enum TransportError {
     /// fresh attempt -- it surfaces immediately, naming the status that was
     /// received, so the card is honest about what's known to have happened.
     BodyReadFailed { status: u16, error: String },
+    /// #727: the request timed out somewhere after the connection was made,
+    /// so the vendor may have received it and may already have billed it.
+    /// Never retried: a second send could be a second charge.
+    TimedOut(String),
+}
+
+/// #727: true when this send failure proves nothing reached the vendor, so a
+/// retry cannot bill twice. Only a DNS or connect timeout qualifies; any
+/// other timeout (global, send, waiting for the response) may have come
+/// after the request was delivered. Non-timeout failures (refused, TLS,
+/// unknown host) happen before the body is sent and stay retryable.
+fn is_provably_unsent(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Timeout(t) => matches!(t, ureq::Timeout::Resolve | ureq::Timeout::Connect),
+        _ => true,
+    }
 }
 
 pub(crate) trait Transport {
@@ -177,7 +193,13 @@ impl Transport for UreqTransport {
             .timeout_global(Some(timeout))
             .build()
             .send_json(body)
-            .map_err(|e| TransportError::NoResponse(e.to_string()))?;
+            .map_err(|e| {
+                if is_provably_unsent(&e) {
+                    TransportError::NoResponse(e.to_string())
+                } else {
+                    TransportError::TimedOut(e.to_string())
+                }
+            })?;
 
         // A status was received from here on -- any further failure is
         // `BodyReadFailed`, never folded back into `NoResponse` (#187).
@@ -426,10 +448,53 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The error codes a vendor uses to say it declined the content itself:
+/// OpenAI's `content_policy_violation` and `invalid_prompt`, and the
+/// `content_filter` that Azure-style endpoints send.
+const POLICY_DECLINE_CODES: [&str; 3] = [
+    "content_policy_violation",
+    "invalid_prompt",
+    "content_filter",
+];
+
+/// Azure's own name for the same thing, found one level down in
+/// `error.innererror.code`.
+const AZURE_POLICY_CODE: &str = "ResponsibleAIPolicyViolation";
+
+/// #920: the policy-decline code in an error body, if it carries one. Only
+/// the structured `error.code`, `error.type` and `error.innererror.code`
+/// count: a body that is not JSON, or that only mentions a filter in prose,
+/// is an ordinary failure. Pure.
+fn content_policy_code(body: &str) -> Option<&'static str> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let inner = error.get("innererror").and_then(|i| i.get("code"));
+    for field in [error.get("code"), error.get("type"), inner] {
+        let Some(text) = field.and_then(Value::as_str) else {
+            continue;
+        };
+        if text == AZURE_POLICY_CODE {
+            return Some(AZURE_POLICY_CODE);
+        }
+        if let Some(code) = POLICY_DECLINE_CODES.iter().copied().find(|c| *c == text) {
+            return Some(code);
+        }
+    }
+    None
+}
+
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
 fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
+    // #920: a 400 that says the content was declined is a decline (it stops
+    // the chain), not a failure to retry on the next vendor. Read from the
+    // raw body: the redaction below rewrites these underscore words.
+    if status == 400 {
+        if let Some(code) = content_policy_code(body) {
+            return super::blocked_error(tag, code);
+        }
+    }
     let truncated = redact_and_truncate(body);
     anyhow!("{tag}: HTTP {status}: {truncated}")
 }
@@ -582,6 +647,14 @@ pub(crate) fn post_json_with(
                     redact_detail(&error)
                 ));
             }
+            // #727: the request may have arrived and been billed; a second
+            // send could charge again, so this surfaces as a card at once.
+            Err(TransportError::TimedOut(e)) => {
+                return Err(anyhow!(
+                    "{tag}: the request timed out and was not sent again, in case it was already processed: {}",
+                    redact_detail(&e)
+                ));
+            }
             Err(TransportError::NoResponse(transport_err)) => {
                 let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
                 if retries < policy.max_retries
@@ -690,6 +763,16 @@ fn log_attempt(
             0,
             egress::Outcome::Failure,
             Some(&format!("transport error: {e}")),
+        ),
+        Err(TransportError::TimedOut(e)) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("timed out: {e}")),
         ),
         Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
             tag,
@@ -1586,6 +1669,12 @@ mod tests {
         })
     }
 
+    /// A scripted #727 failure: the request timed out after it may have
+    /// reached the vendor.
+    fn timed_out(msg: &str) -> std::result::Result<RawResponse, TransportError> {
+        Err(TransportError::TimedOut(msg.to_string()))
+    }
+
     /// A scripted #187 failure: a status was received, then reading the
     /// body failed.
     fn body_read_failed(
@@ -2095,6 +2184,52 @@ mod tests {
         assert_eq!(transport.call_count(), 1);
         assert!(sleeper.recorded().is_empty());
         assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    fn a_timeout_is_never_retried_because_the_vendor_may_have_billed_it() {
+        let _g = network_guard();
+        // #727: a timeout does not prove the request never arrived, so a
+        // second send could be a second billed completion.
+        let transport = ScriptedTransport::new(vec![timed_out("timeout: global"), ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let err = run(&transport, &sleeper, &clock).unwrap_err();
+
+        assert_eq!(transport.call_count(), 1);
+        assert!(sleeper.recorded().is_empty());
+        let text = err.to_string();
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    #[test]
+    fn the_real_transport_reports_a_silent_server_as_timed_out() {
+        // The wiring check for #727: a server that accepts and never answers
+        // must come back as `TimedOut` from the real `ureq` transport, not
+        // `NoResponse`, or the retry loop would send the request again.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_millis(300));
+        drop(listener);
+        assert!(matches!(result, Err(TransportError::TimedOut(_))));
+    }
+
+    #[test]
+    fn only_a_resolve_or_connect_timeout_counts_as_provably_unsent() {
+        use ureq::Timeout;
+        assert!(is_provably_unsent(&ureq::Error::Timeout(Timeout::Resolve)));
+        assert!(is_provably_unsent(&ureq::Error::Timeout(Timeout::Connect)));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(Timeout::Global)));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(
+            Timeout::RecvResponse
+        )));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(
+            Timeout::SendBody
+        )));
+        // Any non-timeout failure keeps the existing behaviour (retryable).
+        assert!(is_provably_unsent(&ureq::Error::HostNotFound));
     }
 
     #[test]
@@ -3091,6 +3226,60 @@ mod tests {
         let msg = run(&transport, &sleeper, &clock).unwrap_err().to_string();
 
         assert_eq!(msg, "anthropic: HTTP 400: {\"error\": \"model not found\"}");
+    }
+
+    /// #920: a 400 whose error code says the content was declined is a
+    /// decline, not a plain failure, so the chain stops instead of sending
+    /// the same screenshot to the next vendor. Covers OpenAI's two codes and
+    /// the Azure-style one, in the places each puts them.
+    #[test]
+    fn an_http_400_content_policy_code_is_a_decline() {
+        let bodies = [
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"content_policy_violation"}}"#,
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"invalid_prompt"}}"#,
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":"prompt","code":"content_filter"}}"#,
+            r#"{"error":{"message":"m","type":"content_filter"}}"#,
+            r#"{"error":{"code":"BadRequest","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#,
+        ];
+        for body in bodies {
+            let _g = network_guard();
+            let transport = ScriptedTransport::new(vec![status(400, vec![], body)]);
+            let err = run(&transport, &RecordingSleeper::new(), &FixedClock(0)).unwrap_err();
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_some(),
+                "{body}: {err:#}"
+            );
+            assert_eq!(
+                transport.call_count(),
+                1,
+                "{body}: a decline is never retried"
+            );
+        }
+    }
+
+    /// #920: only a code decides. Other 400s, a prose mention of a filter, a
+    /// body that is not JSON and a non-400 status stay plain failures.
+    #[test]
+    fn other_http_errors_are_not_declines() {
+        let cases = [
+            (400, r#"{"error":{"code":"invalid_api_key"}}"#),
+            (
+                400,
+                r#"{"error":{"message":"the content_filter setting is off"}}"#,
+            ),
+            (400, "content_policy_violation"),
+            (400, ""),
+            (401, r#"{"error":{"code":"content_filter"}}"#),
+        ];
+        for (code, body) in cases {
+            let _g = network_guard();
+            let transport = ScriptedTransport::new(vec![status(code, vec![], body)]);
+            let err = run(&transport, &RecordingSleeper::new(), &FixedClock(0)).unwrap_err();
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_none(),
+                "{code} {body}: {err:#}"
+            );
+        }
     }
 
     /// A transport error's text is network-derived too: it carries the URL,

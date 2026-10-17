@@ -10,6 +10,7 @@
 
 mod calendar_add;
 mod clipboard;
+pub(crate) mod contact_add;
 mod fill_form;
 mod format_probe;
 pub(crate) mod image_clipboard;

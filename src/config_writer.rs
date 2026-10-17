@@ -50,6 +50,15 @@ pub enum FieldChange {
     },
     /// Remove `path`. Missing is fine.
     Remove { path: Vec<String> },
+    /// Set `path` to `value` only if the file still holds `expected` there (`None`:
+    /// the key is not set). For a whole value (a list, a table) a window changed
+    /// from what it opened with: writing it blind would drop a sibling edit the
+    /// user made by hand in the meantime, so a changed file refuses it instead.
+    SetIfUnchanged {
+        path: Vec<String>,
+        expected: Option<toml::Value>,
+        value: toml::Value,
+    },
 }
 
 impl FieldChange {
@@ -75,7 +84,9 @@ impl FieldChange {
     /// The key this change is about.
     pub fn path(&self) -> &[String] {
         match self {
-            FieldChange::Set { path, .. } | FieldChange::Remove { path } => path,
+            FieldChange::Set { path, .. }
+            | FieldChange::Remove { path }
+            | FieldChange::SetIfUnchanged { path, .. } => path,
         }
     }
 
@@ -84,18 +95,30 @@ impl FieldChange {
     /// (`primary = { vk = 134 }`) is patched in place. The old value's trailing
     /// comment stays with the new one.
     pub fn apply(&self, doc: &mut DocumentMut) -> Result<()> {
+        if let FieldChange::SetIfUnchanged { path, value, .. } = self {
+            // The comparison is made by the caller (`write_changes_with`), which
+            // has the text the doc came from.
+            return FieldChange::Set {
+                path: path.clone(),
+                value: value.clone(),
+            }
+            .apply(doc);
+        }
         let path = self.path();
         let Some((key, parents)) = path.split_last() else {
             bail!("a config change needs a key");
         };
         if let FieldChange::Set { value, .. } = self {
-            if key == "api_key" && !is_blank_string(value) {
+            // The key itself, or anywhere inside a whole table or array being
+            // set (`providers`, `providers.compat`): the in-memory config holds
+            // hydrated keys, and a whole-value change would carry them in.
+            if (key == "api_key" && !is_blank_string(value)) || holds_secret(value) {
                 bail!(
                     "an API key is never written to config.toml; it belongs in Credential Manager"
                 );
             }
         }
-        let create = matches!(self, FieldChange::Set { .. });
+        let create = !matches!(self, FieldChange::Remove { .. });
         let mut table: &mut dyn TableLike = doc.as_table_mut();
         for name in parents {
             if !table.contains_key(name) {
@@ -116,16 +139,51 @@ impl FieldChange {
             FieldChange::Remove { .. } => {
                 table.remove(key);
             }
+            // Returned early above, as a plain `Set`.
+            FieldChange::SetIfUnchanged { .. } => {}
             FieldChange::Set { value, .. } => {
                 let mut item = to_item(value);
                 match table.get_mut(key) {
                     // Replace the value where it stands. `insert` would replace
                     // the key too, and with it the comment lines above it.
                     Some(slot) => {
-                        if let (Some(old), Item::Value(new)) = (slot.as_value(), &mut item) {
-                            *new.decor_mut() = old.decor().clone();
+                        match (&*slot, &mut item) {
+                            (Item::Value(old), Item::Value(new)) => {
+                                *new.decor_mut() = old.decor().clone();
+                            }
+                            // A whole table or list of tables: the new tables
+                            // take the old ones' comments and place in the file,
+                            // or they would lose the comment above them and move
+                            // to the end.
+                            (Item::Table(old), Item::Table(new)) => keep_place(old, new),
+                            (Item::ArrayOfTables(old), Item::ArrayOfTables(new)) => {
+                                let last = old.len().checked_sub(1);
+                                for (i, table) in new.iter_mut().enumerate() {
+                                    if let Some(old) =
+                                        old.get(i).or_else(|| last.and_then(|l| old.get(l)))
+                                    {
+                                        keep_place(old, table);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
+                        let comment = match (&*slot, &item) {
+                            (Item::ArrayOfTables(old), Item::Value(_)) => {
+                                old.get(0).and_then(|t| t.decor().prefix().cloned())
+                            }
+                            _ => None,
+                        };
                         *slot = item;
+                        // A list of tables replaced by an empty list becomes a
+                        // plain `key = []`; the comment that stood above the
+                        // first table moves to the key.
+                        if let Some(prefix) = comment {
+                            if let Some(mut k) = table.key_mut(key) {
+                                k.leaf_decor_mut().set_prefix(prefix);
+                                k.leaf_decor_mut().set_suffix(" ");
+                            }
+                        }
                     }
                     None => {
                         table.insert(key, item);
@@ -137,8 +195,43 @@ impl FieldChange {
     }
 }
 
+/// `new` takes `old`'s comments and position in the file.
+fn keep_place(old: &Table, new: &mut Table) {
+    *new.decor_mut() = old.decor().clone();
+    new.set_position(old.position());
+}
+
 fn is_blank_string(v: &toml::Value) -> bool {
     matches!(v, toml::Value::String(s) if s.is_empty())
+}
+
+/// True if `v` is, or contains at any depth, a non-empty `api_key`.
+fn holds_secret(v: &toml::Value) -> bool {
+    match v {
+        toml::Value::Table(t) => t
+            .iter()
+            .any(|(k, v)| (k == "api_key" && !is_blank_string(v)) || holds_secret(v)),
+        toml::Value::Array(a) => a.iter().any(holds_secret),
+        _ => false,
+    }
+}
+
+/// Empties every non-empty `api_key` at any depth, so a diff neither compares
+/// nor carries a hydrated key.
+fn blank_secrets(v: &mut toml::Value) {
+    match v {
+        toml::Value::Table(t) => {
+            for (k, v) in t.iter_mut() {
+                if k == "api_key" && matches!(v, toml::Value::String(s) if !s.is_empty()) {
+                    *v = toml::Value::String(String::new());
+                } else {
+                    blank_secrets(v);
+                }
+            }
+        }
+        toml::Value::Array(a) => a.iter_mut().for_each(blank_secrets),
+        _ => {}
+    }
 }
 
 fn to_item(v: &toml::Value) -> Item {
@@ -163,11 +256,24 @@ fn to_item(v: &toml::Value) -> Item {
     }
 }
 
+/// A `f32` field reaches `toml::Value` widened to `f64`, which prints as
+/// `1.100000023841858`. If the value is exactly an `f32`, use that `f32`'s
+/// shortest form (`1.1`), which reads back as the same `f32`.
+fn shortest_float(f: f64) -> f64 {
+    let narrow = f as f32;
+    if f64::from(narrow) == f {
+        if let Ok(short) = narrow.to_string().parse::<f64>() {
+            return short;
+        }
+    }
+    f
+}
+
 fn to_value(v: &toml::Value) -> Value {
     match v {
         toml::Value::String(s) => Value::from(s.as_str()),
         toml::Value::Integer(i) => Value::from(*i),
-        toml::Value::Float(f) => Value::from(*f),
+        toml::Value::Float(f) => Value::from(shortest_float(*f)),
         toml::Value::Boolean(b) => Value::from(*b),
         toml::Value::Datetime(d) => Value::from(*d),
         toml::Value::Array(a) => Value::Array(a.iter().map(to_value).collect()),
@@ -183,12 +289,14 @@ fn to_value(v: &toml::Value) -> Value {
 
 /// The keys that differ between two configs, as the smallest set of changes:
 /// a changed leaf, a key present only after (set), a key present only before
-/// (remove). Arrays and the like are one leaf. `api_key` is skipped everywhere:
-/// keys go to Credential Manager, never to the file.
-#[allow(dead_code)] // Settings' Save sends only these (#871); slice 0 ships the tested writer first.
+/// (remove). Arrays and the like are one leaf. `api_key` is skipped everywhere,
+/// and blanked inside any whole table or array that is set: keys go to
+/// Credential Manager, never to the file.
 pub fn diff(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
-    let before = toml::Value::try_from(before).context("could not read the old settings")?;
-    let after = toml::Value::try_from(after).context("could not read the new settings")?;
+    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
+    let mut after = toml::Value::try_from(after).context("could not read the new settings")?;
+    blank_secrets(&mut before);
+    blank_secrets(&mut after);
     let mut out = Vec::new();
     walk(&mut Vec::new(), &before, &after, &mut out);
     Ok(out)
@@ -250,6 +358,128 @@ pub fn coalesce(changes: Vec<FieldChange>) -> Vec<FieldChange> {
         .collect()
 }
 
+/// Writes the jobs that queued up together as one file write (latest value of
+/// each key wins) and returns one result per job, in order. If that combined
+/// write is refused, each job is tried alone, so one refused job (an API key,
+/// say) cannot fail the others; a broken file still fails them all, each with
+/// the same sentence.
+fn write_batch(path: &Path, jobs: &[&[FieldChange]]) -> Vec<Result<(), String>> {
+    let all: Vec<FieldChange> = jobs.iter().flat_map(|j| j.iter().cloned()).collect();
+    match write_changes(path, &coalesce(all)) {
+        Ok(()) => vec![Ok(()); jobs.len()],
+        Err(e) if jobs.len() <= 1 => vec![Err(format!("{e:#}")); jobs.len()],
+        Err(_) => jobs
+            .iter()
+            .map(|j| write_changes(path, &coalesce(j.to_vec())).map_err(|e| format!("{e:#}")))
+            .collect(),
+    }
+}
+
+/// `config` with `changes` applied on top, for changes that could not be written
+/// to the file but are live until quit: a reload from disk would otherwise
+/// silently revert them. Load-time notes that are not part of the file
+/// (`unreadable_secrets`, `load_problem`) carry over.
+pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
+    let mut value = toml::Value::try_from(config).context("could not read the settings")?;
+    for change in changes {
+        change_value(&mut value, change)?;
+    }
+    let mut out: Config = value
+        .try_into()
+        .context("could not apply the unsaved change")?;
+    out.unreadable_secrets = config.unreadable_secrets.clone();
+    out.load_problem = config.load_problem.clone();
+    Ok(out)
+}
+
+fn change_value(root: &mut toml::Value, change: &FieldChange) -> Result<()> {
+    let Some((key, parents)) = change.path().split_last() else {
+        bail!("a config change needs a key");
+    };
+    let mut at = root;
+    for name in parents {
+        let table = at
+            .as_table_mut()
+            .with_context(|| format!("`{name}` is not a table"))?;
+        at = table
+            .entry(name.clone())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+    }
+    let table = at
+        .as_table_mut()
+        .with_context(|| format!("`{key}` is not in a table"))?;
+    match change {
+        FieldChange::Set { value, .. } | FieldChange::SetIfUnchanged { value, .. } => {
+            table.insert(key.clone(), value.clone());
+        }
+        FieldChange::Remove { .. } => {
+            table.remove(key);
+        }
+    }
+    Ok(())
+}
+
+/// Makes every whole-value change in `changes` (a list or a table) conditional on
+/// the file still holding what `before` held there. `diff` hands a changed list
+/// over as one value, so applying it would also replace anything the user added
+/// to that list by hand since the window opened; with this the write is refused
+/// instead and says so. Leaf changes are left alone: a typed value wins over an
+/// older one.
+pub fn guard_whole_values(changes: Vec<FieldChange>, before: &Config) -> Result<Vec<FieldChange>> {
+    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
+    blank_secrets(&mut before);
+    Ok(changes
+        .into_iter()
+        .map(|change| match change {
+            FieldChange::Set { path, value } if value.is_array() || value.is_table() => {
+                let expected = value_at(&before, &path).cloned();
+                FieldChange::SetIfUnchanged {
+                    path,
+                    expected,
+                    value,
+                }
+            }
+            other => other,
+        })
+        .collect())
+}
+
+fn value_at<'a>(root: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    path.iter().try_fold(root, |at, key| at.get(key.as_str()))
+}
+
+/// Refuses a [`FieldChange::SetIfUnchanged`] whose key no longer holds what the
+/// change expected. `on_disk` is the file as `Config` reads it, defaults for
+/// missing keys included, so a list the file never spelled out still compares.
+fn check_unchanged(on_disk: &toml::Value, change: &FieldChange) -> Result<()> {
+    let FieldChange::SetIfUnchanged { path, expected, .. } = change else {
+        return Ok(());
+    };
+    if value_at(on_disk, path) != expected.as_ref() {
+        bail!(
+            "`{}` was changed in config.toml while Settings was open, so Wingman did not \
+             overwrite it. Open Settings again and save once more",
+            path.join(".")
+        );
+    }
+    Ok(())
+}
+
+/// The file text as `Config` reads it, as a value with every key blanked, for
+/// [`check_unchanged`]. `None` when no change needs the comparison, or it could
+/// not be made (a guarded change is then refused: the safe outcome).
+fn effective_on_disk(text: &str, changes: &[FieldChange]) -> Option<toml::Value> {
+    if !changes
+        .iter()
+        .any(|c| matches!(c, FieldChange::SetIfUnchanged { .. }))
+    {
+        return None;
+    }
+    let mut value = toml::Value::try_from(Config::parse_or_default(text)).ok()?;
+    blank_secrets(&mut value);
+    Some(value)
+}
+
 /// Reads `path` fresh, applies `changes`, writes atomically. See the module doc
 /// for the rules.
 pub fn write_changes(path: &Path, changes: &[FieldChange]) -> Result<()> {
@@ -276,10 +506,26 @@ fn write_changes_with(
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e: toml_edit::TomlError| anyhow::anyhow!(refusal(&text, e.span())))?;
+        let on_disk = effective_on_disk(&text, changes);
         for change in changes {
+            match &on_disk {
+                Some(on_disk) => check_unchanged(on_disk, change)?,
+                None if matches!(change, FieldChange::SetIfUnchanged { .. }) => {
+                    bail!(
+                        "could not check config.toml before changing `{}`",
+                        change.path().join(".")
+                    )
+                }
+                None => {}
+            }
             change.apply(&mut doc)?;
         }
-        let out = match_line_endings(&text, doc.to_string());
+        let mut out = match_line_endings(&text, doc.to_string());
+        // `toml_edit` drops a leading byte order mark (Notepad writes one); the
+        // user's file keeps it.
+        if text.starts_with('\u{feff}') && !out.starts_with('\u{feff}') {
+            out.insert(0, '\u{feff}');
+        }
         // A patch must never produce a file Wingman itself would refuse to load.
         if let Err(e) = toml::from_str::<Config>(&out) {
             bail!(
@@ -288,13 +534,16 @@ fn write_changes_with(
             );
         }
         between_read_and_write(attempt);
+        // The check and the write happen under one hold of the write lock, so
+        // another writer cannot slip a write in between them.
+        let _one_writer = crate::config::lock_writes();
         if crate::config::file_mtime(path) != seen {
             continue;
         }
         if out == text {
             return Ok(());
         }
-        return crate::config::write_file_atomically(path, &out);
+        return crate::config::write_file_atomically_held(path, &out, false);
     }
     bail!("config.toml changed while Wingman was saving it, so nothing was written. Try again")
 }
@@ -336,63 +585,164 @@ fn match_line_endings(original: &str, patched: String) -> String {
     }
 }
 
-/// What a caller asks the writer thread to do, and the words it wants back.
-pub struct JobSpec {
-    /// The keys to change.
-    pub changes: Vec<FieldChange>,
-    /// A config whose API keys should go to Credential Manager first (never to
-    /// the file). If that fails the file is not touched. `None` for a change
-    /// that has no key in it.
-    pub secrets: Option<Config>,
-    /// Card headline when the change was written.
-    pub saved: String,
-    /// Card headline when it was not.
-    pub failed: String,
-    /// Added under the failure headline, e.g. what happens to the choice that
-    /// is already live.
-    pub hint: String,
-}
-
 /// What the writer thread tells the caller when a job is done.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriteReply {
-    /// [`JobSpec::saved`].
-    pub saved: String,
-    /// [`JobSpec::failed`].
-    pub failed: String,
-    /// [`JobSpec::hint`].
-    pub hint: String,
+    /// What the caller called the job (for its card or status line).
+    pub label: String,
     /// `Err` holds a plain sentence.
     pub result: Result<(), String>,
 }
 
-impl WriteReply {
-    fn of(spec: &JobSpecTexts, result: Result<(), String>) -> Self {
-        WriteReply {
-            saved: spec.saved.clone(),
-            failed: spec.failed.clone(),
-            hint: spec.hint.clone(),
-            result,
+/// The file as `Config::load` read it after a write, and the modified time that
+/// read saw. The UI thread adopts the time when (and only when) it swaps the
+/// config in; see `config::load_deferring_mtime`.
+pub struct Loaded {
+    pub config: Result<Box<Config>, String>,
+    pub mtime: Option<std::time::SystemTime>,
+}
+
+/// The UI thread has taken a [`Loaded`] as its config: from now on a whole-file
+/// save is judged against what was read then (`Loaded::mtime`).
+pub fn adopt_mtime(mtime: Option<std::time::SystemTime>) {
+    if let Ok(path) = Config::path() {
+        crate::config::note_mtime(&path, mtime);
+    }
+}
+
+/// What the cards say once a write is done. Different tray changes word them
+/// differently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outcome {
+    pub ok_headline: String,
+    pub ok_detail: String,
+    pub ok_secs: u32,
+    /// Show the OK card as a setup card (it points at Settings and stays).
+    pub ok_setup: bool,
+    pub fail_headline: String,
+    /// Said under the failure, after "It ...".
+    pub fail_note: String,
+    /// The change comes from the Settings window: it is not kept in `unsaved` when
+    /// it fails (the running settings stay as they were), its OK card gives way to
+    /// an answer already on screen, and a press of the Wingman key is refused until
+    /// its answer has been applied.
+    pub from_settings: bool,
+}
+
+impl Outcome {
+    /// "<label>" on success; "Using <label>: not saved" and "It will revert when
+    /// you quit." on failure.
+    pub fn simple(label: &str) -> Self {
+        Self {
+            ok_headline: label.to_string(),
+            ok_detail: String::new(),
+            ok_secs: 3,
+            ok_setup: false,
+            fail_headline: format!("Using {label}: not saved"),
+            fail_note: "It will revert when you quit.".to_string(),
+            from_settings: false,
+        }
+    }
+
+    /// A save from the Settings window. On failure nothing was applied, and a key
+    /// typed there was not stored.
+    pub fn settings_save() -> Self {
+        Self {
+            ok_headline: "Settings saved".to_string(),
+            ok_detail: String::new(),
+            ok_secs: 3,
+            ok_setup: false,
+            fail_headline: "Couldn't save settings".to_string(),
+            fail_note: "Your changes were not applied and Wingman is still using its previous \
+                        settings. A key you typed was not stored, so enter it again after \
+                        fixing this."
+                .to_string(),
+            from_settings: true,
         }
     }
 }
 
-struct JobSpecTexts {
-    saved: String,
-    failed: String,
-    hint: String,
+/// What the app is told when a write finishes: the writer's reply, the changes
+/// it was for, how to word the cards, and (on success) the config as
+/// `Config::load` now reads it. The load runs on the writer thread, so the
+/// Credential Manager reads and any `icacls` call it makes never run on the
+/// thread that hosts the keyboard hook.
+pub struct Written {
+    pub reply: WriteReply,
+    pub changes: Vec<FieldChange>,
+    pub outcome: Outcome,
+    /// `None` when the write failed, or the app is quitting.
+    pub loaded: Option<Loaded>,
+    /// Set when the file was written but an API key then could not be stored in
+    /// Credential Manager (a Settings save with a typed key). A plain sentence.
+    pub key_error: Option<String>,
+}
+
+/// One write's reply has been dealt with (or could not be posted): takes it off
+/// the count of writes in flight and says whether it was the last. Only the last
+/// reply may swap in a loaded config; an earlier one was read before a later
+/// choice was made and would overwrite it.
+pub fn finish(pending: &std::sync::atomic::AtomicU32) -> bool {
+    use std::sync::atomic::Ordering;
+    let before = pending
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            Some(n.saturating_sub(1))
+        })
+        .unwrap_or(0);
+    before <= 1
+}
+
+type Seen = Option<std::time::SystemTime>;
+
+/// Which file mtime the UI thread should adopt after a reply, and which good one
+/// to remember for later. `this_ok` is the mtime of this reply's load if it
+/// succeeded; `skipped` the newest good one an earlier reply left unadopted
+/// (not the last). The last reply adopts its own, or, if it failed, the newest
+/// good earlier one: a failed write leaves the file as that load saw it, so
+/// Settings saves are not refused for good.
+pub fn track_mtime(
+    last: bool,
+    this_ok: Option<Seen>,
+    skipped: Option<Seen>,
+) -> (Option<Seen>, Option<Seen>) {
+    let newest = this_ok.or(skipped);
+    if last {
+        (newest, None)
+    } else {
+        (None, newest)
+    }
+}
+
+/// Stores the keys a Settings save changed in Credential Manager (see
+/// `Config::push_changed_secrets`). `Some` is a plain sentence for the failure.
+/// Runs on the writer thread, after the file write has succeeded.
+pub fn store_changed_keys(was: &Config, now: &Config) -> Option<String> {
+    Config::push_changed_secrets(was, now)
+        .err()
+        .map(|e| format!("{e:#}"))
+}
+
+/// `Config::load` for the handler of [`Written`], with the error as a sentence.
+/// Runs on the writer thread.
+pub fn load_after_write() -> Loaded {
+    let load = || Config::load().map(Box::new).map_err(|e| format!("{e:#}"));
+    match Config::path() {
+        Ok(path) => {
+            let (config, mtime) = crate::config::load_deferring_mtime(&path, load);
+            Loaded { config, mtime }
+        }
+        Err(e) => Loaded {
+            config: Err(format!("{e:#}")),
+            mtime: None,
+        },
+    }
 }
 
 struct Job {
     changes: Vec<FieldChange>,
-    secrets: Option<Config>,
-    texts: JobSpecTexts,
+    label: String,
     done: Box<dyn FnOnce(WriteReply) + Send>,
 }
-
-/// Moves the API keys in a config into Credential Manager. Injected so tests
-/// never touch the real store (rule 9).
-type SecretsPusher = Box<dyn Fn(&Config) -> Result<()> + Send>;
 
 /// The writer thread's handle. Cheap to share; the thread ends when the last
 /// handle is dropped.
@@ -401,19 +751,11 @@ pub struct ConfigWriter {
 }
 
 impl ConfigWriter {
-    /// Starts the `settings-writer` thread for `path`, pushing keys to the real
-    /// Credential Manager. See [`ConfigWriter::spawn_with`].
+    /// Starts the `settings-writer` thread for `path`. It blocks on the channel,
+    /// so it costs nothing while idle. Jobs that queue up while it writes are
+    /// coalesced into one write (latest value of each key wins) and every job is
+    /// told the one result.
     pub fn spawn(path: PathBuf) -> Self {
-        Self::spawn_with(path, Box::new(Config::push_secrets_to_credential_manager))
-    }
-
-    /// Starts the thread. It blocks on the channel, so it costs nothing while
-    /// idle. Jobs that queue up while it writes are coalesced into one write
-    /// (the latest value of each key wins) and every job is told the one result.
-    /// A job with keys to store runs its store step first and alone: if the
-    /// store refuses, that job fails and its changes are dropped, and the file
-    /// is not touched for it.
-    pub fn spawn_with(path: PathBuf, push_secrets: SecretsPusher) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         // If the thread cannot start, `rx` is dropped with the closure and
         // `submit` finds the channel closed, which it reports.
@@ -423,66 +765,87 @@ impl ConfigWriter {
                 while let Ok(first) = rx.recv() {
                     let mut jobs = vec![first];
                     jobs.extend(rx.try_iter());
-                    let mut writable = Vec::with_capacity(jobs.len());
-                    for job in jobs {
-                        let stored = match &job.secrets {
-                            Some(config) => push_secrets(config).map_err(|e| format!("{e:#}")),
-                            None => Ok(()),
-                        };
-                        match stored {
-                            Ok(()) => writable.push(job),
-                            Err(reason) => {
-                                (job.done)(WriteReply::of(&job.texts, Err(reason)));
-                            }
-                        }
-                    }
-                    if writable.is_empty() {
-                        continue;
-                    }
-                    let all = writable.iter().flat_map(|j| j.changes.clone()).collect();
-                    let result = write_changes(&path, &coalesce(all)).map_err(|e| format!("{e:#}"));
-                    for job in writable {
-                        (job.done)(WriteReply::of(&job.texts, result.clone()));
+                    let sets: Vec<&[FieldChange]> =
+                        jobs.iter().map(|j| j.changes.as_slice()).collect();
+                    let results = write_batch(&path, &sets);
+                    for (job, result) in jobs.into_iter().zip(results) {
+                        (job.done)(WriteReply {
+                            label: job.label,
+                            result,
+                        });
                     }
                 }
             });
         Self { jobs: tx }
     }
 
-    /// Queues a job; `done` runs on the writer thread with the result. If the
+    /// Waits up to `timeout` for everything queued before this call to finish.
+    /// True if it did. Jobs run in order, so an empty job's callback firing means
+    /// the earlier ones are done.
+    pub fn flush(&self, timeout: std::time::Duration) -> bool {
+        let (tx, rx) = mpsc::channel();
+        self.submit("flush", Vec::new(), move |_| {
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Queues `changes`; `done` runs on the writer thread with the result. If the
     /// thread is gone, `done` runs here with an error, so a caller always hears
     /// back.
-    pub fn submit(&self, spec: JobSpec, done: impl FnOnce(WriteReply) + Send + 'static) {
+    pub fn submit(
+        &self,
+        label: &str,
+        changes: Vec<FieldChange>,
+        done: impl FnOnce(WriteReply) + Send + 'static,
+    ) {
         let job = Job {
-            changes: spec.changes,
-            secrets: spec.secrets,
-            texts: JobSpecTexts {
-                saved: spec.saved,
-                failed: spec.failed,
-                hint: spec.hint,
-            },
+            changes,
+            label: label.to_string(),
             done: Box::new(done),
         };
         if let Err(mpsc::SendError(job)) = self.jobs.send(job) {
-            (job.done)(WriteReply::of(
-                &job.texts,
-                Err("the settings writer is not running".to_string()),
-            ));
+            (job.done)(WriteReply {
+                label: job.label,
+                result: Err("the settings writer is not running".to_string()),
+            });
         }
     }
 }
 
+static WRITER: std::sync::OnceLock<ConfigWriter> = std::sync::OnceLock::new();
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The writer for the real `%APPDATA%\Wingman\config.toml`, started on first use.
+/// A failure to find the path is reported but not remembered: the next call
+/// looks again.
 pub fn global() -> Result<&'static ConfigWriter, String> {
-    static WRITER: std::sync::OnceLock<Result<ConfigWriter, String>> = std::sync::OnceLock::new();
-    WRITER
-        .get_or_init(|| {
-            Config::path()
-                .map(ConfigWriter::spawn)
-                .map_err(|e| format!("{e:#}"))
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+    global_in(&WRITER, Config::path)
+}
+
+fn global_in(
+    cell: &std::sync::OnceLock<ConfigWriter>,
+    path: impl FnOnce() -> Result<PathBuf>,
+) -> Result<&ConfigWriter, String> {
+    if let Some(writer) = cell.get() {
+        return Ok(writer);
+    }
+    let path = path().map_err(|e| format!("{e:#}"))?;
+    Ok(cell.get_or_init(|| ConfigWriter::spawn(path)))
+}
+
+/// Waits up to `timeout` for every queued write to finish, then marks the app as
+/// quitting (see [`shutting_down`]). Called once, from the window's
+/// `WM_DESTROY`. True if there was nothing to wait for or the wait finished.
+pub fn flush_global(timeout: std::time::Duration) -> bool {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    WRITER.get().map_or(true, |w| w.flush(timeout))
+}
+
+/// True once [`flush_global`] has run: the app is quitting, so a finished write
+/// need not reload the config for a window that is going away.
+pub fn shutting_down() -> bool {
+    SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -1116,27 +1479,12 @@ x = 1
 
     // -- the writer thread ------------------------------------------------------
 
-    fn spec(label: &str, changes: Vec<FieldChange>) -> JobSpec {
-        JobSpec {
-            changes,
-            secrets: None,
-            saved: label.to_string(),
-            failed: format!("{label}: not saved"),
-            hint: "hint".to_string(),
-        }
-    }
-
     fn replies(writer: &ConfigWriter, jobs: Vec<(&str, Vec<FieldChange>)>) -> Vec<WriteReply> {
-        let jobs = jobs.into_iter().map(|(l, c)| spec(l, c)).collect();
-        replies_for(writer, jobs)
-    }
-
-    fn replies_for(writer: &ConfigWriter, jobs: Vec<JobSpec>) -> Vec<WriteReply> {
         let (tx, rx) = mpsc::channel();
         let n = jobs.len();
-        for job in jobs {
+        for (label, changes) in jobs {
             let tx = tx.clone();
-            writer.submit(job, move |r| {
+            writer.submit(label, changes, move |r| {
                 let _ = tx.send(r);
             });
         }
@@ -1157,9 +1505,7 @@ x = 1
             &writer,
             vec![("Mode", vec![FieldChange::mode(Mode::Offline)])],
         );
-        assert_eq!(got[0].saved, "Mode");
-        assert_eq!(got[0].failed, "Mode: not saved");
-        assert_eq!(got[0].hint, "hint");
+        assert_eq!(got[0].label, "Mode");
         assert_eq!(got[0].result, Ok(()));
         let out = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1211,91 +1557,714 @@ x = 1
         assert!(got[0].result.is_err());
     }
 
-    fn spawn_with_fake_store(
-        path: PathBuf,
-        fail: bool,
-    ) -> (ConfigWriter, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = seen.clone();
-        let writer = ConfigWriter::spawn_with(
-            path,
-            Box::new(move |config: &Config| {
-                record
-                    .lock()
-                    .unwrap()
-                    .push(config.providers.openai.api_key.clone());
-                if fail {
-                    anyhow::bail!("Credential Manager said no");
-                }
-                Ok(())
-            }),
-        );
-        (writer, seen)
+    // -- review fixes (#889): nested keys, mtime order, BOM, floats --------------
+
+    fn toml_value(text: &str) -> toml::Value {
+        toml::from_str(text).unwrap()
     }
 
-    fn with_key(changes: Vec<FieldChange>) -> JobSpec {
-        let mut config = Config::default();
-        config.providers.openai.api_key = "sk-typed-by-the-user".into();
-        JobSpec {
-            secrets: Some(config),
-            ..spec("Settings saved", changes)
+    #[test]
+    fn a_whole_table_change_carrying_a_nested_api_key_is_refused() {
+        let with_key =
+            toml_value("order = [\"a\"]\n[openai]\nmodel = \"m\"\napi_key = \"sk-live\"\n");
+        let nested_array = toml_value(
+            "[[compat]]\nname = \"x\"\nbase_url = \"http://127.0.0.1:1\"\napi_key = \"sk-live\"\n",
+        );
+        let cases = [
+            FieldChange::Set {
+                path: vec!["providers".into()],
+                value: with_key,
+            },
+            FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: nested_array["compat"].clone(),
+            },
+        ];
+        for change in cases {
+            let path = scratch("nested-key");
+            std::fs::write(&path, HAND_EDITED).unwrap();
+            let err = write_changes(&path, &[change]).unwrap_err();
+            assert!(format!("{err:#}").contains("Credential Manager"), "{err:#}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
+            cleanup(&path);
         }
     }
 
     #[test]
-    fn keys_go_to_the_store_and_never_to_the_file() {
-        let path = scratch("thread-keys");
-        std::fs::write(&path, HAND_EDITED).unwrap();
-        let (writer, seen) = spawn_with_fake_store(path.clone(), false);
-        let got = replies_for(
-            &writer,
-            vec![with_key(vec![set(&["ui", "card_seconds"], 9u32)])],
+    fn a_whole_table_change_with_only_blank_api_keys_is_allowed() {
+        let blank = toml_value(
+            "[[compat]]\nname = \"x\"\nbase_url = \"http://127.0.0.1:1\"\napi_key = \"\"\n",
         );
-        assert_eq!(got[0].result, Ok(()));
-        assert_eq!(*seen.lock().unwrap(), vec!["sk-typed-by-the-user"]);
-        let out = std::fs::read_to_string(&path).unwrap();
-        assert!(!out.contains("sk-typed-by-the-user"), "{out}");
-        assert!(out.contains("card_seconds = 9"));
+        let out = patched(
+            "blank-nested",
+            HAND_EDITED,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: blank["compat"].clone(),
+            }],
+        );
+        assert!(out.contains("name = \"x\""), "{out}");
+    }
+
+    fn compat(name: &str, key: &str) -> crate::config::CompatConfig {
+        crate::config::CompatConfig {
+            name: name.into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: key.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn diff_blanks_the_api_key_inside_a_whole_array_it_sets() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.providers.compat = vec![compat("mine", "sk-hydrated-secret")];
+        let changes = diff(&before, &after).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path(), ["providers", "compat"]);
+        let out = patched("diff-compat", HAND_EDITED, &changes);
+        assert!(out.contains("mine"), "{out}");
+        assert!(!out.contains("sk-hydrated-secret"), "{out}");
+    }
+
+    #[test]
+    fn diff_ignores_a_compat_entry_whose_only_difference_is_its_hydrated_key() {
+        let mut before = Config::default();
+        before.providers.compat = vec![compat("mine", "")];
+        let mut after = before.clone();
+        after.providers.compat[0].api_key = "sk-hydrated-secret".into();
+        assert!(diff(&before, &after).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_write_does_not_mark_the_file_as_seen_so_a_whole_file_save_cannot_clobber_it() {
+        let path = scratch("seen");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        drop(f);
+        let stale = Config::load_from(&path).unwrap();
+        write_changes(&path, &[FieldChange::mode(Mode::Offline)]).unwrap();
+        // The file now holds something the in-memory config has not read. Until a
+        // reload reads it, a whole-file save must be refused, not overwrite it.
+        let err = stale.save_to(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("changed on disk"), "{err:#}");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(r#"mode = "offline""#));
         cleanup(&path);
     }
 
     #[test]
-    fn a_store_failure_leaves_the_file_untouched_and_reports_it() {
-        let path = scratch("thread-store-fails");
-        std::fs::write(&path, HAND_EDITED).unwrap();
-        let (writer, _seen) = spawn_with_fake_store(path.clone(), true);
-        let got = replies_for(
-            &writer,
-            vec![with_key(vec![set(&["ui", "card_seconds"], 9u32)])],
+    fn a_file_with_a_byte_order_mark_is_patched_and_keeps_its_mark() {
+        let text = format!("\u{feff}{HAND_EDITED}");
+        let path = scratch("bom");
+        std::fs::write(&path, &text).unwrap();
+        write_changes(&path, &[FieldChange::mode(Mode::Offline)]).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]), "the BOM was lost");
+        let out = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            out,
+            replaced(&text, r#"mode = "auto""#, r#"mode = "offline""#)
         );
-        let message = got[0].result.clone().unwrap_err();
-        assert!(message.contains("Credential Manager said no"), "{message}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), HAND_EDITED);
         cleanup(&path);
     }
 
     #[test]
-    fn one_job_failing_to_store_does_not_stop_the_others_from_being_written() {
-        let path = scratch("thread-mixed");
+    fn a_single_precision_float_is_written_as_the_user_would_type_it() {
+        let out = patched("f32", HAND_EDITED, &[set(&["ui", "text_scale"], 1.1f32)]);
+        assert!(out.contains("text_scale = 1.1\n"), "{out}");
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert_eq!(loaded.ui.text_scale, 1.1f32);
+    }
+
+    // -- review fixes (#889): batches, quit, path error, reapply ----------------
+
+    #[test]
+    fn a_refused_job_does_not_fail_the_jobs_batched_with_it() {
+        let path = scratch("batch-refused");
         std::fs::write(&path, HAND_EDITED).unwrap();
-        let (writer, _seen) = spawn_with_fake_store(path.clone(), true);
-        let got = replies_for(
-            &writer,
-            vec![
-                with_key(vec![set(&["ui", "card_seconds"], 9u32)]),
-                spec("Mode", vec![FieldChange::mode(Mode::Offline)]),
-            ],
-        );
-        let by_name = |n: &str| got.iter().find(|r| r.saved == n).unwrap();
-        assert!(by_name("Settings saved").result.is_err());
-        assert_eq!(by_name("Mode").result, Ok(()));
+        let good = vec![FieldChange::mode(Mode::Offline)];
+        let bad = vec![set(&["providers", "openai", "api_key"], "sk-live-key")];
+        let other = vec![set(&["ui", "card_seconds"], 4u32)];
+        let results = write_batch(&path, &[&good, &bad, &other]);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], Ok(()));
+        assert!(results[1]
+            .clone()
+            .unwrap_err()
+            .contains("Credential Manager"));
+        assert_eq!(results[2], Ok(()));
         let out = std::fs::read_to_string(&path).unwrap();
-        assert!(out.contains(r#"mode = "offline""#));
+        assert!(out.contains(r#"mode = "offline""#), "{out}");
+        assert!(out.contains("card_seconds = 4"), "{out}");
+        assert!(!out.contains("sk-live-key"), "{out}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_batch_against_a_broken_file_fails_every_job_and_leaves_the_file() {
+        let path = scratch("batch-broken");
+        std::fs::write(&path, "mode = \n").unwrap();
+        let a = vec![FieldChange::mode(Mode::Offline)];
+        let b = vec![set(&["ui", "card_seconds"], 4u32)];
+        let results = write_batch(&path, &[&a, &b]);
+        assert!(results.iter().all(|r| r.is_err()), "{results:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mode = \n");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn flush_returns_only_after_every_queued_write_is_done() {
+        let path = scratch("flush");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let writer = ConfigWriter::spawn(path.clone());
+        let (tx, rx) = mpsc::channel();
+        for n in 1..=3u32 {
+            let tx = tx.clone();
+            writer.submit("n", vec![set(&["ui", "card_seconds"], n)], move |r| {
+                let _ = tx.send(r);
+            });
+        }
+        assert!(writer.flush(std::time::Duration::from_secs(30)));
+        assert_eq!(rx.try_iter().count(), 3, "every job must have been told");
+        let loaded: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.ui.card_seconds, 3);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn flush_gives_up_after_its_time_instead_of_hanging() {
+        let path = scratch("flush-slow");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let writer = ConfigWriter::spawn(path.clone());
+        writer.submit("slow", vec![FieldChange::mode(Mode::Offline)], |_| {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        });
+        let start = std::time::Instant::now();
+        assert!(!writer.flush(std::time::Duration::from_millis(100)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn flush_with_nothing_queued_is_immediate() {
+        let path = scratch("flush-idle");
+        let writer = ConfigWriter::spawn(path.clone());
+        assert!(writer.flush(std::time::Duration::from_secs(30)));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_path_error_is_not_remembered_forever() {
+        let cell = std::sync::OnceLock::new();
+        let first = global_in(&cell, || Err(anyhow::anyhow!("no APPDATA yet")));
+        assert!(first.is_err());
+        let path = scratch("global-retry");
+        let second = global_in(&cell, || Ok(path.clone()));
+        assert!(second.is_ok(), "the second call must try again");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reapply_puts_unsaved_changes_back_on_a_freshly_loaded_config() {
+        let mut loaded = Config::default();
+        loaded.providers.openai.api_key = "sk-hydrated".into();
+        loaded.unreadable_secrets = vec!["anthropic".into()];
+        let out = reapply(&loaded, &[FieldChange::mode(Mode::Offline)]).unwrap();
+        assert_eq!(out.mode, Mode::Offline);
+        assert_eq!(out.providers.openai.api_key, "sk-hydrated");
+        assert_eq!(out.unreadable_secrets, vec!["anthropic".to_string()]);
+    }
+
+    /// The reload after a write (`Config::load`: Credential Manager reads, maybe
+    /// `icacls`) runs on the writer thread, not the thread that hosts the
+    /// keyboard hook; the handler only swaps the result in.
+    #[test]
+    fn the_reload_after_a_write_runs_off_the_ui_thread() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let start = app
+            .find("    fn on_config_written(")
+            .expect("on_config_written moved: this scan is no longer looking at anything");
+        let rest = &app[start..];
+        let end = rest.find("\n    }\n").expect("end of on_config_written");
+        let handler = &rest[..end];
+        assert!(!handler.contains("Config::load"), "{handler}");
+        assert!(!handler.contains("load_after_write"), "{handler}");
+        let start = app
+            .find("    fn persist_changes_with(")
+            .expect("persist_changes_with moved");
+        let rest = &app[start..];
+        let end = rest.find("\n    }\n").expect("end of persist_changes_with");
         assert!(
-            out.contains("card_seconds = 12"),
-            "the failed job's change must not land"
+            rest[..end].contains("load_after_write"),
+            "the writer thread must reload"
         );
+    }
+
+    /// Quit must not lose a write still queued: `WM_DESTROY` waits (bounded) for
+    /// the writer before the process exits.
+    #[test]
+    fn quitting_flushes_the_writer() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let start = app
+            .find("        WM_DESTROY => {")
+            .expect("the WM_DESTROY arm moved: this scan is no longer looking at anything");
+        let rest = &app[start..];
+        let end = rest
+            .find("\n        }\n")
+            .expect("end of the WM_DESTROY arm");
+        assert!(
+            rest[..end].contains("config_writer::flush_global("),
+            "{}",
+            &rest[..end]
+        );
+    }
+
+    // -- re-review fixes (#889) -------------------------------------------------
+
+    #[test]
+    fn replacing_an_array_of_tables_keeps_its_comment_and_its_place() {
+        let text = "# endpoints I use\n[[providers.compat]]\nname = \"a\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n# second one\n[[providers.compat]]\nname = \"a2\"\nbase_url = \"http://127.0.0.1:2/v1\"\n\n[ui]\ncard_seconds = 7 # keep\n\n[unknown_future_table]\nx = 1\n";
+        let compat: Vec<toml::Value> = ["b", "b2", "b3"]
+            .iter()
+            .map(|n| {
+                toml::Value::try_from(crate::config::CompatConfig {
+                    name: (*n).into(),
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    ..Default::default()
+                })
+                .unwrap()
+            })
+            .collect();
+        let out = patched(
+            "aot-place",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: toml::Value::Array(compat),
+            }],
+        );
+        let at = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} lost:\n{out}"))
+        };
+        assert!(
+            at("# endpoints I use") < at("name = \"b\""),
+            "the comment must stay above the first table:\n{out}"
+        );
+        assert!(at("# second one") < at("name = \"b2\""), "{out}");
+        assert!(
+            at("name = \"b3\"") < at("[ui]"),
+            "the tables must stay where they were, before [ui]:\n{out}"
+        );
+        assert!(at("[ui]") < at("[unknown_future_table]"), "{out}");
+    }
+
+    #[test]
+    fn replacing_a_table_keeps_its_comment_and_its_place() {
+        let text =
+            "# my cheap model\n[providers.openai]\nmodel = \"a\"\n\n[ui]\ncard_seconds = 7\n";
+        let value = toml_value("model = \"b\"\n");
+        let out = patched(
+            "table-place",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "openai".into()],
+                value,
+            }],
+        );
+        assert!(
+            out.starts_with("# my cheap model\n[providers.openai]"),
+            "{out}"
+        );
+        assert!(
+            out.find("model = \"b\"").unwrap() < out.find("[ui]").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn two_threads_writing_the_file_do_not_trip_over_the_shared_temp_file() {
+        let path = scratch("lock");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let handles: Vec<_> = (0..2)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..15 {
+                        let text = format!("# writer {t} pass {n}\n{HAND_EDITED}");
+                        crate::config::write_file_atomically(&path, &text, false)
+                            .unwrap_or_else(|e| panic!("writer {t} pass {n}: {e:#}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(toml::from_str::<Config>(&std::fs::read_to_string(&path).unwrap()).is_ok());
         cleanup(&path);
+    }
+
+    #[test]
+    fn a_load_on_the_writer_thread_leaves_the_file_unseen_until_the_ui_adopts_it() {
+        let path = scratch("deferred");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let set_mtime = |t: std::time::SystemTime| {
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(t).unwrap();
+        };
+        set_mtime(past);
+        let held = Config::load_from(&path).unwrap();
+        // The file changes, then the writer thread loads it.
+        std::fs::write(
+            &path,
+            replaced(HAND_EDITED, "card_seconds = 12", "card_seconds = 5"),
+        )
+        .unwrap();
+        let (loaded, mtime) =
+            crate::config::load_deferring_mtime(&path, || Config::load_from(&path).unwrap());
+        assert_eq!(loaded.ui.card_seconds, 5);
+        assert!(mtime.is_some());
+        // Until the UI thread swaps `loaded` in, `held` is stale: its save must
+        // still be refused.
+        let err = held.save_to(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("changed on disk"), "{err:#}");
+        // The swap adopts the mtime the load saw; now a save is allowed.
+        crate::config::note_mtime(&path, mtime);
+        assert!(loaded.save_to(&path).is_ok());
+        cleanup(&path);
+    }
+
+    fn body_of<'a>(src: &'a str, signature: &str) -> &'a str {
+        let start = src.find(signature).unwrap_or_else(|| {
+            panic!("{signature} moved: this scan is no longer looking at anything")
+        });
+        let rest = &src[start..];
+        let end = rest.find("\n    }\n").expect("end of the function");
+        &rest[..end]
+    }
+
+    #[test]
+    fn tray_changes_reach_the_file_through_the_writer_not_a_whole_file_save() {
+        let app = include_str!("app.rs").replace('\r', "");
+        for signature in [
+            "    fn set_provider(",
+            "    fn commit_model_pick(",
+            "    fn on_learned(",
+        ] {
+            let body = body_of(&app, signature);
+            assert!(!body.contains("config.save("), "{signature}\n{body}");
+            assert!(body.contains("persist_diff("), "{signature}\n{body}");
+        }
+        let at = app
+            .find("adopt_local_model(model, &base_url)")
+            .expect("the first-run adoption moved");
+        let window = &app[at..(at + 900).min(app.len())];
+        assert!(!window.contains("config.save("), "{window}");
+        assert!(window.contains("persist_diff("), "{window}");
+    }
+
+    #[test]
+    fn the_handler_swaps_only_when_no_other_write_is_in_flight() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let body = body_of(&app, "    fn on_config_written(");
+        assert!(body.contains("finish("), "{body}");
+    }
+
+    /// The low-level keyboard hook must be gone before Quit waits on the writer,
+    /// or every key in the system stalls behind a wait on the hook's thread.
+    #[test]
+    fn quitting_unhooks_the_keyboard_before_it_waits_for_the_writer() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let start = app
+            .find("        WM_DESTROY => {")
+            .expect("the WM_DESTROY arm moved");
+        let rest = &app[start..];
+        let end = rest
+            .find("\n        }\n")
+            .expect("end of the WM_DESTROY arm");
+        let arm = &rest[..end];
+        let unhook = arm
+            .find("hook = None")
+            .expect("the hook must be dropped in WM_DESTROY");
+        let flush = arm.find("flush_global(").expect("flush");
+        assert!(unhook < flush, "{arm}");
+    }
+
+    // -- round 3 review fixes (#889) --------------------------------------------
+
+    #[test]
+    fn a_pending_count_that_lost_its_reply_still_settles() {
+        use std::sync::atomic::AtomicU32;
+        let pending = AtomicU32::new(0);
+        pending.fetch_add(2, Ordering::SeqCst);
+        // The first write's reply could not be posted (window gone): the poster
+        // settles it itself, and it must not count as the last.
+        assert!(!finish(&pending));
+        // The second reply then is the last.
+        assert!(finish(&pending));
+        // A stray extra never underflows.
+        assert!(finish(&pending));
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_failed_last_reply_still_adopts_the_newest_good_load() {
+        let t = |s: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        // Not the last: remember it, adopt nothing yet.
+        assert_eq!(track_mtime(false, Some(t(1)), None), (None, Some(t(1))));
+        assert_eq!(
+            track_mtime(false, Some(t(2)), Some(t(1))),
+            (None, Some(t(2)))
+        );
+        assert_eq!(track_mtime(false, None, Some(t(1))), (None, Some(t(1))));
+        // Last and good: adopt its own, forget the rest.
+        assert_eq!(
+            track_mtime(true, Some(t(3)), Some(t(1))),
+            (Some(t(3)), None)
+        );
+        // Last but failed: adopt the newest earlier good one.
+        assert_eq!(track_mtime(true, None, Some(t(2))), (Some(t(2)), None));
+        // Nothing good at all.
+        assert_eq!(track_mtime(true, None, None), (None, None));
+    }
+
+    #[test]
+    fn the_changed_since_read_check_happens_while_the_write_lock_is_held() {
+        let path = scratch("lock-check");
+        std::fs::write(&path, HAND_EDITED).unwrap();
+        let guard = crate::config::lock_writes();
+        let worker = {
+            let path = path.clone();
+            std::thread::spawn(move || write_changes(&path, &[FieldChange::mode(Mode::Offline)]))
+        };
+        // Let the worker read the file and reach the lock.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let during = replaced(HAND_EDITED, "card_seconds = 12", "card_seconds = 77");
+        edit_file(&path, &during, 5);
+        drop(guard);
+        worker.join().unwrap().unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains("card_seconds = 77"),
+            "the hand edit was lost:\n{out}"
+        );
+        assert!(out.contains(r#"mode = "offline""#), "{out}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_empty_list_replacing_a_list_of_tables_keeps_the_comment() {
+        let text = "[providers]\norder = [\"openai\"]\n\n# my endpoints\n[[providers.compat]]\nname = \"a\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n[ui]\ncard_seconds = 7 # keep\n";
+        let out = patched(
+            "aot-empty",
+            text,
+            &[FieldChange::Set {
+                path: vec!["providers".into(), "compat".into()],
+                value: toml::Value::Array(Vec::new()),
+            }],
+        );
+        assert!(out.contains("# my endpoints"), "{out}");
+        assert!(
+            out.find("# my endpoints").unwrap() < out.find("compat = []").unwrap(),
+            "{out}"
+        );
+        let loaded: Config = toml::from_str(&out).unwrap();
+        assert!(loaded.providers.compat.is_empty());
+        assert!(out.contains("card_seconds = 7 # keep"), "{out}");
+    }
+
+    #[test]
+    fn a_reload_forgets_the_unsaved_changes() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let reload = body_of(&app, "    fn reload(&mut self) {");
+        assert!(reload.contains("unsaved.clear()"), "{reload}");
+    }
+
+    /// Settings saves through the writer: its Save builds the changes with
+    /// `diff` and `guard_whole_values`, posts them to the main window, and never
+    /// calls `Config::save` or touches the disk itself.
+    #[test]
+    fn the_settings_window_saves_through_the_writer_thread() {
+        let src = include_str!("ui/settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(!code.is_empty());
+        assert!(
+            code.contains("crate::config_writer::diff("),
+            "Save must send only the changed fields"
+        );
+        assert!(
+            code.contains("crate::config_writer::guard_whole_values("),
+            "a changed list must not replace a hand edit of the same list"
+        );
+        assert!(code.contains("crate::app::post_settings_save("));
+        assert!(
+            !code.contains(".save("),
+            "Settings must not save the whole config itself"
+        );
+        assert!(
+            !code.contains("fs::write"),
+            "no file writes on the UI thread"
+        );
+    }
+
+    // -- whole values are written only over what the window saw (#871) -----------
+
+    fn order(items: &[&str]) -> toml::Value {
+        toml::Value::Array(items.iter().map(|s| toml::Value::from(*s)).collect())
+    }
+
+    fn change_order(text: &str, expected: &[&str], to: &[&str]) -> (Result<()>, String, PathBuf) {
+        let path = scratch("guard");
+        std::fs::write(&path, text).unwrap();
+        let change = FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: Some(order(expected)),
+            value: order(to),
+        };
+        let result = write_changes(&path, &[change]);
+        let after = std::fs::read_to_string(&path).unwrap();
+        (result, after, path)
+    }
+
+    #[test]
+    fn a_list_is_written_when_the_file_still_holds_what_the_window_saw() {
+        let text = "[providers]\norder = [\"openai\", \"anthropic\"]  # mine\n";
+        let (result, after, path) = change_order(text, &["openai", "anthropic"], &["anthropic"]);
+        result.unwrap();
+        assert!(after.contains("order = [\"anthropic\"]"), "{after}");
+        assert!(after.contains("# mine"), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_list_the_user_added_to_by_hand_meanwhile_is_not_overwritten() {
+        // The window opened with two vendors; the user then added a third in the
+        // file. Saving the window's list would silently drop it.
+        let text = "[providers]\norder = [\"openai\", \"anthropic\", \"gemini\"]\n";
+        let (result, after, path) = change_order(text, &["openai", "anthropic"], &["anthropic"]);
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("providers.order"), "{message}");
+        assert!(message.contains("Open Settings again"), "{message}");
+        assert!(!message.contains('\u{2014}'), "{message}");
+        assert_eq!(after, text, "the file must be left exactly as it was");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_list_the_file_never_spelled_out_compares_as_its_default() {
+        // No `order` in the file: Config reads the default list, which is what
+        // the window opened with.
+        let default = Config::default().providers.order;
+        let names: Vec<&str> = default.iter().map(String::as_str).collect();
+        let path = scratch("guard-absent");
+        std::fs::write(&path, "mode = \"auto\"\n").unwrap();
+        let change = FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: Some(order(&names)),
+            value: order(&["gemini"]),
+        };
+        write_changes(&path, &[change]).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("order = [\"gemini\"]"), "{after}");
+        assert!(after.contains("mode = \"auto\""), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_guarded_change_leaves_the_other_jobs_in_its_batch_alone() {
+        let path = scratch("guard-batch");
+        let text = "[providers]\norder = [\"openai\", \"gemini\"]\n";
+        std::fs::write(&path, text).unwrap();
+        let guarded = vec![FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: Some(order(&["openai"])),
+            value: order(&["anthropic"]),
+        }];
+        let fine = vec![set(&["ui", "card_seconds"], 9u32)];
+        let results = write_batch(&path, &[&guarded, &fine]);
+        assert!(results[0].is_err());
+        assert_eq!(results[1], Ok(()));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("card_seconds = 9"), "{after}");
+        assert!(after.contains("\"gemini\""), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn guard_whole_values_wraps_lists_and_tables_and_leaves_leaves_alone() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.providers.order = vec!["gemini".into()];
+        after.ui.card_seconds += 1;
+        let changes = diff(&before, &after).unwrap();
+        let guarded = guard_whole_values(changes, &before).unwrap();
+        let order = guarded
+            .iter()
+            .find(|c| c.path() == ["providers", "order"])
+            .expect("the list change is there");
+        match order {
+            FieldChange::SetIfUnchanged { expected, .. } => {
+                let expected = expected.as_ref().expect("the default list was set");
+                assert_eq!(
+                    expected.as_array().unwrap().len(),
+                    before.providers.order.len()
+                );
+            }
+            other => panic!("a list must be guarded: {other:?}"),
+        }
+        let leaf = guarded
+            .iter()
+            .find(|c| c.path() == ["ui", "card_seconds"])
+            .expect("the leaf change is there");
+        assert!(matches!(leaf, FieldChange::Set { .. }), "{leaf:?}");
+    }
+
+    #[test]
+    fn a_guarded_change_that_could_not_be_checked_is_refused() {
+        // `effective_on_disk` is None only when the comparison cannot be made;
+        // write_changes_with then refuses rather than writing blind.
+        let src = include_str!("config_writer.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(
+            code.contains("could not check config.toml before changing"),
+            "the fail-closed arm moved"
+        );
+    }
+
+    #[test]
+    fn a_settings_outcome_keeps_a_failed_save_out_of_unsaved_and_says_nothing_was_applied() {
+        let o = Outcome::settings_save();
+        assert!(o.from_settings);
+        assert!(!Outcome::simple("x").from_settings);
+        assert!(o.fail_note.contains("not applied"), "{}", o.fail_note);
+        assert!(o.fail_note.contains("key"), "{}", o.fail_note);
+        assert!(!o.fail_note.contains('\u{2014}') && !o.ok_headline.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_guarded_change_is_reapplied_like_a_plain_one() {
+        let config = Config::default();
+        let change = FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: None,
+            value: order(&["gemini"]),
+        };
+        let out = reapply(&config, &[change]).unwrap();
+        assert_eq!(out.providers.order, vec!["gemini".to_string()]);
+    }
+
+    #[test]
+    fn a_reply_that_cannot_be_posted_settles_its_own_count() {
+        let app = include_str!("app.rs").replace('\r', "");
+        let body = body_of(&app, "    fn persist_changes_with(");
+        assert!(body.contains("finish("), "{body}");
     }
 
     // -- guards ----------------------------------------------------------------
@@ -1306,48 +2275,19 @@ x = 1
     #[test]
     fn the_tray_mode_change_goes_through_the_writer_thread() {
         let app = include_str!("app.rs").replace('\r', "");
-        let body_of = |signature: &str| -> String {
-            let start = app.find(signature).unwrap_or_else(|| {
-                panic!("{signature} moved: this scan is no longer looking at anything")
-            });
-            let rest = &app[start..];
-            let end = rest.find("\n    }\n").expect("end of fn");
-            rest[..end].to_string()
-        };
-        let set_mode = body_of("    fn set_mode(&mut self, mode: Mode) {");
-        assert!(set_mode.contains("self.persist_mode(mode)"), "{set_mode}");
+        let start = app
+            .find("    fn set_mode(&mut self, mode: Mode) {")
+            .expect("set_mode moved: this scan is no longer looking at anything");
+        let rest = &app[start..];
+        let end = rest.find("\n    }\n").expect("end of set_mode");
+        let body = &rest[..end];
         assert!(
-            !set_mode.contains("config.save("),
-            "set_mode must not re-serialise the whole config on the UI thread:\n{set_mode}"
-        );
-        let persist = body_of("    fn persist_mode(&self, mode: Mode) {");
-        assert!(
-            persist.contains("config_writer::FieldChange::mode(mode)"),
-            "{persist}"
-        );
-        assert!(persist.contains("submit_config_job("), "{persist}");
-    }
-
-    /// Settings saves through the same writer: its Save path builds the sink
-    /// from `config_writer::diff` and `submit_config_job`, and never calls
-    /// `Config::save` or touches the disk itself.
-    #[test]
-    fn the_settings_window_saves_through_the_writer_thread() {
-        let src = include_str!("ui/settings.rs").replace('\r', "");
-        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
-        assert!(!code.is_empty());
-        assert!(
-            code.contains("crate::config_writer::diff("),
-            "Save must send only the changed fields"
-        );
-        assert!(code.contains("crate::app::submit_config_job("));
-        assert!(
-            !code.contains(".save("),
-            "Settings must not save the whole config itself"
+            body.contains("config_writer::"),
+            "set_mode must use the writer:\n{body}"
         );
         assert!(
-            !code.contains("fs::write"),
-            "no file writes on the UI thread"
+            !body.contains("config.save("),
+            "set_mode must not re-serialise the whole config on the UI thread:\n{body}"
         );
     }
 }
