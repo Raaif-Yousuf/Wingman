@@ -151,6 +151,30 @@ pub struct Store {
     heal_state: Mutex<HealState>,
     /// How long a failed heal waits before the next try.
     retry_gap: Duration,
+    /// Called after the file was replaced (#1158).
+    replaced_hooks: Mutex<Vec<(u64, ReplacedHook)>>,
+    next_hook: AtomicU64,
+}
+
+/// What a subscriber runs after the store's file was replaced. It runs with
+/// the connection locked, so it must only signal (set an event, flip a flag)
+/// and never touch the store.
+pub type ReplacedHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Keeps a [`Store::on_replaced`] hook alive; dropping it removes the hook.
+pub struct ReplacedSubscription {
+    store: Arc<Store>,
+    id: u64,
+}
+
+impl Drop for ReplacedSubscription {
+    fn drop(&mut self) {
+        self.store
+            .replaced_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| *id != self.id);
+    }
 }
 
 /// What a store that could not finish healing remembers between locks.
@@ -210,7 +234,55 @@ impl Store {
             fts_seen: AtomicU64::new(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst)),
             heal_state: Mutex::new(HealState::default()),
             retry_gap: RETRY_GAP,
+            replaced_hooks: Mutex::new(Vec::new()),
+            next_hook: AtomicU64::new(0),
         }
+    }
+
+    /// Runs `hook` each time a damaged file is replaced by a fresh one while
+    /// Wingman runs (#1158): row ids kept from before the swap are then
+    /// stale. Event-driven, no polling. See [`ReplacedHook`] for the rule.
+    pub fn on_replaced(self: &Arc<Self>, hook: ReplacedHook) -> ReplacedSubscription {
+        let id = self.next_hook.fetch_add(1, Ordering::SeqCst);
+        self.replaced_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((id, hook));
+        ReplacedSubscription {
+            store: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn fire_replaced(&self) {
+        let hooks: Vec<ReplacedHook> = self
+            .replaced_hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(_, h)| Arc::clone(h))
+            .collect();
+        for hook in hooks {
+            hook();
+        }
+    }
+
+    /// A store over a file in a test directory, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(path: &Path) -> Result<Store, StoreError> {
+        Store::open_at(path)
+    }
+
+    /// Overwrites this store's file with garbage while it stays open, so the
+    /// next query reads it (#660). The checkpoint moves the data into the main
+    /// file and `shrink_memory` drops the page cache first.
+    #[cfg(test)]
+    pub(crate) fn damage_file_for_test(&self) {
+        let path = self.path.clone().expect("a file-backed store");
+        self.lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .unwrap();
+        std::fs::write(path, vec![b'x'; 8192]).unwrap();
     }
 
     /// [`Store::open_at`], but a damaged file is moved aside to
@@ -271,6 +343,7 @@ impl Store {
                 self.seen
                     .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
                 note_recovery(notice);
+                self.fire_replaced();
             }
             Heal::Stuck(why) => {
                 // `seen` stays behind, so a later lock tries again.
@@ -1267,6 +1340,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1158: whoever holds rows from the old file (the knowledge watcher keeps
+    /// a root id) is told when the file was replaced, and not before.
+    #[test]
+    fn a_replaced_store_tells_its_subscribers_once() {
+        let (s, dir) = store_damaged_while_open("runtime-subscribers");
+        let s = Arc::new(s);
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        let sub = s.on_replaced(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing replaced yet");
+
+        // Another test's corrupt error can make the first call heal already.
+        let _ = s.day_total("2026-10-15");
+        let _ = s.day_total("2026-10-15");
+        assert_eq!(damaged_copies(&dir), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(sub);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A store whose connection was swapped for the empty in-memory stand-in
     /// and never got a file connection back (#1165): what a failed undo leaves.
     fn detached_store(s: &Store) {
@@ -1296,6 +1393,24 @@ mod tests {
         assert!(s.day_total("2026-10-15").unwrap().is_some());
         assert_eq!(damaged_copies(&dir), 0, "a healthy file is not moved");
         assert!(!s.heal_state.lock().unwrap().detached);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dropped subscription is not called any more.
+    #[test]
+    fn a_dropped_subscription_is_not_called() {
+        let (s, dir) = store_damaged_while_open("runtime-unsubscribed");
+        let s = Arc::new(s);
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        drop(s.on_replaced(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        })));
+        let _ = s.day_total("2026-10-15");
+        let _ = s.day_total("2026-10-15");
+        assert_eq!(damaged_copies(&dir), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1484,6 +1599,34 @@ mod tests {
         assert!(path.exists());
         drop(state);
         drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1158: a file that went missing (not damaged) is replaced by an empty
+    /// one, so subscribers holding old row ids are told to start again.
+    #[test]
+    fn a_store_started_over_a_missing_file_tells_its_subscribers() {
+        let dir = scratch("missing-subscribers");
+        let path = dir.join("wingman.db");
+        let s = Arc::new(Store::open_at(&path).unwrap());
+        detached_store(&s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("wingman.db{suffix}")));
+        }
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        let sub = s.on_replaced(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None);
+        assert!(path.exists());
+        assert_eq!(damaged_copies(&dir), 0, "nothing was damaged");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(sub);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
