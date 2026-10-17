@@ -4876,6 +4876,7 @@ impl App {
     /// same as if they had arrived that close together with no Settings
     /// window involved at all. A no-op on an empty queue.
     fn deliver_deferred(&mut self, pending: VecDeque<DeferredMessage>) {
+        let mut menu_card_shown = false;
         for message in pending {
             match message {
                 DeferredMessage::Result(result) => self.on_result(result),
@@ -4899,11 +4900,42 @@ impl App {
                 }
                 DeferredMessage::MachineCheck(facts) => self.on_machine_check_result(&facts),
                 DeferredMessage::KeyDuringMenu => {
-                    self.card
-                        .show_answer("The tray menu was open", "Press the key again.", 3, None)
+                    // Repeats collapse into one card.
+                    if !menu_card_shown {
+                        menu_card_shown = true;
+                        self.show_menu_was_open_card();
+                    }
+                }
+                DeferredMessage::ActivateDuringMenu => {
+                    // Every one is counted, as in `wnd_proc`; a refusal says so.
+                    match crate::activation::check_activation_now() {
+                        crate::activation::Verdict::Allowed => {
+                            if !menu_card_shown {
+                                menu_card_shown = true;
+                                self.show_menu_was_open_card();
+                            }
+                        }
+                        crate::activation::Verdict::Refused { notify: true } => {
+                            menu_card_shown = true;
+                            self.card.show_answer(
+                                "Too many requests in a row",
+                                "Try again in a moment.",
+                                3,
+                                None,
+                            )
+                        }
+                        crate::activation::Verdict::Refused { notify: false } => {}
+                    }
                 }
             }
         }
+    }
+
+    /// #1011: the card for a key press or a second launch that arrived while
+    /// the tray menu was open.
+    fn show_menu_was_open_card(&mut self) {
+        self.card
+            .show_answer("The tray menu was open", "Try again.", 3, None);
     }
 
     /// #722: the tray menu runs with the same reentrancy policy as Settings,
@@ -7355,11 +7387,15 @@ enum DeferredMessage {
     /// `WM_APP_MACHINE_CHECK_RESULT` (#1011), tray menu only: the "Working"
     /// card from "Check this PC" turns into its verdict once the menu is gone.
     MachineCheck(Box<crate::machine::MachineFacts>),
-    /// `WM_APP_HOTKEY` or `WM_APP_ACTIVATE` (#1011) during the tray menu. The
-    /// hook has already swallowed the key, so it must not vanish; it is not
-    /// run later either (that would bill a request for a screen the user has
-    /// moved on from), so it ends in a card that says to press it again.
+    /// `WM_APP_HOTKEY` (#1011) during the tray menu. The hook has already
+    /// swallowed the key, so it must not vanish; it is not run later either
+    /// (that would bill a request for a screen the user has moved on from),
+    /// so it ends in a card that says to try again.
     KeyDuringMenu,
+    /// `WM_APP_ACTIVATE` (#1011) during the tray menu. Any process of this
+    /// user can post it (#236), so each one still goes through the activation
+    /// rate limit when it is delivered, and only then may it show the card.
+    ActivateDuringMenu,
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -7767,7 +7803,8 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_MACHINE_CHECK_RESULT => DeferredMessage::MachineCheck(unsafe {
             Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts)
         }),
-        WM_APP_HOTKEY | WM_APP_ACTIVATE => DeferredMessage::KeyDuringMenu,
+        WM_APP_HOTKEY => DeferredMessage::KeyDuringMenu,
+        WM_APP_ACTIVATE => DeferredMessage::ActivateDuringMenu,
         _ => return None,
     })
 }
@@ -11616,7 +11653,16 @@ mod tests {
         for (name, id) in ALL_WM_APP_IDS {
             if tray_menu_policy(*id, FAKE_TASKBAR_CREATED_MSG) == SettingsReentrancy::Defer {
                 checked += 1;
-                assert!(take.contains(name), "{name} is deferred but has no arm");
+                // Code only: a name in a comment must not satisfy this.
+                let arm = take.lines().any(|l| {
+                    let l = l.trim();
+                    !l.starts_with("//")
+                        && (l.starts_with(&format!("{name} =>"))
+                            || l.starts_with(&format!("{name} |"))
+                            || l.starts_with(&format!("| {name}"))
+                            || l.contains(&format!(" {name} =>")))
+                });
+                assert!(arm, "{name} is deferred but has no arm");
             }
         }
         assert!(
