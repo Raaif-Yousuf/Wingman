@@ -13,8 +13,9 @@ use crate::ui::theme::{accent_fill, read_accent_shades, Theme};
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetSysColor, SelectObject, SetBkMode, SetTextColor,
-    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_CENTER,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
+    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT,
+    HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
@@ -309,12 +310,7 @@ pub(crate) unsafe fn draw(
     // Through the shared guard: `DrawTextW` with an empty buffer crashes the
     // process (see `ui::text`), and the options card (#307) draws its own
     // label and passes no text here.
-    crate::ui::text::draw_text_line(
-        hdc,
-        text,
-        rc,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
+    crate::ui::text::draw_text_line(hdc, text, rc, label_flags());
 
     if dis.itemState.0 & ODS_FOCUS != 0 && dis.itemState.0 & ODS_NOFOCUSRECT == 0 {
         let inset = ring + 2;
@@ -338,6 +334,12 @@ pub(crate) unsafe fn draw(
 }
 
 /// Maps a `DRAWITEMSTRUCT` to the state to draw, given the hover flag.
+/// How a button label is drawn: centred on one line, with an ellipsis when it
+/// is wider than the button (a long label used to clip on both sides, #782).
+fn label_flags() -> DRAW_TEXT_FORMAT {
+    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+}
+
 pub(crate) fn state_of(dis: &DRAWITEMSTRUCT, hovered: bool) -> State {
     state_from(dis.itemState.0, hovered)
 }
@@ -345,6 +347,12 @@ pub(crate) fn state_of(dis: &DRAWITEMSTRUCT, hovered: bool) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_flags_ellipsize_a_long_label() {
+        assert!(label_flags().0 & DT_END_ELLIPSIS.0 != 0);
+        assert!(label_flags().0 & DT_SINGLELINE.0 != 0);
+    }
 
     const BG: u32 = 0x00FA_FAFA;
     const SURFACE: Surface = Surface {

@@ -21,8 +21,12 @@
   and is owner-only (no inherited entries, one allowed entry, the current
   user), and a WM_CLOSE exits the process with code 0.
 
-  It needs no API key and no network: nothing here asks a model. The child
-  gets no *_API_KEY variables, and a bare launch does not ask.
+  It needs no API key and no network. The child gets no *_API_KEY variables,
+  and a bare launch does not ask. Then one real action runs end to end
+  against a stand-in provider (stub-provider.ps1, 127.0.0.1 only): the app is
+  relaunched with a test config that points Local mode at the stub and runs
+  Check my work on a key press, and the script checks the stub got the chat
+  request with a screenshot and that the card shows the stub's headline.
 
   This runs the real app with the real mutex and window class names and
   writes the real %APPDATA%\Wingman, and Sparse mode installs a package and
@@ -51,6 +55,12 @@ $AllowLocal = $installSmokeAllowLocal
 
 # The files release.yml puts next to wingman.exe in the zip. A Pester test
 # checks this list still matches the workflow.
+. (Join-Path $PSScriptRoot 'stub-provider.ps1')
+
+# WM_APP + 2, from src/hotkey.rs: what the keyboard hook posts to the owner
+# window on a press of the Wingman key. A Pester test checks it still matches.
+$WM_APP_HOTKEY = 0x8002
+
 $ReleaseZipExtras = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'PRIVACY.md', 'config.example.toml', 'actions.example.toml')
 
 # What is wrong with a config file's access list, as plain sentences; empty
@@ -78,6 +88,27 @@ function Get-OwnerOnlyAclProblem {
         $problems += 'the current user has no allow entry'
     }
     $problems
+}
+
+# The config.toml the stub run uses: Local mode, the stub as the only provider,
+# and the key running Check my work at once (no double-press wait). Pure.
+function Get-StubSmokeConfig {
+    param([Parameter(Mandatory)] [int] $Port)
+    @"
+mode = "local"
+
+[hotkeys]
+primary_action = "check-my-work"
+double_press_ms = 0
+
+[providers]
+order = ["ollama"]
+
+[providers.ollama]
+base_url = "http://127.0.0.1:$Port"
+model = "$StubModel"
+effort = "low"
+"@
 }
 
 # The README's command for running a script of ours, as an argument list for
@@ -144,6 +175,30 @@ Add-Type -Namespace InstallSmoke -Name Win -MemberDefinition @'
 public static extern System.IntPtr FindWindowW(string cls, string title);
 [System.Runtime.InteropServices.DllImport("user32.dll")]
 public static extern bool PostMessageW(System.IntPtr hwnd, uint msg, System.UIntPtr wparam, System.IntPtr lparam);
+'@
+Add-Type -Namespace InstallSmoke -Name Titles -MemberDefinition @'
+public delegate bool EnumProc(System.IntPtr h, System.IntPtr l);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+static extern bool EnumWindows(EnumProc p, System.IntPtr l);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint pid);
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+static extern bool IsWindowVisible(System.IntPtr h);
+[System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+static extern int GetWindowTextW(System.IntPtr h, System.Text.StringBuilder s, int n);
+public static string[] VisibleTitles(uint pid) {
+    var found = new System.Collections.Generic.List<string>();
+    EnumWindows((h, l) => {
+        uint p; GetWindowThreadProcessId(h, out p);
+        if (p == pid && IsWindowVisible(h)) {
+            var sb = new System.Text.StringBuilder(512);
+            GetWindowTextW(h, sb, sb.Capacity);
+            if (sb.Length > 0) found.Add(sb.ToString());
+        }
+        return true;
+    }, System.IntPtr.Zero);
+    return found.ToArray();
+}
 '@
 $WM_CLOSE = 0x0010
 
@@ -226,6 +281,49 @@ function Invoke-BareLaunch {
     [System.Diagnostics.Process]::Start($psi)
 }
 
+# One real action against the stub (#128). Called with the app closed: writes
+# the stub config, starts the app, posts the key press the hook would post,
+# and checks the stub was asked and the card shows its answer. Closes the app.
+function Invoke-StubAsk {
+    param([string] $Exe)
+    $stub = Start-StubProvider
+    $p = $null
+    try {
+        Write-Fact "stub provider on 127.0.0.1:$($stub.Port)"
+        # Set-Content keeps the owner-only access list the app gave the file.
+        Set-Content -LiteralPath $configFile -Value (Get-StubSmokeConfig -Port $stub.Port) -Encoding UTF8
+        $p = Invoke-BareLaunch -Exe $Exe
+        Assert-Up -Process $p
+        $hwnd = Find-Window $OwnerWindowClass
+        if (-not [InstallSmoke.Win]::PostMessageW($hwnd, $WM_APP_HOTKEY, [UIntPtr]::Zero, [IntPtr]::Zero)) {
+            Exit-InstallSmoke 'could not post the key press to the owner window'
+        }
+        $asked = Wait-Until -TimeoutMs 60000 -PollMs 100 -Condition {
+            @($stub.Requests.ToArray() | Where-Object { $_.Method -eq 'POST' -and $_.Path -eq '/api/chat' }).Count -gt 0
+        }
+        $seen = (@($stub.Requests.ToArray() | ForEach-Object { "$($_.Method) $($_.Path) ($($_.Bytes) bytes)" }) -join '; ')
+        if (-not $asked) {
+            $titles = ([InstallSmoke.Titles]::VisibleTitles([uint32]$p.Id) -join ' | ')
+            Exit-InstallSmoke "the stub never got a chat request within 60 s. Requests: [$seen]. Visible windows: [$titles]"
+        }
+        $chat = @($stub.Requests.ToArray() | Where-Object { $_.Method -eq 'POST' -and $_.Path -eq '/api/chat' })[0]
+        if (-not $chat.Body.Contains('"images"')) { Exit-InstallSmoke "the chat request carried no screenshot. Requests: [$seen]" }
+        Write-Fact "ok: the stub got the chat request with a screenshot ($($chat.Bytes) bytes)"
+        $shown = Wait-Until -TimeoutMs 30000 -PollMs 100 -Condition {
+            @([InstallSmoke.Titles]::VisibleTitles([uint32]$p.Id) | Where-Object { $_ -like "*$StubHeadline*" }).Count -gt 0
+        }
+        if (-not $shown) {
+            $titles = ([InstallSmoke.Titles]::VisibleTitles([uint32]$p.Id) -join ' | ')
+            Exit-InstallSmoke "the card never showed the stub's headline. Visible windows: [$titles]"
+        }
+        Write-Fact 'ok: the card shows the stub headline'
+        Invoke-CleanQuit -Process $p
+    }
+    finally {
+        Stop-StubProvider -Stub $stub
+    }
+}
+
 $work = Join-Path ([IO.Path]::GetTempPath()) ('wingman-install-smoke-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
 $proc = $null
@@ -249,6 +347,8 @@ try {
         $proc = Invoke-BareLaunch -Exe (Join-Path $unzipped 'wingman.exe')
         Assert-Up -Process $proc
         Invoke-CleanQuit -Process $proc
+        $proc = $null
+        Invoke-StubAsk -Exe (Join-Path $unzipped 'wingman.exe')
     }
     else {
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -285,6 +385,8 @@ try {
         if (-not $proc) { Exit-InstallSmoke 'install.ps1 did not leave the app running' }
         Assert-Up -Process $proc
         Invoke-CleanQuit -Process $proc
+        $proc = $null
+        Invoke-StubAsk -Exe (Join-Path $installDir $id.Current.ExeName)
 
         Invoke-DocumentedScript -Script (Join-Path $repo 'uninstall.ps1')
         Write-Fact 'ok: uninstall.ps1 finished'
