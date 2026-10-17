@@ -1231,10 +1231,18 @@ impl Config {
     /// cause, and the next load tries the copy again.
     fn load_file_after_migration(old_path: &Path, path: &Path) -> Result<Config> {
         if let Err(e) = Self::migrate_from(old_path, path) {
+            // #1036: when the copy can never work, the user needs a way out
+            // that does not depend on guessing. Renaming the old file makes
+            // the next load see no old settings and write a default config;
+            // the old settings stay on disk. Nothing is copied or deleted
+            // for them, so no key moves anywhere.
+            let folder = old_path.parent().unwrap_or(old_path);
             return Ok(Self::not_loaded(format!(
                 "Your copilot-ask settings could not be copied to the Wingman folder ({}). \
-                 They are still in the copilot-ask folder",
-                format!("{e:#}").chars().take(200).collect::<String>()
+                 They are still in {} (to start fresh instead, rename config.toml there to \
+                 config.toml.old)",
+                format!("{e:#}").chars().take(200).collect::<String>(),
+                folder.display()
             )));
         }
         Self::load_from_file(path)
@@ -1850,7 +1858,7 @@ impl Config {
         if let Some(problem) = &self.load_problem {
             anyhow::bail!(
                 "{problem}, so Wingman did not save over it. Fix the file, then choose \
-                 Reload settings from the tray menu"
+                 Reload settings (tray menu, Help and diagnostics)"
             );
         }
         // A hand edit made after this config was read is not clobbered.
@@ -1858,7 +1866,7 @@ impl Config {
             if seen != now {
                 anyhow::bail!(
                     "config.toml changed on disk since Wingman read it, so it was not saved. \
-                     Choose Reload settings from the tray menu, then try again"
+                     Choose Reload settings (tray menu, Help and diagnostics), then try again"
                 );
             }
         }
@@ -4534,6 +4542,43 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         assert!(!new_path.exists(), "no default file may be written");
         assert!(old_path.exists(), "the old file is left alone");
         assert!(config.check_save_allowed(&new_path).is_err());
+        cleanup(&root.join("dummy"));
+    }
+
+    // #1036: a copy that can never work must not strand the user. The card
+    // names the exact old folder and the one step that starts fresh, and that
+    // step really does end the problem without touching the old settings.
+    #[test]
+    fn failed_migration_names_the_old_folder_and_the_way_to_start_fresh() {
+        let root = scratch_dir("migrate-fail-fresh");
+        let old_dir = root.join("old");
+        let old_path = old_dir.join("config.toml");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(&old_path, "mode = \"offline\"\n").unwrap();
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let blocked = blocker.join("Wingman").join("config.toml");
+
+        let problem = Config::load_file_after_migration(&old_path, &blocked)
+            .unwrap()
+            .load_problem
+            .expect("the failure must be reported");
+        assert!(
+            problem.contains(&old_dir.display().to_string()),
+            "{problem}"
+        );
+        assert!(problem.contains("start fresh"), "{problem}");
+        assert!(problem.contains("config.toml.old"), "{problem}");
+        assert!(!problem.contains('\u{2014}'), "{problem}");
+
+        // Doing what the card says: rename the old file, then load again.
+        let renamed = old_dir.join("config.toml.old");
+        fs::rename(&old_path, &renamed).unwrap();
+        let new_path = root.join("new").join("config.toml");
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+        assert!(config.load_problem.is_none(), "the way out must work");
+        assert!(new_path.exists(), "a default config is written");
+        assert!(renamed.exists(), "the old settings are kept, never deleted");
         cleanup(&root.join("dummy"));
     }
 

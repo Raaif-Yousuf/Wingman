@@ -75,6 +75,21 @@ Describe 'the certificate step (#965)' {
     }
 }
 
+Describe 'the documented install commands (#1021)' {
+    BeforeAll {
+        $script:readme = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\README.md') -Raw) -replace "`r", ''
+    }
+    It 'runs install.ps1 so a default Restricted policy and a downloaded zip do not stop it' {
+        $script:readme.Contains('powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1') | Should -BeTrue
+    }
+    It 'runs uninstall.ps1 the same way' {
+        $script:readme.Contains('powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1') | Should -BeTrue
+    }
+    It 'never tells the user to run either script bare' {
+        $script:readme | Should -Not -Match '(?m)^\.\\(un)?install\.ps1'
+    }
+}
+
 Describe 'the safety rails' {
     It 'refuses to run off a CI runner' {
         $text = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''

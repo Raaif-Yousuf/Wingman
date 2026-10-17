@@ -571,7 +571,7 @@ fn write_changes_with(
 
 fn refusal(text: &str, span: Option<std::ops::Range<usize>>) -> String {
     format!(
-        "{}, so Wingman did not change it. Fix the file, then choose Reload settings from the tray menu",
+        "{}, so Wingman did not change it. Fix the file, then choose Reload settings (tray menu, Help and diagnostics)",
         crate::config::describe_error_span(text, span)
     )
 }

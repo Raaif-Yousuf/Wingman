@@ -386,6 +386,28 @@ static PAUSE_CHORD: AtomicU64 = AtomicU64::new(0);
 /// spec. Common virtual-keys get readable names; anything else falls back to
 /// `VK(0xNN)`.
 pub fn chord_to_string(c: &Chord) -> String {
+    chord_to_string_with(c, layout_char)
+}
+
+/// #1022: the character the active keyboard layout prints on `vk`, or `None`
+/// when the layout has none (a dead key, a control key). Ask Windows, because
+/// the key Wingman stores as `/` (virtual key 0xBF) is labelled `#` on a German
+/// layout and `:` on a French one. THEORY (unverified): those two names are
+/// from the layouts' published tables; not run on a non-US layout here. The
+/// lookup is the documented `MAPVK_VK_TO_CHAR` mapping.
+fn layout_char(vk: u32) -> Option<char> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
+    let raw = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) };
+    // The high bit marks a dead key (an accent that waits for a second press).
+    if raw == 0 || raw & 0x8000_0000 != 0 {
+        return None;
+    }
+    char::from_u32(raw)
+}
+
+/// [`chord_to_string`] with the layout lookup supplied, so a test can stand in
+/// for any keyboard. Only the punctuation keys ask the layout.
+fn chord_to_string_with(c: &Chord, layout: impl Fn(u32) -> Option<char>) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(5);
     if c.ctrl {
         parts.push("Ctrl".to_string());
@@ -399,11 +421,21 @@ pub fn chord_to_string(c: &Chord) -> String {
     if c.shift {
         parts.push("Shift".to_string());
     }
-    parts.push(vk_name(c.vk));
+    parts.push(vk_name(c.vk, layout));
     parts.join("+")
 }
 
-fn vk_name(vk: u32) -> String {
+/// Virtual keys that print punctuation, whose label depends on the layout.
+fn is_punctuation_vk(vk: u32) -> bool {
+    matches!(vk, 0xBA..=0xC0 | 0xDB..=0xDF)
+}
+
+fn vk_name(vk: u32, layout: impl Fn(u32) -> Option<char>) -> String {
+    if is_punctuation_vk(vk) {
+        if let Some(ch) = layout(vk).filter(|c| !c.is_control() && !c.is_whitespace()) {
+            return ch.to_uppercase().collect();
+        }
+    }
     match vk {
         0x08 => "Backspace".to_string(),
         0x09 => "Tab".to_string(),
@@ -1450,7 +1482,37 @@ mod tests {
     #[test]
     fn renders_ctrl_shift_slash() {
         let c = chord(0xBF, true, true, false, false);
-        assert_eq!(chord_to_string(&c), "Ctrl+Shift+/");
+        assert_eq!(chord_to_string_with(&c, |_| None), "Ctrl+Shift+/");
+    }
+
+    // -- #1022: the key is named as the keyboard in front of the user names it
+
+    #[test]
+    fn punctuation_key_takes_its_name_from_the_layout() {
+        let c = chord(0xBF, true, true, false, false);
+        // A German layout prints `#` on virtual key 0xBF.
+        assert_eq!(chord_to_string_with(&c, |_| Some('#')), "Ctrl+Shift+#");
+    }
+
+    #[test]
+    fn a_dead_or_missing_layout_char_falls_back_to_the_table() {
+        let c = chord(0xBF, true, true, false, false);
+        assert_eq!(chord_to_string_with(&c, |_| None), "Ctrl+Shift+/");
+        assert_eq!(chord_to_string_with(&c, |_| Some(' ')), "Ctrl+Shift+/");
+        assert_eq!(chord_to_string_with(&c, |_| Some('\r')), "Ctrl+Shift+/");
+    }
+
+    #[test]
+    fn letters_and_function_keys_never_ask_the_layout() {
+        let ask = |_| Some('#');
+        assert_eq!(
+            chord_to_string_with(&chord(0x41, false, false, false, false), ask),
+            "A"
+        );
+        assert_eq!(
+            chord_to_string_with(&chord(0x86, false, true, false, true), ask),
+            "Win+Shift+F23"
+        );
     }
 
     #[test]

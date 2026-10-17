@@ -14,6 +14,7 @@ pub mod hash;
 pub mod ingest;
 pub mod mask;
 pub mod parse;
+pub mod retrieve;
 
 #[cfg(test)]
 mod tests {

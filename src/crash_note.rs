@@ -153,7 +153,8 @@ pub fn card_text(note: &str) -> (String, String) {
         detail.push_str(&format!("\n\nError: {message}"));
     }
     detail.push_str(
-        "\n\nUse Copy details or Copy diagnostics from the tray menu to report it. \
+        "\n\nUse Copy details on this card or Copy diagnostics (tray menu, Help and \
+         diagnostics) to report it. \
          This message shows once.",
     );
     ("Wingman closed unexpectedly last time".to_string(), detail)
