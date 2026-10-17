@@ -47,10 +47,11 @@ pub struct ChunkHit {
 
 impl Store {
     /// The best `limit` chunks for an FTS5 `MATCH` expression, best first
-    /// (`bm25`), from enabled roots only. The caller builds `fts_query` from
+    /// (`bm25`), from the enabled root at `root_path` only. The caller builds `fts_query` from
     /// quoted terms (`knowledge::retrieve::fts_query`), never from raw text.
     pub fn search_chunks(
         &self,
+        root_path: &str,
         fts_query: &str,
         limit: usize,
     ) -> Result<Vec<ChunkHit>, StoreError> {
@@ -61,11 +62,11 @@ impl Store {
              JOIN chunk c ON c.id = chunk_fts.rowid
              JOIN document d ON d.id = c.doc_id
              JOIN knowledge_root r ON r.id = d.root_id
-             WHERE chunk_fts MATCH ?1 AND r.enabled = 1
+             WHERE chunk_fts MATCH ?1 AND r.enabled = 1 AND r.path = ?3
              ORDER BY bm25(chunk_fts), c.id
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |r| {
+        let rows = stmt.query_map(params![fts_query, limit as i64, root_path], |r| {
             Ok(ChunkHit {
                 doc_id: r.get(0)?,
                 ordinal: r.get(1)?,

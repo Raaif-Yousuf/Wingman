@@ -98,14 +98,19 @@ pub struct Snippet {
     pub score: f64,
 }
 
-/// The top snippets for `question`, best first, at most [`MAX_SNIPPETS`].
+/// The top snippets for `question` from the folder indexed under `root_path`
+/// (never another root), best first, at most [`MAX_SNIPPETS`].
 /// Empty when the question has no usable word or nothing matches. Blocking
 /// (one SQLite query): call it from a worker, never the UI thread.
-pub fn search(store: &Store, question: &str) -> Result<Vec<Snippet>, StoreError> {
+pub fn search_in(
+    store: &Store,
+    root_path: &str,
+    question: &str,
+) -> Result<Vec<Snippet>, StoreError> {
     let Some(query) = fts_query(&query_terms(question)) else {
         return Ok(Vec::new());
     };
-    let hits = store.search_chunks(&query, FTS_TOP)?;
+    let hits = store.search_chunks(root_path, &query, FTS_TOP)?;
     Ok(snippets_from(hits))
 }
 
@@ -339,6 +344,32 @@ mod tests {
             index(&store, root, rel, text);
         }
         store
+    }
+
+    /// The tests' folder is `C:\Notes`.
+    fn search(store: &Store, question: &str) -> Result<Vec<Snippet>, StoreError> {
+        search_in(store, "C:\\Notes", question)
+    }
+
+    #[test]
+    fn only_the_given_root_is_searched() {
+        let store = store_with(&[("new.txt", "the warranty lasts two years")]);
+        let old = store.ensure_root("D:\\Old", 0).unwrap();
+        index(&store, old, "stale.txt", "the warranty lasts ten years");
+        // Both roots are enabled, and both match.
+        assert_eq!(
+            labels(&search_in(&store, "C:\\Notes", "warranty").unwrap()),
+            ["new.txt"]
+        );
+        assert_eq!(
+            labels(&search_in(&store, "D:\\Old", "warranty").unwrap()),
+            ["stale.txt"]
+        );
+        // A root that cannot be resolved finds nothing, never every root.
+        assert!(search_in(&store, "", "warranty").unwrap().is_empty());
+        assert!(search_in(&store, "E:\\Gone", "warranty")
+            .unwrap()
+            .is_empty());
     }
 
     fn labels(snips: &[Snippet]) -> Vec<&str> {

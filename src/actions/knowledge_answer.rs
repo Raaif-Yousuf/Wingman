@@ -145,7 +145,7 @@ pub fn prepare(store: &Store, root_key: &str, line: &str) -> Result<Prepared, St
     if !store.has_indexed_chunks(root_key).map_err(unreadable)? {
         return Err(NOT_INDEXED_MESSAGE.to_string());
     }
-    let mut snippets = retrieve::search(store, line).map_err(unreadable)?;
+    let mut snippets = retrieve::search_in(store, root_key, line).map_err(unreadable)?;
     let mut redactions = crate::redact::Redactions::default();
     for s in &mut snippets {
         s.text = redactions.redact_text(&s.text);
