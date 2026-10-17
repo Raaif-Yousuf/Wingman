@@ -79,6 +79,7 @@ impl Executor for CalendarAddExecutor {
             })?;
 
         let path = result.path.clone();
+        let opened = result.opened;
         let opened_note = if result.opened {
             String::new()
         } else {
@@ -104,8 +105,36 @@ impl Executor for CalendarAddExecutor {
             std::fs::remove_file(&path)
                 .with_context(|| format!("could not remove {}", path.display()))?;
             Ok(())
-        }))
+        })
+        .with_outcome(super::Outcome::Opened(opened)))
     }
+}
+
+/// Longest title, place and notes kept, in characters (#1214). Generous: a
+/// real event is far below them. A longer value is refused, not cut, so the
+/// file never holds less than the preview showed.
+const MAX_TITLE_CHARS: usize = 500;
+const MAX_LOCATION_CHARS: usize = 500;
+const MAX_NOTES_CHARS: usize = 5_000;
+
+/// Strips control and hidden characters (the same rule the file escaping
+/// applies, so the card summary shows what the file holds), turns line breaks
+/// into spaces for a one-line field, trims, and refuses a value over `max`
+/// characters. `None` when nothing is left.
+fn clean_field(name: &str, raw: &str, one_line: bool, max: usize) -> Result<Option<String>> {
+    let stripped = connectors::strip_unsafe_text(raw);
+    let text = if one_line {
+        stripped.replace('\n', " ")
+    } else {
+        stripped
+    };
+    let text = text.trim();
+    if text.chars().count() > max {
+        anyhow::bail!(
+            "calendar_add: \"{name}\" is too long ({max} characters at most). Nothing was added."
+        );
+    }
+    Ok((!text.is_empty()).then(|| text.to_string()))
 }
 
 /// Reads the `calendar_event` schema's five fields (`title`, `start`,
@@ -119,8 +148,9 @@ fn parse_calendar_event(value: &Value) -> Result<CalendarEvent> {
         .get("title")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("calendar_add: proposal has no \"title\" field"))?
-        .to_string();
+        .ok_or_else(|| anyhow!("calendar_add: proposal has no \"title\" field"))?;
+    let title = clean_field("title", title, true, MAX_TITLE_CHARS)?
+        .ok_or_else(|| anyhow!("calendar_add: proposal has no \"title\" field"))?;
 
     let start_str = value
         .get("start")
@@ -138,16 +168,14 @@ fn parse_calendar_event(value: &Value) -> Result<CalendarEvent> {
         _ => None,
     };
 
-    let location = value
-        .get("location")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let description = value
-        .get("notes")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let location = match value.get("location").and_then(Value::as_str) {
+        Some(s) => clean_field("location", s, true, MAX_LOCATION_CHARS)?,
+        None => None,
+    };
+    let description = match value.get("notes").and_then(Value::as_str) {
+        Some(s) => clean_field("notes", s, false, MAX_NOTES_CHARS)?,
+        None => None,
+    };
 
     Ok(CalendarEvent {
         title,
@@ -283,6 +311,57 @@ mod tests {
     }
 
     // -- execute: wires through to the connector and back ------------------
+
+    struct FailingOpener;
+
+    impl Opener for FailingOpener {
+        fn open(&self, _path: &Path) -> Result<()> {
+            Err(anyhow!("no handler"))
+        }
+    }
+
+    /// #1215: the opened flag is typed, so an event titled with the phrase
+    /// the summary uses for "not opened" cannot flip it.
+    #[test]
+    fn the_outcome_says_whether_it_opened_whatever_the_title_says() {
+        let (executor, dir) = executor_with_recording_opener("outcome-opened");
+        let mut proposal = sample_proposal();
+        proposal["title"] = Value::from("could not be opened automatically");
+        let undo = executor.execute(confirmed(proposal)).unwrap();
+        assert_eq!(undo.outcome, super::super::Outcome::Opened(true));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let dir = test_temp_dir("outcome-failed");
+        let connector = IcsConnector::with_temp_dir_and_opener(dir.clone(), FailingOpener);
+        let executor = CalendarAddExecutor::with_connector(Box::new(connector));
+        let undo = executor.execute(confirmed(sample_proposal())).unwrap();
+        assert_eq!(undo.outcome, super::super::Outcome::Opened(false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1214: hidden characters are gone from the card summary and the file,
+    /// and a runaway title is refused with a named error.
+    #[test]
+    fn title_is_stripped_and_capped() {
+        let (executor, dir) = executor_with_recording_opener("clean-title");
+        let mut proposal = sample_proposal();
+        proposal["title"] = Value::from("Sta\u{2028}nd\u{b}up\u{202e}");
+        let undo = executor.execute(confirmed(proposal)).unwrap();
+        assert!(undo.summary.contains("\"Sta ndup\""), "{}", undo.summary);
+        assert!(!undo.summary.contains('\u{202e}') && !undo.summary.contains('\u{b}'));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut huge = sample_proposal();
+        huge["title"] = Value::from("x".repeat(MAX_TITLE_CHARS + 1));
+        let err = parse_calendar_event(&huge).unwrap_err().to_string();
+        assert!(err.contains("too long"), "{err}");
+        let mut ok = sample_proposal();
+        ok["title"] = Value::from("x".repeat(MAX_TITLE_CHARS));
+        assert!(parse_calendar_event(&ok).is_ok());
+        let mut notes = sample_proposal();
+        notes["notes"] = Value::from("\u{e9}".repeat(MAX_NOTES_CHARS + 1));
+        assert!(parse_calendar_event(&notes).is_err());
+    }
 
     #[test]
     fn execute_writes_an_ics_file_through_the_injected_connector_and_never_touches_the_real_shell()

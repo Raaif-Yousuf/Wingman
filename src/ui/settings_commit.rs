@@ -10,6 +10,7 @@
 
 use crate::config::Config;
 use crate::config_writer::{self, FieldChange};
+use crate::keypress::{DOUBLE_PRESS_MAX_MS, DOUBLE_PRESS_MIN_MS};
 
 /// Everything in the window that edits one setting. The label is what the
 /// status line calls it ("Saved: Card corner") and what the writer's answer is
@@ -30,6 +31,9 @@ pub(crate) enum Field {
     PrimaryKey,
     SecondaryKey,
     PauseKey,
+    KeyMode,
+    DoublePressMs,
+    ClickAway,
     Autostart,
     CardSeconds,
     TextScale,
@@ -43,7 +47,7 @@ pub(crate) enum Field {
 }
 
 impl Field {
-    pub(crate) const ALL: [Field; 24] = [
+    pub(crate) const ALL: [Field; 27] = [
         Field::ActiveProvider,
         Field::OpenAiKey,
         Field::OpenAiModel,
@@ -58,6 +62,9 @@ impl Field {
         Field::PrimaryKey,
         Field::SecondaryKey,
         Field::PauseKey,
+        Field::KeyMode,
+        Field::DoublePressMs,
+        Field::ClickAway,
         Field::Autostart,
         Field::CardSeconds,
         Field::TextScale,
@@ -87,6 +94,9 @@ impl Field {
             Field::PrimaryKey => "Copilot key",
             Field::SecondaryKey => "Quick Ask shortcut",
             Field::PauseKey => "Pause shortcut",
+            Field::KeyMode => "Wingman key on a card",
+            Field::DoublePressMs => "Double press time",
+            Field::ClickAway => "Click away closes the card",
             Field::Autostart => "Start with Windows",
             Field::CardSeconds => "Hide card after",
             Field::TextScale => "Text size",
@@ -122,6 +132,9 @@ impl Field {
             Field::PrimaryKey => &[&["hotkeys", "primary"]],
             Field::SecondaryKey => &[&["hotkeys", "secondary"]],
             Field::PauseKey => &[&["hotkeys", "pause"]],
+            Field::KeyMode => &[&["hotkeys", "key_mode"]],
+            Field::DoublePressMs => &[&["hotkeys", "double_press_ms"]],
+            Field::ClickAway => &[&["options", "click_away_dismiss"]],
             Field::CardSeconds => &[&["ui", "card_seconds"]],
             Field::TextScale => &[&["ui", "text_scale"]],
             Field::CardCorner => &[&["ui", "card_corner"]],
@@ -154,6 +167,7 @@ impl Field {
                 | Field::AnthropicKey
                 | Field::GeminiKey
                 | Field::CardSeconds
+                | Field::DoublePressMs
                 | Field::Prompt
         )
     }
@@ -272,6 +286,17 @@ pub(crate) fn invalid(field: Field, text: &str) -> Option<&'static str> {
             let text = text.trim();
             (!text.is_empty() && text.parse::<u32>().is_err())
                 .then_some("Enter a whole number of seconds, such as 8.")
+        }
+        Field::DoublePressMs => {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            match text.parse::<u32>() {
+                Ok(0) => None,
+                Ok(n) if (DOUBLE_PRESS_MIN_MS..=DOUBLE_PRESS_MAX_MS).contains(&n) => None,
+                _ => Some("Enter 0 to turn it off, or a number from 150 to 600."),
+            }
         }
         _ => None,
     }
@@ -632,6 +657,9 @@ pub(crate) mod tests {
             Field::PrimaryKey => c.hotkeys.primary = chord(0x70),
             Field::SecondaryKey => c.hotkeys.secondary = chord(0x71),
             Field::PauseKey => c.hotkeys.pause = Some(chord(0x72)),
+            Field::KeyMode => c.hotkeys.key_mode = "close".into(),
+            Field::DoublePressMs => c.hotkeys.double_press_ms = 450,
+            Field::ClickAway => c.options.click_away_dismiss = !base.options.click_away_dismiss,
             Field::Autostart => {}
             Field::CardSeconds => c.ui.card_seconds = base.ui.card_seconds + 7,
             Field::TextScale => c.ui.text_scale = 1.75,
@@ -717,6 +745,75 @@ pub(crate) mod tests {
         assert_eq!(plan.original.ui.card_corner, base.ui.card_corner);
         assert_eq!(paths_of(&plan.undo), ["ui.card_seconds"]);
         assert!(!plan.key_changed);
+    }
+
+    /// #393: the three key settings each own one key of the file, and a plan for
+    /// one never carries another.
+    #[test]
+    fn the_key_settings_own_their_own_keys() {
+        let base = Config::default();
+        for (field, key) in [
+            (Field::KeyMode, "hotkeys.key_mode"),
+            (Field::DoublePressMs, "hotkeys.double_press_ms"),
+            (Field::ClickAway, "options.click_away_dismiss"),
+        ] {
+            let mut edited = changed(field, &base);
+            // The form holds an uncommitted change to the other two as well.
+            for other in [Field::KeyMode, Field::DoublePressMs, Field::ClickAway] {
+                if other != field {
+                    edited = changed(other, &edited);
+                }
+            }
+            let plan = plan(field, &base, &base, &edited)
+                .unwrap()
+                .expect("the setting changed");
+            assert_eq!(paths_of(&plan.changes), [key]);
+            assert_eq!(paths_of(&plan.undo), [key]);
+        }
+    }
+
+    /// #393: a hand-edited key mode or press time the window cannot show is never
+    /// rewritten by changing another row.
+    #[test]
+    fn a_hand_edited_key_mode_is_left_alone_by_another_row() {
+        let mut base = Config::default();
+        base.hotkeys.key_mode = "PICK ".into();
+        base.hotkeys.double_press_ms = 5000;
+        let edited = changed(Field::CardCorner, &base);
+        let plan_for = |f| plan(f, &base, &base, &edited).unwrap();
+        assert_eq!(
+            paths_of(
+                &plan_for(Field::CardCorner)
+                    .expect("the corner changed")
+                    .changes
+            ),
+            ["ui.card_corner"]
+        );
+        assert!(plan_for(Field::KeyMode).is_none());
+        assert!(plan_for(Field::DoublePressMs).is_none());
+    }
+
+    #[test]
+    fn the_press_time_box_accepts_off_and_the_honoured_range_only() {
+        for ok in ["", "  ", "0", "150", "300", " 600 "] {
+            assert_eq!(invalid(Field::DoublePressMs, ok), None, "{ok:?}");
+        }
+        for bad in [
+            "1",
+            "149",
+            "601",
+            "99999",
+            "-5",
+            "3.5",
+            "abc",
+            "99999999999",
+        ] {
+            assert!(invalid(Field::DoublePressMs, bad).is_some(), "{bad:?}");
+        }
+        let why = invalid(Field::DoublePressMs, "x").unwrap();
+        assert!(!why.contains('\u{2014}'));
+        assert!(Field::DoublePressMs.is_text_box());
+        assert!(!Field::KeyMode.is_text_box() && !Field::ClickAway.is_text_box());
     }
 
     #[test]

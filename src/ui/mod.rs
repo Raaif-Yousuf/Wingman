@@ -15,6 +15,7 @@ pub mod region;
 pub(crate) mod round_rect;
 pub(crate) mod send_gate;
 pub mod settings;
+mod settings_buttons;
 mod settings_commit;
 mod settings_models;
 mod settings_theme;
