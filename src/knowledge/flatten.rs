@@ -1,4 +1,4 @@
-//! CSV and JSON to searchable text (K1). Hand-written and pure: no crate, no
+//! CSV, JSON and JSON Lines to searchable text (K1). Hand-written and pure: no crate, no
 //! file or network access, linear time, and every length is checked, so no
 //! file content can make it panic (release builds abort on a panic).
 //!
@@ -227,6 +227,31 @@ pub fn json_to_text(text: &str, cap: usize) -> Option<(String, bool)> {
     let mut path = String::new();
     walk(&value, &mut path, &mut lines);
     Some(lines.finish())
+}
+
+/// The text of a JSON Lines file (line ends already newlines): each line that
+/// parses is one record, written as `[n].path: value` lines. A blank line, a
+/// line that is not valid JSON and a line over [`MAX_JSON_BYTES`] are skipped,
+/// so one bad record never hides the rest. The flag says the cap was hit.
+pub fn jsonl_to_text(text: &str, cap: usize) -> (String, bool) {
+    let mut lines = Lines::new(cap);
+    let mut record = 0usize;
+    for line in text.split('\n') {
+        if lines.full {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() || line.len() > MAX_JSON_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let mut path = format!("[{record}]");
+        record += 1;
+        walk(&value, &mut path, &mut lines);
+    }
+    lines.finish()
 }
 
 fn walk(value: &Value, path: &mut String, lines: &mut Lines) {

@@ -38,6 +38,9 @@ folder = 'C:\Notes'
 - `.json` files: one line per value, as `address.city: Paris` or `skills[0]:
   rust`. Empty values and `null` are left out. A file that is not valid JSON,
   or is over 1 MB, is read as plain text instead.
+- `.jsonl` and `.ndjson` files: one record per line, written like a `.json`
+  file with the record number in front (`[0].city: Paris`). A line that is not
+  valid JSON, or is over 1 MB, is skipped; the other lines are still read.
 - A heading line is never made from a cell, a key or a web page line: a line
   that would start with `#` gets a backslash. (A `.txt` file is kept as it is,
   so a `#` line in one still reads as a heading.)

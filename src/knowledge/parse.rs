@@ -1,4 +1,4 @@
-//! Plain text, Markdown, HTML, CSV and JSON to text, for the chunker.
+//! Plain text, Markdown, HTML, CSV, JSON and JSON Lines to text, for the chunker.
 
 use super::flatten;
 
@@ -38,6 +38,9 @@ pub enum Parser {
     Csv,
     /// One "path: value" line per value; invalid JSON is read as plain text.
     Json,
+    /// `.jsonl` and `.ndjson`: one record per line, as `[0].path: value`
+    /// lines. A line that is not valid JSON is skipped, not the file.
+    JsonLines,
 }
 
 impl Parser {
@@ -48,6 +51,7 @@ impl Parser {
             Parser::Html => "html",
             Parser::Csv => "csv",
             Parser::Json => "json",
+            Parser::JsonLines => "jsonl",
         }
     }
 }
@@ -65,6 +69,7 @@ pub fn parser_for(file_name: &str) -> Option<Parser> {
         "html" | "htm" => Some(Parser::Html),
         "csv" | "tsv" => Some(Parser::Csv),
         "json" => Some(Parser::Json),
+        "jsonl" | "ndjson" => Some(Parser::JsonLines),
         _ => None,
     }
 }
@@ -123,6 +128,14 @@ pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
                 truncated,
             }),
         },
+        Parser::JsonLines => {
+            let (text, cut) = flatten::jsonl_to_text(&normalized, MAX_TEXT_BYTES);
+            Ok(Parsed {
+                title: None,
+                text,
+                truncated: truncated || cut,
+            })
+        }
     }
 }
 
@@ -865,7 +878,9 @@ mod tests {
         assert_eq!(parser_for("t.csv"), Some(Parser::Csv));
         assert_eq!(parser_for("t.tsv"), Some(Parser::Csv));
         assert_eq!(parser_for("d.json"), Some(Parser::Json));
-        assert_eq!(parser_for("d.jsonl"), None);
+        assert_eq!(parser_for("d.jsonl"), Some(Parser::JsonLines));
+        assert_eq!(parser_for("D.NDJSON"), Some(Parser::JsonLines));
+        assert_eq!(Parser::JsonLines.name(), "jsonl");
         assert_eq!(Parser::Html.name(), "html");
         assert_eq!(Parser::Csv.name(), "csv");
         assert_eq!(Parser::Json.name(), "json");
@@ -1071,6 +1086,87 @@ mod tests {
         assert!(p.text.contains("title: x"), "{}", p.text);
         assert!(p.text.contains("日本: 🙂"), "{}", p.text);
         assert!(p.text.contains(": empty key"), "{}", p.text);
+    }
+
+    #[test]
+    fn json_lines_make_one_record_per_line() {
+        let p = read(
+            Parser::JsonLines,
+            "{\"name\":\"Jane\",\"tags\":[\"a\",\"b\"]}\r\n\r\n\"just text\"\n{\"n\":2}\n",
+        );
+        assert_eq!(
+            p.text,
+            "[0].name: Jane\n[0].tags[0]: a\n[0].tags[1]: b\n[1]: just text\n[2].n: 2"
+        );
+        assert!(!p.truncated);
+    }
+
+    #[test]
+    fn a_bad_json_line_is_skipped_not_the_file() {
+        let p = read(
+            Parser::JsonLines,
+            "{\"a\":\"first\"}\n{\"a\": broken\n{\"a\":\"third\"}\n{\"a\":\"cut",
+        );
+        assert!(p.text.contains("a: first"), "{}", p.text);
+        assert!(p.text.contains("a: third"), "{}", p.text);
+        assert!(
+            !p.text.contains("broken") && !p.text.contains("cut"),
+            "{}",
+            p.text
+        );
+    }
+
+    #[test]
+    fn json_lines_with_bad_bytes_or_no_valid_line_never_panic() {
+        // A stray byte inside a UTF-8 file is read lossily; the line still parses.
+        let mut b = "{\"k\":\"caf\u{e9} \u{65e5}\u{672c}\u{8a9e}\"}\n"
+            .repeat(5)
+            .into_bytes();
+        b.extend_from_slice(b"{\"k\":\"x\xffy\"}\n");
+        let p = parse(Parser::JsonLines, &b).unwrap();
+        assert!(p.text.contains("[0].k: caf\u{e9}"), "{}", p.text);
+        assert!(parse(Parser::JsonLines, b"not json\nat all\n")
+            .unwrap()
+            .text
+            .is_empty());
+        assert_eq!(read(Parser::JsonLines, "").text, "");
+    }
+
+    #[test]
+    fn json_lines_keys_never_make_a_heading() {
+        let p = read(Parser::JsonLines, "{\"# t\":\"x\"}\n");
+        assert!(p.text.lines().all(|l| !l.starts_with('#')), "{}", p.text);
+        assert!(p.text.contains("t: x"), "{}", p.text);
+    }
+
+    #[test]
+    fn a_json_line_over_a_megabyte_is_skipped_and_the_rest_is_kept() {
+        let huge = format!("{{\"k\":\"{}\"}}", "w".repeat(1_100_000));
+        let p = read(
+            Parser::JsonLines,
+            &format!("{{\"k\":\"before\"}}\n{huge}\n{{\"k\":\"after\"}}\n"),
+        );
+        assert!(
+            p.text.contains("k: before") && p.text.contains("k: after"),
+            "{}",
+            p.text.len()
+        );
+        assert!(!p.text.contains("www"));
+    }
+
+    #[test]
+    fn big_json_lines_are_capped_and_marked_truncated() {
+        let mut big = String::new();
+        while big.len() < 1_500_000 {
+            big.push_str("{\"k\":\"some longer value here\"}\n");
+        }
+        let p = parse(Parser::JsonLines, big.as_bytes()).unwrap();
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
+        assert!(!p.text.is_empty());
+        let huge = big.repeat(3);
+        let p = parse(Parser::JsonLines, huge.as_bytes()).unwrap();
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
+        assert!(p.truncated);
     }
 
     #[test]

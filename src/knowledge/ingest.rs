@@ -1017,9 +1017,21 @@ mod tests {
         .unwrap();
         fs::write(dir.join("people.csv"), "Name,City\nJane,Lisbonxyz\n").unwrap();
         fs::write(dir.join("data.json"), r#"{"pet":{"kind":"axolotlq"}}"#).unwrap();
+        fs::write(
+            dir.join("log.jsonl"),
+            "{\"pet\":\"quokkaz\",\"password\":\"hunter2zz\"}\nnot json\n{\"pet\":\"wombatw\"}\n",
+        )
+        .unwrap();
         let store = Store::in_memory();
         let summary = scan_folder(&store, &dir, FUT).unwrap();
-        assert_eq!(summary.indexed, 3, "{summary:?}");
+        assert_eq!(summary.indexed, 4, "{summary:?}");
+        assert_eq!(store.fts_hits("quokkaz").unwrap(), 1);
+        assert_eq!(store.fts_hits("wombatw").unwrap(), 1);
+        assert_eq!(
+            store.fts_hits("hunter2zz").unwrap(),
+            0,
+            "a secret in a record is masked like in any other reader"
+        );
         assert_eq!(store.fts_hits("zebra7").unwrap(), 1);
         assert_eq!(store.fts_hits("Lisbonxyz").unwrap(), 1);
         assert_eq!(store.fts_hits("axolotlq").unwrap(), 1);
