@@ -55,16 +55,17 @@
 //!   a newly focused control into view, and takes a captured shortcut
 //!   (`WM_APP_LEARNED`, posted to the main window) while a Change is pending.
 //!   It is one atomic load when no window is open.
-//! - **Theme**: this window is always drawn with the stock (light) system
-//!   control appearance, regardless of the OS light/dark setting. Unlike
-//!   `card.rs` (which paints its own surface and can safely follow
-//!   `AppsUseLightTheme`), a real dark mode for *native* controls (edit,
-//!   combo, button, trackbar) needs per-control owner-draw or
-//!   `SetWindowTheme("DarkMode_Explorer", ..)` plus `WM_CTLCOLOR*` brushes,
-//!   and even then list/combo popups and the trackbar thumb stay
-//!   light-on-light or otherwise inconsistent. Per the design note that a
-//!   correct light window beats a broken half-dark one, this module does
-//!   not attempt it.
+//! - **Theme** (#582): a real window is still drawn with the stock (light)
+//!   system control appearance, whatever the OS light/dark setting is. Dark is
+//!   being built slice by slice (spec `2026-10-16-settings-dark-and-high-
+//!   contrast-design.md`) and stays off for users, behind
+//!   `settings_theme::SETTINGS_DARK_ENABLED`, until every control follows it:
+//!   a correct light window beats a half-dark one. So far the title bar, the
+//!   window face, the labels, the text boxes, the rail and the footer divider
+//!   follow the theme; buttons, checkboxes, combos, the trackbar and the
+//!   scrollbar are still stock. `edit_style` resolves the theme once per change
+//!   and everything else reads it. The UI gallery forces a theme
+//!   (`--ui-gallery --theme`), which bypasses the gate.
 //!
 //! Fields intentionally not exposed here:
 //! - `providers.openai.models` / `providers.anthropic.models` (the list
@@ -1055,12 +1056,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
         }
         // The rail's background is the window's, not the list box's white.
-        WM_CTLCOLORLISTBOX => LRESULT(
-            windows::Win32::Graphics::Gdi::GetSysColorBrush(
-                windows::Win32::Graphics::Gdi::COLOR_3DFACE,
-            )
-            .0 as isize,
-        ),
+        WM_CTLCOLORLISTBOX => LRESULT(face_brush_now().0 as isize),
+        // #582: the title bar follows the theme from the first frame.
+        windows::Win32::UI::WindowsAndMessaging::WM_CREATE => {
+            apply_title_bar(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // #582: the window's own face and the labels on it (the status line),
+        // where Settings paints them (dark). Otherwise the class brush and the
+        // default colours, as before.
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND if edit_style().paints_face => {
+            erase_with_face(hwnd, wparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC if edit_style().paints_face => {
+            answer_label_colors(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void))
+        }
         WM_SETTINGS_PAGE => {
             handle_page_request(inner, wparam.0, lparam.0);
             LRESULT(0)
@@ -1172,14 +1182,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         | windows::Win32::UI::WindowsAndMessaging::WM_SYSCOLORCHANGE
         | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED
         | WM_DWMCOLORIZATIONCOLORCHANGED_MSG => {
+            // #582: the erase repaints the painted face, so it is only asked
+            // for when the face was painted before or is now (light does not
+            // flicker more than it did).
+            let was_painted = edit_style().paints_face;
             invalidate_edit_style();
             invalidate_rail_style();
+            // The one owner of the theme resolves it again here; the title
+            // bar follows.
+            apply_title_bar(hwnd);
+            let erase = if was_painted || edit_style().paints_face {
+                windows::Win32::Graphics::Gdi::RDW_ERASE
+            } else {
+                Default::default()
+            };
             let _ = RedrawWindow(
                 Some(hwnd),
                 None,
                 None,
                 windows::Win32::Graphics::Gdi::RDW_FRAME
                     | RDW_INVALIDATE
+                    | erase
                     | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
             );
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -3391,6 +3414,90 @@ fn to_px(dp: i32, dpi: u32) -> i32 {
     ((dp as i64 * dpi as i64 + 48) / 96) as i32
 }
 
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The gallery's forced theme for this thread's Settings window, if any
+    /// (#582). A forced theme ignores the system and bypasses the dark gate.
+    static FORCED_THEME: std::cell::Cell<Option<crate::ui::theme::Theme>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Forces `theme` (or none) and drops the cached styles built under the old
+/// one, so the next paint resolves again.
+#[cfg(any(test, debug_assertions))]
+fn force_theme(theme: Option<crate::ui::theme::Theme>) {
+    FORCED_THEME.with(|f| f.set(theme));
+    unsafe {
+        invalidate_edit_style();
+        invalidate_rail_style();
+    }
+}
+
+/// What Settings draws with right now: the theme, the system colours that
+/// theme reads (high contrast), and whether the gallery forced it. Resolved
+/// once per change by [`edit_style`]; nothing else resolves the theme.
+#[derive(Debug, Clone, Copy)]
+struct Look {
+    theme: crate::ui::theme::Theme,
+    sys: crate::ui::theme::SysColors,
+    forced: bool,
+}
+
+/// Resolves the look: the forced theme (the gallery, which draws high contrast
+/// with Windows' black colours since it cannot switch the system), else the
+/// detected one, with dark gated off for real users (see
+/// `settings_theme::SETTINGS_DARK_ENABLED`).
+fn current_look() -> Look {
+    use crate::ui::theme::{detect_theme, SysColors};
+    #[cfg(any(test, debug_assertions))]
+    if let Some(theme) = FORCED_THEME.with(std::cell::Cell::get) {
+        let sys = if theme == crate::ui::theme::Theme::HighContrast {
+            crate::ui::theme::HC_BLACK
+        } else {
+            SysColors::read()
+        };
+        return Look {
+            theme,
+            sys,
+            forced: true,
+        };
+    }
+    Look {
+        theme: crate::ui::settings_theme::gate(
+            detect_theme(),
+            crate::ui::settings_theme::SETTINGS_DARK_ENABLED,
+        ),
+        sys: SysColors::read(),
+        forced: false,
+    }
+}
+
+/// Sets the title bar to the theme (`DWMWA_USE_IMMERSIVE_DARK_MODE`, documented
+/// since Windows 10 20H1). Left alone in high contrast, where the system draws
+/// the caption. A failure leaves the title bar as it was: the body is still
+/// right, so it fails safe. Light is only written back after a dark one was
+/// applied, so a light-only run never touches the attribute.
+unsafe fn apply_title_bar(hwnd: HWND) {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    thread_local! {
+        static DARK_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if let Some(dark) = crate::ui::settings_theme::title_bar_dark(edit_style().look.theme) {
+        if !dark && !DARK_APPLIED.get() {
+            return;
+        }
+        DARK_APPLIED.set(dark);
+        let value = BOOL::from(dark);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &value as *const BOOL as *const c_void,
+            std::mem::size_of::<BOOL>() as u32,
+        );
+    }
+}
+
 /// Below this the prompt box stops being usable; scroll rather than shrink
 /// further. (`MIN_PROMPT_EDIT_H` in dp, three text rows tall.)
 const MIN_PROMPT_EDIT_H: i32 = ROW_H * 3;
@@ -4160,21 +4267,23 @@ fn is_hint_id(id: i32) -> bool {
 }
 
 /// The text colour of the helper lines (#824, #972). Secondary text, never the
-/// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
-/// system's own button text in high contrast (where grey means disabled).
-/// Settings is drawn on the system face today; the dark-mode work swaps in
-/// the theme's tokens.
-fn hint_text_color(high_contrast: bool, btn_text: u32) -> u32 {
-    if high_contrast {
+/// disabled grey: the theme's `text_dim` token, and the system's own button
+/// text in high contrast (where grey means disabled).
+fn hint_text_color(
+    theme: crate::ui::theme::Theme,
+    tokens: &crate::ui::theme::Tokens,
+    btn_text: u32,
+) -> u32 {
+    if theme == crate::ui::theme::Theme::HighContrast {
         btn_text
     } else {
-        crate::ui::theme::LIGHT.text_dim
+        tokens.text_dim
     }
 }
 
 /// #934: the colours of a text box. Tokens in a normal theme, system colours in
-/// high contrast. Settings is drawn on the system face and does not follow
-/// dark mode yet, so a normal theme here is always the light one.
+/// high contrast. `theme` is the look's: light for a real window until dark
+/// ships (#582).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EditColors {
     fill: u32,
@@ -4201,15 +4310,22 @@ struct EditColors {
 const EDIT_DISABLED_FILL_PCT: u32 = 60;
 
 fn edit_colors(
-    high_contrast: bool,
+    theme: crate::ui::theme::Theme,
     sys: &crate::ui::theme::SysColors,
     accent: u32,
     face: u32,
 ) -> EditColors {
     use crate::ui::card_buttons::blend;
     use crate::ui::theme::{menu_hover_fill, menu_text_color, Theme, Tokens};
-    let theme = Theme::resolve(true, high_contrast);
+    let high_contrast = theme == Theme::HighContrast;
     let t = Tokens::for_theme(theme, sys);
+    // Dark draws the control edge token (3:1); light keeps its hairline until
+    // light moves onto the new paint (spec: no change to light in this slice).
+    let edge = if theme == Theme::Dark {
+        t.control_border
+    } else {
+        t.border
+    };
     // A list's rows lie on the text box fill, so the hover tint is taken from it.
     let on_list = Tokens {
         surface: t.control_fill,
@@ -4219,14 +4335,11 @@ fn edit_colors(
         // No tints in high contrast: the window colour, and GrayText ink.
         (sys.window, sys.gray_text)
     } else {
-        (
-            blend(t.control_fill, face, EDIT_DISABLED_FILL_PCT),
-            t.border,
-        )
+        (blend(t.control_fill, face, EDIT_DISABLED_FILL_PCT), edge)
     };
     EditColors {
         fill: t.control_fill,
-        border: t.border,
+        border: edge,
         text: t.text,
         focus_line: if high_contrast { sys.highlight } else { accent },
         face,
@@ -4236,7 +4349,7 @@ fn edit_colors(
         hover_border: if high_contrast {
             sys.highlight
         } else {
-            blend(t.border, t.text, EDIT_HOVER_BORDER_PCT)
+            blend(edge, t.text, EDIT_HOVER_BORDER_PCT)
         },
         item_hover: menu_hover_fill(theme, &on_list, sys),
         item_text_hot: menu_text_color(theme, &on_list, sys, true, false),
@@ -4267,20 +4380,6 @@ thread_local! {
     static EDIT_STYLE_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// The colours for a text box right now. Reads the registry (the accent), so
-/// only [`edit_style`] calls it.
-unsafe fn current_edit_colors() -> EditColors {
-    use crate::ui::theme::{SysColors, Theme, LIGHT};
-    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
-    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-    edit_colors(
-        high_contrast,
-        &SysColors::read(),
-        crate::ui::card_buttons::system_accent(Theme::Light, LIGHT.surface),
-        GetSysColor(COLOR_3DFACE),
-    )
-}
-
 /// The focus line of a text box `w` by `h` px: along the bottom, between the
 /// rounded corners, as thick as Windows 11's 2 dp accent underline. The
 /// bottom border row is part of it, so the line reads as the border turning
@@ -4305,6 +4404,18 @@ const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
 /// back. Owned here and freed by [`invalidate_edit_style`].
 #[derive(Clone, Copy)]
 struct EditStyle {
+    /// #582: the one place the theme is resolved; the rail, the divider, the
+    /// title bar and the colour messages all read it from here.
+    look: Look,
+    /// Whether Settings fills its own face (dark, or the gallery's forced high
+    /// contrast). False means the system draws it, as before.
+    paints_face: bool,
+    /// The window face: the surface token where Settings paints it, else the
+    /// system's.
+    face: u32,
+    face_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// The helper lines' ink (#824, #972).
+    hint_text: u32,
     colors: EditColors,
     brush: windows::Win32::Graphics::Gdi::HBRUSH,
     disabled_brush: windows::Win32::Graphics::Gdi::HBRUSH,
@@ -4322,15 +4433,37 @@ thread_local! {
 /// The cached style, built on first use after a theme change. Painting and
 /// colour messages run on the UI thread, so they never reach the registry.
 unsafe fn edit_style() -> EditStyle {
-    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
+    use crate::ui::settings_theme::{face_color, paints_face};
+    use crate::ui::theme::{Theme, Tokens};
+    use windows::Win32::Graphics::Gdi::{
+        CreateSolidBrush, GetSysColor, COLOR_3DFACE, COLOR_BTNTEXT,
+    };
     if let Some(style) = EDIT_STYLE.get() {
         return style;
     }
     #[cfg(test)]
     EDIT_STYLE_BUILDS.set(EDIT_STYLE_BUILDS.get() + 1);
-    let colors = current_edit_colors();
+    let look = current_look();
+    let tokens = Tokens::for_theme(look.theme, &look.sys);
+    let face = face_color(look.theme, look.forced, &tokens, GetSysColor(COLOR_3DFACE));
+    let accent = if look.theme == Theme::HighContrast {
+        face
+    } else {
+        crate::ui::card_buttons::system_accent(look.theme, tokens.surface)
+    };
+    let colors = edit_colors(look.theme, &look.sys, accent, face);
+    let btn_text = if look.forced {
+        look.sys.window_text
+    } else {
+        GetSysColor(COLOR_BTNTEXT)
+    };
     let solid = |c: u32| CreateSolidBrush(windows::Win32::Foundation::COLORREF(c));
     let style = EditStyle {
+        look,
+        paints_face: paints_face(look.theme, look.forced),
+        face,
+        face_brush: solid(face),
+        hint_text: hint_text_color(look.theme, &tokens, btn_text),
         colors,
         brush: solid(colors.fill),
         disabled_brush: solid(colors.disabled_fill),
@@ -4345,6 +4478,7 @@ unsafe fn edit_style() -> EditStyle {
 /// on a theme, accent or system colour change, and when Settings closes.
 unsafe fn invalidate_edit_style() {
     if let Some(style) = EDIT_STYLE.take() {
+        let _ = DeleteObject(HGDIOBJ(style.face_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.brush.0));
         let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.hairline_brush.0));
@@ -4378,6 +4512,45 @@ unsafe fn answer_edit_colors(hdc: windows::Win32::Graphics::Gdi::HDC, disabled: 
     SetTextColor(hdc, COLORREF(ink));
     SetBkColor(hdc, COLORREF(fill));
     LRESULT(brush.0 as isize)
+}
+
+/// The brush the window's face is, for the controls it shows through: the
+/// surface token where Settings paints its face (#582), else the system's.
+unsafe fn face_brush_now() -> windows::Win32::Graphics::Gdi::HBRUSH {
+    let style = edit_style();
+    if style.paints_face {
+        style.face_brush
+    } else {
+        windows::Win32::Graphics::Gdi::GetSysColorBrush(windows::Win32::Graphics::Gdi::COLOR_3DFACE)
+    }
+}
+
+/// Answers a label's colour request when Settings paints its own face: the
+/// text token on a transparent background, with the face brush behind it. The
+/// caller only asks while `paints_face` is set, so light and the system's high
+/// contrast keep the default answer.
+unsafe fn answer_label_colors(hdc: windows::Win32::Graphics::Gdi::HDC) -> LRESULT {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TRANSPARENT};
+    let style = edit_style();
+    SetTextColor(hdc, COLORREF(style.colors.text));
+    SetBkMode(hdc, TRANSPARENT);
+    LRESULT(face_brush_now().0 as isize)
+}
+
+/// `WM_ERASEBKGND` when Settings paints its own face: fills the client area
+/// with the face colour. The class brush is the system face, which would show
+/// light in dark.
+unsafe fn erase_with_face(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        windows::Win32::Graphics::Gdi::FillRect(
+            windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+            &rc,
+            face_brush_now(),
+        );
+    }
+    LRESULT(1)
 }
 
 /// Draws a text box's frame onto `hdc` (#934): the Windows 11 look of a
@@ -4610,11 +4783,9 @@ fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i3
 
 /// #935: the divider's colour: the hairline token of the current theme, which
 /// is the system's window text in high contrast, where a pale hairline would
-/// not show. Settings does not follow dark mode yet, so a normal theme here is
-/// the light one (as for the text boxes).
-fn footer_divider_color(high_contrast: bool, sys: &crate::ui::theme::SysColors) -> u32 {
-    use crate::ui::theme::{Theme, Tokens};
-    Tokens::for_theme(Theme::resolve(true, high_contrast), sys).border
+/// not show.
+fn footer_divider_color(theme: crate::ui::theme::Theme, sys: &crate::ui::theme::SysColors) -> u32 {
+    crate::ui::theme::Tokens::for_theme(theme, sys).border
 }
 
 /// Paints the footer divider (#935). The class background has already filled
@@ -4627,8 +4798,8 @@ unsafe fn paint_footer_divider(hwnd: HWND) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = windows::Win32::Foundation::RECT::default();
     if GetClientRect(hwnd, &mut rc).is_ok() {
-        let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-        let ink = footer_divider_color(high_contrast, &crate::ui::theme::SysColors::read());
+        let look = edit_style().look;
+        let ink = footer_divider_color(look.theme, &look.sys);
         let (l, t, r, b) =
             footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
         let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
@@ -4665,16 +4836,18 @@ unsafe extern "system" fn body_wndproc(
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
             if is_hint_id(GetDlgCtrlID(HWND(lparam.0 as *mut c_void))) =>
         {
-            use windows::Win32::Graphics::Gdi::{
-                GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
-                COLOR_BTNTEXT, TRANSPARENT,
-            };
+            use windows::Win32::Graphics::Gdi::{SetBkMode, SetTextColor, TRANSPARENT};
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-            let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-            let ink = hint_text_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
+            SetTextColor(
+                hdc,
+                windows::Win32::Foundation::COLORREF(edit_style().hint_text),
+            );
             SetBkMode(hdc, TRANSPARENT);
-            LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
+            LRESULT(face_brush_now().0 as isize)
+        }
+        // #582: the body's own face, where Settings paints it (dark).
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND if edit_style().paints_face => {
+            erase_with_face(hwnd, wparam)
         }
         // #877: a hairline is a one pixel static filled with the border token.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
@@ -4696,6 +4869,12 @@ unsafe extern "system" fn body_wndproc(
                 windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
                 true,
             )
+        }
+        // #582: every other label (and a group box's caption) in the text
+        // token on the painted face. Light and the system's high contrast take
+        // the default answer, as before.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC if edit_style().paints_face => {
+            answer_label_colors(windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void))
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -8087,10 +8266,7 @@ thread_local! {
 
 /// The cached rail style for `dpi`, built on first use after a change.
 unsafe fn rail_style(dpi: u32) -> RailStyle {
-    use crate::ui::theme::{
-        accent_fill, read_accent_shades, SysColors, Theme, Tokens, ICON_FONT_DP,
-    };
-    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_BTNFACE};
+    use crate::ui::theme::{accent_fill, read_accent_shades, Theme, Tokens, ICON_FONT_DP};
     if let Some(style) = RAIL_STYLE.get() {
         if style.dpi == dpi {
             return style;
@@ -8099,11 +8275,10 @@ unsafe fn rail_style(dpi: u32) -> RailStyle {
     }
     #[cfg(test)]
     RAIL_STYLE_BUILDS.set(RAIL_STYLE_BUILDS.get() + 1);
-    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-    let sys = SysColors::read();
-    let theme = Theme::resolve(true, high_contrast);
+    let shared = edit_style();
+    let (theme, sys, face) = (shared.look.theme, shared.look.sys, shared.face);
+    let high_contrast = theme == Theme::HighContrast;
     let tokens = Tokens::for_theme(theme, &sys);
-    let face = GetSysColor(COLOR_BTNFACE);
     let accent = if high_contrast {
         face
     } else {
@@ -8463,7 +8638,7 @@ unsafe fn draw_item_pill(
     use windows::Win32::Graphics::Gdi::{
         FillRect, GetStockObject, RoundRect, SelectObject, NULL_PEN,
     };
-    if crate::ui::card_buttons::system_high_contrast().is_some() {
+    if style.look.theme == crate::ui::theme::Theme::HighContrast {
         FillRect(hdc, &rc, style.item_hover_brush);
         return;
     }
@@ -9780,7 +9955,21 @@ impl GalleryWindow {
     /// Opens the window and shows it without taking focus. `dpi` lays it out
     /// at that DPI whatever the monitor says (the gallery's `--dpi`); `None`
     /// uses the window's own.
+    #[cfg(test)]
     pub fn open(instance: HINSTANCE, dpi: Option<u32>) -> Option<GalleryWindow> {
+        GalleryWindow::open_themed(instance, dpi, None)
+    }
+
+    /// Opens the window and shows it without taking focus, under a forced theme
+    /// (#582); `None` follows the system. `dpi` is as for the plain open. The
+    /// forced theme lasts until the window is dropped. High contrast is drawn
+    /// with Windows' black colours, since the gallery cannot switch the system
+    /// theme; dark is drawn although real windows keep it off.
+    pub fn open_themed(
+        instance: HINSTANCE,
+        dpi: Option<u32>,
+        theme: Option<crate::ui::theme::Theme>,
+    ) -> Option<GalleryWindow> {
         static ONCE: std::sync::Once = std::sync::Once::new();
         static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         ONCE.call_once(|| {
@@ -9798,6 +9987,7 @@ impl GalleryWindow {
         let unaware = (dpi == Some(96)).then(UnawareScope::enter);
         let dpi = if unaware.is_some() { None } else { dpi };
         FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
+        force_theme(theme);
 
         let config = Config::default();
         let raw = Box::into_raw(Box::new(SettingsInner::new(config.clone())));
@@ -9821,6 +10011,7 @@ impl GalleryWindow {
         };
         let Ok(hwnd) = created else {
             FORCED_DPI.with(|f| f.set(None));
+            force_theme(None);
             unsafe { drop(Box::from_raw(raw)) };
             return None;
         };
@@ -9967,12 +10158,14 @@ impl Drop for GalleryWindow {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
         }
+        force_theme(None);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::theme::Theme;
     use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
 
     #[test]
@@ -11912,13 +12105,17 @@ mod tests {
                     windows::Win32::Graphics::Gdi::COLOR_3DFACE,
                 )
             };
-            let ink = hint_text_color(false, rgb(0, 0, 0));
+            let light =
+                crate::ui::theme::Tokens::for_theme(Theme::Light, &crate::ui::theme::HC_BLACK);
+            let ink = hint_text_color(Theme::Light, &light, rgb(0, 0, 0));
             let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
             assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
         }
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
-        assert_eq!(hint_text_color(true, hc), hc);
+        let hc_tokens =
+            crate::ui::theme::Tokens::for_theme(Theme::HighContrast, &crate::ui::theme::HC_BLACK);
+        assert_eq!(hint_text_color(Theme::HighContrast, &hc_tokens, hc), hc);
     }
 
     /// #972: every helper line is drawn as a hint (secondary text colour), and
@@ -12044,10 +12241,38 @@ mod tests {
     #[test]
     fn footer_divider_colour_comes_from_the_tokens() {
         use crate::ui::theme::{HC_BLACK, HC_WHITE, LIGHT};
-        assert_eq!(footer_divider_color(false, &HC_BLACK), LIGHT.border);
+        assert_eq!(footer_divider_color(Theme::Light, &HC_BLACK), LIGHT.border);
+        assert_eq!(
+            footer_divider_color(Theme::Dark, &HC_BLACK),
+            crate::ui::theme::DARK.border
+        );
         for sys in [HC_BLACK, HC_WHITE] {
-            assert_eq!(footer_divider_color(true, &sys), sys.window_text);
+            assert_eq!(
+                footer_divider_color(Theme::HighContrast, &sys),
+                sys.window_text
+            );
         }
+    }
+
+    /// #582: a helper line is the dim text token in light and dark, and the
+    /// system's button text in high contrast.
+    #[test]
+    fn hint_text_colour_follows_the_theme() {
+        use crate::ui::theme::{Tokens, DARK, HC_BLACK, LIGHT};
+        let btn = 0x0012_3456;
+        let t = |theme| Tokens::for_theme(theme, &HC_BLACK);
+        assert_eq!(
+            hint_text_color(Theme::Light, &t(Theme::Light), btn),
+            LIGHT.text_dim
+        );
+        assert_eq!(
+            hint_text_color(Theme::Dark, &t(Theme::Dark), btn),
+            DARK.text_dim
+        );
+        assert_eq!(
+            hint_text_color(Theme::HighContrast, &t(Theme::HighContrast), btn),
+            btn
+        );
     }
 
     /// #934: a text box takes its fill, border and text from the theme tokens
@@ -12058,14 +12283,26 @@ mod tests {
         use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE, LIGHT};
         let accent = rgb(0, 103, 192);
         let face = rgb(240, 240, 240);
-        let c = edit_colors(false, &HC_BLACK, accent, face);
+        let c = edit_colors(Theme::Light, &HC_BLACK, accent, face);
         assert_eq!(c.fill, LIGHT.control_fill);
         assert_eq!(c.border, LIGHT.border);
         assert_eq!(c.text, LIGHT.text);
         assert_eq!(c.focus_line, accent);
         assert_eq!(c.face, face);
+        // #582: dark is the dark tokens, with the control edge (not the
+        // decorative hairline) as the border.
+        let d = edit_colors(
+            Theme::Dark,
+            &HC_BLACK,
+            accent,
+            crate::ui::theme::DARK.surface,
+        );
+        assert_eq!(d.fill, crate::ui::theme::DARK.control_fill);
+        assert_eq!(d.border, crate::ui::theme::DARK.control_border);
+        assert_eq!(d.text, crate::ui::theme::DARK.text);
+        assert_eq!(d.face, crate::ui::theme::DARK.surface);
         for sys in [HC_BLACK, HC_WHITE] {
-            let c = edit_colors(true, &sys, accent, face);
+            let c = edit_colors(Theme::HighContrast, &sys, accent, face);
             assert_eq!(c.fill, sys.window);
             assert_eq!(c.border, sys.window_text);
             assert_eq!(c.text, sys.window_text);
@@ -12080,18 +12317,180 @@ mod tests {
         use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
         let accent = rgb(0, 103, 192);
         let face = rgb(240, 240, 240);
-        let c = edit_colors(false, &HC_BLACK, accent, face);
+        let c = edit_colors(Theme::Light, &HC_BLACK, accent, face);
         assert_ne!(
             c.hover_border, c.border,
             "a hovered box has a firmer border"
         );
         for sys in [HC_BLACK, HC_WHITE] {
-            let c = edit_colors(true, &sys, accent, face);
+            let c = edit_colors(Theme::HighContrast, &sys, accent, face);
             assert_eq!(c.hover_border, sys.highlight);
         }
         let hovered = frame_colors(&c, true);
         assert_eq!(hovered.border, c.hover_border);
         assert_eq!(frame_colors(&c, false).border, c.border);
+    }
+
+    /// Forces a theme for the test's thread and puts it back on drop, even if
+    /// the test panics.
+    struct Forced;
+    impl Forced {
+        fn new(theme: Theme) -> Forced {
+            force_theme(Some(theme));
+            Forced
+        }
+    }
+    impl Drop for Forced {
+        fn drop(&mut self) {
+            force_theme(None);
+        }
+    }
+
+    /// The colour of the pixel the window paints at (5, 5) when asked to erase
+    /// its background into a memory bitmap.
+    fn erased_face_pixel(hwnd: HWND) -> u32 {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetPixel, SelectObject,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND;
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, 64, 64);
+            let old = SelectObject(dc, bitmap.into());
+            let answer = SendMessageW(hwnd, WM_ERASEBKGND, Some(WPARAM(dc.0 as usize)), None);
+            assert_eq!(answer.0, 1, "the erase is answered");
+            let pixel = GetPixel(dc, 5, 5).0;
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            pixel
+        }
+    }
+
+    /// What the window answers a label's colour request with: the brush's
+    /// colour and the text colour left on the DC.
+    fn label_answer(hwnd: HWND) -> (u32, u32) {
+        let status = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line");
+        label_answer_for(hwnd, status)
+    }
+
+    /// The same, asked of `window` about `label` (the body answers for its own
+    /// labels).
+    fn label_answer_for(window: HWND, label: HWND) -> (u32, u32) {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, DeleteDC, GetObjectW, GetTextColor, LOGBRUSH,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let brush = SendMessageW(
+                window,
+                WM_CTLCOLORSTATIC,
+                Some(WPARAM(dc.0 as usize)),
+                Some(LPARAM(label.0 as isize)),
+            );
+            let mut logbrush = LOGBRUSH::default();
+            GetObjectW(
+                HGDIOBJ(brush.0 as *mut c_void),
+                std::mem::size_of::<LOGBRUSH>() as i32,
+                Some(&mut logbrush as *mut LOGBRUSH as *mut c_void),
+            );
+            let text = GetTextColor(dc).0;
+            let _ = DeleteDC(dc);
+            (logbrush.lbColor.0, text)
+        }
+    }
+
+    fn get_dlg_item_body(hwnd: HWND) -> HWND {
+        unsafe { GetDlgItem(Some(hwnd), ID_BODY) }.expect("body window")
+    }
+
+    /// A plain label under the body, with no id the body singles out.
+    fn body_test_label(body: HWND) -> HWND {
+        let class = wide_z("STATIC");
+        unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class.as_ptr()),
+                PCWSTR::null(),
+                WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                Some(body),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a body label")
+    }
+
+    /// Whether the title bar asks for the dark frame.
+    fn title_bar_is_dark(hwnd: HWND) -> bool {
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+        let mut value = 0i32;
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &mut value as *mut i32 as *mut c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+            .expect("read the title bar attribute");
+        }
+        value != 0
+    }
+
+    /// #582, wired-to-nothing check: with nothing wired, a dark window would
+    /// still erase to the system face and answer labels with the default
+    /// colours. It erases to the surface token, answers labels with the text
+    /// token on it, and asks DWM for the dark title bar. Light keeps the
+    /// system's answer, and a theme change while open switches between them.
+    #[test]
+    fn a_dark_window_paints_its_face_and_labels_from_the_tokens() {
+        use crate::ui::theme::{DARK, HC_BLACK};
+        use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
+        use windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED;
+        let system_face = unsafe { GetSysColor(COLOR_3DFACE) };
+        {
+            let _forced = Forced::new(Theme::Dark);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert_eq!(erased_face_pixel(hwnd), DARK.surface);
+                assert_eq!(label_answer(hwnd), (DARK.surface, DARK.text));
+                assert!(title_bar_is_dark(hwnd));
+                // The body answers for its own face and labels too.
+                let body = get_dlg_item_body(hwnd);
+                let label = body_test_label(body);
+                assert_eq!(erased_face_pixel(body), DARK.surface);
+                assert_eq!(label_answer_for(body, label), (DARK.surface, DARK.text));
+                // Live re-theme: back to light, the same window.
+                force_theme(Some(Theme::Light));
+                unsafe { SendMessageW(hwnd, WM_THEMECHANGED, None, None) };
+                assert_eq!(erased_face_pixel(hwnd), system_face);
+                assert!(!title_bar_is_dark(hwnd));
+                assert_ne!(label_answer_for(body, label).0, DARK.surface);
+            });
+        }
+        {
+            let _forced = Forced::new(Theme::Light);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert_eq!(erased_face_pixel(hwnd), system_face);
+                assert_eq!(label_answer(hwnd).0, system_face);
+                assert!(!title_bar_is_dark(hwnd));
+            });
+        }
+        {
+            // The gallery's high contrast is Windows' black theme.
+            let _forced = Forced::new(Theme::HighContrast);
+            with_window(Config::default(), |hwnd, _raw| {
+                assert_eq!(erased_face_pixel(hwnd), HC_BLACK.window);
+                assert_eq!(label_answer(hwnd), (HC_BLACK.window, HC_BLACK.window_text));
+            });
+        }
     }
 
     /// #1109: the mouse over a combo hovers it, once: moving inside it again
@@ -12344,11 +12743,21 @@ mod tests {
     fn disabled_edit_colours_come_from_the_tokens() {
         use crate::ui::theme::{rgb, HC_BLACK};
         let face = rgb(240, 240, 240);
-        let c = edit_colors(true, &HC_BLACK, rgb(0, 103, 192), face);
+        let c = edit_colors(
+            crate::ui::theme::Theme::HighContrast,
+            &HC_BLACK,
+            rgb(0, 103, 192),
+            face,
+        );
         assert_eq!(c.disabled_fill, HC_BLACK.window);
         assert_eq!(c.disabled_border, HC_BLACK.gray_text);
         assert_eq!(c.disabled_text, HC_BLACK.gray_text);
-        let c = edit_colors(false, &HC_BLACK, rgb(0, 103, 192), face);
+        let c = edit_colors(
+            crate::ui::theme::Theme::Light,
+            &HC_BLACK,
+            rgb(0, 103, 192),
+            face,
+        );
         assert_ne!(c.disabled_fill, c.fill);
         assert_ne!(c.disabled_text, c.text);
     }
@@ -14434,7 +14843,12 @@ mod tests {
     fn high_contrast_list_rows_use_the_system_highlight() {
         use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
         for sys in [HC_BLACK, HC_WHITE] {
-            let c = edit_colors(true, &sys, rgb(0, 103, 192), sys.window);
+            let c = edit_colors(
+                crate::ui::theme::Theme::HighContrast,
+                &sys,
+                rgb(0, 103, 192),
+                sys.window,
+            );
             assert_eq!(c.item_hover, sys.highlight);
             assert_eq!(c.item_text_hot, sys.highlight_text);
         }
