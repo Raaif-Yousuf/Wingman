@@ -169,29 +169,13 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     inner.owner = owner;
     inner.owns_itself = true;
     let owner_raw = owner.0 as isize;
-    // What the FILE held when the window opened, defaults for keys it does not
-    // spell out. The running config is not that (a tray change not yet written,
-    // a default never written), and comparing with it refuses a save that
-    // touched nothing by hand. Tests do not read the real file (rule 9).
-    let file_baseline = if live {
-        crate::config::Config::path()
-            .ok()
-            .and_then(|p| crate::config_writer::file_baseline(&p))
-    } else {
-        None
-    };
-    // A list changed here replaces the whole list in the file, so it is written
-    // only if the file's list is still the one the window last saw (`baseline`);
-    // a hand edit of a sibling entry is not silently dropped.
-    if let Some(file) = file_baseline {
-        inner.baseline = file;
-    }
+    // What the FILE held when the window opened is read on a worker once the
+    // window exists (#1105, `start_open_read`): the running config is not that
+    // (a tray change not yet written, a default never written), and comparing
+    // with it refuses a save that touched nothing by hand. Tests do not read
+    // the real file (rule 9).
     if live {
         inner.file_path = crate::config::Config::path().ok();
-        inner.file_mtime = inner
-            .file_path
-            .as_deref()
-            .and_then(crate::config::file_mtime);
     }
     inner.save_sink = Some(Box::new(move |label, changes, original, edited| {
         crate::app::post_settings_save(
@@ -292,6 +276,16 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     inner_ref.adopt(built);
     sync_card_display_enabled(hwnd);
     if live {
+        // #1105: the file's baseline and the Run key are read off the UI thread;
+        // the Start with Windows box is unchecked until its worker answers.
+        start_open_read(inner_ref);
+        // The box cannot be clicked until the Run key has been read.
+        if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
+            unsafe {
+                let _ = EnableWindow(box_, false);
+            }
+        }
+        start_autostart(inner_ref, AutostartJob::Read);
         // #527, #568: the Ollama status and button arrive later, off the UI
         // thread; the group says "Checking Ollama..." until then.
         spawn_ollama_status_probe(
@@ -795,6 +789,17 @@ struct SettingsInner {
     refreshing: bool,
     /// The worker's answer, taken by `WM_SETTINGS_REFRESH`.
     refresh_slot: RefreshSlot,
+    /// #1105: the open-time read of the file runs on a worker; its answer is
+    /// taken by `WM_SETTINGS_OPENED`.
+    open_slot: OpenSlot,
+    /// A commit or Undo has moved `baseline` since the window opened.
+    wrote: bool,
+    /// #1105: the Start with Windows worker. One job at a time; a click that
+    /// comes while one runs sets `autostart_again`.
+    autostart_busy: bool,
+    autostart_again: bool,
+    autostart_slot: AutostartSlot,
+    autostart_seams: AutostartSeams,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and is applied at once when a chord is learned.
     hotkeys: Hotkeys,
@@ -931,6 +936,12 @@ impl SettingsInner {
             file_mtime: None,
             refreshing: false,
             refresh_slot: Default::default(),
+            open_slot: Default::default(),
+            wrote: false,
+            autostart_busy: false,
+            autostart_again: false,
+            autostart_slot: Default::default(),
+            autostart_seams: AutostartSeams::REAL,
             learning: None,
             pending_conflict: None,
             original,
@@ -1013,6 +1024,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // #875: the worker re-read the file after the window was activated.
         WM_SETTINGS_REFRESH => {
             take_refresh(inner);
+            LRESULT(0)
+        }
+        // #1105: the Start with Windows worker answered.
+        WM_SETTINGS_AUTOSTART => {
+            take_autostart(inner);
+            LRESULT(0)
+        }
+        // #1105: the worker read the file the window opened on.
+        WM_SETTINGS_OPENED => {
+            take_open_read(inner);
             LRESULT(0)
         }
         // #872: the rail draws itself through us.
@@ -1245,6 +1266,12 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             fetch_for_typed_key(inner, index);
         }
         return;
+    }
+    // #1143: a combo whose list opens is no longer under the pointer.
+    if notify == windows::Win32::UI::WindowsAndMessaging::CBN_DROPDOWN {
+        if let Some(combo) = get_dlg_item(inner.hwnd, id) {
+            set_combo_hover(combo, false);
+        }
     }
     match id {
         ID_UNDO if notify == BN_CLICKED => undo_last(inner),
@@ -1794,6 +1821,7 @@ fn apply_field(inner: &mut SettingsInner, field: Field, raw: &RawForm, note: Opt
         fail_row(inner, field, &reason);
         return;
     }
+    inner.wrote = true;
     inner.tracker.begin(commit::InFlight {
         field,
         undoing: false,
@@ -1825,29 +1853,293 @@ fn apply_field(inner: &mut SettingsInner, field: Field, raw: &RawForm, note: Opt
 /// Why a Start with Windows change failed (#777): the registry would not take it.
 const AUTOSTART_FAILED: &str = "Windows did not allow the change.";
 
-/// Start with Windows is the registry's, not the file's: one small write on the
-/// click (what Save did before), and it is put back on a failure.
+/// What a Start with Windows worker is asked to do (#1105).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutostartJob {
+    /// Only read the Run key (the window just opened, or a row is shown again).
+    Read,
+    /// The user clicked the box: make the key say this.
+    Set(bool),
+    /// Undo: put the key back to this.
+    Undo(bool),
+}
+
+/// What the worker found. `now` is the key as it stands after the job, which is
+/// what the checkbox shows whatever happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutostartAnswer {
+    was: bool,
+    now: bool,
+    failed: bool,
+    changed: bool,
+}
+
+struct AutostartDone {
+    job: AutostartJob,
+    answer: AutostartAnswer,
+}
+
+/// The Run key behind two function pointers, so the tests put a fake there
+/// (rule 9: no test touches the real key).
+#[derive(Clone, Copy)]
+struct AutostartSeams {
+    is_enabled: fn() -> bool,
+    set_enabled: fn(bool) -> anyhow::Result<()>,
+}
+
+impl AutostartSeams {
+    #[cfg(not(test))]
+    const REAL: AutostartSeams = AutostartSeams {
+        is_enabled: crate::autostart::is_enabled,
+        set_enabled: crate::autostart::set_enabled,
+    };
+
+    /// In a test build no window reaches the real Run key.
+    #[cfg(test)]
+    const REAL: AutostartSeams = AutostartSeams {
+        is_enabled: || false,
+        set_enabled: |_| Ok(()),
+    };
+}
+
+type AutostartSlot = std::sync::Arc<std::sync::Mutex<Option<AutostartDone>>>;
+
+/// The worker's whole job. A write that changes nothing is skipped. The answer
+/// carries the key as it stands afterwards, read back, so a refused or half
+/// applied write never leaves the box showing something untrue.
+fn run_autostart(job: AutostartJob, seams: AutostartSeams) -> AutostartAnswer {
+    let was = (seams.is_enabled)();
+    let want = match job {
+        AutostartJob::Read => None,
+        AutostartJob::Set(want) | AutostartJob::Undo(want) => Some(want),
+    };
+    let Some(want) = want.filter(|w| *w != was) else {
+        return AutostartAnswer {
+            was,
+            now: was,
+            failed: false,
+            changed: false,
+        };
+    };
+    let wrote = (seams.set_enabled)(want);
+    let now = (seams.is_enabled)();
+    let failed = wrote.is_err() || now != want;
+    AutostartAnswer {
+        was,
+        now,
+        failed,
+        changed: !failed,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AutostartVerdict {
+    /// Nothing to say: a read, or a click that changed nothing.
+    Quiet,
+    Saved {
+        was: bool,
+    },
+    Undone,
+    Failed,
+}
+
+fn autostart_verdict(job: AutostartJob, answer: &AutostartAnswer) -> AutostartVerdict {
+    match job {
+        AutostartJob::Read => AutostartVerdict::Quiet,
+        _ if answer.failed => AutostartVerdict::Failed,
+        AutostartJob::Set(_) if answer.changed => AutostartVerdict::Saved { was: answer.was },
+        AutostartJob::Undo(_) if answer.changed => AutostartVerdict::Undone,
+        _ => AutostartVerdict::Quiet,
+    }
+}
+
+/// Whether a job that arrives while another runs is remembered. Only a click
+/// is: it reads the box when its turn comes. A read is dropped (the running
+/// job's answer is as fresh), and it must never be run as a click, which
+/// would commit a placeholder box.
+fn queued_when_busy(job: AutostartJob) -> bool {
+    matches!(job, AutostartJob::Set(_))
+}
+
+/// Runs a Start with Windows job on a short worker and posts the answer back
+/// (#1105): the window's thread never touches the registry. One job runs at a
+/// time; a click that comes meanwhile is looked at when the answer lands.
+fn start_autostart(inner: &mut SettingsInner, job: AutostartJob) {
+    if inner.closing {
+        return;
+    }
+    if inner.autostart_busy {
+        if queued_when_busy(job) {
+            inner.autostart_again = true;
+        }
+        return;
+    }
+    inner.autostart_busy = true;
+    let slot = inner.autostart_slot.clone();
+    let alive = inner.alive.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let seams = inner.autostart_seams;
+    let spawned = std::thread::Builder::new()
+        .name("settings-autostart".into())
+        .spawn(move || {
+            let answer = run_autostart(job, seams);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(AutostartDone { job, answer });
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_SETTINGS_AUTOSTART,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        });
+    if spawned.is_err() {
+        inner.autostart_busy = false;
+        if job == AutostartJob::Read {
+            // No answer will come: do not leave the box dead.
+            if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+                if !crate::portable::is_portable() {
+                    unsafe {
+                        let _ = EnableWindow(box_, true);
+                    }
+                }
+            }
+        } else {
+            // Rule 7: not started is a failed row, not a silent no-op.
+            inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
+            set_status(
+                inner,
+                &commit::failed_line(Field::Autostart.label(), AUTOSTART_FAILED),
+                false,
+            );
+        }
+    }
+}
+
+/// Start with Windows is the registry's, not the file's: the click is handed to
+/// a worker, and the box shows what the key really says once it answers.
 fn commit_autostart(inner: &mut SettingsInner) {
     let want = checkbox_checked(inner.hwnd, ID_AUTOSTART);
-    let was = crate::autostart::is_enabled();
-    if want == was {
+    start_autostart(inner, AutostartJob::Set(want));
+}
+
+/// The worker's answer: the box follows the key, and the status line says what
+/// happened.
+fn take_autostart(inner: &mut SettingsInner) {
+    inner.autostart_busy = false;
+    let Some(done) = inner.autostart_slot.lock().ok().and_then(|mut g| g.take()) else {
         return;
+    };
+    if inner.closing {
+        return;
+    }
+    // The first answer makes the box real: it was disabled until the Run key
+    // was read (portable mode keeps it disabled for good).
+    if !crate::portable::is_portable() {
+        if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+            unsafe {
+                let _ = EnableWindow(box_, true);
+            }
+        }
+    }
+    // Clicked again while the job ran (this is the retry after a failed or
+    // finished job): the box holds the newer wish, so it is not overwritten
+    // with this answer, and that wish is sent now as a fresh job.
+    if std::mem::take(&mut inner.autostart_again) {
+        commit_autostart(inner);
+    } else if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+        set_checkbox(box_, done.answer.now);
     }
     let label = Field::Autostart.label();
-    if crate::autostart::set_enabled(want).is_err() {
-        if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
-            set_checkbox(box_, crate::autostart::is_enabled());
+    match autostart_verdict(done.job, &done.answer) {
+        AutostartVerdict::Quiet => {}
+        AutostartVerdict::Failed => {
+            inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
+            set_status(inner, &commit::failed_line(label, AUTOSTART_FAILED), false);
         }
-        inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
-        set_status(inner, &commit::failed_line(label, AUTOSTART_FAILED), false);
+        AutostartVerdict::Saved { was } => {
+            inner.tracker.clear_failed(Field::Autostart);
+            inner.tracker.undo = Some(commit::UndoSlot {
+                field: Field::Autostart,
+                what: commit::UndoWhat::Autostart { was },
+            });
+            set_status(inner, &commit::saved_line(label), true);
+        }
+        AutostartVerdict::Undone => {
+            set_status(inner, &commit::undone_line(label), false);
+        }
+    }
+}
+
+/// What reading the file at open found (#1105).
+struct Opened {
+    baseline: Option<Config>,
+    mtime: Option<std::time::SystemTime>,
+}
+
+type OpenSlot = std::sync::Arc<std::sync::Mutex<Option<Opened>>>;
+
+/// Whether what the open-time read found may still replace the baseline: only
+/// while it is the truth. A write already moved the baseline, a re-read already
+/// took the file, or the window is going away.
+fn open_read_applies(
+    wrote: bool,
+    writes_in_flight: usize,
+    file_already_read: bool,
+    closing: bool,
+) -> bool {
+    !wrote && writes_in_flight == 0 && !file_already_read && !closing
+}
+
+/// Reads the file's baseline and modified time on a worker (#1105); the answer
+/// is `WM_SETTINGS_OPENED`. When it cannot be used the window keeps the running
+/// config as its baseline and the next activation re-reads the file.
+fn start_open_read(inner: &mut SettingsInner) {
+    let Some(path) = inner.file_path.clone() else {
+        return;
+    };
+    let slot = inner.open_slot.clone();
+    let alive = inner.alive.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("settings-open-read".into())
+        .spawn(move || {
+            let opened = Opened {
+                baseline: crate::config_writer::file_baseline(&path),
+                mtime: crate::config::file_mtime(&path),
+            };
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(opened);
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_SETTINGS_OPENED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        });
+}
+
+fn take_open_read(inner: &mut SettingsInner) {
+    let Some(found) = inner.open_slot.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    if !open_read_applies(
+        inner.wrote,
+        inner.tracker.writes_in_flight(),
+        inner.file_mtime.is_some(),
+        inner.closing,
+    ) {
         return;
     }
-    inner.tracker.clear_failed(Field::Autostart);
-    inner.tracker.undo = Some(commit::UndoSlot {
-        field: Field::Autostart,
-        what: commit::UndoWhat::Autostart { was },
-    });
-    set_status(inner, &commit::saved_line(label), true);
+    if let Some(file) = found.baseline {
+        inner.baseline = file;
+    }
+    inner.file_mtime = found.mtime;
 }
 
 /// A field that could not be applied: the control goes back to what is applied,
@@ -1944,6 +2236,17 @@ fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
 /// Undo: the latest change goes back through the same writer, and the control
 /// shows the old value at once.
 fn undo_last(inner: &mut SettingsInner) {
+    // A Start with Windows job is still running: its answer comes first, and
+    // Undo stays on offer until then.
+    if inner.autostart_busy
+        && inner
+            .tracker
+            .undo
+            .as_ref()
+            .is_some_and(|u| u.field == Field::Autostart)
+    {
+        return;
+    }
     let Some(slot) = inner.tracker.undo.take() else {
         set_undo_shown(inner, false);
         return;
@@ -1952,20 +2255,7 @@ fn undo_last(inner: &mut SettingsInner) {
     let field = slot.field;
     match slot.what {
         commit::UndoWhat::Autostart { was } => {
-            let ok = crate::autostart::set_enabled(was).is_ok();
-            if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
-                set_checkbox(box_, crate::autostart::is_enabled());
-            }
-            if ok {
-                set_status(inner, &commit::undone_line(field.label()), false);
-            } else {
-                inner.tracker.fail(field, AUTOSTART_FAILED);
-                set_status(
-                    inner,
-                    &commit::failed_line(field.label(), AUTOSTART_FAILED),
-                    false,
-                );
-            }
+            start_autostart(inner, AutostartJob::Undo(was));
         }
         commit::UndoWhat::Config { restore } => {
             let restored = crate::config_writer::reapply(&inner.original, &restore)
@@ -1984,6 +2274,7 @@ fn undo_last(inner: &mut SettingsInner) {
                 fail_row(inner, field, &reason);
                 return;
             }
+            inner.wrote = true;
             inner.tracker.begin(commit::InFlight {
                 field,
                 undoing: true,
@@ -2161,11 +2452,7 @@ fn show_field(inner: &mut SettingsInner, field: Field, cfg: &Config) {
             inner.hotkeys.pause = cfg.hotkeys.pause;
             set_hotkey_labels(hwnd, &inner.hotkeys);
         }
-        Field::Autostart => {
-            if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
-                set_checkbox(box_, crate::autostart::is_enabled());
-            }
-        }
+        Field::Autostart => start_autostart(inner, AutostartJob::Read),
         Field::CardSeconds => {
             if let Some(edit) = get_dlg_item(hwnd, ID_CARD_SECONDS) {
                 set_text(edit, &cfg.ui.card_seconds.to_string());
@@ -3895,6 +4182,10 @@ struct EditColors {
     disabled_text: u32,
     /// #1109: a hovered combo's border (the system highlight in high contrast).
     hover_border: u32,
+    /// #1169: the row under the pointer or cursor in a dropped-open list (the
+    /// system highlight in high contrast), and the ink on it.
+    item_hover: u32,
+    item_text_hot: u32,
 }
 
 /// How far a disabled box's fill moves from the text box fill toward the
@@ -3908,9 +4199,14 @@ fn edit_colors(
     face: u32,
 ) -> EditColors {
     use crate::ui::card_buttons::blend;
-    use crate::ui::theme::{menu_text_color, Theme, Tokens};
+    use crate::ui::theme::{menu_hover_fill, menu_text_color, Theme, Tokens};
     let theme = Theme::resolve(true, high_contrast);
     let t = Tokens::for_theme(theme, sys);
+    // A list's rows lie on the text box fill, so the hover tint is taken from it.
+    let on_list = Tokens {
+        surface: t.control_fill,
+        ..t
+    };
     let (disabled_fill, disabled_border) = if high_contrast {
         // No tints in high contrast: the window colour, and GrayText ink.
         (sys.window, sys.gray_text)
@@ -3934,6 +4230,8 @@ fn edit_colors(
         } else {
             blend(t.border, t.text, EDIT_HOVER_BORDER_PCT)
         },
+        item_hover: menu_hover_fill(theme, &on_list, sys),
+        item_text_hot: menu_text_color(theme, &on_list, sys, true, false),
     }
 }
 
@@ -4005,6 +4303,8 @@ struct EditStyle {
     /// The line between rows (#877): the border token, or the system's window
     /// text in high contrast.
     hairline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// The hovered row of a combo's drop list (#1169).
+    item_hover_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 }
 
 thread_local! {
@@ -4027,6 +4327,7 @@ unsafe fn edit_style() -> EditStyle {
         brush: solid(colors.fill),
         disabled_brush: solid(colors.disabled_fill),
         hairline_brush: solid(colors.border),
+        item_hover_brush: solid(colors.item_hover),
     };
     EDIT_STYLE.set(Some(style));
     style
@@ -4039,6 +4340,7 @@ unsafe fn invalidate_edit_style() {
         let _ = DeleteObject(HGDIOBJ(style.brush.0));
         let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.hairline_brush.0));
+        let _ = DeleteObject(HGDIOBJ(style.item_hover_brush.0));
     }
 }
 
@@ -4992,6 +5294,7 @@ impl Ctx {
                         COMBO_SUBCLASS_ID,
                         0,
                     );
+                    subclass_combo_list(hwnd);
                 }
             }
             if class == WC_EDIT {
@@ -7000,10 +7303,10 @@ fn build_ui_recorded(
 
     r.ctl_w = CONTROL_W;
 
-    // Autostart state is owned by Windows, not by Config -- read the Run key
-    // itself so the box can never disagree with reality.
+    // Autostart state is owned by Windows, not by Config. The box starts
+    // unchecked: the Run key is read by a worker once the window exists (#1105),
+    // so the box can never disagree with reality for long.
     let autostart = ctx.check_row(&mut r, "Start with &Windows", ID_AUTOSTART, None, 0);
-    set_checkbox(autostart, crate::autostart::is_enabled());
     // Portable mode (#130) makes no registry writes, so the switch is greyed.
     if crate::portable::is_portable() {
         unsafe {
@@ -7479,6 +7782,12 @@ const WM_SETTINGS_WRITE_RESULT: u32 = 0x8000 + 46; // WM_APP + 46
 /// #875: the worker that re-reads the file after an activation has its answer
 /// ready in `refresh_slot`.
 const WM_SETTINGS_REFRESH: u32 = 0x8000 + 47; // WM_APP + 47
+
+/// Posted when the Start with Windows worker has stored its answer (#1105).
+const WM_SETTINGS_AUTOSTART: u32 = 0x8000 + 52; // WM_APP + 52
+
+/// Posted when the open-time read of the file has stored its answer (#1105).
+const WM_SETTINGS_OPENED: u32 = 0x8000 + 53; // WM_APP + 53
 /// `lparam` is the page's rail position.
 const PAGE_PICK: usize = 0;
 /// `lparam` is how many pages to move (negative goes back), wrapping.
@@ -7786,6 +8095,9 @@ pub(crate) const CARD_CORNER_COMBO: i32 = ID_CARD_CORNER;
 
 /// `WM_MOUSELEAVE`, sent once after `TrackMouseEvent(TME_LEAVE)`.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_ENABLE: u32 = 0x000A;
+const WM_SHOWWINDOW: u32 = 0x0018;
+const WM_CAPTURECHANGED: u32 = 0x0215;
 
 thread_local! {
     /// #1109: the combo the mouse is over (0: none). One mouse, one hover.
@@ -7890,9 +8202,119 @@ unsafe extern "system" fn combo_subclass(
             set_combo_hover(hwnd, false);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
+        // #1143: Windows does not always send `WM_MOUSELEAVE` to a combo that is
+        // disabled, hidden or has lost the mouse capture to its list, so those
+        // end the hover themselves. (The list opening is `CBN_DROPDOWN`, which
+        // the window handles.)
+        WM_ENABLE | WM_SHOWWINDOW if wparam.0 == 0 => {
+            set_combo_hover(hwnd, false);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_CAPTURECHANGED => {
+            set_combo_hover(hwnd, false);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
         WM_NCDESTROY => {
             set_combo_hover(hwnd, false);
             let _ = RemoveWindowSubclass(hwnd, Some(combo_subclass), COMBO_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
+const COMBO_LIST_SUBCLASS_ID: usize = 0x1164;
+
+/// Gives the drop list of `combo` the Settings look: its frame and the fill
+/// behind its rows (#1169). The list window exists from the combo's creation, so
+/// it is subclassed once here and goes away with the combo.
+unsafe fn subclass_combo_list(combo: HWND) {
+    use windows::Win32::UI::Controls::COMBOBOXINFO;
+    use windows::Win32::UI::WindowsAndMessaging::CB_GETCOMBOBOXINFO;
+    let mut info = COMBOBOXINFO {
+        cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+        ..Default::default()
+    };
+    SendMessageW(
+        combo,
+        CB_GETCOMBOBOXINFO,
+        Some(WPARAM(0)),
+        Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+    );
+    if !info.hwndList.is_invalid() {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            info.hwndList,
+            Some(combo_list_subclass),
+            COMBO_LIST_SUBCLASS_ID,
+            0,
+        );
+    }
+}
+
+/// The drop list's own frame and background: the border colour of the closed
+/// combo around it, and the list fill where no row reaches (#1169). Only cached
+/// brushes. A list long enough for a scroll bar lets the system draw that first.
+/// The list is a top-level popup, so `dpi_for` reads its own monitor's scale on
+/// every paint (nothing is cached per DPI); the cached colours are dropped on a
+/// theme change and the list repaints whole each time it opens.
+unsafe extern "system" fn combo_list_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{FillRect, GetWindowDC, ReleaseDC, HDC};
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetWindowLongPtrW, GWL_STYLE, SM_CXBORDER, WM_ERASEBKGND, WM_NCDESTROY,
+        WM_NCPAINT,
+    };
+    match msg {
+        WM_ERASEBKGND => {
+            let mut rc = RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() {
+                FillRect(HDC(wparam.0 as *mut c_void), &rc, edit_style().brush);
+                LRESULT(1)
+            } else {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_NCPAINT => {
+            let scrolls = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL.0;
+            let result = if scrolls != 0 {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            } else {
+                LRESULT(0)
+            };
+            let mut wr = RECT::default();
+            let hdc = GetWindowDC(Some(hwnd));
+            if !hdc.is_invalid() {
+                if GetWindowRect(hwnd, &mut wr).is_ok() {
+                    // The ring the system reserves for the frame, in the border
+                    // colour of the closed combo.
+                    let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+                    let edge = GetSystemMetricsForDpi(SM_CXBORDER, dpi_for(hwnd)).max(1);
+                    let brush = edit_style().hairline_brush;
+                    let side = |left, top, right, bottom| RECT {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    };
+                    FillRect(hdc, &side(0, 0, w, edge), brush);
+                    FillRect(hdc, &side(0, h - edge, w, h), brush);
+                    FillRect(hdc, &side(0, 0, edge, h), brush);
+                    FillRect(hdc, &side(w - edge, 0, w, h), brush);
+                }
+                ReleaseDC(Some(hwnd), hdc);
+            }
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(combo_list_subclass), COMBO_LIST_SUBCLASS_ID);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         _ => DefSubclassProc(hwnd, msg, wparam, lparam),
@@ -7952,17 +8374,54 @@ unsafe fn measure_combo_item(lparam: LPARAM, dpi: u32) -> bool {
     true
 }
 
-/// `WM_DRAWITEM` for a combo: the item (or the closed field) on the system
-/// colours, its text kept `COMBO_TEXT_PAD_DP` off the border. Returns false
-/// for anything else. Only system brushes and colours, so nothing to free and
-/// high contrast needs no special case.
+/// The hover pill of a list row (#1169): inset like a Windows 11 menu's, with
+/// 4 dp corners, filled with the cached hover brush. High contrast fills the
+/// whole row square, as every native list does. Nothing is created or freed.
+unsafe fn draw_item_pill(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rc: windows::Win32::Foundation::RECT,
+    dpi: u32,
+    style: &EditStyle,
+) {
+    use crate::ui::theme::{COMBO_ITEM_INSET_Y_DP, CONTROL_RADIUS_DP, MENU_EDGE_PAD_DP};
+    use windows::Win32::Graphics::Gdi::{
+        FillRect, GetStockObject, RoundRect, SelectObject, NULL_PEN,
+    };
+    if crate::ui::card_buttons::system_high_contrast().is_some() {
+        FillRect(hdc, &rc, style.item_hover_brush);
+        return;
+    }
+    let (inset_x, inset_y) = (
+        to_px(MENU_EDGE_PAD_DP, dpi),
+        to_px(COMBO_ITEM_INSET_Y_DP, dpi),
+    );
+    let round = 2 * to_px(CONTROL_RADIUS_DP, dpi);
+    let old_brush = SelectObject(hdc, HGDIOBJ(style.item_hover_brush.0));
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    // A null pen leaves the right and bottom edges off, so grow them by one.
+    let _ = RoundRect(
+        hdc,
+        rc.left + inset_x,
+        rc.top + inset_y,
+        rc.right - inset_x + 1,
+        rc.bottom - inset_y + 1,
+        round,
+        round,
+    );
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+}
+
+/// `WM_DRAWITEM` for a combo: the item (or the closed field), its text kept
+/// `COMBO_TEXT_PAD_DP` off the border. Returns false for anything else. Colours
+/// come from the cached [`edit_style`] (system colours in high contrast) or the
+/// system's own brushes, so nothing is created per paint.
 unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::Graphics::Gdi::{
         DrawTextW, FillRect, GetSysColor, GetSysColorBrush, SelectObject, SetBkMode, SetTextColor,
-        COLOR_3DFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-        COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        TRANSPARENT,
+        COLOR_3DFACE, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{CB_GETLBTEXT, CB_GETLBTEXTLEN, WM_GETFONT};
 
@@ -7979,14 +8438,27 @@ unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     // frame draws is its focus mark.
     let in_field = state & ODS_COMBOBOXEDIT != 0;
     let selected = state & ODS_SELECTED != 0 && !disabled && !in_field;
-    let (face, ink) = if disabled {
-        (COLOR_3DFACE, COLOR_GRAYTEXT)
-    } else if selected {
-        (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT)
+    // A list row lies on the text box fill and its hover is a rounded pill, as
+    // in Windows 11's own lists (#1169); the closed field and a disabled combo
+    // keep the system colours.
+    let ink = if !in_field && !disabled {
+        let style = edit_style();
+        FillRect(hdc, &rc, style.brush);
+        if selected {
+            draw_item_pill(hdc, rc, dpi_for(di.hwndItem), &style);
+            style.colors.item_text_hot
+        } else {
+            style.colors.text
+        }
     } else {
-        (COLOR_WINDOW, COLOR_WINDOWTEXT)
+        let (face, ink) = if disabled {
+            (COLOR_3DFACE, COLOR_GRAYTEXT)
+        } else {
+            (COLOR_WINDOW, COLOR_WINDOWTEXT)
+        };
+        FillRect(hdc, &rc, GetSysColorBrush(face));
+        GetSysColor(ink)
     };
-    FillRect(hdc, &rc, GetSysColorBrush(face));
 
     // An empty combo asks to be drawn with item id -1: just the background.
     let Ok(index) = usize::try_from(di.itemID as i32) else {
@@ -8014,7 +8486,7 @@ unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     let font = SendMessageW(di.hwndItem, WM_GETFONT, None, None).0;
     let old = (font != 0).then(|| SelectObject(hdc, HGDIOBJ(font as *mut c_void)));
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, COLORREF(GetSysColor(ink)));
+    SetTextColor(hdc, COLORREF(ink));
     DrawTextW(
         hdc,
         &mut text,
@@ -8300,21 +8772,27 @@ struct RawForm {
     redact: bool,
 }
 
+/// The Active provider combo's selection as `RawForm::provider_choice`. A
+/// control that was never created, or one with nothing selected, is
+/// `usize::MAX` (no choice), which keeps the stored order. A null window would
+/// read 0, which is "ChatGPT first" (#782).
+fn provider_choice_from(cursel: Option<isize>) -> usize {
+    match cursel {
+        Some(i) if i >= 0 => i as usize,
+        _ => usize::MAX,
+    }
+}
+
 /// Reads every control into a [`RawForm`], without yet folding it into a
 /// [`Config`]. Split out from [`read_form`] so Save can validate the raw
 /// values (#344) before committing to `build_config`'s fallback behavior.
 fn read_raw_form(inner: &SettingsInner) -> RawForm {
     let hwnd = inner.hwnd;
     RawForm {
-        provider_choice: unsafe {
-            SendMessageW(
-                get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).unwrap_or(HWND(std::ptr::null_mut())),
-                CB_GETCURSEL,
-                None,
-                None,
-            )
-            .0 as usize
-        },
+        provider_choice: provider_choice_from(
+            get_dlg_item(hwnd, ID_ACTIVE_PROVIDER)
+                .map(|h| unsafe { SendMessageW(h, CB_GETCURSEL, None, None).0 }),
+        ),
         ollama_model: combo_selected_text(hwnd, ID_OLLAMA_MODEL),
         openai_key: get_dlg_item(hwnd, ID_OPENAI_KEY)
             .map(get_text)
@@ -11491,6 +11969,55 @@ mod tests {
         });
     }
 
+    /// #1143: a combo that is disabled, hidden or opened does not keep the
+    /// hovered border, whether or not Windows still sends `WM_MOUSELEAVE`.
+    #[test]
+    fn a_combo_loses_the_hover_when_disabled_hidden_or_opened() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CBN_DROPDOWN, WM_CAPTURECHANGED, WM_ENABLE, WM_MOUSEMOVE, WM_SHOWWINDOW,
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let combo = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            let hover = || unsafe {
+                SendMessageW(
+                    combo,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(0x0005_0005)),
+                );
+            };
+            let send = |msg: u32, w: usize| unsafe {
+                SendMessageW(combo, msg, Some(WPARAM(w)), Some(LPARAM(0)));
+            };
+            // Staying enabled or shown, or a capture change, are told apart.
+            hover();
+            assert!(combo_is_hovered(combo));
+            send(WM_ENABLE, 1);
+            send(WM_SHOWWINDOW, 1);
+            assert!(combo_is_hovered(combo), "enabled and shown keep the hover");
+            send(WM_ENABLE, 0);
+            assert!(!combo_is_hovered(combo), "disabled");
+            hover();
+            send(WM_SHOWWINDOW, 0);
+            assert!(!combo_is_hovered(combo), "hidden");
+            hover();
+            send(WM_CAPTURECHANGED, 0);
+            assert!(!combo_is_hovered(combo), "capture moved away");
+            hover();
+            assert!(combo_is_hovered(combo));
+            let id = ID_CARD_CORNER as usize;
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(((CBN_DROPDOWN as usize) << 16) | id)),
+                    Some(LPARAM(combo.0 as isize)),
+                );
+            }
+            assert!(!combo_is_hovered(combo), "its list opened");
+        });
+    }
+
     /// #934: the focus line is a bar along the bottom of the box, inside the
     /// border and clear of the rounded corners, at every scale.
     #[test]
@@ -11583,6 +12110,8 @@ mod tests {
             disabled_border: 0x0000_8080,
             disabled_text: 0,
             hover_border: 0x0000_0080,
+            item_hover: 0x00EE_EEEE,
+            item_text_hot: 0,
         };
         for dpi in [96u32, 240] {
             let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
@@ -11633,6 +12162,8 @@ mod tests {
             disabled_border: 0x0000_8080,
             disabled_text: 0,
             hover_border: 0x0000_0080,
+            item_hover: 0x00EE_EEEE,
+            item_text_hot: 0,
         };
         let (w, h) = (to_px(120, 96), to_px(ROW_H, 96));
         let (screen, dc, bmp) = unsafe {
@@ -13441,6 +13972,14 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_provider_combo_reads_as_no_selection() {
+        assert_eq!(provider_choice_from(None), usize::MAX);
+        assert_eq!(provider_choice_from(Some(-1)), usize::MAX);
+        assert_eq!(provider_choice_from(Some(0)), 0);
+        assert_eq!(provider_choice_from(Some(2)), 2);
+    }
+
+    #[test]
     fn build_config_applies_edited_fields() {
         let original = Config::default();
         let mut raw = raw_from(&original);
@@ -13570,13 +14109,14 @@ mod tests {
     /// Draws a combo's selected item through the real `draw_combo_item` into
     /// a white bitmap and returns the first column with ink, and the width.
     fn first_ink_column(dpi: u32, disabled: bool) -> (i32, i32) {
-        let (first, w, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
+        let (first, w, _, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
         (first, w)
     }
 
     /// [`first_ink_column`] for any item state; also returns the item's
-    /// background colour (its top-left pixel as a `COLORREF`).
-    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32) {
+    /// colour at its middle right (clear of the text, as a `COLORREF`) and
+    /// at its top-left pixel.
+    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32, u32) {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, DeleteDC, GdiFlush, SelectObject, BITMAPINFO,
@@ -13618,7 +14158,7 @@ mod tests {
         }
         let (w, h) = (300i32, 24i32);
         let mut first = -1;
-        let back;
+        let (back, corner);
         unsafe {
             let dc = CreateCompatibleDC(None);
             let bmi = BITMAPINFO {
@@ -13658,7 +14198,12 @@ mod tests {
             let _ = GdiFlush();
             let px = std::slice::from_raw_parts(pixels as *const u8, (w * h * 4) as usize);
             let bg = [px[0], px[1], px[2]];
-            back = u32::from(px[2]) | u32::from(px[1]) << 8 | u32::from(px[0]) << 16;
+            let at = |x: i32, y: i32| {
+                let i = ((y * w + x) * 4) as usize;
+                u32::from(px[i + 2]) | u32::from(px[i + 1]) << 8 | u32::from(px[i]) << 16
+            };
+            corner = at(0, 0);
+            back = at(w - 24, h / 2);
             'cols: for x in 0..w {
                 for y in 0..h {
                     let i = ((y * w + x) * 4) as usize;
@@ -13673,7 +14218,7 @@ mod tests {
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(combo);
         }
-        (first, w, back)
+        (first, w, back, corner)
     }
 
     #[test]
@@ -13683,11 +14228,84 @@ mod tests {
         let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) } & 0x00FF_FFFF;
         assert_ne!(window, highlight, "the check needs two different colours");
         // The closed field, focused: the combo hands us ODS_SELECTED with it.
-        let (_, _, field) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
+        let (_, _, field, _) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
         assert_eq!(field, window, "a focused field stays on the window colour");
-        // A list item under the pointer or cursor still highlights.
-        let (_, _, item) = probe_combo(96, ODS_SELECTED);
-        assert_eq!(item, highlight, "a selected list item highlights");
+        // A list item under the pointer or cursor still highlights, in the
+        // theme's own hover fill and not the system's bright blue (#1169).
+        let (_, _, item, _) = probe_combo(96, ODS_SELECTED);
+        let hover = unsafe { edit_style() }.colors.item_hover;
+        assert_eq!(item, hover, "a selected list item takes the hover fill");
+        assert_ne!(item, highlight, "and not the system highlight");
+    }
+
+    #[test]
+    fn a_list_item_is_a_rounded_pill_on_the_list_fill() {
+        use crate::ui::theme::{CONTROL_RADIUS_DP, MENU_EDGE_PAD_DP};
+        if crate::ui::card_buttons::system_high_contrast().is_some() {
+            return; // high contrast fills the whole row, square
+        }
+        let colors = unsafe { edit_style() }.colors;
+        for dpi in [96u32, 144, 240] {
+            let (_, _, idle, corner) = probe_combo(dpi, 0);
+            assert_eq!(idle, colors.fill, "an idle item is the list fill at {dpi}");
+            let (_, _, hot, hot_corner) = probe_combo(dpi, ODS_SELECTED);
+            assert_eq!(hot, colors.item_hover, "pill fill at {dpi}");
+            assert_eq!(corner, colors.fill);
+            assert_eq!(
+                hot_corner, colors.fill,
+                "the pill is inset from the row at {dpi}"
+            );
+            assert!(to_px(MENU_EDGE_PAD_DP, dpi) > 0 && to_px(CONTROL_RADIUS_DP, dpi) > 0);
+        }
+    }
+
+    /// High contrast: the hovered row is the system Highlight with
+    /// HighlightText on it, whatever the tokens say.
+    #[test]
+    fn high_contrast_list_rows_use_the_system_highlight() {
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, rgb(0, 103, 192), sys.window);
+            assert_eq!(c.item_hover, sys.highlight);
+            assert_eq!(c.item_text_hot, sys.highlight_text);
+        }
+    }
+
+    /// Every combo's drop list is the one the frame and fill are given to.
+    /// Debug builds only on purpose: it needs `GalleryWindow`, which release
+    /// builds do not contain.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_settings_combo_list_gets_the_list_subclass() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Controls::COMBOBOXINFO;
+        use windows::Win32::UI::Shell::GetWindowSubclass;
+        use windows::Win32::UI::WindowsAndMessaging::CB_GETCOMBOBOXINFO;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let w = GalleryWindow::open(HINSTANCE(h.0), Some(96)).expect("open");
+        let combo = get_dlg_item(w.hwnd(), ID_ACTIVE_PROVIDER).expect("combo");
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_GETCOMBOBOXINFO,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+            );
+            assert!(!info.hwndList.is_invalid(), "the combo has a list window");
+            let mut data = 0usize;
+            let found = GetWindowSubclass(
+                info.hwndList,
+                Some(combo_list_subclass),
+                COMBO_LIST_SUBCLASS_ID,
+                Some(&mut data),
+            );
+            assert!(found.as_bool(), "the list is subclassed");
+        }
+        drop(w);
     }
 
     /// The combo is a real Settings combo, and the body window really draws it.
@@ -16901,5 +17519,254 @@ mod tests {
             pause_label(&hk.pause),
             format!("Pause s&hortcut: {}", chord_to_string(&c))
         );
+    }
+
+    // ---- #1105: no registry or file work on the window's thread ----
+
+    thread_local! {
+        static FAKE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FAKE_SET_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FAKE_SETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn fake_is_enabled() -> bool {
+        FAKE_ON.with(|c| c.get())
+    }
+    fn fake_set_enabled(on: bool) -> anyhow::Result<()> {
+        FAKE_SETS.with(|c| c.set(c.get() + 1));
+        if FAKE_SET_FAILS.with(|c| c.get()) {
+            anyhow::bail!("denied");
+        }
+        FAKE_ON.with(|c| c.set(on));
+        Ok(())
+    }
+    fn fake_seams(on: bool, fails: bool) -> AutostartSeams {
+        FAKE_ON.with(|c| c.set(on));
+        FAKE_SET_FAILS.with(|c| c.set(fails));
+        FAKE_SETS.with(|c| c.set(0));
+        AutostartSeams {
+            is_enabled: fake_is_enabled,
+            set_enabled: fake_set_enabled,
+        }
+    }
+
+    fn ans(was: bool, now: bool, failed: bool, changed: bool) -> AutostartAnswer {
+        AutostartAnswer {
+            was,
+            now,
+            failed,
+            changed,
+        }
+    }
+
+    #[test]
+    fn the_autostart_worker_reads_only_when_asked_to_read() {
+        let a = run_autostart(AutostartJob::Read, fake_seams(true, false));
+        assert!(a.now && !a.failed && !a.changed);
+        assert_eq!(FAKE_SETS.with(|c| c.get()), 0, "a read wrote");
+    }
+
+    #[test]
+    fn the_autostart_worker_skips_a_write_that_changes_nothing() {
+        let a = run_autostart(AutostartJob::Set(true), fake_seams(true, false));
+        assert!(a.now && !a.failed && !a.changed);
+        assert_eq!(FAKE_SETS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn the_autostart_worker_reports_a_change_and_the_new_state() {
+        let a = run_autostart(AutostartJob::Set(true), fake_seams(false, false));
+        assert!(!a.was && a.now && a.changed && !a.failed);
+        let a = run_autostart(AutostartJob::Undo(false), fake_seams(true, false));
+        assert!(a.was && !a.now && a.changed && !a.failed);
+    }
+
+    #[test]
+    fn a_refused_autostart_write_reports_the_real_state_for_the_checkbox() {
+        let a = run_autostart(AutostartJob::Set(true), fake_seams(false, true));
+        assert!(a.failed && !a.changed);
+        assert!(!a.now, "the box must go back to what the registry holds");
+    }
+
+    #[test]
+    fn the_autostart_answer_decides_the_status_line() {
+        let ok = ans(false, true, false, true);
+        let bad = ans(false, false, true, false);
+        let same = ans(true, true, false, false);
+        let set = AutostartJob::Set(true);
+        assert_eq!(
+            autostart_verdict(set, &ok),
+            AutostartVerdict::Saved { was: false }
+        );
+        assert_eq!(
+            autostart_verdict(AutostartJob::Undo(false), &ok),
+            AutostartVerdict::Undone
+        );
+        assert_eq!(autostart_verdict(set, &bad), AutostartVerdict::Failed);
+        assert_eq!(
+            autostart_verdict(AutostartJob::Undo(true), &bad),
+            AutostartVerdict::Failed
+        );
+        assert_eq!(autostart_verdict(set, &same), AutostartVerdict::Quiet);
+        assert_eq!(
+            autostart_verdict(AutostartJob::Read, &ok),
+            AutostartVerdict::Quiet
+        );
+        assert_eq!(
+            autostart_verdict(AutostartJob::Read, &bad),
+            AutostartVerdict::Quiet
+        );
+    }
+
+    #[test]
+    fn only_a_click_is_queued_behind_a_running_autostart_job() {
+        assert!(queued_when_busy(AutostartJob::Set(true)));
+        assert!(
+            !queued_when_busy(AutostartJob::Read),
+            "a read would commit the placeholder"
+        );
+        assert!(!queued_when_busy(AutostartJob::Undo(true)));
+    }
+
+    #[test]
+    fn a_coalesced_read_does_not_ask_for_a_second_job() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            inner.autostart_busy = true;
+            start_autostart(inner, AutostartJob::Read);
+            assert!(!inner.autostart_again);
+            start_autostart(inner, AutostartJob::Set(true));
+            assert!(inner.autostart_again);
+        });
+    }
+
+    #[test]
+    fn the_open_time_read_replaces_the_baseline_only_when_it_applies() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let mut file = Config::default();
+            file.ui.card_seconds = 77;
+            let mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+            *inner.open_slot.lock().unwrap() = Some(Opened {
+                baseline: Some(file.clone()),
+                mtime,
+            });
+            inner.wrote = true;
+            take_open_read(inner);
+            assert_ne!(inner.baseline.ui.card_seconds, 77, "a write came first");
+            assert!(inner.file_mtime.is_none());
+            inner.wrote = false;
+            *inner.open_slot.lock().unwrap() = Some(Opened {
+                baseline: Some(file),
+                mtime,
+            });
+            take_open_read(inner);
+            assert_eq!(inner.baseline.ui.card_seconds, 77);
+            assert_eq!(inner.file_mtime, mtime);
+        });
+    }
+
+    #[test]
+    fn the_open_time_read_is_taken_only_while_it_is_still_true() {
+        assert!(open_read_applies(false, 0, false, false));
+        assert!(
+            !open_read_applies(true, 0, false, false),
+            "a write has moved the baseline"
+        );
+        assert!(!open_read_applies(false, 1, false, false));
+        assert!(
+            !open_read_applies(false, 0, true, false),
+            "a refresh already read the file"
+        );
+        assert!(!open_read_applies(false, 0, false, true), "closing");
+    }
+
+    #[test]
+    fn a_finished_autostart_job_updates_the_box_status_and_undo() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let box_ = get_dlg_item(hwnd, ID_AUTOSTART).unwrap();
+            set_checkbox(box_, true);
+            inner.autostart_busy = true;
+            *inner.autostart_slot.lock().unwrap() = Some(AutostartDone {
+                job: AutostartJob::Set(true),
+                answer: ans(false, false, true, false),
+            });
+            take_autostart(inner);
+            assert!(
+                !checkbox_checked(hwnd, ID_AUTOSTART),
+                "a failure reverts the box"
+            );
+            assert!(!inner.autostart_busy);
+            assert!(status_is(
+                hwnd,
+                &commit::failed_line(Field::Autostart.label(), AUTOSTART_FAILED)
+            ));
+            inner.autostart_busy = true;
+            *inner.autostart_slot.lock().unwrap() = Some(AutostartDone {
+                job: AutostartJob::Set(true),
+                answer: ans(false, true, false, true),
+            });
+            take_autostart(inner);
+            assert!(checkbox_checked(hwnd, ID_AUTOSTART));
+            assert!(inner.tracker.undo.is_some(), "a saved change offers Undo");
+        });
+    }
+
+    /// Only a worker, or a seam a worker calls, touches the registry or the file.
+    #[test]
+    fn nothing_on_the_ui_thread_touches_the_registry_or_the_file() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let allowed = [
+            "fn start_refresh(",
+            "fn read_file_config(",
+            "fn start_open_read(",
+            "fn start_autostart(",
+            "const REAL: AutostartSeams",
+        ];
+        let mut found = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for banned in [
+                "crate::autostart::",
+                "file_baseline(",
+                "file_mtime(",
+                "read_to_string(",
+                "std::fs::",
+            ] {
+                if !line.contains(banned) {
+                    continue;
+                }
+                found += 1;
+                let owner = lines[..=i]
+                    .iter()
+                    .rev()
+                    .find(|l| {
+                        let t = l.trim_start();
+                        t.starts_with("fn ")
+                            || t.starts_with("pub fn ")
+                            || t.starts_with("unsafe fn ")
+                            || t.starts_with("const REAL")
+                    })
+                    .copied()
+                    .unwrap_or("");
+                assert!(
+                    allowed.iter().any(|a| owner.contains(a)),
+                    "`{banned}` on line {} is in `{}`, which runs on the window's thread",
+                    i + 1,
+                    owner.trim()
+                );
+            }
+        }
+        assert!(
+            found >= 4,
+            "the scan found only {found} candidates: it checks nothing"
+        );
+        for arm in ["WM_SETTINGS_AUTOSTART =>", "WM_SETTINGS_OPENED =>"] {
+            assert!(code.contains(arm), "no `{arm}` arm");
+        }
     }
 }
