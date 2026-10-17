@@ -653,7 +653,15 @@ struct App {
     /// #42: the action being dispatched right now. It becomes `last_action`
     /// only when its run starts ([`App::note_run_started`]), not on a refusal.
     pending_action: Option<String>,
+    /// #964: what started the action being dispatched right now, so a worker
+    /// it spawns can label its egress rows. Set around one dispatch, then cleared.
+    run_trigger: Option<Trigger>,
     chain: Arc<Chain>,
+    /// #81: the knowledge folder watcher, while a usable folder is set and the
+    /// watch is alive. Dropping it asks its thread to stop.
+    knowledge_watch: Option<crate::knowledge::watch::Watcher>,
+    /// The `[knowledge] folder` text the scan and watcher were last started for.
+    knowledge_folder: String,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
     /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
@@ -882,8 +890,7 @@ pub fn run() -> Result<()> {
     // is only known on the scan thread and waits in its own notice queue.
     let knowledge_setting_problem =
         crate::knowledge::ingest::startup_problem(&config.knowledge.folder);
-    let knowledge_spawn_problem =
-        crate::knowledge::ingest::start_scan(&config.knowledge.folder).err();
+    let (knowledge_watch, knowledge_spawn_problem) = start_knowledge(&config.knowledge.folder);
     let chain = Arc::new(config.build_chain());
 
     // #105: every `Chain` built from here on asks the owner window to show
@@ -960,9 +967,12 @@ pub fn run() -> Result<()> {
         card.show_error(&headline, &detail);
     }
 
+    let knowledge_folder = config.knowledge.folder.clone();
     let mut app = Box::new(App {
         instance,
         taskbar_created_msg,
+        knowledge_watch,
+        knowledge_folder,
         config,
         unsaved: Vec::new(),
         pending_writes: Arc::default(),
@@ -986,6 +996,7 @@ pub fn run() -> Result<()> {
         look_pressed_at: None,
         last_action: None,
         pending_action: None,
+        run_trigger: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1161,6 +1172,33 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #81: whether a Reload or Settings save must start the knowledge scan and
+/// watch again: the folder text changed, or the watch ended on its own (its
+/// folder went away) and Reload is the retry. Pure.
+fn knowledge_needs_restart(started_for: &str, wanted: &str, watch_ended: bool) -> bool {
+    started_for != wanted || watch_ended
+}
+
+/// #81: starts watching the knowledge folder, then the start-up scan. The
+/// watch is armed first (`watch::start` waits for that, bounded), so a file
+/// changed while the scan walks is still seen. Returns the watcher, if one is
+/// running, and a plain sentence for whatever could not be started.
+fn start_knowledge(folder: &str) -> (Option<crate::knowledge::watch::Watcher>, Option<String>) {
+    let mut problems = Vec::new();
+    let watch = match crate::knowledge::watch::start(folder) {
+        Ok(watch) => watch,
+        Err(e) => {
+            problems.push(e);
+            None
+        }
+    };
+    if let Err(e) = crate::knowledge::ingest::start_scan(folder) {
+        problems.push(e);
+    }
+    let problem = (!problems.is_empty()).then(|| problems.join("\n\n"));
+    (watch, problem)
 }
 
 /// #1054: the start-up card for a knowledge folder that will not be indexed
@@ -2571,7 +2609,7 @@ impl App {
         self.close_options_card();
         std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         self.palette_password_manager = false;
-        self.dispatch_palette_action(id, "");
+        self.dispatch_palette_action(id, "", Trigger::Options);
     }
 
     /// #308, #393: one press of the Wingman key. What it does follows what is
@@ -2742,7 +2780,7 @@ impl App {
             PrimaryDispatch::CheckMyWork => self.ask(trigger),
             PrimaryDispatch::Other(id) => {
                 self.palette_password_manager = false;
-                self.dispatch_palette_action(&id, "");
+                self.dispatch_palette_action(&id, "", trigger);
             }
             PrimaryDispatch::Unknown(id) => {
                 let (title, reason) = unknown_primary_action_text(&id);
@@ -2803,7 +2841,7 @@ impl App {
     /// corresponding tray item already calls; there is no second,
     /// palette-only code path. A `None` target (an id the palette itself
     /// never produces) is a no-op, not a panic (rule 7).
-    fn dispatch_palette_action(&mut self, action_id: &str, line: &str) {
+    fn dispatch_palette_action(&mut self, action_id: &str, line: &str, trigger: Trigger) {
         // A run posted before Settings opened, or while a save is applied.
         if self.refuse_for_settings() {
             return;
@@ -2813,7 +2851,9 @@ impl App {
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
         self.pending_action = Some(action_id.to_string());
+        self.run_trigger = Some(trigger);
         self.dispatch_palette_target(action_id, line);
+        self.run_trigger = None;
         self.pending_action = None;
         self.password_manager_hint = false;
     }
@@ -3067,8 +3107,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
@@ -3341,8 +3383,10 @@ impl App {
             } else {
                 (action.clone(), schema.clone())
             };
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
                     // #127 step 1: find the link, check it, and hand it back for
@@ -3549,7 +3593,10 @@ impl App {
                 .and_then(Value::as_str)
                 .and_then(|url| crate::inputs::web_page::parse_target(url).ok())
                 .map_or_else(|| "this link".to_string(), |t| t.host);
-            self.pending_preview = Some(PendingPreview::FetchLink(action.id.clone()));
+            self.pending_preview = Some(PendingPreview::FetchLink(
+                action.id.clone(),
+                self.run_trigger,
+            ));
             self.pending_preview_generation = self.card.show_preview(
                 &actions::link_summary::confirm_title(&host),
                 &schema,
@@ -3766,7 +3813,7 @@ impl App {
             Some(PendingPreview::GenericReplace(action, plan)) => {
                 self.run_confirmed_generic_replace(&action, plan, confirmed);
             }
-            Some(PendingPreview::FetchLink(action_id)) => {
+            Some(PendingPreview::FetchLink(action_id, trigger)) => {
                 // #127: the user confirmed the address on the card, so this
                 // is the one place a linked page is fetched.
                 let url = confirmed
@@ -3775,7 +3822,13 @@ impl App {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 match url {
-                    Some(url) => self.run_generic_action_with(&action_id, "", Some(url)),
+                    Some(url) => {
+                        // #964: the click that confirmed is not the entry
+                        // point; the run keeps the one that opened the card.
+                        self.run_trigger = trigger;
+                        self.run_generic_action_with(&action_id, "", Some(url));
+                        self.run_trigger = None;
+                    }
                     None => {
                         let detail = self.track_error(
                             "Couldn't fetch the link",
@@ -3991,8 +4044,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
@@ -4189,8 +4244,10 @@ impl App {
         let target = self.hwnd_isize();
         let run = self.run_generation;
         let redact = self.config.capture.redact;
+        let trigger = self.run_trigger;
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
+            crate::activation::set_worker_trigger_opt(trigger);
             let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 form_fill_worker(
@@ -5364,10 +5421,10 @@ impl App {
     }
 
     /// #1011: the card for a key press or a second launch that arrived while
-    /// the tray menu was open.
+    /// the tray menu or a file dialog was open (#900).
     fn show_menu_was_open_card(&mut self) {
         self.card
-            .show_answer("The tray menu was open", "Try again.", 3, None);
+            .show_answer("A menu or dialog was open", "Try again.", 3, None);
     }
 
     /// #722: the tray menu runs with the same reentrancy policy as Settings,
@@ -5424,6 +5481,7 @@ impl App {
         self.card.set_text_scale(self.config.ui.text_scale);
         self.card
             .set_placement(self.config.ui.card_corner, &self.config.ui.card_monitor);
+        self.restart_knowledge_if_needed();
         if let Some(hook) = &self.hook {
             hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
             // #181: a Reload/Settings-save always re-syncs the pause chord
@@ -5439,6 +5497,34 @@ impl App {
         }
         self.refresh_tray_labels();
         self.sync_settings_window();
+    }
+
+    /// #81: after a Reload or a Settings save, watch and scan the folder now in
+    /// the settings, or start again after a watch that ended (its folder was
+    /// deleted or renamed). Unchanged settings with a live watch do nothing.
+    /// Problems have no start-up card to ride, so they wait for the next
+    /// result card like the scan's own notices.
+    fn restart_knowledge_if_needed(&mut self) {
+        let folder = self.config.knowledge.folder.clone();
+        let watch_ended = self
+            .knowledge_watch
+            .as_ref()
+            .is_some_and(|w| !w.is_running());
+        if !knowledge_needs_restart(&self.knowledge_folder, &folder, watch_ended) {
+            return;
+        }
+        // Stop the old watch first, so it cannot apply a batch to a root the
+        // new scan is about to retire.
+        self.knowledge_watch = None;
+        self.knowledge_folder = folder.clone();
+        let (watch, problem) = start_knowledge(&folder);
+        self.knowledge_watch = watch;
+        for text in [crate::knowledge::ingest::startup_problem(&folder), problem]
+            .into_iter()
+            .flatten()
+        {
+            crate::knowledge::notice::report(&text);
+        }
     }
 
     /// #174: `edit_settings` only needs to save when the file did not exist
@@ -6129,12 +6215,24 @@ impl App {
     /// everything instead of forming a second `&mut App` (see its doc
     /// comment). What was deferred is delivered afterwards, as
     /// `open_settings` does. The closure must not touch `self`.
+    ///
+    /// A press of the key meanwhile is answered by "A menu or dialog was
+    /// open", shown here. When the caller then puts up its own card (the import
+    /// preview, an error, "Action saved") that card replaces the note. That is
+    /// intended: the press was dropped, and the caller's card appearing right
+    /// after the dialog closes is the visible answer that Wingman is awake. When
+    /// the dialog was cancelled the caller shows nothing and the note stays.
     fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
         // Like `open_settings`: no card timers or click watcher while the
         // nested loop runs.
         self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
+        // #900: a press or a second launch meanwhile is held and answered with
+        // a card afterwards, not dropped. Only those two: the tray menu's other
+        // deferrals (a send preview, a stage, the router) would be shown under
+        // the card the caller puts up next, where Settings' policy frees them.
+        FILE_DIALOG_OPEN.with(|c| c.set(true));
         // #1013: Settings is not owned by the owner window, so the dialog does
         // not stop it, yet its Tab, Enter and Esc need the main pump this
         // loop replaces. Disabled, it is plainly out of play until the dialog
@@ -6150,6 +6248,7 @@ impl App {
                 settings::bring_to_front();
             }
         }
+        FILE_DIALOG_OPEN.with(|c| c.set(false));
         SETTINGS_OPEN.with(|c| c.set(false));
         let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -7772,6 +7871,10 @@ thread_local! {
     /// selects [`tray_menu_policy`] instead of the Settings one.
     static TRAY_MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// True while an OS file dialog runs (#900). Always set together with
+    /// `SETTINGS_OPEN`; selects [`file_dialog_policy`].
+    static FILE_DIALOG_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// True while a command chosen from the tray runs (#1012). The menu takes
     /// the foreground, so "Settings is in front" is never true for such a
     /// command; `refuse_for_settings` asks whether Settings is open instead.
@@ -8118,7 +8221,7 @@ enum PendingPreview {
     ),
     /// #127: a linked-page action's confirmation card. Carries the action's
     /// id; "Do it" starts the fetch step with the address on the card.
-    FetchLink(String),
+    FetchLink(String, Option<Trigger>),
     /// #105: a worker is blocked before a request that leaves the machine,
     /// waiting for this preview's answer. Holds the channel back to it:
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
@@ -8209,6 +8312,19 @@ fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
         | WM_APP_PAUSE_TOGGLE
         | WM_APP_HOTKEY
         | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
+        _ => settings_reentrancy_policy(msg, taskbar_created_msg),
+    }
+}
+
+/// #900: the policy while an OS file dialog is open. The card is hidden first
+/// (as for Settings), so the Settings policy stands, with one change: a press
+/// of the Wingman key or a second launch is deferred, not dropped, so it ends
+/// in a card (`DeferredMessage::KeyDuringMenu`/`ActivateDuringMenu`). The tray
+/// menu's other deferrals do not apply: they exist to keep a card that is
+/// still up, and none is, so they stay freed as Settings frees them.
+fn file_dialog_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
+    match msg {
+        WM_APP_HOTKEY | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
         _ => settings_reentrancy_policy(msg, taskbar_created_msg),
     }
 }
@@ -8722,6 +8838,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         }
     }
     let _from_tray = TrayCommandScope::enter();
+    app.run_trigger = Some(Trigger::Tray);
     match decode(id) {
         MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
         MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
@@ -8774,6 +8891,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     }
     // Not after Quit: the window (and `app`) may already be gone.
     if !matches!(decode(id), MenuChoice::Command(cmd::QUIT)) {
+        app.run_trigger = None;
         app.password_manager_hint = false;
     }
     LRESULT(0)
@@ -8948,6 +9066,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         let policy = if TRAY_MENU_OPEN.with(|c| c.get()) {
             tray_menu_policy(msg, taskbar_created_msg)
+        } else if FILE_DIALOG_OPEN.with(|c| c.get()) {
+            file_dialog_policy(msg, taskbar_created_msg)
         } else {
             settings_reentrancy_policy(msg, taskbar_created_msg)
         };
@@ -9213,7 +9333,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // through the same dispatch table the palette's rows were built
             // from.
             let run = unsafe { *Box::from_raw(lparam.0 as *mut palette_model::PaletteRun) };
-            app.dispatch_palette_action(&run.id, &run.line);
+            app.dispatch_palette_action(&run.id, &run.line, Trigger::Palette);
             LRESULT(0)
         }
         WM_APP_FIRST_RUN => {
@@ -9826,6 +9946,66 @@ mod tests {
         }
     }
 
+    /// #900: a key press or second launch during a file dialog gets the same
+    /// deferred card the tray menu gives it, not a silent drop.
+    #[test]
+    fn a_file_dialog_defers_a_press_and_a_second_launch_like_the_menu() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn run_os_dialog<T>(", "\n    }\n");
+        assert!(!body.is_empty());
+        let on = body
+            .find("FILE_DIALOG_OPEN.with(|c| c.set(true))")
+            .expect("run_os_dialog never selects the file dialog policy");
+        let run = body.find("dialog()").expect("no dialog call");
+        let off = body
+            .find("FILE_DIALOG_OPEN.with(|c| c.set(false))")
+            .expect("run_os_dialog never clears the file dialog policy");
+        assert!(
+            on < run && run < off,
+            "set before the dialog, cleared after"
+        );
+        // wnd_proc reads the cell, or the policy is wired to nothing.
+        let wnd = body_between(&src, "let policy = if TRAY_MENU_OPEN", "};");
+        assert!(wnd.contains("FILE_DIALOG_OPEN") && wnd.contains("file_dialog_policy"));
+        // And the policy it selects defers both, never ignores them.
+        for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE] {
+            assert_eq!(super::file_dialog_policy(id, 0), SettingsReentrancy::Defer);
+        }
+    }
+
+    /// #900: nothing else the tray menu defers is delivered during a file
+    /// dialog. The card is hidden, so a send preview, a stage, a first-run
+    /// answer or a router result would be shown under the card the caller puts
+    /// up next (or strand a blocked worker behind it). They stay freed, as
+    /// Settings frees them, and every other id matches the Settings policy.
+    #[test]
+    fn a_file_dialog_frees_what_settings_frees_except_the_press_and_the_second_launch() {
+        use super::file_dialog_policy;
+        for msg in [
+            WM_APP_SEND_PREVIEW,
+            WM_APP_PENDING_STAGE,
+            WM_APP_FIRST_RUN,
+            WM_APP_ROUTER_RESULT,
+        ] {
+            assert_eq!(file_dialog_policy(msg, 0), SettingsReentrancy::Ignore);
+            assert_ne!(super::tray_menu_policy(msg, 0), SettingsReentrancy::Ignore);
+            // Ignored ids have their boxed payload freed in wnd_proc.
+        }
+        let mut checked = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            if [WM_APP_HOTKEY, WM_APP_ACTIVATE].contains(id) {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                file_dialog_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                settings_reentrancy_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                "{name}"
+            );
+        }
+        assert!(checked > 10, "the registry scan found {checked} ids");
+    }
+
     /// The gate is in the one place every model action starts, before the
     /// busy/paused check and any capture, and nothing keeps a press for later.
     #[test]
@@ -9912,7 +10092,7 @@ mod tests {
         );
         let handler = body_between(&src, "        WM_APP_PALETTE_RUN => {", "\n        }\n");
         assert!(
-            handler.contains("dispatch_palette_action(&run.id, &run.line)"),
+            handler.contains("dispatch_palette_action(&run.id, &run.line, Trigger::Palette)"),
             "{handler}"
         );
         let worker = body_between(
@@ -11154,29 +11334,58 @@ mod tests {
     #[test]
     fn opening_the_palette_sends_no_model_request() {
         let src = lf(include_str!("app.rs"));
-        let start = src
-            .find("    fn toggle_palette(&mut self) {")
-            .expect("toggle_palette exists");
-        let body = &src[start..];
-        let end = body.find("\n    }\n").expect("toggle_palette ends");
-        let body = &body[..end];
-        assert!(
-            body.contains("palette.show("),
-            "the scan found the wrong body"
-        );
-        for forbidden in [
-            "show_options_card",
-            "router_worker",
-            "capture::",
-            "grab_raw",
-            "thread::spawn",
-            "set_router_pending",
-        ] {
-            assert!(
-                !body.contains(forbidden),
-                "toggle_palette starts a request again: {forbidden}"
-            );
+        // The body of `fn name(&mut self` or `fn name(&self`, up to the first
+        // method-closing brace.
+        let body_of = |name: &str| -> Option<String> {
+            let start = ["(&mut self", "(&self"]
+                .iter()
+                .find_map(|recv| src.find(&format!("    fn {name}{recv}")))?;
+            let body = &src[start..];
+            Some(body[..body.find("\n    }\n")?].to_owned())
+        };
+        // Everything `toggle_palette` reaches through `self.helper(` calls
+        // defined in this file, so a request hidden behind a new helper is
+        // found too (#886).
+        let mut todo = vec!["toggle_palette".to_owned()];
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(name) = todo.pop() {
+            if seen.contains(&name) {
+                continue;
+            }
+            let Some(body) = body_of(&name) else {
+                continue;
+            };
+            if name == "toggle_palette" {
+                assert!(
+                    body.contains("palette.show("),
+                    "the scan found the wrong body"
+                );
+            }
+            for forbidden in [
+                "show_options_card",
+                "router_worker",
+                "capture::",
+                "grab_raw",
+                "thread::spawn",
+                "set_router_pending",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "opening the palette starts a request again, in {name}: {forbidden}"
+                );
+            }
+            for (i, _) in body.match_indices("self.") {
+                let rest = &body[i + 5..];
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if rest[end..].starts_with('(') {
+                    todo.push(rest[..end].to_owned());
+                }
+            }
+            seen.push(name);
         }
+        assert!(seen.len() > 1, "the scan followed no helper calls");
     }
 
     /// #723: the stuck bound covers every provider in a chain at its own
@@ -12931,6 +13140,44 @@ mod tests {
     /// its loopback check entirely and a non-loopback-configured Ollama (or
     /// any `compat:` provider pointed off-box) keeps sending while the user
     /// believes Offline is on.
+    /// #81: a changed folder, or a watch that ended, restarts the knowledge
+    /// watch; nothing else does. The reload path and start-up both go through
+    /// `start_knowledge` (watch armed before the scan).
+    #[test]
+    fn a_reload_restarts_the_knowledge_watch_only_when_needed() {
+        assert!(!super::knowledge_needs_restart(
+            r"C:\Notes",
+            r"C:\Notes",
+            false
+        ));
+        assert!(super::knowledge_needs_restart(
+            r"C:\Notes",
+            r"C:\Other",
+            false
+        ));
+        assert!(super::knowledge_needs_restart("", r"C:\Notes", false));
+        assert!(super::knowledge_needs_restart(r"C:\Notes", "", false));
+        assert!(super::knowledge_needs_restart(
+            r"C:\Notes",
+            r"C:\Notes",
+            true
+        ));
+        let app_src = lf(include_str!("app.rs"));
+        assert!(
+            apply_config_body(&app_src).contains("restart_knowledge_if_needed()"),
+            "apply_config must restart the knowledge watch (#81)"
+        );
+        let run = app_src
+            .split("fn start_knowledge(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("start_knowledge exists");
+        let watch_at = run.find("watch::start(").expect("starts the watch");
+        let scan_at = run.find("start_scan(").expect("starts the scan");
+        assert!(watch_at < scan_at, "the watch is armed before the scan");
+        assert!(app_src.contains("start_knowledge(&config.knowledge.folder)"));
+    }
+
     #[test]
     fn apply_config_resyncs_the_mode_mirror() {
         let app_src = lf(include_str!("app.rs"));
@@ -14868,6 +15115,66 @@ mod tests {
                     "edit_settings returns after a card without arming click-away"
                 );
             }
+        }
+    }
+
+    /// #964: every entry point that can start a model call says what started
+    /// it, and every worker that can write an egress row picks that up.
+    #[test]
+    fn every_entry_point_and_model_worker_names_its_trigger() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        // Entry points: the options card, the palette, a pinned primary action.
+        assert!(
+            body_of("run_option").contains("dispatch_palette_action(id, \"\", Trigger::Options)")
+        );
+        assert!(production
+            .contains("app.dispatch_palette_action(&run.id, &run.line, Trigger::Palette)"));
+        assert!(
+            body_of("run_primary_action").contains("dispatch_palette_action(&id, \"\", trigger)")
+        );
+        // The dispatch funnel holds the trigger for the length of the run.
+        let funnel = body_of("dispatch_palette_action");
+        assert!(
+            funnel.contains("self.run_trigger = Some(trigger)"),
+            "{funnel}"
+        );
+        assert!(funnel.contains("self.run_trigger = None"), "{funnel}");
+        // The tray menu does the same for its direct commands.
+        assert!(production.contains("app.run_trigger = Some(Trigger::Tray)"));
+        // A linked-page action keeps its trigger across the confirm card.
+        let squashed: String = production.split_whitespace().collect();
+        assert!(squashed.contains("PendingPreview::FetchLink(action.id.clone(),self.run_trigger,)"));
+        assert!(squashed.contains(
+            "self.run_trigger=trigger;self.run_generic_action_with(&action_id,\"\",Some(url));"
+        ));
+        // Workers that call a model carry it into the thread.
+        for name in [
+            "add_event_from_screen",
+            "run_generic_action_with",
+            "review_this_email",
+            "fill_form_from_screen",
+        ] {
+            let body = body_of(name);
+            assert!(
+                body.contains("let trigger = self.run_trigger;"),
+                "{name} does not capture the trigger"
+            );
+            let spawn = body.find("std::thread::spawn").expect("worker spawn");
+            assert!(
+                body[spawn..].contains("crate::activation::set_worker_trigger_opt(trigger)"),
+                "{name}'s worker does not set the trigger"
+            );
         }
     }
 

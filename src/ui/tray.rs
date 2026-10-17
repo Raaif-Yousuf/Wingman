@@ -7,8 +7,8 @@
 //!
 //! [`Tray::new`] switches the icon to `NOTIFYICON_VERSION_4` via
 //! `NIM_SETVERSION` immediately after `NIM_ADD`. Under that version the
-//! shell sends semantic notifications (`NIN_SELECT` for activation via mouse
-//! *or* keyboard, `WM_CONTEXTMENU` for the menu gesture via mouse *or*
+//! shell sends semantic notifications (`NIN_SELECT` for a mouse activation,
+//! `NIN_KEYSELECT` for Enter or Space, `WM_CONTEXTMENU` for the menu gesture via mouse *or*
 //! keyboard) rather than only raw mouse messages, which is the documented,
 //! more robust way to handle the callback.
 //!
@@ -74,6 +74,24 @@ const GLYPH_SETTINGS: char = '\u{E713}';
 const GLYPH_COPY: char = '\u{E8C8}';
 const GLYPH_PLAY: char = '\u{E768}';
 const GLYPH_QUIT: char = '\u{E7E8}';
+
+/// `NIN_SELECT | NINF_KEY`: Enter or Space on the focused icon. The `windows`
+/// crate does not export it; the value is fixed by `shellapi.h`.
+const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
+
+/// The notification event of a `WM_APP_TRAY` message: the low word of
+/// `lParam` under `NOTIFYICON_VERSION_4` (the high word is the icon id).
+fn event_of(lparam: LPARAM) -> u32 {
+    (lparam.0 as u32) & 0xFFFF
+}
+
+/// Whether `event` is an activation of the icon: a left click, or `NIN_SELECT`
+/// / `NIN_KEYSELECT` (Enter and Space on the focused icon, #827). A press can
+/// deliver more than one of these; opening Settings is idempotent, so a
+/// duplicate only refocuses the window.
+fn is_activation(event: u32) -> bool {
+    event == WM_LBUTTONUP || event == NIN_SELECT || event == NIN_KEYSELECT
+}
 
 /// What a tray message asks for. See [`Tray::on_tray_message`].
 pub enum TrayEvent {
@@ -723,7 +741,7 @@ impl Tray {
     /// (see `show_menu`). The caller reads who was in front BEFORE
     /// `on_tray_message` runs (#339).
     pub fn opens_menu(lparam: LPARAM) -> bool {
-        let event = (lparam.0 as u32) & 0xFFFF;
+        let event = event_of(lparam);
         event == WM_CONTEXTMENU || event == WM_RBUTTONUP
     }
 
@@ -732,9 +750,9 @@ impl Tray {
     /// [`TrayEvent::Menu`], so the caller can drop its borrow of the app
     /// before [`PreparedMenu::track`] pumps messages.
     pub fn on_tray_message(&mut self, lparam: LPARAM) -> TrayEvent {
-        let event = (lparam.0 as u32) & 0xFFFF;
+        let event = event_of(lparam);
         match event {
-            e if e == WM_LBUTTONUP || e == NIN_SELECT => TrayEvent::Command(cmd::OPEN_SETTINGS),
+            e if is_activation(e) => TrayEvent::Command(cmd::OPEN_SETTINGS),
             e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => {
                 self.snapshot_models();
                 match self.prepare_menu() {
@@ -1726,6 +1744,32 @@ mod tests {
     }
 
     use super::*;
+
+    /// #827: under `NOTIFYICON_VERSION_4` Enter and Space on the focused icon
+    /// arrive as `NIN_KEYSELECT`, not `NIN_SELECT`. Both, and the plain left
+    /// click, open Settings; the menu gestures and noise do not.
+    #[test]
+    fn keyboard_and_mouse_activation_share_one_mapping() {
+        assert!(is_activation(WM_LBUTTONUP));
+        assert!(is_activation(NIN_SELECT));
+        assert!(is_activation(NIN_KEYSELECT));
+        assert_eq!(NIN_KEYSELECT, 0x401, "WM_USER + 1, per shellapi.h");
+        assert!(!is_activation(WM_CONTEXTMENU));
+        assert!(!is_activation(WM_RBUTTONUP));
+        assert!(!is_activation(0));
+    }
+
+    #[test]
+    fn keyselect_in_the_low_word_of_lparam_opens_settings() {
+        // Event in the low word, icon id in the high word (v4 packing).
+        let lparam = LPARAM((((7u32) << 16) | NIN_KEYSELECT) as isize);
+        assert_eq!(
+            event_of(lparam),
+            NIN_KEYSELECT,
+            "the high word must not leak into the event"
+        );
+        assert!(is_activation(event_of(lparam)));
+    }
 
     // -- Version label (#317) ------------------------------------------------
 

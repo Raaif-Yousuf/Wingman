@@ -241,14 +241,16 @@ fn font_text_height(font: HFONT, dpi: u32) -> i32 {
     }
 }
 
-/// Extracts the signed `y` client coordinate from a mouse message's
-/// `lParam` (`GET_Y_LPARAM`, winuser.h) -- not re-exported by the `windows`
-/// crate for these messages, so spelled out here the same way this file
-/// already spells out `EN_CHANGE`.
+/// Extracts the signed `x` client coordinate from a mouse message's
+/// `lParam` (`GET_X_LPARAM`, winuser.h).
 fn mouse_x(lparam: LPARAM) -> i32 {
     (lparam.0 as i32 as u32 & 0xFFFF) as u16 as i16 as i32
 }
 
+/// Extracts the signed `y` client coordinate from a mouse message's
+/// `lParam` (`GET_Y_LPARAM`, winuser.h) -- not re-exported by the `windows`
+/// crate for these messages, so spelled out here the same way this file
+/// already spells out `EN_CHANGE`.
 fn mouse_y(lparam: LPARAM) -> i32 {
     let raw = lparam.0 as i32 as u32;
     ((raw >> 16) & 0xFFFF) as u16 as i16 as i32
