@@ -4930,7 +4930,7 @@ impl App {
         }
         let rewrite = match reason {
             HideReason::Esc => {
-                self.card.hide();
+                self.hide_card();
                 self.set_watch(false);
                 return;
             }
@@ -4972,7 +4972,7 @@ impl App {
             return false;
         }
         self.drop_overlay();
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         true
     }
@@ -14249,6 +14249,38 @@ mod tests {
         assert!(
             window < acquire,
             "the owner window must be created before single_instance::acquire"
+        );
+    }
+
+    /// Every `SetTimer` id used on the main window must be distinct: two
+    /// one-shot timers sharing an id would silently replace each other.
+    /// (The card's own ids live on the card window and do not count.)
+    #[test]
+    fn main_window_timer_ids_are_distinct() {
+        use super::{KEY_WINDOW_TIMER_ID, PAUSE_TIMER_ID, RELOAD_TIMER_ID, STUCK_TIMER_ID};
+        use crate::ui::overlay::OVERLAY_TIMER_ID;
+        let ids = [
+            ("PAUSE_TIMER_ID", PAUSE_TIMER_ID),
+            ("STUCK_TIMER_ID", STUCK_TIMER_ID),
+            ("KEY_WINDOW_TIMER_ID", KEY_WINDOW_TIMER_ID),
+            ("RELOAD_TIMER_ID", RELOAD_TIMER_ID),
+            ("OVERLAY_TIMER_ID", OVERLAY_TIMER_ID),
+        ];
+        for (i, (a, x)) in ids.iter().enumerate() {
+            for (b, y) in &ids[i + 1..] {
+                assert_ne!(x, y, "{a} and {b} share a SetTimer id on the main window");
+            }
+        }
+        // A new `*_TIMER_ID` const in app.rs must be added to the list above.
+        let src = include_str!("app.rs").replace('\r', "");
+        let declared = src
+            .lines()
+            .filter(|l| l.starts_with("const ") && l.contains("_TIMER_ID: usize"))
+            .count();
+        assert_eq!(
+            declared,
+            ids.len() - 1,
+            "a timer id is missing from the list"
         );
     }
 
