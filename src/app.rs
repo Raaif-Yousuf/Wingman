@@ -1179,9 +1179,17 @@ fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
 /// replace a setup card: the user must be told which file to open.
 fn broken_file_card(problem: &str, config_path: &str) -> (String, String) {
     let (headline, detail) = config_problem_card(problem);
+    // #1036: a copy from the copilot-ask folder that failed leaves no file at
+    // `config_path`; "the file is here" would point at nothing. That problem
+    // text already names the folder that does hold the settings.
+    if !std::path::Path::new(config_path).exists() {
+        return (headline, detail);
+    }
     (
         headline,
-        format!("{detail}\n\nThe file is here (tray menu, Open config.toml):\n{config_path}"),
+        format!(
+            "{detail}\n\nThe file is here (tray menu, Help and diagnostics, Open config.toml):\n{config_path}"
+        ),
     )
 }
 
@@ -1208,7 +1216,7 @@ fn config_problem_card(problem: &str) -> (String, String) {
         format!(
             "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
              computer) and will not save over your file. Fix it, then choose Reload settings \
-             from the tray menu."
+             (tray menu, Help and diagnostics)."
         ),
     )
 }
@@ -1558,7 +1566,7 @@ impl App {
     fn readiness_gate(
         mode: Mode,
         providers: &Providers,
-        config_path: &str,
+        _config_path: &str,
     ) -> Option<(String, String)> {
         let selected = providers.build_chain_for_mode(mode, true);
         if !selected.ready_provider_names().is_empty() {
@@ -1566,18 +1574,20 @@ impl App {
         }
         Some(match mode {
             Mode::Local | Mode::Offline => (
-                "Local mode needs Ollama configured".to_string(),
-                format!(
-                    "Add \"ollama\" to providers.order and a base_url and model under [providers.ollama] in:\n{config_path}"
-                ),
+                format!("{} mode needs Ollama set up", mode.label()),
+                "Click here to open Settings, then pick Ollama (local) as the Active provider \
+                 and choose an Ollama model."
+                    .to_string(),
             ),
             Mode::Cloud => (
                 "No AI model set up yet".to_string(),
-                "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+                "Paste an API key, or install Ollama to run models on this PC for free."
+                    .to_string(),
             ),
             Mode::Auto => (
                 "No AI model set up yet".to_string(),
-                "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+                "Paste an API key, or install Ollama to run models on this PC for free."
+                    .to_string(),
             ),
         })
     }
@@ -4957,7 +4967,7 @@ impl App {
             // Rule 7: never a silent no-op.
             self.card.show_error(
                 "Couldn't open settings",
-                "Windows would not create the settings window. Try again, or edit config.toml from the tray menu.",
+                "Windows would not create the settings window. Try again, or open config.toml (tray menu, Help and diagnostics, Open config.toml).",
             );
         }
     }
@@ -10926,9 +10936,13 @@ mod tests {
             "C:\\cfg\\config.toml",
         )
         .expect("must block: local mode has no ollama configured");
-        assert_eq!(headline, "Local mode needs Ollama configured");
-        assert!(detail.contains("ollama"), "{detail}");
-        assert!(detail.contains("C:\\cfg\\config.toml"), "{detail}");
+        assert_eq!(headline, "Local mode needs Ollama set up");
+        // #1022: the way out is Settings (a click on the card), never a hand
+        // edit of the file, and the words match Settings' own labels.
+        assert!(detail.contains("Click here to open Settings"), "{detail}");
+        assert!(detail.contains("Ollama (local)"), "{detail}");
+        assert!(detail.contains("Active provider"), "{detail}");
+        assert!(!detail.contains("providers.order"), "{detail}");
     }
 
     #[test]
@@ -10936,7 +10950,8 @@ mod tests {
         let (headline, _) =
             App::readiness_gate(Mode::Offline, &cloud_ready_providers(), "config.toml")
                 .expect("must block: offline mode has no ollama configured");
-        assert_eq!(headline, "Local mode needs Ollama configured");
+        // #1022: Offline names itself, not "Local".
+        assert_eq!(headline, "Offline mode needs Ollama set up");
     }
 
     #[test]
@@ -11248,9 +11263,26 @@ mod tests {
     /// providers; the setup card must name the file, not tell the user to
     /// edit `providers.order` in the file Wingman could not read.
     #[test]
+    fn a_failed_copy_card_does_not_point_at_a_file_that_is_not_there() {
+        // #1036: nothing exists at the new path after a failed migration.
+        let missing = std::env::temp_dir()
+            .join("wingman-test-1036-no-such-dir")
+            .join("config.toml");
+        let (_, detail) = super::broken_file_card("a problem", &missing.display().to_string());
+        assert!(!detail.contains("The file is here"), "{detail}");
+        assert!(detail.contains("a problem"), "{detail}");
+        // A file that exists is still named.
+        let exe = std::env::current_exe().unwrap();
+        let (_, detail) = super::broken_file_card("a problem", &exe.display().to_string());
+        assert!(detail.contains("The file is here"), "{detail}");
+    }
+
+    #[test]
     fn a_file_that_did_not_parse_is_named_by_the_gate_and_the_empty_chain_card() {
         let problem = Some("config.toml has an error at line 3, column 1");
-        let path = "C:\\Users\\me\\config.toml";
+        // A file that exists (#1036: a path with no file gets no "file is here" line).
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let path = exe.as_str();
         let providers = nothing_configured_providers();
         let cards = [
             super::setup_gate(Mode::Offline, &providers, path, problem).expect("blocked"),
@@ -11262,6 +11294,14 @@ mod tests {
             assert!(detail.contains("line 3, column 1"), "{detail}");
             assert!(detail.contains(path), "{detail}");
             assert!(detail.contains("Open config.toml"), "{detail}");
+            // #1022: both menu items live under the Help and diagnostics
+            // submenu, and the card says so.
+            assert!(detail.contains("Help and diagnostics"), "{detail}");
+            assert_eq!(
+                detail.matches("Help and diagnostics").count(),
+                2,
+                "{detail}"
+            );
             assert!(!detail.contains("providers.order"), "{detail}");
             assert!(!detail.contains('\u{2014}'));
         }

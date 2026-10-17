@@ -78,8 +78,9 @@ use crate::ui::theme::{
     accent_fill, contrast_ratio, detect_theme, progress_ring_ink, read_accent_shades,
     relative_luminance, rgb, setting_change_affects_theme, setting_change_name, type_height_px,
     AccentShades, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT, BADGE_LOW,
-    BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE, GAP_DP, MARGIN_DP, PADDING_DP,
-    PREFERRED_FONT_FACE, TYPE_BODY_PX, TYPE_CAPTION_PX,
+    BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE, GAP_DP, GLYPH_ERROR,
+    ICON_BOX_DP, ICON_FONT_DP, MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE, SPACE_SM_DP,
+    TYPE_BODY_PX, TYPE_CAPTION_PX,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -279,6 +280,7 @@ impl Card {
             owner: None,
             open_settings_on_click: false,
             copy_details_available: false,
+            error_mark: false,
             copy_details_rect: None,
             report_rect: None,
             copy_available: false,
@@ -438,7 +440,7 @@ impl Card {
         // whatever unrelated error happened to run last. Only
         // [`Card::show_error_with_details`] -- reserved for callers that
         // just recorded the matching chain -- grows the footer.
-        self.inner.show_collapsed(headline, detail, 0, None);
+        self.inner.show_error_collapsed(headline, detail);
     }
 
     /// Like [`Card::show_error`], except the card also offers "Copy
@@ -450,7 +452,7 @@ impl Card {
     /// comment). Using this for an untracked error would let "Copy details"
     /// silently copy a stale, unrelated chain (PR #451's cold review).
     pub fn show_error_with_details(&mut self, headline: &str, detail: &str) {
-        self.inner.show_collapsed(headline, detail, 0, None);
+        self.inner.show_error_collapsed(headline, detail);
         // Set AFTER show_collapsed, which unconditionally clears this for
         // every other caller (show_answer and plain show_error included) --
         // so a later untracked error, or a later answer, can never inherit
@@ -467,7 +469,7 @@ impl Card {
     /// step for those is Settings, not more text to read.
     pub fn show_settings_needed(&mut self, headline: &str, detail: &str) {
         self.inner
-            .show_collapsed_with(headline, detail, 0, None, true);
+            .show_collapsed_with(headline, detail, 0, None, true, false);
     }
 
     pub fn hide(&mut self) {
@@ -940,6 +942,9 @@ struct Fonts {
     body: HFONT,
     /// Caption font: detail text, footer links, the status line and the badge.
     caption: HFONT,
+    /// Segoe Fluent Icons (Segoe MDL2 Assets on Windows 10): the decorative
+    /// glyphs beside the footer links and the error headline.
+    icon: HFONT,
 }
 
 impl Fonts {
@@ -948,6 +953,7 @@ impl Fonts {
             headline: HFONT(std::ptr::null_mut()),
             body: HFONT(std::ptr::null_mut()),
             caption: HFONT(std::ptr::null_mut()),
+            icon: HFONT(std::ptr::null_mut()),
         }
     }
 
@@ -961,6 +967,9 @@ impl Fonts {
             }
             if !self.caption.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.caption.0));
+            }
+            if !self.icon.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(self.icon.0));
             }
         }
     }
@@ -1033,10 +1042,16 @@ fn build_fonts(dpi: u32, text_scale: f32) -> Fonts {
         let body_lf = ramp(TYPE_BODY_PX, FW_NORMAL.0 as i32);
         let caption_lf = ramp(TYPE_CAPTION_PX, FW_NORMAL.0 as i32);
 
+        // Icons: the same face detection the palette uses, sized with the
+        // text so a glyph keeps its place beside the label.
+        let mut icon_lf = ramp(ICON_FONT_DP, FW_NORMAL.0 as i32);
+        set_face_name(&mut icon_lf, crate::ui::palette::icon_face());
+
         Fonts {
             headline: font_or_stock(&headline_lf),
             body: font_or_stock(&body_lf),
             caption: font_or_stock(&caption_lf),
+            icon: font_or_stock(&icon_lf),
         }
     }
 }
@@ -1385,6 +1400,19 @@ fn answer_clipboard_text(headline: &str, detail: &str) -> String {
     }
 }
 
+/// #973: the icon-font glyph drawn before a footer link's label. Decorative:
+/// the link's accessible name is still the label alone.
+fn footer_glyph(label: &str) -> char {
+    match label {
+        "Read aloud" => '\u{E767}',
+        "Stop reading" => '\u{E71A}',
+        "Report a problem" => '\u{E939}',
+        "Copied" => '\u{E73E}',
+        // "Copy", "Copy details" and "Couldn't copy".
+        _ => '\u{E8C8}',
+    }
+}
+
 /// Issue #531: splits the pinned footer row into the "Read aloud" link (when
 /// the card has one) and the "Copy" link beside it. Each link is as wide as
 /// its measured label; whatever does not fit is clipped to the footer, never
@@ -1614,6 +1642,9 @@ struct CardInner {
     /// path into Collapsed (`show_collapsed`, used by both `show_answer` and
     /// `show_error`) so an answer card can never inherit it.
     copy_details_available: bool,
+    /// #973: the card is an error card, so its headline carries the error
+    /// glyph. Set by `show_error_collapsed`, cleared by every other show.
+    error_mark: bool,
     /// The "Copy details" affordance's hit-test rect while Expanded, in the
     /// same client-window coordinates `WM_LBUTTONDOWN`'s `lparam` arrives
     /// in -- a pinned footer row, so unlike the headline/detail text it is
@@ -1843,7 +1874,20 @@ impl CardInner {
         auto_dismiss_secs: u32,
         difficulty: Option<Difficulty>,
     ) {
-        self.show_collapsed_with(headline, detail, auto_dismiss_secs, difficulty, false);
+        self.show_collapsed_with(
+            headline,
+            detail,
+            auto_dismiss_secs,
+            difficulty,
+            false,
+            false,
+        );
+    }
+
+    /// An error card: collapsed, never auto-dismissed, with the error glyph
+    /// beside its headline (#973).
+    fn show_error_collapsed(&mut self, headline: &str, detail: &str) {
+        self.show_collapsed_with(headline, detail, 0, None, false, true);
     }
 
     /// `open_settings` must be known before the layout runs: a setup card
@@ -1855,10 +1899,12 @@ impl CardInner {
         auto_dismiss_secs: u32,
         difficulty: Option<Difficulty>,
         open_settings: bool,
+        error: bool,
     ) {
         self.leave_preview_if_active();
         self.leave_options_if_active();
         self.reset_activation_and_timers();
+        self.error_mark = error;
         self.headline = headline.to_string();
         self.detail = detail.to_string();
         self.difficulty = difficulty;
@@ -2760,8 +2806,9 @@ impl CardInner {
         self.report_rect = None;
         if let Some(f) = footer.filter(|_| self.copy_details_available) {
             let body = self.fonts.caption;
-            let details_w = self.measure_label(body, "Copy details").0;
-            let report_w = self.measure_label(body, "Report a problem").0;
+            let indent = self.footer_icon_indent();
+            let details_w = self.measure_label(body, "Copy details").0 + indent;
+            let report_w = self.measure_label(body, "Report a problem").0 + indent;
             let gap = self.scale(FOOTER_LINK_GAP_DP);
             let (details, report) = footer_links_layout(f, Some(details_w), report_w, gap);
             self.copy_details_rect = details;
@@ -2774,12 +2821,14 @@ impl CardInner {
         self.copy_rect = None;
         if let Some(f) = footer.filter(|_| self.copy_available || self.read_aloud_available) {
             let body = self.fonts.caption;
+            let indent = self.footer_icon_indent();
             let widest = |labels: &[&str]| {
                 labels
                     .iter()
                     .map(|l| self.measure_label(body, l).0)
                     .max()
                     .unwrap_or(0)
+                    + indent
             };
             let read_w = self
                 .read_aloud_available
@@ -2948,7 +2997,59 @@ impl CardInner {
     /// site must use this (not the raw content width) so the reserved space
     /// stays in sync between measurement and drawing.
     fn headline_content_width(&self, content_w: i32) -> i32 {
-        (content_w - self.badge_reserve(self.difficulty) - self.chevron_reserve()).max(1)
+        (content_w
+            - self.badge_reserve(self.difficulty)
+            - self.chevron_reserve()
+            - self.headline_indent())
+        .max(1)
+    }
+
+    /// #973: the side of the square an icon glyph is drawn in, scaled with
+    /// the DPI and the text size.
+    fn icon_box(&self) -> i32 {
+        type_height_px(ICON_BOX_DP, self.dpi, self.text_scale)
+            .abs()
+            .max(1)
+    }
+
+    /// #973: room a footer link keeps left of its label for the glyph and the
+    /// gap after it.
+    fn footer_icon_indent(&self) -> i32 {
+        self.icon_box() + self.scale(SPACE_SM_DP)
+    }
+
+    /// #973: how far an error card's headline is moved right for the error
+    /// glyph; zero on every other card.
+    fn headline_indent(&self) -> i32 {
+        if self.error_mark {
+            self.footer_icon_indent()
+        } else {
+            0
+        }
+    }
+
+    /// #973: draws one icon glyph in a box of [`CardInner::icon_box`] at the
+    /// left of `row`, centred on its first line of `line_h`. Decorative: no
+    /// accessible name hangs off it.
+    unsafe fn draw_icon(&self, hdc: HDC, glyph: char, row: RECT, line_h: i32, color: u32) {
+        let side = self.icon_box();
+        let top = row.top + (line_h - side) / 2;
+        let rect = RECT {
+            left: row.left,
+            top,
+            right: row.left + side,
+            bottom: top + side,
+        };
+        let old = SelectObject(hdc, HGDIOBJ(self.fonts.icon.0));
+        SetTextColor(hdc, windows::Win32::Foundation::COLORREF(color));
+        let text = glyph.to_string();
+        draw_text_line(
+            hdc,
+            &text,
+            rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old);
     }
 
     /// #885: a collapsed click-to-open-Settings card draws its detail line
@@ -3228,12 +3329,14 @@ impl CardInner {
             .min(max_headline_h)
             .max(headline_line_h);
 
+        let indent = self.headline_indent();
         let headline_rect = RECT {
-            left: rc.left + padding,
+            left: rc.left + padding + indent,
             top: rc.top + padding,
-            right: rc.left + padding + headline_w,
+            right: rc.left + padding + indent + headline_w,
             bottom: rc.top + padding + headline_h,
         };
+        self.paint_error_mark(hdc, headline_rect, headline_line_h, palette);
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
         draw_text_line(
@@ -3316,12 +3419,19 @@ impl CardInner {
             .max(self.line_height(self.fonts.headline));
 
         let y0 = content_top - self.scroll_offset;
+        let indent = self.headline_indent();
         let headline_rect = RECT {
-            left: content_left,
+            left: content_left + indent,
             top: y0,
-            right: content_left + headline_w,
+            right: content_left + indent + headline_w,
             bottom: y0 + headline_h,
         };
+        self.paint_error_mark(
+            hdc,
+            headline_rect,
+            self.line_height(self.fonts.headline).max(1),
+            palette,
+        );
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
         draw_text_line(
@@ -3375,7 +3485,7 @@ impl CardInner {
             // Anchored off `content_bottom` (the scroll area's own bottom
             // edge, #425) and left of the badge reservation, so it never
             // lands on the "Copy details" footer or the difficulty badge.
-            let cx = content_left + headline_w - self.scale(CHEVRON_HALF_DP);
+            let cx = content_left + indent + headline_w - self.scale(CHEVRON_HALF_DP);
             let cy = content_bottom - line_h / 2;
             self.draw_chevron(hdc, cx, cy, palette.detail);
         }
@@ -3396,12 +3506,20 @@ impl CardInner {
         let _ = SelectClipRgn(hdc, None);
         SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
+        let indent = self.footer_icon_indent();
+        let line_h = self.line_height(self.fonts.caption).max(1);
         for (rect, label) in links {
             if let Some(rect) = rect {
+                self.draw_icon(hdc, footer_glyph(label), rect, line_h, palette.link);
+                SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
+                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
                 draw_text_line(
                     hdc,
                     label,
-                    rect,
+                    RECT {
+                        left: (rect.left + indent).min(rect.right),
+                        ..rect
+                    },
                     DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
                 );
             }
@@ -3426,6 +3544,27 @@ impl CardInner {
             };
             frame_rect(hdc, &inner, 1, palette.bg);
         }
+    }
+
+    /// #973: the error glyph in the danger colour, in the indent left of an
+    /// error card's headline (`headline_rect` is already moved past it). A
+    /// no-op on every other card. High contrast takes the system text colour
+    /// through the palette's `danger`.
+    unsafe fn paint_error_mark(
+        &self,
+        hdc: HDC,
+        headline_rect: RECT,
+        line_h: i32,
+        palette: &Palette,
+    ) {
+        if !self.error_mark {
+            return;
+        }
+        let row = RECT {
+            left: headline_rect.left - self.headline_indent(),
+            ..headline_rect
+        };
+        self.draw_icon(hdc, GLYPH_ERROR, row, line_h, palette.danger);
     }
 
     fn link_rect(&self, link: FooterLink) -> Option<RECT> {
@@ -5629,6 +5768,46 @@ mod tests {
             .inner
             .handle_message(WM_DWMCOLORIZATIONCOLORCHANGED_MSG, WPARAM(0), LPARAM(0));
         assert_eq!(card.inner.accent_reads, reads + 1);
+    }
+
+    // -- glyph icons on the footer links and the error headline (#973) ------
+
+    #[test]
+    fn each_footer_label_has_its_own_glyph() {
+        assert_eq!(footer_glyph("Copy"), '\u{E8C8}');
+        assert_eq!(footer_glyph("Copy details"), '\u{E8C8}');
+        assert_eq!(footer_glyph("Read aloud"), '\u{E767}');
+        assert_eq!(footer_glyph("Stop reading"), '\u{E71A}');
+        assert_eq!(footer_glyph("Report a problem"), '\u{E939}');
+        assert_eq!(footer_glyph("Copied"), '\u{E73E}');
+    }
+
+    #[test]
+    fn an_error_card_reserves_room_for_its_glyph_and_an_answer_card_does_not() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error("Couldn't read the screen", "detail");
+        assert!(card.inner.error_mark);
+        assert!(card.inner.headline_indent() > 0);
+        let narrow = card.inner.headline_content_width(400);
+        card.show_answer("Answer", "detail", 0, None);
+        assert!(!card.inner.error_mark, "an answer never inherits the mark");
+        assert_eq!(card.inner.headline_indent(), 0);
+        assert!(card.inner.headline_content_width(400) > narrow);
+    }
+
+    #[test]
+    fn a_footer_link_is_wide_enough_for_its_glyph_and_label() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let rect = card.inner.copy_details_rect.expect("Copy details");
+        let label = card
+            .inner
+            .measure_label(card.inner.fonts.caption, "Copy details")
+            .0;
+        assert!(rect.right - rect.left >= label + card.inner.footer_icon_indent());
     }
 
     // -- "Copy details" affordance on an expanded error card (#425) --------
