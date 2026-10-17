@@ -137,12 +137,26 @@ documents have none.
 A labelled secret is a value after a word such as `password`, `pwd`, `pin`,
 `secret`, `token`, `api key`, `Passwort`, `mot de passe` or `contraseña`
 (any capitals). `password: hunter2`, `pwd=abc` and `"pin": "1234"` become
-`password: [secret]` and so on. The value must follow a `:` or `=`, or, after
-a plain space, contain a digit (`PIN 1234`), so "the password policy" is left
-alone. A short word may sit between (`PIN number:`, `PIN code 1234`,
-`password for wifi:`, `Passwort lautet:`). The value ends at the next space or the end of the line. A secret
-written in some other way, such as "the password is hunter2", is not
-recognised.
+`password: [secret]` and so on. The value must follow a `:` or `=` (also the
+full-width forms), a table `|`, a tab, a comma written straight after the label
+(`password,hunter2`), or, after a plain space, contain a digit (`PIN 1234`), so
+"the password policy" is left alone. A short word may sit between (`PIN
+number:`, `PIN code 1234`, `password for wifi:`, `Passwort lautet:`), and
+Markdown emphasis around the label or value is skipped (`**Password:** x`).
+
+Where the value ends: a quoted value, to its closing quote. After `:` or `=`,
+to a `;` followed by a space or to the end of the line, so a flattened CSV row
+or JSON line (`Name: Jane; Password: a b; Role: x`) loses only the password.
+Because of that, text after `password:` on the same line is masked too, and an
+unquoted JSON value masks the rest of its line. After a table `|`, a comma or a
+tab, to the next one. After a plain space, one word. A value made only of
+punctuation is not a value.
+
+Not recognised: a secret written in a sentence ("the password is hunter2"),
+a password in the cell below a header (`password` in one row, the value in
+the next row of a raw `.md` table), and a label in other languages than the
+ones listed. The CSV and JSON readers write
+`header: value`, which is covered.
 
 ## Limits worth knowing
 

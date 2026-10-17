@@ -53,7 +53,7 @@ fn match_label(chars: &[(usize, char)], at: usize, label: &str) -> Option<usize>
             let start = i;
             while chars
                 .get(i)
-                .is_some_and(|&(_, c)| matches!(c, ' ' | '_' | '-' | '\t'))
+                .is_some_and(|&(_, c)| is_blank(c) || matches!(c, '_' | '-'))
             {
                 i += 1;
             }
@@ -71,8 +71,43 @@ fn match_label(chars: &[(usize, char)], at: usize, label: &str) -> Option<usize>
     Some(i)
 }
 
+/// A line break of any kind: a value never runs past one.
+fn is_eol(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// Whitespace that stays on the line (space, tab, no-break space, U+3000).
 fn is_blank(c: char) -> bool {
-    c == ' ' || c == '\t'
+    c.is_whitespace() && !is_eol(c)
+}
+
+/// Markdown emphasis around a label or value.
+fn is_emphasis(c: char) -> bool {
+    matches!(c, '*' | '_' | '~')
+}
+
+fn is_quote(c: char) -> bool {
+    matches!(c, '"' | '\'' | '`')
+}
+
+/// How a label and its value are joined; decides where the value ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Join {
+    /// `:`, `=` (also full width): to `; ` or the end of the line, so a
+    /// flattened CSV row ("Name: Jane; Password: a b; Role: x") keeps its
+    /// other cells and a multi-word value is masked whole.
+    Colon,
+    /// A table cell: to the next `|`.
+    Pipe,
+    /// `password,hunter2`: to the next comma.
+    Comma,
+    /// `password<TAB>hunter2`: to the next tab.
+    Tab,
+    /// Only blanks: the next word, and only when it holds a digit.
+    Space,
 }
 
 /// Short words that may sit between a label and its value: "PIN number:",
@@ -114,12 +149,15 @@ fn skip_filler(chars: &[(usize, char)], j: usize) -> usize {
 }
 
 /// Byte ranges of values that follow a secret label: `password: hunter2`,
-/// `pwd=abc`, `"pin": "1234"`, `PIN 1234`. The value runs to the next
-/// whitespace, never past the end of the line. A label alone does not count
-/// ("the password policy"): a `:` or `=` must follow it, or, with only a space,
-/// the next word must hold a digit. Spans are on character boundaries.
+/// `pwd=abc`, `"pin": "1234"`, `**Password:** x`, `| password | x |`,
+/// `password,x`, `PIN 1234`. A quoted value is masked to its closing quote (or
+/// the end of the line); see [`Join`] for the rest. A label alone does not
+/// count ("the password policy"), nor does a value of only punctuation. Spans
+/// are on character boundaries, and the scan is linear: every attempt that
+/// reads ahead either becomes a span or stops at the first letter or digit.
 fn secret_spans(text: &str) -> Vec<Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let at = |k: usize| chars.get(k).map(|&(_, c)| c);
     let mut spans = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -139,54 +177,107 @@ fn secret_spans(text: &str) -> Vec<Range<usize>> {
             continue;
         };
         // A plural label ("passwords:").
-        if chars.get(j).is_some_and(|&(_, c)| lower(c) == 's')
-            && !chars.get(j + 1).is_some_and(|&(_, c)| c.is_alphanumeric())
-        {
+        if at(j).is_some_and(|c| lower(c) == 's') && !at(j + 1).is_some_and(char::is_alphanumeric) {
             j += 1;
         }
-        if chars.get(j).is_some_and(|&(_, c)| c.is_alphanumeric()) {
+        if at(j).is_some_and(char::is_alphanumeric) {
             i += 1;
             continue;
         }
         j = skip_filler(&chars, j);
-        // A closing quote around the label (`"pin":`).
-        if chars
-            .get(j)
-            .is_some_and(|&(_, c)| matches!(c, '"' | '\'' | '`'))
-        {
+        // Emphasis or quotes closing the label (`**Password**:`, `"pin":`).
+        while at(j).is_some_and(|c| is_emphasis(c) || is_quote(c)) {
             j += 1;
         }
         let blanks_start = j;
-        while chars.get(j).is_some_and(|&(_, c)| is_blank(c)) {
+        let mut has_tab = false;
+        while let Some(c) = at(j).filter(|&c| is_blank(c)) {
+            has_tab |= c == '\t';
             j += 1;
         }
-        let spaced = j > blanks_start;
-        let explicit = chars.get(j).is_some_and(|&(_, c)| c == ':' || c == '=');
-        if explicit {
+        let join = match at(j) {
+            Some(':' | '=' | '：' | '＝') => {
+                j += 1;
+                if at(j) == Some('>') {
+                    j += 1;
+                }
+                Join::Colon
+            }
+            Some('|') => {
+                j += 1;
+                Join::Pipe
+            }
+            Some(',') if j == blanks_start && at(j + 1).is_some_and(|c| !c.is_whitespace()) => {
+                j += 1;
+                Join::Comma
+            }
+            _ if has_tab => Join::Tab,
+            _ if j > blanks_start => Join::Space,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        while at(j).is_some_and(is_blank) {
             j += 1;
-            if chars.get(j).is_some_and(|&(_, c)| c == '>') {
-                j += 1;
+        }
+        // Emphasis after the separator: `**Password:** x` closes before the
+        // value, `**x**` is part of it.
+        let mut value_begin = j;
+        while at(value_begin).is_some_and(is_emphasis) {
+            value_begin += 1;
+        }
+        let mut span_begin = j;
+        if value_begin > j && at(value_begin).is_some_and(is_blank) {
+            while at(value_begin).is_some_and(is_blank) {
+                value_begin += 1;
             }
-            while chars.get(j).is_some_and(|&(_, c)| is_blank(c)) {
-                j += 1;
+            span_begin = value_begin;
+        }
+        let (stop, content) = match at(value_begin).filter(|&c| is_quote(c)) {
+            Some(q) => {
+                let mut e = value_begin + 1;
+                while at(e).is_some_and(|c| c != q && !is_eol(c)) {
+                    e += 1;
+                }
+                let stop = if at(e) == Some(q) { e + 1 } else { e };
+                (stop, value_begin + 1..e)
             }
-        } else if !spaced {
+            None => {
+                let mut e = value_begin;
+                while let Some(c) = at(e) {
+                    let ends = is_eol(c)
+                        || match join {
+                            Join::Colon => {
+                                c == ';' && !at(e + 1).is_some_and(|n| !n.is_whitespace())
+                            }
+                            Join::Pipe => c == '|',
+                            Join::Comma => c == ',',
+                            Join::Tab => c == '\t',
+                            Join::Space => c.is_whitespace(),
+                        };
+                    if ends {
+                        break;
+                    }
+                    e += 1;
+                }
+                while e > value_begin && at(e - 1).is_some_and(is_blank) {
+                    e -= 1;
+                }
+                (e, value_begin..e)
+            }
+        };
+        let value = &chars[content];
+        let holds_value = value.iter().any(|&(_, c)| c.is_alphanumeric())
+            && (join != Join::Space || value.iter().any(|&(_, c)| c.is_ascii_digit()));
+        if !holds_value || span_begin >= stop {
             i += 1;
             continue;
         }
-        let value_start = j;
-        while chars.get(j).is_some_and(|&(_, c)| !c.is_whitespace()) {
-            j += 1;
-        }
-        let value = &chars[value_start..j];
-        if value.is_empty() || (!explicit && !value.iter().any(|&(_, c)| c.is_ascii_digit())) {
-            i += 1;
-            continue;
-        }
-        let start = chars[value_start].0;
-        let stop = chars.get(j).map_or(text.len(), |&(b, _)| b);
-        spans.push(start..stop);
-        i = j;
+        let from = chars[span_begin].0;
+        let to = chars.get(stop).map_or(text.len(), |&(b, _)| b);
+        spans.push(from..to);
+        i = stop;
     }
     spans
 }
@@ -269,10 +360,7 @@ mod tests {
     fn a_labelled_secret_value_is_masked_and_the_label_kept() {
         for (text, want) in [
             ("password: hunter2", "password: [secret]"),
-            (
-                "Password = hunter2 and more",
-                "Password = [secret] and more",
-            ),
+            ("Password = hunter2 and more", "Password = [secret]"),
             ("pwd=abc123;port=1", "pwd=[secret]"),
             ("PIN 1234 for the door", "PIN [secret] for the door"),
             ("Secret: s3cr3t.", "Secret: [secret]"),
@@ -282,7 +370,7 @@ mod tests {
             ("client_secret: abc", "client_secret: [secret]"),
             (
                 "{\"pin\": \"1234\", \"x\": 1}",
-                "{\"pin\": [secret] \"x\": 1}",
+                "{\"pin\": [secret], \"x\": 1}",
             ),
             ("passwords: a1", "passwords: [secret]"),
             ("Passwort: geheim", "Passwort: [secret]"),
@@ -293,6 +381,99 @@ mod tests {
         ] {
             assert_eq!(mask_sensitive(text), want, "input: {text}");
         }
+    }
+
+    #[test]
+    fn quoted_values_are_masked_whole_without_the_comma() {
+        for (text, want) in [
+            ("password: 'a b c'", "password: [secret]"),
+            (
+                "password: \"a b c\" and more",
+                "password: [secret] and more",
+            ),
+            (
+                "{\"password\": \"correct horse battery\"}",
+                "{\"password\": [secret]}",
+            ),
+            (
+                "{\"pin\": \"x y\", \"user\": \"bob\"}",
+                "{\"pin\": [secret], \"user\": \"bob\"}",
+            ),
+            ("pwd = `a b`", "pwd = [secret]"),
+            ("password: \"never closed words", "password: [secret]"),
+            (
+                "password: \"closed on line one\nnext: line",
+                "password: [secret]\nnext: line",
+            ),
+        ] {
+            assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+    }
+
+    #[test]
+    fn markdown_emphasis_around_label_and_value_is_skipped() {
+        for (text, want) in [
+            ("**Password:** hunter2", "**Password:** [secret]"),
+            ("**Password**: hunter2", "**Password**: [secret]"),
+            ("__pin__: 1234", "__pin__: [secret]"),
+            ("*secret*: abc", "*secret*: [secret]"),
+            ("**pin** 1234", "**pin** [secret]"),
+            ("password: **hunter2**", "password: [secret]"),
+            ("password: _abc", "password: [secret]"),
+        ] {
+            assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+        // Nothing but punctuation after the separator is no value.
+        for text in ["password: ***", "password: ---", "pin: ** \nx"] {
+            assert_eq!(mask_sensitive(text), text, "input: {text}");
+        }
+    }
+
+    #[test]
+    fn odd_blanks_and_full_width_separators_count() {
+        for (text, want) in [
+            ("password:\u{a0}hunter2", "password:\u{a0}[secret]"),
+            (
+                "password\u{3000}:\u{3000}hunter2",
+                "password\u{3000}:\u{3000}[secret]",
+            ),
+            ("password：hunter2", "password：[secret]"),
+            ("pin＝1234", "pin＝[secret]"),
+            ("PIN\u{a0}1234", "PIN\u{a0}[secret]"),
+        ] {
+            assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+        // A line separator still ends the value.
+        assert_eq!(
+            mask_sensitive("password:\u{2028}hunter2"),
+            "password:\u{2028}hunter2"
+        );
+    }
+
+    #[test]
+    fn table_cells_and_flattened_csv_rows_are_masked() {
+        for (text, want) in [
+            ("| password | hunter2 |", "| password | [secret] |"),
+            ("|**PIN**|1234|", "|**PIN**|[secret]|"),
+            ("password,hunter2,bob", "password,[secret],bob"),
+            ("password\thunter2\tbob", "password\t[secret]\tbob"),
+            // The CSV reader writes "header: value; header: value".
+            (
+                "Name: Jane; Password: correct horse; Role: Engineer",
+                "Name: Jane; Password: [secret]; Role: Engineer",
+            ),
+            // The JSON reader writes "path: value", one per line.
+            (
+                "login.password: two words\nuser: bob",
+                "login.password: [secret]\nuser: bob",
+            ),
+        ] {
+            assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+        assert_eq!(
+            mask_sensitive("password, then click"),
+            "password, then click"
+        );
     }
 
     #[test]
@@ -363,6 +544,10 @@ mod tests {
             "mot de ",
             "passwords",
             &"pin ".repeat(5000),
+            &"password: ** ".repeat(20_000),
+            &"password: \"".repeat(20_000),
+            &"| pin |".repeat(20_000),
+            &"password,".repeat(20_000),
             &format!("pin{}", " ".repeat(50_000)),
         ] {
             let _ = mask_sensitive(text);
