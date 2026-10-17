@@ -1935,7 +1935,7 @@ impl Providers {
     /// [`Providers::build_chain`]'s own behavior. The list
     /// `diagnostics::provider_rows` iterates (issue #201).
     pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
-        self.order
+        self.effective_order()
             .iter()
             .filter_map(|name| self.describe(name))
             .collect()
@@ -1948,13 +1948,37 @@ impl Providers {
     /// `hotkeys`/`capture`/`ui` along for no reason.
     pub fn build_chain(&self) -> Chain {
         let providers: Vec<Box<dyn Provider>> = self
-            .order
+            .effective_order()
             .iter()
             .filter_map(|name| self.provider_for(name))
             .collect();
         Chain::new(providers)
     }
 
+    /// #923: `order` as it is used at runtime. Gemini is not in the stock
+    /// order, and #780 stops an untouched Save from adding it, so a Gemini key
+    /// pasted on its own would never be used. When `order` is still the stock
+    /// pair (in either order, so choosing Anthropic as Active keeps this) and
+    /// Gemini is the only cloud provider with a key, it is appended here, in
+    /// memory only: the file is not rewritten. If OpenAI or Anthropic has a
+    /// key too, nothing is added, so a `GEMINI_API_KEY` set for another tool
+    /// never becomes a silent extra fallback that gets screenshots. An edited
+    /// order is a choice and is returned unchanged.
+    fn effective_order(&self) -> Vec<String> {
+        let mut order = self.order.clone();
+        let stock_pair = order.len() == 2
+            && order.iter().any(|n| n == "openai")
+            && order.iter().any(|n| n == "anthropic");
+        let keyed = |key: &str| !unreadable_as_empty(key).is_empty();
+        if stock_pair
+            && keyed(&self.gemini.api_key)
+            && !keyed(&self.openai.api_key)
+            && !keyed(&self.anthropic.api_key)
+        {
+            order.push("gemini".to_string());
+        }
+        order
+    }
     /// #133: whether a first press with no model ready may look for a local
     /// Ollama and adopt it. Only for a setup the user has not shaped: Cloud
     /// mode is a choice to use the cloud, an `order` that already names
@@ -2019,7 +2043,12 @@ impl Providers {
     /// requests through. Kept as the one place both callers share so they
     /// can never disagree about which providers `mode` allows.
     pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
-        crate::mode::select_providers(mode, &self.order, ollama_ready, &self.local_compat_names())
+        crate::mode::select_providers(
+            mode,
+            &self.effective_order(),
+            ollama_ready,
+            &self.local_compat_names(),
+        )
     }
 
     /// #16: a compat endpoint's locality is decided by its configured
@@ -2875,6 +2904,91 @@ model = "gpt-5.5"
             Mode::Auto => "auto",
             Mode::Offline => "offline",
         }
+    }
+
+    /// #923: a Gemini key on a stock order is reachable without anyone
+    /// editing `providers.order` (#780 keeps an untouched Save from adding it).
+    #[test]
+    fn a_gemini_key_on_the_stock_order_is_reachable_in_every_cloud_path() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        assert_eq!(p.order, Providers::default().order, "the file is untouched");
+        assert_eq!(
+            p.build_chain_for_mode(Mode::Cloud, false).provider_names(),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Auto, false),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.build_chain().ready_provider_names(),
+            vec!["gemini"],
+            "the mode-agnostic chain sees it too"
+        );
+        assert_eq!(p.order, Providers::default().order, "never rewritten");
+    }
+
+    #[test]
+    fn a_gemini_entry_without_a_key_is_not_added_to_the_stock_order() {
+        let p = Config::default().providers;
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+        let mut unreadable = Config::default().providers;
+        unreadable.gemini.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert_eq!(
+            unreadable.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+    }
+
+    /// A Gemini key set globally for another tool must not become a silent
+    /// extra fallback: Gemini is added only when no other cloud provider has a
+    /// key, in either order of the stock pair (choosing Anthropic as Active
+    /// makes it anthropic, openai).
+    #[test]
+    fn gemini_is_added_only_when_it_is_the_only_keyed_cloud_provider() {
+        for order in [["openai", "anthropic"], ["anthropic", "openai"]] {
+            let mut p = Config::default().providers;
+            p.order = order.iter().map(|s| s.to_string()).collect();
+            p.gemini.api_key = "g-key".to_string();
+            let mut expected: Vec<String> = p.order.clone();
+            expected.push("gemini".to_string());
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), expected);
+            p.openai.api_key = "o-key".to_string();
+            assert_eq!(
+                p.selected_order_for_mode(Mode::Cloud, false),
+                order,
+                "another keyed provider: no gemini"
+            );
+            p.openai.api_key.clear();
+            p.anthropic.api_key = "a-key".to_string();
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), order);
+        }
+    }
+    /// A hand-edited order is a choice: a keyed vendor the user left out
+    /// stays out, so a screenshot never goes to a vendor they removed.
+    #[test]
+    fn a_hand_edited_order_is_never_widened_by_a_gemini_key() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        p.order = vec!["anthropic".to_string()];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["anthropic"]
+        );
+        p.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+        ];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic", "gemini"],
+            "no duplicate when it is already listed"
+        );
     }
 
     #[test]
