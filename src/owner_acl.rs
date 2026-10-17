@@ -251,7 +251,22 @@ pub(crate) mod dacl {
         } else {
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        parse_sddl(&text)
+        let (protected, mut aces) = parse_sddl(&text);
+        // SDDL writes the local Administrator (RID 500) and Guest (501)
+        // accounts as `LA` and `LG` (MEASURED 2026-10-17: the CI runner's user
+        // is the local Administrator, so its own entry came back as `LA`).
+        let me = super::current_user_sid().unwrap();
+        for ace in &mut aces {
+            let rid = match ace.sid.as_str() {
+                "LA" => "-500",
+                "LG" => "-501",
+                _ => continue,
+            };
+            if me.ends_with(rid) {
+                ace.sid = me.clone();
+            }
+        }
+        (protected, aces)
     }
 
     /// Gives `path` an explicit full-control entry for `sid` (`*S-1-...`),
