@@ -21,6 +21,7 @@
 
 use super::*;
 use crate::options_keys::{self, Choice, Claim, WM_APP_OPTIONS_CHOICE};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// One button: the action id it runs and the label shown on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,39 +86,88 @@ const MA_NOACTIVATE: isize = 3;
 /// The hint line under the rows. It names exactly what the hook claims, so a
 /// digit that is not claimed never looks like it should have worked.
 pub(super) fn hint_text(count: usize, claim_keys: bool) -> String {
+    hint_parts(count, claim_keys)
+        .into_iter()
+        .map(|p| match p {
+            HintPart::Text(s) | HintPart::Key(s) => s,
+        })
+        .collect()
+}
+
+/// A piece of the hint line: plain words, or a key drawn as a keycap (#1049).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HintPart {
+    Text(String),
+    Key(String),
+}
+
+/// The hint line as words and keys. Joined, the parts are exactly
+/// [`hint_text`], which stays the one string the window is named with.
+pub(super) fn hint_parts(count: usize, claim_keys: bool) -> Vec<HintPart> {
     let count = count.min(options_keys::MAX_OPTIONS);
+    let text = |s: &str| HintPart::Text(s.to_string());
+    let key = |s: &str| HintPart::Key(s.to_string());
     match (claim_keys, count) {
-        (true, 0) => "Esc to close".to_string(),
-        (true, 1) => "Press 1, or Esc to close".to_string(),
-        (true, n) => format!("Press 1 to {n}, or Esc to close"),
-        (false, 0) => "Click elsewhere to close".to_string(),
-        (false, _) => "Click an option, or click elsewhere to close".to_string(),
+        (true, 0) => vec![key("Esc"), text(" to close")],
+        (true, 1) => vec![
+            text("Press "),
+            key("1"),
+            text(", or "),
+            key("Esc"),
+            text(" to close"),
+        ],
+        (true, n) => vec![
+            text("Press "),
+            key("1"),
+            text(" to "),
+            HintPart::Key(n.to_string()),
+            text(", or "),
+            key("Esc"),
+            text(" to close"),
+        ],
+        (false, 0) => vec![text("Click elsewhere to close")],
+        (false, _) => vec![text("Click an option, or click elsewhere to close")],
     }
+}
+
+/// The left edge of each run of the hint line when the runs (text and keycaps,
+/// `widths` wide) sit one after the other from 0. `None` when they are wider
+/// than `avail` or there are none, so the caller draws the plain line, which
+/// ends in an ellipsis, rather than a clipped row of chips.
+pub(super) fn hint_run_lefts(widths: &[i32], avail: i32) -> Option<Vec<i32>> {
+    if widths.is_empty() {
+        return None;
+    }
+    let mut x = 0;
+    let mut lefts = Vec::with_capacity(widths.len());
+    for w in widths {
+        lefts.push(x);
+        x += (*w).max(0);
+    }
+    (x <= avail).then_some(lefts)
+}
+
+/// A hint keycap's width: its text and a pad each side, but never narrower
+/// than it is tall, so a digit is the same square as on the rows.
+pub(super) fn hint_keycap_width(text_w: i32, height: i32, pad: i32) -> i32 {
+    (text_w + pad * 2).max(height)
 }
 
 /// `text` unchanged when `fits` accepts it, otherwise its longest prefix that
 /// still fits once an ellipsis is added (#969). GDI's `DT_END_ELLIPSIS` does not
 /// mark the cut when a wrapped paragraph is clipped by the rectangle, so the
-/// cut is made here, on `char` boundaries (never a byte slice) and after
-/// trimming the whitespace it would leave in front of the ellipsis. The cut
-/// also backs off over a joiner, variation selector, skin tone or combining
-/// mark, so it never leaves a stray joiner or parts a mark from its base.
+/// cut is made here, on grapheme-cluster boundaries (never a byte slice, never
+/// inside a flag, a ZWJ emoji, an Indic conjunct or a base with its marks) and
+/// after trimming the whitespace it would leave in front of the ellipsis.
 pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> String {
     if fits(text) {
         return text.to_string();
     }
-    // Byte offsets of the first `n` chars, for n in 0..=chars: always on a boundary.
-    let mut ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // Byte offsets of every grapheme-cluster boundary, 0 and `text.len()`
+    // included: a cut is only ever made on one of these.
+    let mut ends: Vec<usize> = text.grapheme_indices(true).map(|(i, _)| i).collect();
     ends.push(text.len());
-    let chars: Vec<char> = text.chars().collect();
-    let candidate = |mut n: usize| {
-        // A cut before a continuation, or right after a joiner, splits a cluster.
-        while n > 0 && (n < chars.len() && is_cluster_continuation(chars[n]) || chars[n - 1] == ZWJ)
-        {
-            n -= 1;
-        }
-        format!("{}\u{2026}", text[..ends[n]].trim_end())
-    };
+    let candidate = |n: usize| format!("{}\u{2026}", text[..ends[n]].trim_end());
     // Largest `n` whose prefix fits; `fits` only gets harder as `n` grows.
     let (mut lo, mut hi) = (0usize, ends.len() - 1);
     while lo < hi {
@@ -129,24 +179,6 @@ pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> Strin
         }
     }
     candidate(lo)
-}
-
-const ZWJ: char = '\u{200D}';
-
-/// A char that belongs to the one before it: a joiner, a variation selector,
-/// an emoji skin tone or a combining mark.
-fn is_cluster_continuation(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200D}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{1F3FB}'..='\u{1F3FF}'
-            | '\u{0300}'..='\u{036F}'
-            | '\u{1AB0}'..='\u{1AFF}'
-            | '\u{1DC0}'..='\u{1DFF}'
-            | '\u{20D0}'..='\u{20FF}'
-            | '\u{FE20}'..='\u{FE2F}'
-    )
 }
 
 /// The name a row button carries for assistive tech: the whole label, with
@@ -238,6 +270,47 @@ pub(super) fn options_layout(i: &LayoutInputs) -> OptionsMetrics {
 /// The keycap's side: the row minus a gap above and below.
 pub(super) fn keycap_size(row_h: i32, gap: i32) -> i32 {
     (row_h - gap * 2).max(1)
+}
+
+/// The three colours of a keycap chip.
+#[derive(Clone, Copy)]
+struct KeycapInk {
+    fill: u32,
+    edge: u32,
+    text: u32,
+}
+
+/// Draws one keycap chip, the row digits' and the hint's alike: a filled
+/// rounded square with a hairline and the key's text centred in it, in the font
+/// selected into `hdc`. Every GDI object made here is freed on the way out.
+unsafe fn draw_keycap(hdc: HDC, rect: RECT, text: &str, ink: KeycapInk, ring: i32, radius: i32) {
+    use windows::Win32::Foundation::COLORREF;
+    let fill = CreateSolidBrush(COLORREF(ink.fill));
+    let pen = CreatePen(PS_SOLID, ring.max(1), COLORREF(ink.edge));
+    let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    let corner = (radius * 2 / 3).max(2) * 2;
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        corner,
+        corner,
+    );
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+    let _ = DeleteObject(HGDIOBJ(fill.0));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(ink.text));
+    draw_text_line(
+        hdc,
+        text,
+        rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -670,12 +743,112 @@ impl CardInner {
 
         SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-        draw_text_line(
-            hdc,
-            &hint_text(ui.rows.len(), ui.behavior.claim_keys),
-            metrics.hint,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-        );
+        let parts = hint_parts(ui.rows.len(), ui.behavior.claim_keys);
+        if !self.paint_hint_with_keycaps(hdc, palette, &parts, metrics.hint) {
+            // No keys to draw, or no room for the chips: the plain line, which
+            // ends in an ellipsis where it is too wide.
+            draw_text_line(
+                hdc,
+                &hint_text(ui.rows.len(), ui.behavior.claim_keys),
+                metrics.hint,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+    }
+
+    /// Draws the hint with each key as a keycap, the same chip as the row
+    /// digits (#1049). The body font is selected and the hint colour set. Returns
+    /// false, drawing nothing, when there is no key or the runs do not fit in
+    /// `area`.
+    unsafe fn paint_hint_with_keycaps(
+        &self,
+        hdc: HDC,
+        palette: &Palette,
+        parts: &[HintPart],
+        area: RECT,
+    ) -> bool {
+        use windows::Win32::Foundation::{COLORREF, SIZE};
+        use windows::Win32::Graphics::Gdi::GetTextExtentPoint32W;
+        if !parts.iter().any(|p| matches!(p, HintPart::Key(_))) {
+            return false;
+        }
+        let area_h = area.bottom - area.top;
+        let ring = self.scale(1);
+        let chip_h = (area_h - ring * 2).max(1);
+        let pad = self.scale(GAP_DP) / 2;
+        // Air each side of a chip, so a comma after it does not touch it.
+        let margin = self.scale(2);
+        let widths: Vec<i32> = parts
+            .iter()
+            .map(|part| {
+                let (HintPart::Text(s) | HintPart::Key(s)) = part;
+                let wide: Vec<u16> = s.encode_utf16().collect();
+                let mut size = SIZE::default();
+                if !GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
+                    size.cx = 0;
+                }
+                match part {
+                    HintPart::Text(_) => size.cx,
+                    HintPart::Key(_) => hint_keycap_width(size.cx, chip_h, pad) + margin * 2,
+                }
+            })
+            .collect();
+        let Some(lefts) = hint_run_lefts(&widths, area.right - area.left) else {
+            return false;
+        };
+        let high_contrast = self.theme == Theme::HighContrast;
+        let ink = if high_contrast {
+            self.sys.window_text
+        } else {
+            palette.detail
+        };
+        let edge = if high_contrast {
+            self.sys.window_text
+        } else {
+            palette.border
+        };
+        let fill = crate::ui::theme::keycap_fill(self.theme, palette.bg, palette.headline);
+        let radius = self.scale(CONTROL_RADIUS_DP);
+        for ((part, left), width) in parts.iter().zip(lefts).zip(widths) {
+            let x = area.left + left;
+            match part {
+                HintPart::Text(s) => {
+                    SetTextColor(hdc, COLORREF(palette.hint));
+                    draw_text_line(
+                        hdc,
+                        s,
+                        RECT {
+                            left: x,
+                            right: x + width,
+                            ..area
+                        },
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+                HintPart::Key(s) => {
+                    let top = area.top + (area_h - chip_h) / 2;
+                    let chip = RECT {
+                        left: x + margin,
+                        top,
+                        right: x + width - margin,
+                        bottom: top + chip_h,
+                    };
+                    draw_keycap(
+                        hdc,
+                        chip,
+                        s,
+                        KeycapInk {
+                            fill,
+                            edge,
+                            text: ink,
+                        },
+                        ring,
+                        radius,
+                    );
+                }
+            }
+        }
+        true
     }
 
     /// Paints one row button for `WM_DRAWITEM`: the shared outline button,
@@ -749,37 +922,18 @@ impl CardInner {
                 palette.border
             };
             let cap_fill = crate::ui::theme::keycap_fill(self.theme, look.fill, palette.headline);
-            let fill = CreateSolidBrush(windows::Win32::Foundation::COLORREF(cap_fill));
-            let pen = CreatePen(
-                PS_SOLID,
-                ring.max(1),
-                windows::Win32::Foundation::COLORREF(cap_edge),
-            );
-            let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
-            let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
-            let corner = (radius * 2 / 3).max(2) * 2;
-            let _ = RoundRect(
-                hdc,
-                cap_rect.left,
-                cap_rect.top,
-                cap_rect.right,
-                cap_rect.bottom,
-                corner,
-                corner,
-            );
-            SelectObject(hdc, old_pen);
-            SelectObject(hdc, old_brush);
-            let _ = DeleteObject(HGDIOBJ(pen.0));
-            let _ = DeleteObject(HGDIOBJ(fill.0));
-
             let old_font = SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(cap_ink));
-            draw_text_line(
+            draw_keycap(
                 hdc,
-                &(index + 1).to_string(),
                 cap_rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                &(index + 1).to_string(),
+                KeycapInk {
+                    fill: cap_fill,
+                    edge: cap_edge,
+                    text: cap_ink,
+                },
+                ring,
+                radius,
             );
 
             // The label wraps to at most two lines (the row grew to fit, see
@@ -981,6 +1135,56 @@ mod tests {
     }
 
     #[test]
+    fn the_hint_parts_read_as_the_hint_text() {
+        // One accessible string: the parts joined are exactly the text the
+        // window is named with, so drawing keycaps changes nothing for a reader.
+        for claim in [true, false] {
+            for count in 0..=5 {
+                let joined: String = hint_parts(count, claim)
+                    .iter()
+                    .map(|p| match p {
+                        HintPart::Text(s) | HintPart::Key(s) => s.as_str(),
+                    })
+                    .collect();
+                assert_eq!(joined, hint_text(count, claim), "{count} {claim}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_keys_in_the_hint_are_the_keys_it_names() {
+        let keys = |count, claim| -> Vec<String> {
+            hint_parts(count, claim)
+                .into_iter()
+                .filter_map(|p| match p {
+                    HintPart::Key(k) => Some(k),
+                    HintPart::Text(_) => None,
+                })
+                .collect()
+        };
+        assert_eq!(keys(0, true), ["Esc"]);
+        assert_eq!(keys(1, true), ["1", "Esc"]);
+        assert_eq!(keys(3, true), ["1", "3", "Esc"]);
+        assert_eq!(keys(9, true), ["1", "4", "Esc"]);
+        // With the claim off no key is promised, so no keycap is drawn.
+        assert!(keys(3, false).is_empty());
+    }
+
+    #[test]
+    fn hint_runs_sit_edge_to_edge_and_none_when_too_wide() {
+        assert_eq!(hint_run_lefts(&[10, 20, 5], 100), Some(vec![0, 10, 30]));
+        assert_eq!(hint_run_lefts(&[10, 20, 5], 35), Some(vec![0, 10, 30]));
+        assert_eq!(hint_run_lefts(&[10, 20, 5], 34), None);
+        assert_eq!(hint_run_lefts(&[], 100), None);
+    }
+
+    #[test]
+    fn a_hint_keycap_is_at_least_square_and_grows_with_its_text() {
+        assert_eq!(hint_keycap_width(6, 18, 4), 18, "a digit is a square");
+        assert_eq!(hint_keycap_width(24, 18, 4), 32, "Esc is wider");
+    }
+
+    #[test]
     fn a_row_is_named_by_its_whole_label_and_position() {
         assert_eq!(
             accessible_name("Review this email to Dana", 1, 3),
@@ -1081,34 +1285,82 @@ mod tests {
     }
 
     #[test]
-    fn ellipsize_never_leaves_half_a_cluster_before_the_mark() {
-        // Family emoji (joined by U+200D), a heart with a variation selector,
-        // a thumb with a skin tone, and e + combining acute.
+    fn ellipsize_never_splits_a_grapheme_cluster() {
+        use unicode_segmentation::UnicodeSegmentation;
         let texts = [
+            // Family emoji joined by ZWJ.
             "ab\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}cd",
+            // Heart with a variation selector, thumb with a skin tone.
             "ab\u{2764}\u{FE0F}cd",
             "ab\u{1F44D}\u{1F3FD}cd",
+            // e + combining acute.
             "ab\u{0065}\u{0301}cd",
+            // Two flags (regional-indicator pairs).
+            "ab\u{1F1FA}\u{1F1F8}cd\u{1F1EC}\u{1F1E7}ef",
+            // Subdivision flag (tag characters).
+            "ab\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}cd",
+            // Devanagari conjuncts and vowel signs.
+            "\u{0915}\u{094D}\u{0937}\u{093F}\u{0928}\u{094D}\u{0926}\u{0940}ab",
+            // Hebrew with points.
+            "\u{05D1}\u{05B0}\u{05BC}\u{05E8}\u{05B5}ab",
+            // Hangul jamo sequence.
+            "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}ab",
+            // Keycap sequence and CRLF.
+            "a1\u{FE0F}\u{20E3}b\r\nc",
         ];
         for text in texts {
-            for limit in 1..text.chars().count() {
+            let boundaries: Vec<usize> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+            assert!(boundaries.len() > 3, "{text:?}");
+            for limit in 0..=text.chars().count() {
                 let out = ellipsize_to_fit(text, |s| s.chars().count() <= limit);
-                let kept: Vec<char> = out.trim_end_matches('\u{2026}').chars().collect();
-                let last = kept.last().copied();
+                let kept = out.strip_suffix('\u{2026}').unwrap_or(&out);
                 assert!(
-                    last != Some('\u{200D}'),
-                    "stray joiner in {out:?} (limit {limit})"
+                    text.starts_with(kept),
+                    "{out:?} is not a prefix of {text:?}"
                 );
-                // The text after the cut never starts with a continuation, so
-                // no mark was separated from its base.
-                let rest: Vec<char> = text.chars().skip(kept.len()).collect();
+                // The cut sits on a cluster boundary (trimmed spaces aside).
+                let cut = kept.len();
+                let cut_ok = cut == text.len()
+                    || boundaries.contains(&cut)
+                    || text[cut..].chars().next().is_some_and(char::is_whitespace);
                 assert!(
-                    !matches!(
-                        rest.first(),
-                        Some('\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{0301}' | '\u{1F3FD}')
-                    ),
-                    "cut inside a cluster in {out:?} (limit {limit})"
+                    cut_ok,
+                    "cut inside a cluster in {out:?} (limit {limit}) of {text:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn ellipsize_keeps_a_whole_flag_or_drops_it() {
+        let text = "ab\u{1F1FA}\u{1F1F8}cd";
+        // Room for "ab" plus one more char: the flag (two chars) does not fit.
+        let out = ellipsize_to_fit(text, |s| s.chars().count() <= 4);
+        assert_eq!(out, "ab\u{2026}");
+        let out = ellipsize_to_fit(text, |s| s.chars().count() <= 5);
+        assert_eq!(out, "ab\u{1F1FA}\u{1F1F8}\u{2026}");
+    }
+
+    #[test]
+    fn ellipsize_keeps_an_indic_conjunct_whole() {
+        let text = "\u{0915}\u{094D}\u{0937}\u{093F}ab";
+        // The conjunct is four chars: with room for three, none of it stays.
+        let out = ellipsize_to_fit(text, |s| s.chars().count() <= 3);
+        assert_eq!(out, "\u{2026}");
+    }
+
+    #[test]
+    fn ellipsize_never_panics_on_odd_input() {
+        for text in [
+            "",
+            "\u{200D}",
+            "\u{0301}\u{0301}",
+            "\u{1F1FA}",
+            "\u{1F1FA}\u{1F1F8}\u{1F1EC}",
+            "\u{E0067}\u{E007F}",
+        ] {
+            for limit in 0..6 {
+                let _ = ellipsize_to_fit(text, |s| s.chars().count() <= limit);
             }
         }
     }
