@@ -7946,6 +7946,9 @@ unsafe fn subclass_combo_list(combo: HWND) {
 /// The drop list's own frame and background: the border colour of the closed
 /// combo around it, and the list fill where no row reaches (#1169). Only cached
 /// brushes. A list long enough for a scroll bar lets the system draw that first.
+/// The list is a top-level popup, so `dpi_for` reads its own monitor's scale on
+/// every paint (nothing is cached per DPI); the cached colours are dropped on a
+/// theme change and the list repaints whole each time it opens.
 unsafe extern "system" fn combo_list_subclass(
     hwnd: HWND,
     msg: u32,
@@ -13885,7 +13888,21 @@ mod tests {
         }
     }
 
+    /// High contrast: the hovered row is the system Highlight with
+    /// HighlightText on it, whatever the tokens say.
+    #[test]
+    fn high_contrast_list_rows_use_the_system_highlight() {
+        use crate::ui::theme::{HC_BLACK, HC_WHITE};
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, rgb(0, 103, 192), sys.window);
+            assert_eq!(c.item_hover, sys.highlight);
+            assert_eq!(c.item_text_hot, sys.highlight_text);
+        }
+    }
+
     /// Every combo's drop list is the one the frame and fill are given to.
+    /// Debug builds only on purpose: it needs `GalleryWindow`, which release
+    /// builds do not contain.
     #[cfg(debug_assertions)]
     #[test]
     fn a_settings_combo_list_gets_the_list_subclass() {
