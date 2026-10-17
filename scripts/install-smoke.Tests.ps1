@@ -27,6 +27,17 @@ Describe 'Get-OwnerOnlyAclProblem' {
             [pscustomobject]@{ Sid = 'S-1-5-32-545'; Type = 'Allow' }
         )
         Get-OwnerOnlyAclProblem -IsProtected $true -Rules $rules -OwnerSid $me | Should -Match 'S-1-5-32-545'
+        $rules = @([pscustomobject]@{ Sid = 'S-1-1-0'; Type = 'Allow' }, $rules[0])
+        Get-OwnerOnlyAclProblem -IsProtected $true -Rules $rules -OwnerSid $me | Should -Match 'S-1-1-0'
+    }
+
+    It 'allows SYSTEM and Administrators beside the owner' {
+        $rules = @(
+            [pscustomobject]@{ Sid = 'S-1-5-18'; Type = 'Allow' },
+            [pscustomobject]@{ Sid = 'S-1-5-32-544'; Type = 'Allow' },
+            [pscustomobject]@{ Sid = $me; Type = 'Allow' }
+        )
+        @(Get-OwnerOnlyAclProblem -IsProtected $true -Rules $rules -OwnerSid $me).Count | Should -Be 0
     }
 
     It 'flags a list with no owner entry or no entries' {

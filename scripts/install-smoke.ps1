@@ -57,18 +57,25 @@ $ReleaseZipExtras = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'PRIVACY.md', 'config
 # when it is owner-only. Pure: takes the facts, not the file.
 #   $IsProtected  inheritance is cut (icacls /inheritance:r)
 #   $Rules        objects with Sid (string) and Type ('Allow' or 'Deny')
+#   $AlsoAllowed  SIDs that may hold an entry besides the owner. Default:
+#                 SYSTEM and Administrators. MEASURED 2026-10-17 on a GitHub
+#                 runner (elevated admin): after the app's icacls restriction
+#                 the file still lists SYSTEM, Administrators and the user as
+#                 explicit entries, from the creating token's default DACL.
+#                 Both can take the file anyway; anyone else is a problem.
 function Get-OwnerOnlyAclProblem {
     param(
         [Parameter(Mandatory)] [bool] $IsProtected,
         [AllowEmptyCollection()] [object[]] $Rules = @(),
-        [Parameter(Mandatory)] [string] $OwnerSid
+        [Parameter(Mandatory)] [string] $OwnerSid,
+        [string[]] $AlsoAllowed = @('S-1-5-18', 'S-1-5-32-544')
     )
     $problems = @()
     if (-not $IsProtected) { $problems += 'inheritance is not cut, so the folder entries apply too' }
     $allow = @($Rules | Where-Object { $_.Type -eq 'Allow' })
     if ($allow.Count -eq 0) { $problems += 'no allow entry at all' }
     foreach ($r in $allow) {
-        if ($r.Sid -ne $OwnerSid) { $problems += "access is also granted to $($r.Sid)" }
+        if ($r.Sid -ne $OwnerSid -and $AlsoAllowed -notcontains $r.Sid) { $problems += "access is also granted to $($r.Sid)" }
     }
     if ($allow.Count -gt 0 -and -not ($allow | Where-Object { $_.Sid -eq $OwnerSid })) {
         $problems += 'the current user has no allow entry'
