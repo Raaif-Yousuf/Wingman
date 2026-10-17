@@ -33,7 +33,7 @@ pub(crate) use egress::append_pending_at;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode};
 
@@ -106,6 +106,15 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+/// Whether `e` says the file is damaged, without counting it as an event.
+fn is_corrupt(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    )
+}
+
 /// Counts corrupt-class errors seen anywhere in the process (#660). A store
 /// whose own count is behind checks itself the next time it is locked.
 static CORRUPT_EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -117,7 +126,37 @@ pub struct Store {
     path: Option<PathBuf>,
     /// The value of [`CORRUPT_EVENTS`] this store last checked itself against.
     seen: AtomicU64,
+    /// Only touched with `conn` held, so it never contends.
+    heal_state: Mutex<HealState>,
+    /// How long a failed heal waits before the next try.
+    retry_gap: Duration,
 }
+
+/// What a store that could not finish healing remembers between locks.
+#[derive(Default)]
+struct HealState {
+    /// A failed heal does not run again before this.
+    not_before: Option<Instant>,
+    /// Whether the user was already told the store is stuck.
+    told: bool,
+    /// Set once the damaged file was moved here but no fresh database is open
+    /// yet: the next try only has to open one.
+    kept: Option<PathBuf>,
+}
+
+/// How a heal ended.
+enum Heal {
+    /// Nothing to do: not this store's file, or a check that could not run.
+    Fine,
+    /// A fresh database replaced the damaged one; the notice for the user.
+    Replaced(String),
+    /// Could not finish. The text says why. Tried again after [`RETRY_GAP`].
+    Stuck(String),
+}
+
+/// Wait between tries after a heal failed, so a file that stays held does not
+/// get a `quick_check` on every lock.
+const RETRY_GAP: Duration = Duration::from_secs(30);
 
 impl Store {
     /// Opens (creating if needed) the database at `path`: pragmas, then
@@ -137,6 +176,8 @@ impl Store {
             conn: Mutex::new(conn),
             path,
             seen: AtomicU64::new(CORRUPT_EVENTS.load(Ordering::SeqCst)),
+            heal_state: Mutex::new(HealState::default()),
+            retry_gap: RETRY_GAP,
         }
     }
 
@@ -162,40 +203,79 @@ impl Store {
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // A panic elsewhere must not take the history with it.
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let events = CORRUPT_EVENTS.load(Ordering::SeqCst);
-        if self.seen.swap(events, Ordering::SeqCst) != events {
-            if let Some(notice) = self.heal(&mut conn) {
-                note_recovery(notice);
-            }
+        // One atomic load when nothing happened. The later store is safe: the
+        // connection mutex is held.
+        if self.seen.load(Ordering::SeqCst) != CORRUPT_EVENTS.load(Ordering::SeqCst) {
+            self.check(&mut conn);
         }
         conn
     }
 
-    /// Runs after a corrupt-class error was seen (#660): if this store's file
-    /// really is damaged, closes it, moves it aside and opens a fresh one.
-    /// Returns the notice for the user, or `None` when the file is fine (the
-    /// error came from another store, or was not about the file). Never
-    /// deletes the damaged file. If it cannot be moved or a fresh file cannot
-    /// be made, the store is left empty so every later call is an ordinary
-    /// error (the callers already handle those) and the notice says so.
-    fn heal(&self, conn: &mut Connection) -> Option<String> {
-        let path = self.path.as_ref()?;
-        if !file_is_damaged(conn) {
-            return None;
+    /// Runs after a corrupt-class error was seen (#660), with `conn` held.
+    fn check(&self, conn: &mut Connection) {
+        let mut state = self.heal_state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if state.not_before.is_some_and(|t| now < t) {
+            return;
         }
-        // Closing the old connection first: Windows will not rename an open file.
-        let empty = Connection::open_in_memory().ok()?;
-        drop(std::mem::replace(conn, empty));
-        let kept = match quarantine(path) {
-            Ok(kept) => kept,
-            Err(e) => return Some(runtime_recovery_notice(Err(&e.to_string()))),
+        match self.heal(conn, &mut state) {
+            Heal::Fine => {
+                self.seen
+                    .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            Heal::Replaced(notice) => {
+                *state = HealState::default();
+                self.seen
+                    .store(CORRUPT_EVENTS.load(Ordering::SeqCst), Ordering::SeqCst);
+                note_recovery(notice);
+            }
+            Heal::Stuck(why) => {
+                // `seen` stays behind, so a later lock tries again.
+                state.not_before = Some(now + self.retry_gap);
+                if !state.told {
+                    state.told = true;
+                    note_recovery(runtime_recovery_notice(Err(&why)));
+                }
+            }
+        }
+    }
+
+    /// If this store's file really is damaged, closes it, moves it aside and
+    /// opens a fresh one. Never deletes the damaged file. When it cannot move
+    /// the file, the original stays open (calls keep failing with ordinary
+    /// errors the callers already handle) and a later lock tries again.
+    fn heal(&self, conn: &mut Connection, state: &mut HealState) -> Heal {
+        let Some(path) = self.path.as_ref() else {
+            return Heal::Fine;
         };
+        if state.kept.is_none() {
+            if !file_is_damaged(conn) {
+                return Heal::Fine;
+            }
+            // Closing the old connection first: Windows will not rename an open file.
+            let Ok(empty) = Connection::open_in_memory() else {
+                return Heal::Fine;
+            };
+            drop(std::mem::replace(conn, empty));
+            match quarantine(path) {
+                Ok(kept) => state.kept = Some(kept),
+                Err(e) => {
+                    reopen_original(conn, path);
+                    return Heal::Stuck(e.to_string());
+                }
+            }
+        }
+        // A `-wal` left behind would replay the old log onto the new file.
+        if side_files_present(path) {
+            return Heal::Stuck("old log files are still in the way".into());
+        }
         match Store::open_at(path) {
             Ok(fresh) => {
                 *conn = fresh.conn.into_inner().unwrap_or_else(|e| e.into_inner());
-                Some(runtime_recovery_notice(Ok(&kept)))
+                let kept = state.kept.take().unwrap_or_else(|| path.clone());
+                Heal::Replaced(runtime_recovery_notice(Ok(&kept)))
             }
-            Err(e) => Some(runtime_recovery_notice(Err(&e.to_string()))),
+            Err(e) => Heal::Stuck(e.to_string()),
         }
     }
 
@@ -213,8 +293,31 @@ impl Store {
 fn file_is_damaged(conn: &Connection) -> bool {
     match conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0)) {
         Ok(verdict) => verdict != "ok",
-        Err(e) => matches!(StoreError::from(e), StoreError::Corrupt(_)),
+        Err(e) => is_corrupt(&e),
     }
+}
+
+/// Puts the original file back under `conn` after it could not be moved. Its
+/// errors keep surfacing; nothing is created if the file is gone.
+fn reopen_original(conn: &mut Connection, path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    if let Ok(c) = Connection::open(path) {
+        let _ = configure(&c);
+        *conn = c;
+    }
+}
+
+/// True if a `-wal` or `-shm` sits next to `path`.
+fn side_files_present(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    ["-wal", "-shm"]
+        .iter()
+        .any(|suffix| path.with_file_name(format!("{name}{suffix}")).exists())
 }
 
 /// The card text after a store was replaced mid-run. `Ok` holds where the
@@ -226,7 +329,7 @@ fn runtime_recovery_notice(kept: Result<&Path, &str>) -> String {
             path.display()
         ),
         Err(why) => format!(
-            "Wingman's saved data was damaged while it was running and could not be replaced ({why}), so it is not saving history until you restart Wingman. The damaged file was not deleted."
+            "Wingman's saved data was damaged while it was running and could not be replaced ({why}), so history is not being saved for now. Wingman will try again. The damaged file was not deleted."
         ),
     }
 }
@@ -257,23 +360,44 @@ fn quarantine(path: &Path) -> Result<PathBuf, StoreError> {
 
 /// [`quarantine`] with the clock reading injected (`None`: the clock failed).
 fn quarantine_at(path: &Path, now: Option<u64>) -> Result<PathBuf, StoreError> {
-    let stamp = now.unwrap_or(0);
+    let mut stamp = now.unwrap_or(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let mut main_target = path.to_path_buf();
-    for suffix in ["", "-wal", "-shm"] {
-        let from = path.with_file_name(format!("{name}{suffix}"));
-        let to = path.with_file_name(format!("{name}{suffix}.corrupt-{stamp}"));
-        if suffix.is_empty() {
-            main_target = to.clone();
+    let moves = |stamp: u64| -> Vec<(PathBuf, PathBuf)> {
+        ["", "-wal", "-shm"]
+            .iter()
+            .map(|suffix| {
+                (
+                    path.with_file_name(format!("{name}{suffix}")),
+                    path.with_file_name(format!("{name}{suffix}.corrupt-{stamp}")),
+                )
+            })
+            .collect()
+    };
+    // Never replace an earlier copy: two damaged files in one second get
+    // consecutive stamps.
+    while moves(stamp).iter().any(|(_, to)| to.exists()) {
+        stamp += 1;
+    }
+    let moves = moves(stamp);
+    let main_target = moves[0].1.clone();
+    let mut done: Vec<&(PathBuf, PathBuf)> = Vec::new();
+    for pair in &moves {
+        if !pair.0.exists() {
+            continue;
         }
-        if from.exists() {
-            std::fs::rename(&from, &to).map_err(|e| {
-                StoreError::Other(format!("could not move the damaged data aside: {e}"))
-            })?;
+        if let Err(e) = std::fs::rename(&pair.0, &pair.1) {
+            // Undo, so a stale `-wal` never meets a fresh database.
+            for (from, to) in done.iter().rev().map(|p| (&p.0, &p.1)) {
+                let _ = std::fs::rename(to, from);
+            }
+            return Err(StoreError::Other(format!(
+                "could not move the damaged data aside: {e}"
+            )));
         }
+        done.push(pair);
     }
     // With no usable clock the fresh copy is stamped 0, which would sort as
     // the oldest and be deleted at once, so nothing is pruned then.
@@ -934,7 +1058,7 @@ mod tests {
         let moved: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .filter(|e| e.file_name().to_string_lossy().contains(".db.corrupt-"))
             .collect();
         assert_eq!(moved.len(), 1);
         drop(s);
@@ -958,20 +1082,35 @@ mod tests {
         (s, dir)
     }
 
+    /// Quarantined main files only: `wingman.db.corrupt-<n>`, not the `-wal`
+    /// and `-shm` copies that come with it.
     fn damaged_copies(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.contains(".db.corrupt-") && corrupt_stamp(&name, "wingman.db").is_some()
+            })
             .count()
+    }
+
+    /// Lets the next `lock()` retry a stuck heal at once (the real wait is
+    /// `RETRY_GAP`).
+    fn expire_retry_wait(_s: &Store) {
+        _s.heal_state.lock().unwrap().not_before = None;
     }
 
     #[test]
     fn a_file_damaged_while_running_is_replaced_by_a_fresh_store() {
         let (s, dir) = store_damaged_while_open("runtime-corrupt");
 
+        // Another test's corrupt error can make this very call heal first.
         let first = s.day_total("2026-10-15");
-        assert!(matches!(first, Err(StoreError::Corrupt(_))), "{first:?}");
+        assert!(
+            matches!(first, Err(StoreError::Corrupt(_)) | Ok(None)),
+            "{first:?}"
+        );
 
         // The next call heals: the old file is kept, a fresh one works.
         assert_eq!(s.day_total("2026-10-15").unwrap(), None);
@@ -1021,6 +1160,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The file is held for a moment (antivirus, backup): the store keeps the
+    /// original file and heals on a later call instead of staying empty.
+    #[test]
+    fn a_store_that_could_not_move_the_file_heals_once_it_is_free() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (s, dir) = store_damaged_while_open("runtime-released");
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(dir.join("wingman.db"))
+            .unwrap();
+
+        assert!(s.day_total("2026-10-15").is_err());
+        expire_retry_wait(&s);
+        assert!(s.day_total("2026-10-15").is_err());
+        drop(hold);
+        expire_retry_wait(&s);
+
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None);
+        s.record_usage("2026-10-16", "a", "m", Some(0.2), None)
+            .unwrap();
+        assert!(s.day_total("2026-10-16").unwrap().is_some());
+        assert_eq!(damaged_copies(&dir), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that stays held is not checked on every lock.
+    #[test]
+    fn a_stuck_heal_waits_before_trying_again() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (s, dir) = store_damaged_while_open("runtime-wait");
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(dir.join("wingman.db"))
+            .unwrap();
+        assert!(s.day_total("2026-10-15").is_err());
+        assert!(s.day_total("2026-10-15").is_err());
+        drop(hold);
+
+        // Free now, but the wait has not passed: no heal yet.
+        assert!(s.day_total("2026-10-15").is_err());
+        assert_eq!(damaged_copies(&dir), 0);
+        expire_retry_wait(&s);
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None);
+        assert_eq!(damaged_copies(&dir), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_quarantines_in_one_second_keep_both_copies() {
+        let dir = scratch("same-second");
+        let db = dir.join("wingman.db");
+        std::fs::write(&db, b"first").unwrap();
+        let a = quarantine_at(&db, Some(500)).unwrap();
+        std::fs::write(&db, b"second").unwrap();
+        let b = quarantine_at(&db, Some(500)).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The database moved but its `-wal` could not: the move is undone, so the
+    /// stale log never meets a fresh database.
+    #[test]
+    fn a_half_finished_quarantine_is_undone() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = scratch("half-move");
+        let db = dir.join("wingman.db");
+        let wal = dir.join("wingman.db-wal");
+        std::fs::write(&db, b"main").unwrap();
+        std::fs::write(&wal, b"log").unwrap();
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&wal)
+            .unwrap();
+
+        assert!(quarantine_at(&db, Some(700)).is_err());
+        drop(hold);
+
+        assert_eq!(std::fs::read(&db).unwrap(), b"main");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"log");
+        assert_eq!(damaged_copies(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn leftover_side_files_are_noticed() {
+        let dir = scratch("side-files");
+        let db = dir.join("wingman.db");
+        assert!(!side_files_present(&db));
+        std::fs::write(dir.join("wingman.db-shm"), b"x").unwrap();
+        assert!(side_files_present(&db));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_runtime_notice_says_what_was_lost_and_where_the_copy_is() {
         let kept = runtime_recovery_notice(Ok(Path::new("C:/x/wingman.db.corrupt-5")));
@@ -1029,7 +1268,7 @@ mod tests {
         assert!(kept.contains("documents"), "{kept}");
         let stuck = runtime_recovery_notice(Err("in use"));
         assert!(stuck.contains("in use"), "{stuck}");
-        assert!(stuck.contains("not saving"), "{stuck}");
+        assert!(stuck.contains("not being saved"), "{stuck}");
         for t in [kept, stuck] {
             assert!(!t.contains('\u{2014}'), "{t}");
         }
