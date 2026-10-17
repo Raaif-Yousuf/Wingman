@@ -7,6 +7,17 @@ tagged release.
 
 ## [Unreleased]
 
+### Changed
+
+- One press of the Wingman key now shows the options card (a few choices for
+  what is on screen) instead of running Check my work. This costs one small
+  model call for the card, then one more for the choice you pick. To keep the
+  old one-press flow, set `primary_action = "check-my-work"` under `[hotkeys]`
+  in `config.toml`. Pressing the key again while the card is up runs the first
+  choice (never one that writes the clipboard) or closes the card.
+- Starting Wingman a second time (the Start menu, the Copilot-key picker) shows
+  the same card with only the choices that need no model, and sends nothing.
+
 ## [0.2.0] - 2026-10-16
 
 Changes since 0.1.0, grouped by what you notice. The release page has the download and its checksums.

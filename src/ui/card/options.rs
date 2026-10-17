@@ -208,6 +208,18 @@ impl Card {
         self.inner.set_options_state(generation, summary, rows)
     }
 
+    /// Whether one press of the key will run option 1, for the card showing
+    /// `generation`: only then is row 1 drawn as the default. Called when the
+    /// router's answer decides which rows there are, just before
+    /// [`Card::set_options`] repaints. A no-op for any other card.
+    pub fn set_options_key_runs_first(&mut self, generation: u32, key_runs_first: bool) {
+        if let Some(ui) = self.inner.options.as_mut() {
+            if ui.generation == generation {
+                ui.behavior.key_runs_first = key_runs_first;
+            }
+        }
+    }
+
     /// The generation of the options card on screen, `None` in every other
     /// state.
     pub fn options_generation(&self) -> Option<u32> {
@@ -1238,6 +1250,25 @@ mod tests {
         // A hidden card has nothing to put back.
         card.rearm_options_claim();
         assert_eq!(options_keys::current(), None);
+    }
+
+    #[test]
+    fn the_default_outline_follows_whether_the_key_will_run_option_one() {
+        let _g = lock();
+        let mut card = new_card();
+        card.show_options(3, "Looking at your screen", &[], BEHAVIOR);
+        assert!(!card.inner.options.as_ref().unwrap().behavior.key_runs_first);
+        // A stale generation changes nothing.
+        card.set_options_key_runs_first(2, true);
+        assert!(!card.inner.options.as_ref().unwrap().behavior.key_runs_first);
+        card.set_options_key_runs_first(3, true);
+        assert!(card.inner.options.as_ref().unwrap().behavior.key_runs_first);
+        assert!(card.set_options(3, "S", &rows(2)));
+        assert!(
+            card.inner.options.as_ref().unwrap().behavior.key_runs_first,
+            "the rows arriving keep what the router answer decided"
+        );
+        card.hide();
     }
 
     #[test]

@@ -45,6 +45,7 @@ use crate::hotkey::{
     LearnedVerdict, HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
     WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
+use crate::keypress;
 use crate::mode::{self, Mode};
 use crate::options_keys::{self, Choice, WM_APP_OPTIONS_CHOICE};
 use crate::pause::{self, PauseChoice, PauseState};
@@ -311,6 +312,51 @@ struct OptionsSession {
     /// The catalogue the router's answer is checked against and topped up from.
     /// Only held while the router works.
     catalogue: Vec<palette_model::PaletteAction>,
+    /// Per button, whether the Wingman key may run it (#308, #859): decided by
+    /// the action's own `effect`, never by the router's confidence. Empty while
+    /// the router works.
+    key_pickable: Vec<bool>,
+}
+
+/// What the Wingman key sees on the options card, from the app's session and
+/// the card's own generation. A session the card is no longer showing is no
+/// options card at all. Pure, so the key table is tested over every state.
+fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) -> keypress::Phase {
+    match (session, card_generation) {
+        (Some(s), Some(g)) if s.generation == g => {
+            if s.ids.is_empty() {
+                keypress::Phase::Looking
+            } else {
+                keypress::Phase::Options {
+                    first_key_pickable: s.key_pickable.first().copied().unwrap_or(false),
+                }
+            }
+        }
+        _ => keypress::Phase::Other,
+    }
+}
+
+/// Whether one press of the key runs option 1 (so it is drawn as the default).
+fn keypress_runs_first(key_pickable: &[bool]) -> bool {
+    key_pickable.first().copied().unwrap_or(false)
+}
+
+/// #308, #859: for each shown option, whether the key may run it. An id the
+/// catalogue does not know is not key-pickable.
+fn option_key_pickable(
+    options: &[router::RouterOption],
+    catalogue: &[palette_model::PaletteAction],
+) -> Vec<bool> {
+    options
+        .iter()
+        .take(options_keys::MAX_OPTIONS)
+        .map(|o| {
+            catalogue
+                .iter()
+                .find(|a| a.id == o.intent)
+                .is_some_and(|a| palette_model::key_pickable(a.effect))
+        })
+        .collect()
 }
 
 /// What an options-card choice message asks for, once checked against the card
@@ -1787,10 +1833,10 @@ impl App {
         }
     }
 
-    /// How the options card behaves, from `[options]`. One press of the key
-    /// does not run option 1 yet (the bare key still runs Check my work), so
-    /// no row is drawn as the default.
-    fn options_behavior(&self) -> OptionsBehavior {
+    /// How the options card behaves, from `[options]`. `key_runs_first` is
+    /// whether one press of the key will run option 1 (it is only drawn as the
+    /// default, with the accent outline, when it will).
+    fn options_behavior(&self, key_runs_first: bool) -> OptionsBehavior {
         // Read once: the claim follows this window for the card's whole life.
         let (fg, fg_is_own) = foreground_window_and_ownership();
         OptionsBehavior {
@@ -1803,7 +1849,7 @@ impl App {
                 foreground_keyboard_layout(),
                 options_keys::foreground_usable(fg, fg_is_own),
             ),
-            key_runs_first: false,
+            key_runs_first,
             foreground: fg,
         }
     }
@@ -1819,7 +1865,11 @@ impl App {
     /// capture-gate card is shown instead, and nothing is captured). A router
     /// failure of any kind is not an error card: the card shows the floor.
     /// Nothing runs until a row is picked ([`App::on_options_choice`]).
-    fn show_options_card(&mut self, trigger: Trigger) {
+    ///
+    /// `use_router` is false for a duplicate launch (the Start menu, the
+    /// Copilot-key picker): that shows the static card, the model-free options
+    /// only, and sends nothing, so it can never cost money (#308).
+    fn show_options_card(&mut self, trigger: Trigger, use_router: bool) {
         if self.busy_now() {
             self.show_busy_card();
             return;
@@ -1847,21 +1897,24 @@ impl App {
         let mode = self.config.mode;
         // The same optimistic, network-free "is anything configured" check
         // `ask`'s readiness gate uses: configured, not reachable right now.
-        let model_ready = !providers
-            .build_chain_for_mode(mode, true)
-            .ready_provider_names()
-            .is_empty();
+        let model_ready = use_router
+            && !providers
+                .build_chain_for_mode(mode, true)
+                .ready_provider_names()
+                .is_empty();
         self.options_generation = options_keys::next_generation(self.options_generation);
         let generation = self.options_generation;
-        let behavior = self.options_behavior();
 
         if !model_ready {
             let content = router::options_content(None, &catalogue, false);
             let rows = option_rows(&content.options);
+            let key_pickable = option_key_pickable(&content.options, &catalogue);
+            let behavior = self.options_behavior(keypress_runs_first(&key_pickable));
             self.options = Some(OptionsSession {
                 generation,
                 ids: rows.iter().map(|r| r.id.clone()).collect(),
                 catalogue: Vec::new(),
+                key_pickable,
             });
             self.card
                 .show_options(generation, &content.summary, &rows, behavior);
@@ -1904,7 +1957,10 @@ impl App {
             generation,
             ids: Vec::new(),
             catalogue,
+            key_pickable: Vec::new(),
         });
+        // No buttons yet, so nothing for the key to run: no default outline.
+        let behavior = self.options_behavior(false);
         self.card
             .show_options(generation, router::LOOKING_SUMMARY, &[], behavior);
         self.set_watch(true);
@@ -2007,11 +2063,15 @@ impl App {
         };
         let content = router::options_content(routed.as_ref(), &session.catalogue, true);
         let rows = option_rows(&content.options);
+        let key_pickable = option_key_pickable(&content.options, &session.catalogue);
+        self.card
+            .set_options_key_runs_first(generation, keypress_runs_first(&key_pickable));
         if self.card.set_options(generation, &content.summary, &rows) {
             self.options = Some(OptionsSession {
                 generation,
                 ids: rows.iter().map(|r| r.id.clone()).collect(),
                 catalogue: Vec::new(),
+                key_pickable,
             });
         }
     }
@@ -2044,12 +2104,56 @@ impl App {
                 }
             }
             OptionsChoiceAction::Close => self.close_options_card(),
-            OptionsChoiceAction::Run(id) => {
-                self.close_options_card();
-                std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
-                self.palette_password_manager = false;
-                self.dispatch_palette_action(&id);
+            OptionsChoiceAction::Run(id) => self.run_option(&id),
+        }
+    }
+
+    /// Hides the options card, lets it settle, and runs the chosen action
+    /// through the one dispatch. Shared by a click, a digit and the key.
+    fn run_option(&mut self, id: &str) {
+        self.close_options_card();
+        std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+        self.palette_password_manager = false;
+        self.dispatch_palette_action(id);
+    }
+
+    /// #308: one press of the Wingman key. What it does follows the options
+    /// card ([`keypress::on_key`]): while the router works it cancels, on the
+    /// card it runs option 1 when the key may, otherwise it closes the card.
+    /// With no options card it does the primary action: show the options card
+    /// (the default), or run the action `hotkeys.primary_action` names, with
+    /// no router call (`"check-my-work"` is the old one-press flow).
+    fn on_primary_key(&mut self, trigger: Trigger) {
+        let phase = key_phase_of(self.options.as_ref(), self.card.options_generation());
+        match keypress::on_key(phase) {
+            keypress::KeyAction::Close => self.close_options_card(),
+            keypress::KeyAction::RunFirst => {
+                let first = self.options.as_ref().and_then(|s| s.ids.first().cloned());
+                match first {
+                    Some(id) => self.run_option(&id),
+                    None => self.close_options_card(),
+                }
             }
+            keypress::KeyAction::Proceed => match self.config.hotkeys.primary_target() {
+                crate::config::PrimaryAction::Options => self.show_options_card(trigger, true),
+                crate::config::PrimaryAction::Action(id) => self.run_pinned_action(&id, trigger),
+            },
+        }
+    }
+
+    /// A pinned `primary_action`: the action runs at once. Check my work keeps
+    /// its own trigger (the egress log still says what started the call); every
+    /// other id goes through the palette's dispatch, which ends an id it does
+    /// not know in that action's own error card.
+    fn run_pinned_action(&mut self, id: &str, trigger: Trigger) {
+        if matches!(
+            palette_model::dispatch_target_for(id),
+            Some(DispatchTarget::CheckMyWork)
+        ) {
+            self.ask(trigger);
+        } else {
+            self.palette_password_manager = false;
+            self.dispatch_palette_action(id);
         }
     }
 
@@ -7228,7 +7332,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
         MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
         MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
-        MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card(Trigger::Tray),
+        MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card(Trigger::Tray, true),
         MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
         MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
         MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
@@ -7432,7 +7536,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         WM_APP_HOTKEY => {
             let _which = wparam.0; // both bindings do the same thing
             if !app.cancel_pending_send_preview() {
-                app.ask(Trigger::Hotkey);
+                app.on_primary_key(Trigger::Hotkey);
             }
             LRESULT(0)
         }
@@ -7450,11 +7554,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     model_action_gate(app.busy_now(), pause::is_paused_now()),
                     ModelActionGate::Proceed
                 );
+                // #308: a duplicate launch shows the static card, the
+                // model-free options only. No router call, so it cannot cost
+                // money; the limiter stays as it was.
                 if !would_run {
-                    app.ask(Trigger::Activation);
+                    app.show_options_card(Trigger::Activation, false);
                 } else {
                     match crate::activation::check_activation_now() {
-                        crate::activation::Verdict::Allowed => app.ask(Trigger::Activation),
+                        crate::activation::Verdict::Allowed => {
+                            app.show_options_card(Trigger::Activation, false)
+                        }
                         // Rule 7: the Start menu and the Copilot-key picker
                         // arrive here too, so a refusal says so once.
                         crate::activation::Verdict::Refused { notify: true } => {
@@ -7972,6 +8081,7 @@ mod tests {
             generation,
             ids: ids.iter().map(|s| s.to_string()).collect(),
             catalogue: Vec::new(),
+            key_pickable: Vec::new(),
         }
     }
 
@@ -8175,6 +8285,7 @@ mod tests {
             generation: 5,
             ids: vec!["a".to_string(), "b".to_string()],
             catalogue: Vec::new(),
+            key_pickable: Vec::new(),
         };
         // A digit made on an older card: ignored, card still up.
         let stale = options_choice_action(1, 4, Some(5), Some(&session));
@@ -8191,6 +8302,111 @@ mod tests {
         let esc = options_choice_action(0, 5, Some(5), Some(&session));
         assert_eq!(esc, OptionsChoiceAction::Close);
         assert!(!rearm_after(&esc));
+    }
+
+    // -- #308: the bare key opens the options card ------------------------
+
+    fn catalogue_with_builtins() -> Vec<crate::ui::palette_model::PaletteAction> {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        crate::ui::palette_model::catalogue(&resolved)
+    }
+
+    fn routed(intent: &str, confidence: f64) -> crate::router::RouterOption {
+        crate::router::RouterOption {
+            intent: intent.to_string(),
+            label: "x".to_string(),
+            confidence,
+        }
+    }
+
+    /// #859: a router reply for a screen carrying injected text can put a
+    /// clipboard option first at confidence 1.0; the key must still not run it.
+    #[test]
+    fn a_clipboard_option_at_full_confidence_is_still_not_key_pickable() {
+        use crate::ui::palette_model::Effect;
+        let cat = catalogue_with_builtins();
+        let clip: Vec<_> = cat
+            .iter()
+            .filter(|a| a.effect == Effect::Clipboard)
+            .collect();
+        assert!(clip.len() >= 3);
+        for a in clip {
+            let picks = super::option_key_pickable(&[routed(&a.id, 1.0)], &cat);
+            assert_eq!(picks, vec![false], "{}", a.id);
+        }
+        // A read-only action is; an id the catalogue does not know is not.
+        let picks = super::option_key_pickable(
+            &[
+                routed(crate::actions::DEFAULT_ACTION_ID, 0.1),
+                routed("not-an-action", 1.0),
+            ],
+            &cat,
+        );
+        assert_eq!(picks, vec![true, false]);
+        assert!(!super::keypress_runs_first(&[]));
+    }
+
+    /// The single-press table, read off the app's own state.
+    #[test]
+    fn the_key_reads_the_options_card_state_the_app_holds() {
+        use crate::keypress::Phase;
+        let mut s = session(4, &[]);
+        // Looking: a shell with no buttons.
+        assert_eq!(super::key_phase_of(Some(&s), Some(4)), Phase::Looking);
+        s = session(4, &["a", "b"]);
+        s.key_pickable = vec![true, false];
+        assert_eq!(
+            super::key_phase_of(Some(&s), Some(4)),
+            Phase::Options {
+                first_key_pickable: true
+            }
+        );
+        s.key_pickable = vec![false, true];
+        assert_eq!(
+            super::key_phase_of(Some(&s), Some(4)),
+            Phase::Options {
+                first_key_pickable: false
+            }
+        );
+        // A card that is not this session's, or no card: not an options card.
+        assert_eq!(super::key_phase_of(Some(&s), Some(5)), Phase::Other);
+        assert_eq!(super::key_phase_of(Some(&s), None), Phase::Other);
+        assert_eq!(super::key_phase_of(None, Some(4)), Phase::Other);
+    }
+
+    /// Wired-to-nothing guard: the hook's message reaches the key table, and a
+    /// duplicate launch shows the static card and never asks a model.
+    #[test]
+    fn the_hotkey_runs_the_key_table_and_activation_shows_the_static_card() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        let hotkey = proc_src
+            .split("WM_APP_HOTKEY => {")
+            .nth(1)
+            .expect("no WM_APP_HOTKEY arm");
+        let hotkey = &hotkey[..hotkey.find("LRESULT(0)").unwrap()];
+        assert!(
+            hotkey.contains("app.on_primary_key(Trigger::Hotkey)"),
+            "{hotkey}"
+        );
+        assert!(!hotkey.contains(".ask("), "the key no longer asks directly");
+        let activate = proc_src
+            .split("WM_APP_ACTIVATE => {")
+            .nth(1)
+            .expect("no WM_APP_ACTIVATE arm");
+        let activate = &activate[..activate.find("LRESULT(0)").unwrap()];
+        assert!(
+            activate.contains("show_options_card(Trigger::Activation, false)"),
+            "{activate}"
+        );
+        assert!(!activate.contains(".ask("), "an activation must never ask");
+        let key = src
+            .split("fn on_primary_key(")
+            .nth(1)
+            .expect("no on_primary_key");
+        let key = &key[..key.find("\n    }\n").unwrap()];
+        assert!(key.contains("keypress::on_key("), "{key}");
+        assert!(key.contains("primary_target()"), "{key}");
     }
 
     /// The tray menu clears the claim; it is put back right after the menu
