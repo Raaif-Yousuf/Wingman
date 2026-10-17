@@ -857,7 +857,9 @@ fn is_popup_menu_class(name: &str) -> bool {
     name == MENU_CLASS
 }
 
-/// Rounds every popup menu window of this thread that is on screen (#979).
+/// Rounds every popup menu window of this thread (#979), only while a menu
+/// of ours is being tracked: a `WM_ENTERIDLE` from some other modal loop on
+/// this thread finds no drawing context and does nothing.
 /// `TrackPopupMenu` creates the window itself, and a window hook cannot reach
 /// it in time (MEASURED 2026-10-17: at `HCBT_CREATEWND` DWM does not know the
 /// window yet, "handle is invalid"; a `WH_CALLWNDPROCRET` hook never saw its
@@ -865,6 +867,9 @@ fn is_popup_menu_class(name: &str) -> bool {
 /// `WM_ENTERIDLE` once the menu is up, so the sweep runs on those two only:
 /// nothing runs while idle. A failure leaves the stock square frame.
 fn round_menu_windows() {
+    if !TRACK_ACTIVE.with(|c| c.get()) || CTX.with(|c| c.borrow().is_none()) {
+        return;
+    }
     unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> BOOL {
         let mut buf = [0u16; 16];
         let n = unsafe { GetClassNameW(hwnd, &mut buf) };
@@ -1106,12 +1111,18 @@ mod tests {
         // TrackPopupMenu; the owner is told WM_INITMENUPOPUP and rounds it.
         // A window of the same class made here stands in for it.
         use windows::Win32::Graphics::Dwm::{
-            DwmGetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            DWM_WINDOW_CORNER_PREFERENCE,
+            DwmGetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE,
         };
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WS_EX_TOOLWINDOW, WS_POPUP,
         };
+        // The corner attributes exist from Windows 11 (build 22000).
+        let build = crate::diagnostics::windows_build_number().and_then(|b| b.parse::<u32>().ok());
+        if build.is_none_or(|b| b < 22000) {
+            println!("SKIP: Windows build {build:?} has no DWM corner preference");
+            return;
+        }
         let sys = SysColors::read();
         let make = || unsafe {
             CreateWindowExW(
@@ -1131,14 +1142,36 @@ mod tests {
         };
         let read = |hwnd: HWND| unsafe {
             let mut pref = DWM_WINDOW_CORNER_PREFERENCE(0);
-            let _ = DwmGetWindowAttribute(
+            let got = DwmGetWindowAttribute(
                 hwnd,
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &mut pref as *mut _ as *mut core::ffi::c_void,
                 std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
             );
-            pref
+            got.map(|()| pref)
         };
+        let read_border = |hwnd: HWND| unsafe {
+            let mut color = 0u32;
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR,
+                &mut color as *mut u32 as *mut core::ffi::c_void,
+                4,
+            )
+            .map(|()| color)
+        };
+        // A window of the stand-in class that DWM cannot be asked about
+        // cannot prove anything: say so rather than pass.
+        let probe = make().expect("menu-class window");
+        let readable = read(probe).is_ok();
+        unsafe {
+            let _ = DestroyWindow(probe);
+        }
+        if !readable {
+            println!("SKIP: DwmGetWindowAttribute cannot read the corner preference here");
+            return;
+        }
+        let read = |hwnd: HWND| read(hwnd).expect("corner preference");
         // Outside a track nothing is touched.
         let outside = make().expect("menu-class window");
         assert!(handle_message(WM_INITMENUPOPUP, WPARAM(0), LPARAM(0)).is_none());
@@ -1151,11 +1184,23 @@ mod tests {
         assert_ne!(read(inside), DWMWCP_ROUND, "not before the sweep");
         let _ = handle_message(WM_INITMENUPOPUP, WPARAM(0), LPARAM(0));
         let pref = read(inside);
+        let border = read_border(inside);
         unsafe {
             let _ = DestroyWindow(inside);
         }
         drop(scope);
         assert_eq!(pref, DWMWCP_ROUND);
+        // MEASURED 2026-10-17: `DWMWA_BORDER_COLOR` cannot be read back on
+        // this build (E_INVALIDARG, 0x80070057): it is a set-only attribute.
+        // When it can be read, it must be the theme's border colour.
+        match border {
+            Ok(color) => assert_eq!(
+                color,
+                Tokens::for_theme(Theme::Dark, &sys).border,
+                "the sweep also sets the theme's border colour"
+            ),
+            Err(e) => println!("SKIP: border colour not readable back here: {e}"),
+        }
         // Once the track is over, a menu window is left alone.
         let after = make().expect("menu-class window");
         let _ = handle_message(WM_INITMENUPOPUP, WPARAM(0), LPARAM(0));
@@ -1172,6 +1217,7 @@ mod tests {
         assert!(!is_popup_menu_class("Static"));
         assert!(!is_popup_menu_class(""));
     }
+
     #[test]
     fn records_round_trip_and_a_new_build_forgets_the_old_ones() {
         begin_build();
