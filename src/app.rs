@@ -1675,7 +1675,8 @@ impl App {
     /// the router is a background convenience, never something whose
     /// failure the user is told about (rule 7's "every failure ends in a
     /// card" is about the action the user actually asked for; the router
-    /// never was one).
+    /// never was one). The one exception is #918: the first send to an
+    /// Ollama that is not on this PC shows the #806 card instead.
     #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     fn maybe_start_router(
         &mut self,
@@ -1694,6 +1695,14 @@ impl App {
             .ready_provider_names()
             .is_empty();
         if !optimistic_ready {
+            return;
+        }
+
+        // #918: the router sends the screenshot too, and does not go through
+        // `begin_action`, so it asks the same remote-Ollama question: the
+        // first time for an address that is not on this PC, show the card
+        // and send nothing.
+        if self.show_remote_ollama_notice() {
             return;
         }
 
@@ -10859,6 +10868,27 @@ mod tests {
         let capture = body.find("capture::grab_raw_for").expect("capture call");
         assert!(notice < capture, "the notice must come before the capture");
         assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
+    }
+
+    /// #918: the intent router builds its own chain and never passes through
+    /// `begin_action`, so it must ask the same remote-Ollama question itself,
+    /// before it captures or sends anything.
+    #[test]
+    fn the_router_shows_the_remote_ollama_notice_before_capture() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let begin = src
+            .find("fn maybe_start_router(")
+            .expect("maybe_start_router exists");
+        let rest = &src[begin..];
+        let end = rest.find("\n    fn ").expect("a later fn");
+        let body = &rest[..end];
+        let notice = body
+            .find("show_remote_ollama_notice()")
+            .expect("the router must call the notice");
+        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let spawn = body.find("std::thread::spawn").expect("worker spawn");
+        assert!(notice < capture, "the notice must come before the capture");
+        assert!(notice < spawn, "the notice must come before the send");
     }
 
     /// #541: every handler that ends a run on a result card must consult the
