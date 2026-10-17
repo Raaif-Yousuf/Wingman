@@ -34,6 +34,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         sql: include_str!("schema/v004.sql"),
     },
+    Migration {
+        version: 5,
+        sql: include_str!("schema/v005.sql"),
+    },
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, StoreError> {
@@ -282,6 +286,69 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{table} is there and empty");
         }
+    }
+
+    #[test]
+    fn the_real_v4_database_upgrades_to_v5_with_its_rows_intact() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        run(&mut conn, &MIGRATIONS[..4], None).unwrap();
+        conn.execute(
+            "INSERT INTO profile_field (key, value, updated_unix) VALUES ('full_name', x'00', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO knowledge_root (id, path, kind, added_unix) VALUES (1, 'C:\\k', 'extra', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document (id, root_id, rel_path, status) VALUES (1, 1, 'a.md', 'indexed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens) VALUES (1, 0, 'hello', 'h', 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, MIGRATIONS, None).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 5);
+        let (profile, docs, chunks): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM profile_field), (SELECT count(*) FROM document), (SELECT count(*) FROM chunk)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((profile, docs, chunks), (1, 1, 1));
+        for table in ["memory_item", "memory_source"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} is there and empty");
+        }
+        // A deleted document leaves the memory source with its label.
+        conn.execute(
+            "INSERT INTO memory_item (id, kind, text, dedupe, created_unix, updated_unix) VALUES (1, 'fact', x'00', 'd', 5, 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_source (item_id, source_kind, doc_id, label, added_unix) VALUES (1, 'doc', 1, 'a.md', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM document WHERE id = 1", []).unwrap();
+        let (doc_id, label): (Option<i64>, String) = conn
+            .query_row("SELECT doc_id, label FROM memory_source", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((doc_id, label.as_str()), (None, "a.md"));
     }
 
     #[test]
