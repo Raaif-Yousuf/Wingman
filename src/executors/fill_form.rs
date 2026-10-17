@@ -552,14 +552,22 @@ fn do_fill(access: &Arc<dyn TextElementAccess>, form: &FormFill) -> Result<Undo>
             " Undo cannot restore \"{label}\": its old text could not be read before it was replaced."
         ));
     }
+    let outcome = super::Outcome::Filled {
+        filled: results
+            .iter()
+            .filter(|r| r.outcome == FieldOutcome::Filled)
+            .count(),
+        total: results.len(),
+    };
     if filled.is_empty() {
         // Nothing can be put back, so do not offer an Undo that "succeeds".
-        return Ok(Undo::none(summary));
+        return Ok(Undo::none(summary).with_outcome(outcome));
     }
     let undo_access = Arc::clone(access);
-    Ok(Undo::recording(summary, move || {
-        restore_fields(&undo_access, &filled)
-    }))
+    Ok(
+        Undo::recording(summary, move || restore_fields(&undo_access, &filled))
+            .with_outcome(outcome),
+    )
 }
 
 /// Restore: re-resolves every filled field independently and writes its
@@ -1224,6 +1232,13 @@ mod tests {
             "ada@example.com"
         );
         assert!(undo.summary.contains("Filled 2 of 2 fields"));
+        assert_eq!(
+            undo.outcome,
+            crate::executors::Outcome::Filled {
+                filled: 2,
+                total: 2
+            }
+        );
     }
 
     #[test]
@@ -1267,6 +1282,13 @@ mod tests {
         assert_eq!(*access.fields[&target_for("dob")].text.borrow(), "");
         assert_eq!(*access.fields[&target_for("name")].text.borrow(), "Ada");
         assert!(undo.summary.contains("Filled 1 of 2 fields"));
+        assert_eq!(
+            undo.outcome,
+            crate::executors::Outcome::Filled {
+                filled: 1,
+                total: 2
+            }
+        );
     }
 
     #[test]
@@ -1368,6 +1390,13 @@ mod tests {
         assert_eq!(*access.fields[&target_for("name")].text.borrow(), "Ada");
         assert!(undo.summary.contains("Ghost field"));
         assert!(undo.summary.contains("Filled 1 of 2 fields"));
+        assert_eq!(
+            undo.outcome,
+            crate::executors::Outcome::Filled {
+                filled: 1,
+                total: 2
+            }
+        );
     }
 
     // -- #266, at the symptom level: `do_fill` (via `execute`) must never
@@ -1467,6 +1496,13 @@ mod tests {
             undo.summary
         );
         assert!(undo.summary.contains("Filled 1 of 2 fields"));
+        assert_eq!(
+            undo.outcome,
+            crate::executors::Outcome::Filled {
+                filled: 1,
+                total: 2
+            }
+        );
         assert_eq!(
             *access.fields[&target_for("email")].text.borrow(),
             "ada@example.com"
@@ -1590,6 +1626,13 @@ mod tests {
 
         let undo = executor.execute(confirmed(form)).unwrap();
         assert!(undo.summary.contains("Filled 2 of 2 fields"));
+        assert_eq!(
+            undo.outcome,
+            crate::executors::Outcome::Filled {
+                filled: 2,
+                total: 2
+            }
+        );
         assert!(undo.summary.contains("Notes"), "{}", undo.summary);
         assert!(
             undo.summary.contains("Undo cannot restore"),

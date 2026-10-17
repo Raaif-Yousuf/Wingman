@@ -74,16 +74,39 @@ pub enum Effect {
 /// clipboard) that have no natural serialized representation.
 pub struct Undo {
     pub summary: String,
+    /// What happened, typed (#1215). The card headline is decided from this,
+    /// never by searching `summary`, which carries names from the screen.
+    pub outcome: Outcome,
     restore: Box<dyn FnOnce() -> anyhow::Result<()> + Send>,
     restorable: bool,
 }
 
+/// The machine-readable result an executor may attach to its [`Undo`], for
+/// the one caller that must choose a headline from it (#1215).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Outcome {
+    /// The executor reports nothing typed; callers use their default wording.
+    #[default]
+    Unspecified,
+    /// A file was written and an attempt made to open it: whether it opened.
+    Opened(bool),
+    /// Form fields written out of those asked for.
+    Filled { filled: usize, total: usize },
+}
+
 impl Undo {
+    /// Attaches the typed result.
+    pub fn with_outcome(mut self, outcome: Outcome) -> Self {
+        self.outcome = outcome;
+        self
+    }
+
     /// For an executor with no prior state to restore (read-only actions:
     /// there is nothing to undo because nothing was written).
     pub fn none(summary: impl Into<String>) -> Self {
         Self {
             summary: summary.into(),
+            outcome: Outcome::Unspecified,
             restore: Box::new(|| Ok(())),
             restorable: false,
         }
@@ -96,6 +119,7 @@ impl Undo {
     ) -> Self {
         Self {
             summary: summary.into(),
+            outcome: Outcome::Unspecified,
             restore: Box::new(restore),
             restorable: true,
         }
