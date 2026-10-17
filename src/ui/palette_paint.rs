@@ -376,6 +376,13 @@ pub(super) fn snap_stroke(r: RECT, radius_dp: i32, width_dp: i32, dpi: u32) -> S
     }
 }
 
+/// The top of the band a focus line is cut to: far enough up that the box's
+/// side and the same shape moved up by `width` are both still straight, so the
+/// line thins to nothing there instead of ending in a step.
+pub(super) fn focus_band_top(bottom: i32, radius: i32, width: i32) -> i32 {
+    bottom - radius - width
+}
+
 // ---------------------------------------------------------------------------
 // The paint list
 // ---------------------------------------------------------------------------
@@ -400,6 +407,16 @@ pub(super) enum Op {
     FillRound { rect: RECT, radius: i32, color: u32 },
     /// An outline drawn inside `rect`, `width` thick.
     StrokeRound {
+        rect: RECT,
+        radius: i32,
+        width: i32,
+        color: u32,
+    },
+    /// The bottom edge of the rounded box `rect`, `width` thick, following the
+    /// corner arcs and thinning to nothing where they meet the sides (#1039):
+    /// the box's shape less the same shape moved up by `width`, cut to the
+    /// bottom band ([`focus_band_top`] down). It paints over the border there.
+    FocusLine {
         rect: RECT,
         radius: i32,
         width: i32,
@@ -448,14 +465,10 @@ pub(super) fn build_ops(dpi: u32, input: &PaintInput) -> Vec<Op> {
         color: c.border,
     });
     let focus = px(FOCUS_LINE_DP, dpi).max(1);
-    ops.push(Op::FillRound {
-        rect: rect(
-            b.left + radius,
-            b.bottom - focus,
-            b.right - radius,
-            b.bottom,
-        ),
-        radius: focus / 2,
+    ops.push(Op::FocusLine {
+        rect: b,
+        radius,
+        width: focus,
         color: c.focus_line,
     });
     ops.push(Op::Text {
@@ -737,17 +750,37 @@ mod tests {
                     if text == "\u{E721}")),
                 "dpi {dpi}: the magnifier glyph"
             );
-            // The focus line sits on the bottom edge of the box, inside it.
+            // #1039: the focus line is the box's own bottom edge, corners
+            // included, not a bar that stops where the corners begin.
             let b = box_rect(dpi);
-            let line = ops
+            let (line, r, width) = ops
                 .iter()
                 .find_map(|op| match op {
-                    Op::FillRound { rect, color, .. } if *color == c.focus_line => Some(*rect),
+                    Op::FocusLine {
+                        rect,
+                        radius,
+                        width,
+                        color,
+                    } if *color == c.focus_line => Some((*rect, *radius, *width)),
                     _ => None,
                 })
                 .expect("a focus line");
-            assert_eq!(line.bottom, b.bottom, "dpi {dpi}");
-            assert!(line.left > b.left && line.right < b.right, "dpi {dpi}");
+            assert_eq!(line, b, "dpi {dpi}");
+            assert_eq!(r, radius, "dpi {dpi}: the box's corner radius");
+            assert!(width >= 1, "dpi {dpi}");
+        }
+    }
+
+    #[test]
+    fn the_focus_band_starts_above_where_the_corner_curve_does() {
+        for dpi in DPIS {
+            let b = box_rect(dpi);
+            let (radius, width) = (px(CONTROL_RADIUS_DP, dpi), px(FOCUS_LINE_DP, dpi).max(1));
+            let top = focus_band_top(b.bottom, radius, width);
+            // The curve of the moved-up copy starts `width` higher than the
+            // box's own, so the band reaches that far.
+            assert!(top <= b.bottom - radius - width, "dpi {dpi}");
+            assert!(top > b.top, "dpi {dpi}: inside the box");
         }
     }
 
@@ -841,6 +874,7 @@ mod tests {
                     Op::Clear { .. } => continue,
                     Op::FillRound { rect, .. }
                     | Op::StrokeRound { rect, .. }
+                    | Op::FocusLine { rect, .. }
                     | Op::Text { rect, .. } => rect,
                 };
                 assert!(
@@ -959,6 +993,7 @@ mod tests {
                     Op::Clear { color }
                     | Op::FillRound { color, .. }
                     | Op::StrokeRound { color, .. }
+                    | Op::FocusLine { color, .. }
                     | Op::Text { color, .. } => *color,
                 };
                 assert!(allowed.contains(&color), "{op:?} is not a system colour");

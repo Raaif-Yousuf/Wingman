@@ -366,6 +366,24 @@ fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) 
     }
 }
 
+/// #42: moves the pending action to the last-run slot. Pure.
+fn remember_started(pending: &mut Option<String>, last: &mut Option<String>) {
+    if let Some(id) = pending.take() {
+        *last = Some(id);
+    }
+}
+
+/// #42: the action a double press repeats: the last one the user ran, if the
+/// catalogue still knows it and its effect lets a bare key run it (never one
+/// that writes the clipboard, #859). Pure.
+fn repeat_target(last: Option<&str>, catalogue: &[palette_model::PaletteAction]) -> Option<String> {
+    let last = last?;
+    catalogue
+        .iter()
+        .find(|a| a.id == last && palette_model::key_pickable(a.effect))
+        .map(|a| a.id.clone())
+}
+
 /// #393: `phase` with what only the card and the clock know filled in. A
 /// press inside the window of the one that started a Look is the second tap
 /// of a double (`early`), and an answer, error or info card is `Answer`.
@@ -375,12 +393,20 @@ fn refine_key_phase(
     card_state: crate::ui::card::CardState,
     since_look_press: Option<Duration>,
     window: Option<Duration>,
+    can_repeat: bool,
 ) -> keypress::Phase {
     use crate::ui::card::CardState;
     match phase {
-        keypress::Phase::Looking { .. } => keypress::Phase::Looking {
-            early: matches!((since_look_press, window), (Some(d), Some(w)) if d < w),
-        },
+        keypress::Phase::Looking { .. } => {
+            let early = matches!((since_look_press, window), (Some(d), Some(w)) if d < w);
+            // #42: the second tap of a double repeats the last action when
+            // there is one; with none it is absorbed, as before.
+            if early && can_repeat {
+                keypress::Phase::Repeat
+            } else {
+                keypress::Phase::Looking { early }
+            }
+        }
         keypress::Phase::Other
             if matches!(card_state, CardState::Collapsed | CardState::Expanded) =>
         {
@@ -615,6 +641,13 @@ struct App {
     key_quiet_until: Option<Instant>,
     /// #393: when the press that started the current Look was made.
     look_pressed_at: Option<Instant>,
+    /// #42: the id of the last action whose run started, kept for this run
+    /// only (a double press repeats it). Not saved: an id from an earlier
+    /// session could name an action that has since changed.
+    last_action: Option<String>,
+    /// #42: the action being dispatched right now. It becomes `last_action`
+    /// only when its run starts ([`App::note_run_started`]), not on a refusal.
+    pending_action: Option<String>,
     chain: Arc<Chain>,
     /// #81: the knowledge folder watcher, while a usable folder is set and the
     /// watch is alive. Dropping it asks its thread to stop.
@@ -953,6 +986,8 @@ pub fn run() -> Result<()> {
         key_pending: None,
         key_quiet_until: None,
         look_pressed_at: None,
+        last_action: None,
+        pending_action: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1053,13 +1088,18 @@ pub fn run() -> Result<()> {
         }
         _ => false,
     };
+    // Non-fatal: without it the card still auto-dismisses on its timer.
+    // Installed before the welcome card so that card can be armed (#906).
+    app.watcher = ClickWatcher::install(hwnd).ok();
+
     if welcome {
         let (headline, detail) = welcome_card(&chord_to_string(&app.config.hotkeys.secondary));
         app.card.show_settings_needed(&headline, &detail);
     }
-
-    // Non-fatal: without it the card still auto-dismisses on its timer.
-    app.watcher = ClickWatcher::install(hwnd).ok();
+    // Any startup card above (welcome or a key problem) persists until dismissed.
+    if !matches!(app.card.state(), crate::ui::card::CardState::Hidden) {
+        app.set_watch(true);
+    }
 
     // Hand the App to the window proc. It stays alive until WM_DESTROY.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize) };
@@ -1546,6 +1586,23 @@ fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
     }
 }
 
+/// #845: what a machine-check verdict may do to the card on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineCheckCard {
+    /// Nothing else is on screen but the check's own working card.
+    Show,
+    /// A preview, an options card or a run in flight owns the card.
+    Hold,
+}
+
+fn machine_check_card(card: crate::ui::card::CardState, busy: bool) -> MachineCheckCard {
+    use crate::ui::card::CardState;
+    if busy || matches!(card, CardState::Preview | CardState::Options) {
+        MachineCheckCard::Hold
+    } else {
+        MachineCheckCard::Show
+    }
+}
 /// #723: whether a press still finds the app busy. A run flagged stuck is
 /// abandoned by the press, so the press can start a new one.
 fn busy_after_press(busy: bool, stuck: bool) -> bool {
@@ -2049,6 +2106,7 @@ impl App {
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
+        self.note_run_started();
         self.set_busy(true);
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
@@ -2087,6 +2145,24 @@ impl App {
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
     fn ask(&mut self, trigger: Trigger) {
+        // #42: Check my work from the key or the tray has no dispatch id.
+        let own = self.pending_action.is_none();
+        if own {
+            self.pending_action = Some(actions::DEFAULT_ACTION_ID.to_string());
+        }
+        self.ask_inner(trigger);
+        if own {
+            self.pending_action = None;
+        }
+    }
+
+    /// #42: called where a run actually starts, after every gate and just
+    /// before the app goes busy: the pending action becomes the last one.
+    fn note_run_started(&mut self) {
+        remember_started(&mut self.pending_action, &mut self.last_action);
+    }
+
+    fn ask_inner(&mut self, trigger: Trigger) {
         let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
@@ -2620,6 +2696,7 @@ impl App {
             self.card.state(),
             self.look_pressed_at.map(|t| now.duration_since(t)),
             window,
+            self.last_action.is_some(),
         )
     }
 
@@ -2643,10 +2720,31 @@ impl App {
                 }
             }
             keypress::KeyAction::Absorb => {}
+            keypress::KeyAction::Repeat => {
+                self.repeat_last_action();
+                // Like every immediate action: a third tap during the settle
+                // must not reach the busy card.
+                self.key_quiet_until = window.map(|w| Instant::now() + w);
+            }
             keypress::KeyAction::Proceed => {
                 self.look_pressed_at = Some(now);
                 self.run_primary_action(trigger);
             }
+        }
+    }
+
+    /// #42: a double press with no card up runs the last action again on a
+    /// fresh look at the screen. The first tap's Look is closed (and settled)
+    /// first, so no card is in the screenshot. Only an action the key may run
+    /// ([`repeat_target`]) repeats: with none, or a clipboard one, the first
+    /// tap's options card simply stays, which is what a single press does.
+    /// Settings in front is refused by the dispatch, as for any run.
+    fn repeat_last_action(&mut self) {
+        let Some(catalogue) = self.load_catalogue(false) else {
+            return;
+        };
+        if let Some(id) = repeat_target(self.last_action.as_deref(), &catalogue) {
+            self.run_option(&id);
         }
     }
 
@@ -2743,7 +2841,9 @@ impl App {
         // sees whatever Windows re-activated. Honour what was in front when
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
+        self.pending_action = Some(action_id.to_string());
         self.dispatch_palette_target(action_id);
+        self.pending_action = None;
         self.password_manager_hint = false;
     }
 
@@ -2854,6 +2954,7 @@ impl App {
             }
         };
 
+        self.note_run_started();
         self.set_busy(true);
         self.set_watch(false);
         // No model in this flow (see the doc comment above): `Working` is
@@ -2925,6 +3026,7 @@ impl App {
                     self.track_error("Couldn't open the region selector", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't open the region selector", &detail);
+                self.set_watch(true);
                 return;
             }
         };
@@ -2958,6 +3060,7 @@ impl App {
                 let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't copy the region", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -4831,6 +4934,11 @@ impl App {
     }
 
     fn on_machine_check_result(&mut self, facts: &crate::machine::MachineFacts) {
+        // #845: never cover a preview, an options card or a working card of a
+        // run in flight. The check is on demand and cheap, so it is run again.
+        if machine_check_card(self.card.state(), self.busy) == MachineCheckCard::Hold {
+            return;
+        }
         let verdict = crate::machine::verdict(facts);
         self.card
             .show_answer(&verdict.headline, &verdict.detail(), 20, None);
@@ -4860,6 +4968,7 @@ impl App {
             return;
         }
 
+        self.note_run_started();
         self.set_busy(true);
         self.set_watch(false);
         // Issue #354 follow-up review, finding 3: this reads the current
@@ -5180,7 +5289,7 @@ impl App {
     /// window involved at all. A no-op on an empty queue.
     fn deliver_deferred(&mut self, pending: VecDeque<DeferredMessage>) {
         let mut menu_card_shown = false;
-        for message in pending {
+        for message in order_deferred(pending) {
             match message {
                 DeferredMessage::Result(result) => self.on_result(result),
                 DeferredMessage::CalendarResult(result) => self.on_calendar_result(result),
@@ -5208,6 +5317,10 @@ impl App {
                         menu_card_shown = true;
                         self.show_menu_was_open_card();
                     }
+                }
+                DeferredMessage::LearnLost => {
+                    let (headline, detail) = learn_lost_card();
+                    self.card.show_answer(headline, detail, 6, None);
                 }
                 DeferredMessage::ActivateDuringMenu => {
                     // Every one is counted, as in `wnd_proc`; a refusal says so.
@@ -5266,6 +5379,7 @@ impl App {
     fn show_tray_restore_error(&mut self, error: Option<String>) {
         if let Some(e) = error {
             self.card.show_error("Couldn't restore the tray icon", &e);
+            self.set_watch(true);
         }
     }
 
@@ -5902,6 +6016,7 @@ impl App {
     fn on_taskbar_created(&mut self) {
         if let Some(e) = self.try_restore_tray_icon() {
             self.card.show_error("Couldn't restore the tray icon", &e);
+            self.set_watch(true);
         }
     }
 
@@ -5999,7 +6114,21 @@ impl App {
         self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
+        // #1013: Settings is not owned by the owner window, so the dialog does
+        // not stop it, yet its Tab, Enter and Esc need the main pump this
+        // loop replaces. Disabled, it is plainly out of play until the dialog
+        // closes.
+        let settings_was_front = settings::is_foreground();
+        let settings_disabled = settings::set_enabled(false);
         let out = dialog();
+        if settings_disabled {
+            settings::set_enabled(true);
+            // A disabled window cannot be activated, so when the dialog closed
+            // Windows may have picked another app; give Settings the focus back.
+            if settings_was_front {
+                settings::bring_to_front();
+            }
+        }
         SETTINGS_OPEN.with(|c| c.set(false));
         let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -6045,6 +6174,7 @@ impl App {
                 let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't import the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -6064,6 +6194,7 @@ impl App {
                 let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't import the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -6107,6 +6238,7 @@ impl App {
                 let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't export the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -7745,6 +7877,32 @@ enum DeferredMessage {
     /// user can post it (#236), so each one still goes through the activation
     /// rate limit when it is delivered, and only then may it show the card.
     ActivateDuringMenu,
+    /// `WM_APP_LEARNED` (#1013) while a menu, a file dialog or Settings had
+    /// the loop. The hook swallowed that key for a tray "Set ... key", so it
+    /// ends in a card (`learn_lost_card`).
+    LearnLost,
+}
+
+/// The card for a key the hook captured for a shortcut change that could not be
+/// applied because a menu, a dialog or Settings was up (#1013). The learn state
+/// is cleared by the hook the moment it captures, so `wnd_proc` cannot tell a
+/// tray "Set ... key" from a Settings Change that just ended (a timer race);
+/// the wording therefore fits both and names both ways to retry.
+fn learn_lost_card() -> (&'static str, &'static str) {
+    (
+        "Shortcut unchanged",
+        "A key was pressed while a window was open, so it was not applied. Use Set key or Change to try again.",
+    )
+}
+
+/// The batch in delivery order: a `LearnLost` first, so its card never
+/// replaces the card of a result that finished in the same batch (a later
+/// card visibly supersedes an earlier one, and the result matters more).
+fn order_deferred(mut pending: VecDeque<DeferredMessage>) -> VecDeque<DeferredMessage> {
+    pending
+        .make_contiguous()
+        .sort_by_key(|m| !matches!(m, DeferredMessage::LearnLost));
+    pending
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -7959,21 +8117,18 @@ enum SettingsReentrancy {
     /// menu does not pop up, and none of its commands can fire, over the
     /// modal), a dismiss click (the card is already hidden and its watcher
     /// disarmed before `show_modal` runs, so there is nothing to do),
-    /// `WM_APP_LEARNED` (a key captured for a Change inside Settings (#345)
-    /// never gets here: Settings' own message loop takes it off the queue
-    /// first. Any other one is stale, and its boxed `Chord` payload is freed
-    /// rather than leaked), `WM_APP_PAUSE_TOGGLE` (#181: same
-    /// treatment as the hotkey -- a chord press while Settings is open is
-    /// dropped, not queued), and the two palette messages (#25: the palette
-    /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s
-    /// boxed `String` payload is freed rather than leaked, same as
-    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the options
+    /// `WM_APP_PAUSE_TOGGLE` (#181: same treatment as the hotkey -- a chord
+    /// press while Settings is open is dropped, not queued), and the two
+    /// palette messages (#25: the palette cannot be shown while Settings is
+    /// modal-open anyway; `WM_APP_PALETTE_RUN`'s boxed `String` payload is
+    /// freed rather than leaked), and `WM_APP_ROUTER_RESULT` (#24: the options
     /// card a router suggestion belongs to cannot be visible while Settings is
     /// modal-open either, so there is nothing left to apply it to -- a
     /// router suggestion is advisory, unlike a finished action's own
     /// result, so rule 7 does not require it to survive Settings the way
     /// `Defer`'s ids must; its boxed `(u64, Result<...>)` payload is freed
-    /// rather than leaked, same as `WM_APP_LEARNED`'s).
+    /// rather than leaked). `WM_APP_LEARNED` is no longer here (#1013): the
+    /// hook swallowed that key, so it is `Defer`red into a card.
     Ignore,
     /// Push the message's payload onto `PENDING_MESSAGES`, oldest-last;
     /// `open_settings` drains and delivers every one of them, in arrival
@@ -8058,12 +8213,16 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_EXECUTOR_DONE
         | WM_APP_CONFIG_WRITTEN
         | WM_APP_SETTINGS_LEFT
-        | WM_APP_SETTINGS_SAVE => SettingsReentrancy::Defer,
+        | WM_APP_SETTINGS_SAVE
+        // #1013: the hook swallowed the key, so it ends in a card.
+        | WM_APP_LEARNED
+        // #845: the verdict the user asked for is shown once Settings is gone,
+        // not dropped (#328 ignored it, which left no card at all).
+        | WM_APP_MACHINE_CHECK_RESULT => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
         | WM_APP_DISMISS
-        | WM_APP_LEARNED
         | WM_APP_PAUSE_TOGGLE
         // #133: only a card update; with Settings open there is nothing to
         // update, so the box is freed and the probe's answer dropped.
@@ -8086,8 +8245,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // still passes the keydown through per the Ignore branch above), so
         // both palette messages are simply dropped here, same treatment
         // WM_APP_PAUSE_TOGGLE already gets. WM_APP_PALETTE_RUN's boxed
-        // `String` payload is freed explicitly below (mirroring
-        // WM_APP_LEARNED's) so it never leaks.
+        // `String` payload is freed explicitly below (`free_boxed_payload`)
+        // so it never leaks.
         // #24: WM_APP_ROUTER_RESULT is dropped the same way -- a router
         // suggestion is advisory, and the palette it belongs to cannot be
         // visible while Settings is modal-open either, so there is nothing
@@ -8103,10 +8262,6 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
-        // #328: an on-demand card; Settings hides every card when it
-        // opens, so a result arriving then has nothing to show on. The
-        // boxed facts are freed below.
-        | WM_APP_MACHINE_CHECK_RESULT
         // #105: a send preview cannot be answered while Settings is
         // modal-open, so it is dropped, which cancels the send (the worker
         // sees the reply channel close and the request ends in a card).
@@ -8246,6 +8401,12 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts)
         }),
         WM_APP_HOTKEY => DeferredMessage::KeyDuringMenu,
+        // #1013: never applied late (that would rebind on a stale press); the
+        // chord is freed and the user is told it was not taken.
+        WM_APP_LEARNED => {
+            drop(unsafe { Box::from_raw(lparam.0 as *mut Chord) });
+            DeferredMessage::LearnLost
+        }
         WM_APP_ACTIVATE => DeferredMessage::ActivateDuringMenu,
         _ => return None,
     })
@@ -8355,7 +8516,12 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_EXECUTOR_DONE
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_SEND_PREVIEW
-        | WM_APP_PAUSE_TOGGLE => ForegroundPolicy::Hold,
+        | WM_APP_PAUSE_TOGGLE
+        // #1013: a chord the hook swallowed for a tray "Set ... key" while
+        // Settings is in front. Settings takes its own Change's chord before
+        // it gets here, so this one belongs to the tray; it ends in a card.
+        | WM_APP_LEARNED
+        | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
         WM_APP_PENDING_STAGE
@@ -8363,12 +8529,7 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         | WM_APP_ROUTER_RESULT
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
-        | WM_APP_MACHINE_CHECK_RESULT
         | WM_APP_OPTIONS_CHOICE => ForegroundPolicy::Drop,
-        // Settings takes a chord itself while its own Change is pending; one
-        // that reaches here is from a Change that ended (Esc, timeout), and
-        // applying it would rebind a hotkey the user cancelled.
-        WM_APP_LEARNED => ForegroundPolicy::Drop,
         // The writer's answer and the save apply the setting at once; the Wingman
         // key and activation are refused with a card (`settings_hold_card`);
         // Quit, the tray and the card's own clicks work as always.
@@ -8711,9 +8872,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         };
         match policy {
             SettingsReentrancy::Ignore => {
-                // WM_APP_LEARNED, WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT
-                // are the only ignored messages carrying a boxed payload;
-                // free them so none leaks. (WM_APP_CALENDAR_RESULT,
+                // WM_APP_PALETTE_RUN and WM_APP_ROUTER_RESULT are the only
+                // ignored messages carrying a boxed payload (WM_APP_LEARNED's
+                // is taken by the Defer arm since #1013); free them so none
+                // leaks. (WM_APP_CALENDAR_RESULT,
                 // WM_APP_REVIEW_RESULT and WM_APP_FORM_FILL_RESULT are all
                 // Defer, not Ignore -- issue #213/#40.)
                 free_boxed_payload(msg, lparam);
@@ -9260,6 +9422,11 @@ mod tests {
             WM_APP_PREVIEW_DECIDED,
             WM_APP_SEND_PREVIEW,
             WM_APP_PAUSE_TOGGLE,
+            // #1013: a chord the hook swallowed for a tray "Set ... key" must
+            // end in a card, not vanish.
+            WM_APP_LEARNED,
+            // #845: an on-demand verdict is still owed a card.
+            WM_APP_MACHINE_CHECK_RESULT,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Hold, "{id}");
         }
@@ -9269,12 +9436,7 @@ mod tests {
             WM_APP_ROUTER_RESULT,
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
-            WM_APP_MACHINE_CHECK_RESULT,
             WM_APP_OPTIONS_CHOICE,
-            // Settings takes a captured chord itself while a Change is
-            // pending; one that reaches the main window is from a Change that
-            // was cancelled or timed out, and must not rebind a hotkey.
-            WM_APP_LEARNED,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Drop, "{id}");
         }
@@ -9291,6 +9453,83 @@ mod tests {
         ] {
             assert_eq!(settings_foreground_policy(id), P::Pass, "{id}");
         }
+    }
+
+    /// #1013 item 2: a chord the hook swallowed for a tray "Set ... key" ends
+    /// in a card whenever it arrives while a menu, a file dialog or Settings is
+    /// up, and the card says the shortcut is unchanged.
+    #[test]
+    fn a_swallowed_learn_key_is_deferred_into_a_card_not_dropped() {
+        use super::{learn_lost_card, take_deferred, DeferredMessage};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        assert_eq!(
+            settings_reentrancy_policy(WM_APP_LEARNED, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+        assert_eq!(
+            super::tray_menu_policy(WM_APP_LEARNED, FAKE_TASKBAR_CREATED_MSG),
+            SettingsReentrancy::Defer
+        );
+        let boxed = Box::into_raw(Box::new(crate::hotkey::Chord {
+            vk: 0x41,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            win: false,
+        }));
+        let got = take_deferred(WM_APP_LEARNED, WPARAM(0), LPARAM(boxed as isize));
+        assert!(matches!(got, Some(DeferredMessage::LearnLost)));
+        let (headline, detail) = learn_lost_card();
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+        assert!(headline.contains("unchanged"), "{headline}");
+        // Fits a tray "Set key" and a Settings "Change" alike.
+        assert!(
+            detail.contains("Set key") && detail.contains("Change"),
+            "{detail}"
+        );
+    }
+
+    /// #1013: a lost-key card queued after a finished result must not replace
+    /// the result's card, so `LearnLost` is delivered first.
+    #[test]
+    fn a_lost_learn_key_is_delivered_before_a_result_card() {
+        use super::{order_deferred, DeferredMessage};
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(DeferredMessage::KeyDuringMenu);
+        q.push_back(DeferredMessage::Result(Err("e".to_string())));
+        q.push_back(DeferredMessage::LearnLost);
+        let out: Vec<_> = order_deferred(q).into_iter().collect();
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], DeferredMessage::LearnLost));
+        assert!(matches!(out[1], DeferredMessage::KeyDuringMenu));
+        assert!(matches!(out[2], DeferredMessage::Result(_)));
+        // The issue's case: [Result(ok-ish), LearnLost].
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(DeferredMessage::Result(Err("e".to_string())));
+        q.push_back(DeferredMessage::LearnLost);
+        let out = order_deferred(q);
+        assert!(matches!(out.back(), Some(DeferredMessage::Result(_))));
+    }
+
+    /// #1013 item 1: the file dialog is not owned by Settings, so Settings is
+    /// disabled for as long as the dialog runs (its Tab, Enter and Esc come
+    /// from the main pump, which the dialog's own loop replaces).
+    #[test]
+    fn the_os_file_dialog_disables_settings_around_it() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn run_os_dialog<T>(", "\n    }\n");
+        let off = body
+            .find("settings::set_enabled(false)")
+            .expect("never disabled");
+        let dlg = body.find("dialog()").expect("no dialog call");
+        let on = body
+            .find("settings::set_enabled(true)")
+            .expect("never re-enabled");
+        assert!(off < dlg && dlg < on, "disable, run the dialog, re-enable");
+        let front = body
+            .find("settings::bring_to_front()")
+            .expect("focus never given back");
+        assert!(on < front, "refocus only after it is enabled again");
     }
 
     /// Everything the policy holds must be something `take_deferred` can take, or
@@ -9835,6 +10074,31 @@ mod tests {
         }
     }
 
+    /// #845: a machine-check verdict never covers a card the user is
+    /// reading or answering, or one for a run in flight. Only its own
+    /// working card (or nothing) is replaced.
+    #[test]
+    fn machine_check_card_never_covers_another_card() {
+        use super::MachineCheckCard::{Hold, Show};
+        use crate::ui::card::CardState;
+        for (state, busy, expected) in [
+            (CardState::Pending, false, Show),
+            (CardState::Hidden, false, Show),
+            (CardState::Collapsed, false, Show),
+            (CardState::Expanded, false, Show),
+            (CardState::Preview, false, Hold),
+            (CardState::Options, false, Hold),
+            (CardState::Pending, true, Hold),
+            (CardState::Hidden, true, Hold),
+            (CardState::Preview, true, Hold),
+        ] {
+            assert_eq!(
+                super::machine_check_card(state, busy),
+                expected,
+                "{state:?} busy={busy}"
+            );
+        }
+    }
     // -- #307: the options card's choices ---------------------------------
 
     fn session(generation: u32, ids: &[&str]) -> super::OptionsSession {
@@ -10224,6 +10488,155 @@ mod tests {
         assert_eq!(super::key_phase_of(None, Some(4)), Phase::Other);
     }
 
+    /// #42: the second tap repeats only when there is something to repeat.
+    #[test]
+    fn a_second_tap_repeats_only_with_a_last_action() {
+        use crate::keypress::Phase;
+        use crate::ui::card::CardState;
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        let looking = Phase::Looking { early: false };
+        assert_eq!(
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300), true),
+            Phase::Repeat
+        );
+        // Too late, or double press off: a cancel, never a repeat.
+        for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
+            assert_eq!(
+                super::refine_key_phase(looking, CardState::Options, since, win, true),
+                Phase::Looking { early: false }
+            );
+        }
+        // No card is not a Look: nothing becomes a repeat.
+        assert_eq!(
+            super::refine_key_phase(Phase::Other, CardState::Hidden, None, ms(300), true),
+            Phase::Other
+        );
+    }
+
+    /// #42: the repeated action is the last one run, and never a clipboard one.
+    #[test]
+    fn the_repeat_target_is_the_last_action_and_never_a_clipboard_one() {
+        use crate::ui::palette_model::{Effect, PaletteAction};
+        let act = |id: &str, effect| PaletteAction {
+            id: id.to_string(),
+            name: id.to_string(),
+            group: None,
+            requires_model: false,
+            effect,
+        };
+        let cat = [
+            act("a", Effect::None),
+            act("b", Effect::Preview),
+            act("c", Effect::Clipboard),
+        ];
+        assert_eq!(super::repeat_target(Some("a"), &cat).as_deref(), Some("a"));
+        assert_eq!(super::repeat_target(Some("b"), &cat).as_deref(), Some("b"));
+        assert_eq!(super::repeat_target(Some("c"), &cat), None, "clipboard");
+        assert_eq!(super::repeat_target(Some("gone"), &cat), None);
+        assert_eq!(super::repeat_target(None, &cat), None);
+    }
+
+    /// #42: an action is remembered only once its run starts, never on a
+    /// refusal. The pure part.
+    #[test]
+    fn an_action_is_remembered_only_when_its_run_starts() {
+        let mut pending = Some("a".to_string());
+        let mut last = Some("old".to_string());
+        // A refusal never reaches `remember_started`: the old one stays.
+        assert_eq!(last.as_deref(), Some("old"));
+        super::remember_started(&mut pending, &mut last);
+        assert_eq!(last.as_deref(), Some("a"));
+        assert_eq!(pending, None, "consumed, so a later run cannot reuse it");
+        // Nothing pending: what was remembered is kept.
+        super::remember_started(&mut pending, &mut last);
+        assert_eq!(last.as_deref(), Some("a"));
+    }
+
+    /// #42: `note_run_started` sits after every gate and just before the run
+    /// goes busy, in each path that starts a run. Fails if it moves above a
+    /// gate (a refusal would then be remembered) or the paths change.
+    #[test]
+    fn the_run_is_noted_after_the_gates_and_just_before_it_goes_busy() {
+        let src = lf(include_str!("app.rs"));
+        let paths: [(&str, &[&str]); 3] = [
+            (
+                "    fn begin_action<",
+                &[
+                    "refuse_for_settings()",
+                    "model_action_gate(",
+                    "refuse_if_password_manager()",
+                    "grab_raw_for(",
+                ],
+            ),
+            (
+                "    fn run_model_free_screen_action(",
+                &[
+                    "busy_now()",
+                    "gate(pause::is_paused_now())",
+                    "refuse_if_password_manager()",
+                    "capture_screen()",
+                ],
+            ),
+            (
+                "    fn calculate_selection(",
+                &[
+                    "busy_now()",
+                    "is_paused_now()",
+                    "refuse_if_password_manager()",
+                ],
+            ),
+        ];
+        let mut checked = 0;
+        for (sig, gates) in paths {
+            let body = body_between(&src, sig, "\n    }\n");
+            let note = body.find("self.note_run_started();").expect(sig);
+            for g in gates {
+                let at = body.find(g).unwrap_or_else(|| panic!("{sig} lost `{g}`"));
+                assert!(at < note, "{sig}: `{g}` must come before the note");
+            }
+            let busy = body.find("self.set_busy(true);").expect(sig);
+            assert!(note < busy, "{sig}");
+            assert!(body[note..busy].lines().count() <= 3, "{sig}");
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
+    }
+
+    /// #42: Check my work from the key or the tray is remembered too, and the
+    /// dispatch's pending id is cleared when the dispatch returns.
+    #[test]
+    fn check_my_work_from_the_key_or_tray_is_remembered_and_nothing_goes_stale() {
+        let src = lf(include_str!("app.rs"));
+        let ask = body_between(
+            &src,
+            "    fn ask(&mut self, trigger: Trigger) {",
+            "\n    }\n",
+        );
+        assert!(
+            ask.contains("DEFAULT_ACTION_ID") && ask.contains("ask_inner("),
+            "{ask}"
+        );
+        let dispatch = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
+        let set = dispatch.find("self.pending_action = Some(").expect("set");
+        let run = dispatch.find("self.dispatch_palette_target(").expect("run");
+        let clear = dispatch.find("self.pending_action = None").expect("clear");
+        assert!(set < run && run < clear, "{dispatch}");
+    }
+
+    /// #42: a Repeat reaches `repeat_last_action`, and the key goes quiet
+    /// after it so a third tap during the settle does not hit the busy card.
+    #[test]
+    fn the_repeat_key_action_is_handled_and_quiets_the_key() {
+        let src = lf(include_str!("app.rs"));
+        let apply = body_between(&src, "    fn apply_key_action(", "\n    }\n");
+        let arm = apply.find("KeyAction::Repeat =>").expect("arm");
+        let tail = &apply[arm..];
+        assert!(tail.contains("self.repeat_last_action()"), "{apply}");
+        assert!(tail.contains("self.key_quiet_until"), "{apply}");
+        let rep = body_between(&src, "    fn repeat_last_action(", "\n    }\n");
+        assert!(rep.contains("run_option("), "{rep}");
+    }
+
     /// #393: what only the card and the clock know.
     #[test]
     fn the_key_phase_is_refined_by_the_card_state_and_the_clock() {
@@ -10233,26 +10646,26 @@ mod tests {
         let looking = Phase::Looking { early: false };
         // Inside the window of the press that started the Look: a second tap.
         assert_eq!(
-            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300)),
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300), false),
             Phase::Looking { early: true }
         );
         // Outside it, or with double press off, or no press recorded: a cancel.
         for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
             assert_eq!(
-                super::refine_key_phase(looking, CardState::Options, since, win),
+                super::refine_key_phase(looking, CardState::Options, since, win, false),
                 Phase::Looking { early: false }
             );
         }
         // An answer, error or info card is an Answer; nothing else is.
         for st in [CardState::Collapsed, CardState::Expanded] {
             assert_eq!(
-                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Answer
             );
         }
         for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
             assert_eq!(
-                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Other
             );
         }
@@ -10261,7 +10674,7 @@ mod tests {
             pickable: [true, true],
         };
         assert_eq!(
-            super::refine_key_phase(opts, CardState::Options, None, ms(300)),
+            super::refine_key_phase(opts, CardState::Options, None, ms(300), false),
             opts
         );
     }
@@ -11766,7 +12179,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_learned_and_pause_toggle() {
+    fn settings_reentrancy_ignores_hotkey_activate_tray_dismiss_and_pause_toggle() {
         // Issue #213: WM_APP_CALENDAR_RESULT, WM_APP_REVIEW_RESULT,
         // WM_APP_PREVIEW_DECIDED and (#40) WM_APP_FORM_FILL_RESULT used to
         // be asserted Ignore here too, before they moved to Defer -- see
@@ -11776,7 +12189,6 @@ mod tests {
             WM_APP_ACTIVATE,
             WM_APP_TRAY,
             WM_APP_DISMISS,
-            WM_APP_LEARNED,
             WM_APP_PAUSE_TOGGLE,
         ] {
             assert_eq!(
@@ -11791,7 +12203,7 @@ mod tests {
     fn settings_reentrancy_ignores_palette_and_router_messages() {
         // #25/#24: these three share one match arm in
         // `settings_reentrancy_policy` -- covered together here (a gap the
-        // pre-existing `..._hotkey_activate_tray_dismiss_learned_and_pause_toggle`
+        // pre-existing `..._hotkey_activate_tray_dismiss_and_pause_toggle`
         // test above never closed for WM_APP_PALETTE_TOGGLE/WM_APP_PALETTE_RUN;
         // filed as a finding rather than folded into that test's name, which
         // this commit does not otherwise touch). WM_APP_ROUTER_RESULT is
@@ -12663,7 +13075,6 @@ mod tests {
         const DROPPED: &[u32] = &[
             WM_APP_TRAY,
             WM_APP_DISMISS,
-            WM_APP_LEARNED,
             WM_APP_PALETTE_TOGGLE,
             WM_APP_PALETTE_RUN,
             WM_APP_CARD_OPEN_SETTINGS,
@@ -12836,7 +13247,7 @@ mod tests {
         ("WM_APP_TRAY", WM_APP_TRAY, SettingsReentrancy::Ignore),
         ("WM_APP_HOTKEY", WM_APP_HOTKEY, SettingsReentrancy::Ignore),
         ("WM_APP_RESULT", WM_APP_RESULT, SettingsReentrancy::Defer),
-        ("WM_APP_LEARNED", WM_APP_LEARNED, SettingsReentrancy::Ignore),
+        ("WM_APP_LEARNED", WM_APP_LEARNED, SettingsReentrancy::Defer),
         ("WM_APP_DISMISS", WM_APP_DISMISS, SettingsReentrancy::Ignore),
         (
             "WM_APP_ACTIVATE",
@@ -12916,7 +13327,7 @@ mod tests {
         (
             "WM_APP_MACHINE_CHECK_RESULT",
             WM_APP_MACHINE_CHECK_RESULT,
-            SettingsReentrancy::Ignore,
+            SettingsReentrancy::Defer,
         ),
         (
             "WM_APP_FIRST_RUN",
@@ -14283,6 +14694,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #906: the persistent error cards outside the setup helper must also arm
+    /// click-away, and the startup cards (welcome, key problems) need the
+    /// watcher installed before they are shown, then an arm after them.
+    #[test]
+    fn persistent_error_cards_arm_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let names = [
+            "show_tray_restore_error",
+            "on_taskbar_created",
+            "copy_region",
+            "commit_import",
+            "export_action",
+        ];
+        for name in names {
+            let body = body_of(name);
+            assert!(body.contains(".show_error"), "{name}: no error card found");
+            assert!(
+                body.contains("set_watch(true)"),
+                "{name} shows a persistent error card without arming click-away"
+            );
+        }
+        // Startup: install, then the cards, then arm if any card is up.
+        let run_start = production.find("pub fn run()").expect("run not found");
+        let run = &production[run_start..];
+        let install = run.find("ClickWatcher::install").expect("no install");
+        let welcome = run.find("welcome_card(").expect("no welcome card");
+        let arm = run.find("app.set_watch(true)").expect("no startup arm");
+        assert!(
+            install < welcome,
+            "the watcher is installed after the welcome card"
+        );
+        assert!(
+            welcome < arm,
+            "the startup arm comes before the welcome card"
+        );
     }
 
     #[test]

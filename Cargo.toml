@@ -41,6 +41,9 @@ ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "js
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6"
+# Grapheme-cluster boundaries for the options card ellipsis (#1023). (MIT OR
+# Apache-2.0), no dependencies of its own.
+unicode-segmentation = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # QR decoding (#313): pure Rust, no model, no network. (MIT OR Apache-2.0) AND
 # ISC (the ISC part is its port of the quirc detector), re-verified at adoption
