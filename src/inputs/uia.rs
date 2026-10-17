@@ -26,9 +26,9 @@
 //!
 //! # Threading (AGENTS.md rule 8, the task brief)
 //!
-//! [`snapshot_hwnd`] and [`snapshot_foreground`] initialize COM
-//! apartment-threaded (`COINIT_APARTMENTTHREADED`) and uninitialize it
-//! before returning, via the RAII guard `com::ComApartment`. **Call these
+//! [`snapshot_hwnd`] initializes COM
+//! apartment-threaded (`COINIT_APARTMENTTHREADED`) and uninitializes it
+//! before returning, via the RAII guard `com::ComApartment`. **Call it
 //! from a dedicated worker thread, never from the low-level keyboard hook's
 //! thread**: a blocking COM call into another process's UI Automation
 //! provider (a hung app, a slow browser) can take seconds, and the hook
@@ -36,8 +36,7 @@
 //! receiving keyboard input for as long as the call takes.
 //!
 //! `app.rs`'s generic-action worker calls [`snapshot_hwnd`] (the `uia` input,
-//! #484). [`snapshot_foreground`] has no caller yet; the
-//! Some `#[allow(dead_code)]` attributes below date from before the wiring and
+//! #484). Some `#[allow(dead_code)]` attributes below date from before the wiring and
 //! are harmless. Every public item is exercised by this file's own tests.
 
 use std::time::Duration;
@@ -756,16 +755,6 @@ impl PasswordLookup {
             slot: Default::default(),
         }
     }
-}
-
-/// Snapshots the current foreground window. A thin wrapper: every
-/// constraint on [`snapshot_hwnd`] (threading, budget, truncation) applies
-/// unchanged.
-#[allow(dead_code)] // some items have no caller outside tests
-pub fn snapshot_foreground(max_elements: usize, budget: Duration) -> anyhow::Result<Snapshot> {
-    let hwnd = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    anyhow::ensure!(!hwnd.0.is_null(), "no foreground window");
-    snapshot_hwnd(hwnd, max_elements, budget)
 }
 
 // ---------------------------------------------------------------------------
