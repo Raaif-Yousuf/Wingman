@@ -31,6 +31,11 @@ const MAX_DEPTH: usize = 32;
 const ATTR_OFFLINE: u32 = 0x0000_1000;
 const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
+/// Tests that go through the process-wide store (and the process-wide notice
+/// queue) take turns on this, here and in the watcher's tests.
+#[cfg(test)]
+pub(super) static GLOBAL_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What one scan did, for the notice and the tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ScanSummary {
@@ -131,7 +136,7 @@ fn spawn_failed_notice(error: &str) -> String {
 /// release profile is `panic = "abort"`, where nothing can be caught and the
 /// crash note (`crash_note.rs`) shows a card at the next start instead. The
 /// panic text is never shown (it can come from file contents).
-fn guarded(work: impl FnOnce()) {
+pub(super) fn guarded(work: impl FnOnce()) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         notice::report(
             "Indexing your knowledge folder stopped unexpectedly. Wingman keeps running; it will try again at the next start.",
@@ -143,9 +148,11 @@ fn guarded(work: impl FnOnce()) {
 /// free next time, or it never will be.
 #[derive(Debug, PartialEq, Eq)]
 enum OpenFailure {
-    /// In use right now (a sharing or lock violation), or gone since it was
-    /// listed: try again at the next scan.
+    /// In use right now (a sharing or lock violation): try again at the next
+    /// scan.
     Busy,
+    /// Not there any more: deleted since it was listed. Nothing to retry.
+    Gone,
     /// Refused by permissions: retrying at every start only repeats the same
     /// notice, so it is recorded as failed and left alone until the file changes.
     Denied,
@@ -155,13 +162,15 @@ fn open_failure(e: &std::io::Error) -> OpenFailure {
     // ERROR_ACCESS_DENIED
     if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) {
         OpenFailure::Denied
+    } else if e.kind() == std::io::ErrorKind::NotFound {
+        OpenFailure::Gone
     } else {
         OpenFailure::Busy
     }
 }
 
 /// The one sentence a finished scan leaves for the next card, if any.
-fn summary_notice(summary: &ScanSummary) -> Option<String> {
+pub(super) fn summary_notice(summary: &ScanSummary) -> Option<String> {
     let unreadable = summary.failed + summary.pending;
     if unreadable > 0 {
         Some(format!(
@@ -218,7 +227,7 @@ fn run_scan(setting: Setting) {
 
 /// Background mode lowers CPU, disk and memory priority for this thread.
 /// Best effort: a refusal only means the scan runs at normal priority.
-fn lower_thread_priority() {
+pub(super) fn lower_thread_priority() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
     };
@@ -228,7 +237,7 @@ fn lower_thread_priority() {
     }
 }
 
-fn now_unix() -> i64 {
+pub(super) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -237,7 +246,7 @@ fn now_unix() -> i64 {
 
 /// The folder as an absolute path without the `\\?\` prefix. The folder is
 /// never created here (it is made on first use, spec question 1).
-fn canonical_root(folder: &Path) -> Result<PathBuf, String> {
+pub(super) fn canonical_root(folder: &Path) -> Result<PathBuf, String> {
     let canon = std::fs::canonicalize(folder).map_err(|_| {
         format!(
             "The knowledge folder {} was not found, so nothing was indexed.",
@@ -257,8 +266,8 @@ fn canonical_root(folder: &Path) -> Result<PathBuf, String> {
     }
 }
 
-struct FoundFile {
-    rel: String,
+pub(super) struct FoundFile {
+    pub(super) rel: String,
     path: PathBuf,
     size: u64,
     mtime: Option<i64>,
@@ -269,6 +278,26 @@ struct FoundFile {
 /// Walks `root` once and brings the store in line with it. A store error
 /// stops the scan (the store is likely broken); a bad file never does.
 pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, StoreError> {
+    scan_folder_until(store, root, now, &|| false)
+}
+
+/// [`scan_folder`] that gives up once `stopped` says yes: asked before the
+/// root is inserted and before every file, and after it says yes nothing more
+/// is written (no root, no documents, no deletes). A watcher that was replaced
+/// must not bring its retired folder back while the new one is scanned.
+pub fn scan_folder_until(
+    store: &Store,
+    root: &Path,
+    now: i64,
+    stopped: &dyn Fn() -> bool,
+) -> Result<ScanSummary, StoreError> {
+    let stopped_summary = || ScanSummary {
+        incomplete: true,
+        ..Default::default()
+    };
+    if stopped() {
+        return Ok(stopped_summary());
+    }
     let root_key = root.to_string_lossy().into_owned();
     let root_id = store.ensure_root(&root_key, now)?;
     let (files, mut incomplete) = walk(root);
@@ -278,6 +307,11 @@ pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, 
     let mut summary = ScanSummary::default();
 
     for file in &files {
+        if stopped() {
+            // Returning here also keeps the deletes below from running.
+            summary.incomplete = true;
+            return Ok(summary);
+        }
         let existing = by_path.get(file.rel.as_str()).copied();
         match index_file(store, root_id, file, existing, now)? {
             Outcome::Indexed => summary.indexed += 1,
@@ -285,6 +319,8 @@ pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, 
             Outcome::Skipped => summary.skipped += 1,
             Outcome::Failed => summary.failed += 1,
             Outcome::Pending => summary.pending += 1,
+            // Deleted while the scan ran: nothing to count, nothing left over.
+            Outcome::Gone => {}
         }
     }
 
@@ -332,6 +368,17 @@ fn walk(root: &Path) -> (Vec<FoundFile>, bool) {
                 if name.starts_with('.') {
                     continue;
                 }
+                // A cloud placeholder folder has the reparse bit but is not a
+                // symlink. The watcher does not enter these (`ancestors_state`),
+                // so the scan does not either: both skip, the safer way.
+                match entry.metadata() {
+                    Ok(meta) if attributes(&meta) & ATTR_REPARSE_POINT != 0 => continue,
+                    Ok(_) => {}
+                    Err(_) => {
+                        incomplete = true;
+                        continue;
+                    }
+                }
                 if depth + 1 > MAX_DEPTH {
                     incomplete = true;
                 } else {
@@ -339,32 +386,16 @@ fn walk(root: &Path) -> (Vec<FoundFile>, bool) {
                 }
                 continue;
             }
-            if !kind.is_file() || is_ignored_file(&name) {
+            if !kind.is_file() || is_ignored_file(&name) || parser_for(&name).is_none() {
                 continue;
             }
-            let Some(parser) = parser_for(&name) else {
-                continue;
-            };
             let Ok(meta) = entry.metadata() else {
                 incomplete = true;
                 continue;
             };
-            let path = entry.path();
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            files.push(FoundFile {
-                rel: rel_key(rel),
-                size: meta.len(),
-                mtime: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64),
-                attributes: attributes(&meta),
-                parser,
-                path,
-            });
+            if let Some(file) = file_candidate(root, entry.path(), &meta) {
+                files.push(file);
+            }
         }
     }
     files.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -372,12 +403,142 @@ fn walk(root: &Path) -> (Vec<FoundFile>, bool) {
     (files, incomplete)
 }
 
+/// The indexable file at `path` under `root`, or `None` for one that is
+/// ignored, has no parser, or is not under `root`. The one place a
+/// [`FoundFile`] is built, for the scan's walk and the watcher's single paths.
+fn file_candidate(root: &Path, path: PathBuf, meta: &std::fs::Metadata) -> Option<FoundFile> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    if is_ignored_file(&name) {
+        return None;
+    }
+    let parser = parser_for(&name)?;
+    let rel = path.strip_prefix(root).ok()?;
+    Some(FoundFile {
+        rel: rel_key(rel),
+        size: meta.len(),
+        mtime: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64),
+        attributes: attributes(meta),
+        parser,
+        path,
+    })
+}
+
+/// What is at one path under a root right now (the watcher's view of a change).
+pub(super) enum Probe {
+    /// Nothing there: deleted, or renamed away.
+    Gone,
+    /// A folder that is walked (not a dot-folder, not a link).
+    Dir,
+    /// A link, a dot-folder, a lock or temp file, or a type with no parser.
+    Ignored,
+    /// Could not be looked at (in use, no access): try again shortly.
+    Unreadable,
+    File(FoundFile),
+}
+
+/// True for a relative path the scan would never index: anything inside a
+/// dot-folder, a `~$` Office lock file, a `.tmp` file. Pure.
+pub(super) fn is_ignored_rel(rel: &str) -> bool {
+    let mut parts = rel.split('/').filter(|p| !p.is_empty()).peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_some() {
+            if part.starts_with('.') {
+                return true;
+            }
+        } else {
+            return is_ignored_file(part);
+        }
+    }
+    true
+}
+
+/// What the folders between the root and a file are.
+enum Ancestors {
+    Plain,
+    /// One is a symbolic link, junction or other reparse point.
+    Link,
+    Missing,
+    /// One could not be looked at: treated as unreadable, never as plain.
+    Unknown,
+}
+
+const ATTR_REPARSE_POINT: u32 = 0x400;
+
+fn ancestors_state(root: &Path, rel: &str) -> Ancestors {
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    let mut path = root.to_path_buf();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || attributes(&meta) & ATTR_REPARSE_POINT != 0 {
+                    return Ancestors::Link;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ancestors::Missing,
+            Err(_) => return Ancestors::Unknown,
+        }
+    }
+    Ancestors::Plain
+}
+
+/// Looks at `rel` under `root` without following links, the final component's
+/// or any folder's on the way.
+pub(super) fn probe(root: &Path, rel: &str) -> Probe {
+    if is_ignored_rel(rel) {
+        return Probe::Ignored;
+    }
+    // A folder inside the root that became a link would resolve outside it,
+    // and the final-component check below cannot see that.
+    match ancestors_state(root, rel) {
+        Ancestors::Plain => {}
+        Ancestors::Link => return Probe::Ignored,
+        Ancestors::Missing => return Probe::Gone,
+        Ancestors::Unknown => return Probe::Unreadable,
+    }
+    let path = root.join(rel);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probe::Gone,
+        Err(_) => return Probe::Unreadable,
+    };
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Probe::Ignored
+    } else if kind.is_dir() {
+        let dotted = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if dotted {
+            Probe::Ignored
+        } else {
+            Probe::Dir
+        }
+    } else if kind.is_file() {
+        file_candidate(root, path, &meta).map_or(Probe::Ignored, Probe::File)
+    } else {
+        Probe::Ignored
+    }
+}
+
+/// The folder the watcher should watch for this setting, if it is a usable one.
+pub(super) fn watch_target(folder: &str) -> Option<PathBuf> {
+    match read_setting(folder) {
+        Setting::Folder(path) => Some(path),
+        Setting::Off | Setting::Invalid(_) => None,
+    }
+}
+
 fn is_ignored_file(name: &str) -> bool {
     name.starts_with("~$") || name.to_ascii_lowercase().ends_with(".tmp")
 }
 
 /// A path relative to its root, with `/` separators, as the document key.
-fn rel_key(rel: &Path) -> String {
+pub(super) fn rel_key(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
@@ -389,7 +550,10 @@ fn attributes(meta: &std::fs::Metadata) -> u32 {
     meta.file_attributes()
 }
 
-enum Outcome {
+pub(super) enum Outcome {
+    /// The file was deleted between listing and reading: its row, if any, is
+    /// dropped and no `pending` row is left behind.
+    Gone,
     Indexed,
     Unchanged,
     Skipped,
@@ -397,7 +561,7 @@ enum Outcome {
     Pending,
 }
 
-fn index_file(
+pub(super) fn index_file(
     store: &Store,
     root_id: i64,
     file: &FoundFile,
@@ -457,6 +621,12 @@ fn index_file(
                 &stamp,
                 "the file could not be opened or read (permission refused or damaged)",
             );
+        }
+        Err(OpenFailure::Gone) => {
+            if let Some(doc) = existing {
+                store.delete_documents(&[doc.id])?;
+            }
+            return Ok(Outcome::Gone);
         }
         Err(OpenFailure::Busy) => {
             store.mark_document(
@@ -578,7 +748,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, OpenFailure> {
 fn read_failure(e: &std::io::Error) -> OpenFailure {
     match e.raw_os_error() {
         Some(32 | 33) => OpenFailure::Busy,
-        _ if e.kind() == std::io::ErrorKind::NotFound => OpenFailure::Busy,
+        _ if e.kind() == std::io::ErrorKind::NotFound => OpenFailure::Gone,
         _ => OpenFailure::Denied,
     }
 }
@@ -593,7 +763,7 @@ mod tests {
 
     /// `start_scan` works on the one process-wide store and retires the roots
     /// it was not given, so the tests that go through it take turns.
-    static GLOBAL_STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::GLOBAL_STORE_LOCK as GLOBAL_STORE;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -616,6 +786,50 @@ mod tests {
             section("Skills", "Rust and Win32. "),
         ]
         .concat()
+    }
+
+    #[test]
+    fn a_stopped_scan_inserts_no_root_and_no_documents() {
+        let dir = scratch("stopped-scan");
+        fs::write(dir.join("a.md"), "# A\nstoppedscanword\n").unwrap();
+        let store = Store::in_memory();
+        scan_folder_until(&store, &dir, FUT, &|| true).unwrap();
+        assert_eq!(store.fts_hits("stoppedscanword").unwrap(), 0);
+        assert_eq!(
+            store.retire_default_roots_except(None).unwrap(),
+            0,
+            "the stopped scan must not have created the root"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scan_stopped_part_way_indexes_no_more_files_and_removes_nothing() {
+        let dir = scratch("stopped-midway");
+        fs::write(dir.join("a.md"), "# A\nmidwayone\n").unwrap();
+        fs::write(dir.join("b.md"), "# B\nmidwaytwo\n").unwrap();
+        let store = Store::in_memory();
+        scan_folder(&store, &dir, FUT).unwrap();
+        fs::remove_file(dir.join("a.md")).unwrap();
+        fs::write(dir.join("c.md"), "# C\nmidwaythree\n").unwrap();
+        let asked = std::cell::Cell::new(0);
+        // Not stopped for ensure_root and the first file, stopped after.
+        let stopped = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        };
+        scan_folder_until(&store, &dir, FUT, &stopped).unwrap();
+        assert_eq!(
+            store.fts_hits("midwaythree").unwrap(),
+            0,
+            "c.md is after the stop"
+        );
+        assert_eq!(
+            store.fts_hits("midwayone").unwrap(),
+            1,
+            "no deletes after the stop"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -943,7 +1157,7 @@ mod tests {
         );
         assert_eq!(
             open_failure(&Error::from(ErrorKind::NotFound)),
-            OpenFailure::Busy
+            OpenFailure::Gone
         );
         assert_eq!(
             open_failure(&Error::from(ErrorKind::PermissionDenied)),
@@ -958,13 +1172,13 @@ mod tests {
     #[test]
     fn a_read_error_is_retried_only_when_the_file_is_in_use_or_gone() {
         use std::io::{Error, ErrorKind};
-        for busy in [
-            Error::from_raw_os_error(32),
-            Error::from_raw_os_error(33),
-            Error::from(ErrorKind::NotFound),
-        ] {
+        for busy in [Error::from_raw_os_error(32), Error::from_raw_os_error(33)] {
             assert_eq!(read_failure(&busy), OpenFailure::Busy, "{busy:?}");
         }
+        assert_eq!(
+            read_failure(&Error::from(ErrorKind::NotFound)),
+            OpenFailure::Gone
+        );
         for permanent in [
             Error::from_raw_os_error(23),
             Error::from(ErrorKind::InvalidData),
@@ -976,6 +1190,76 @@ mod tests {
                 "{permanent:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_file_deleted_before_it_was_read_is_gone_not_pending() {
+        let dir = scratch("gone-before-read");
+        let file = FoundFile {
+            rel: "vanished.md".into(),
+            path: dir.join("vanished.md"),
+            size: 10,
+            mtime: Some(100),
+            attributes: 0,
+            parser: parser_for("vanished.md").unwrap(),
+        };
+        let store = Store::in_memory();
+        let root = store.ensure_root("C:\\gone-root", 0).unwrap();
+        let outcome = index_file(&store, root, &file, None, FUT).unwrap();
+        assert!(matches!(outcome, Outcome::Gone));
+        assert_eq!(store.document_state(root, "vanished.md").unwrap(), None);
+
+        // A row that was there is dropped with it.
+        fs::write(dir.join("vanished.md"), "# V\nvanishword\n").unwrap();
+        let found = match probe(&dir, "vanished.md") {
+            Probe::File(f) => f,
+            _ => panic!("the file is there"),
+        };
+        index_file(&store, root, &found, None, FUT).unwrap();
+        let known = store.documents_in_root(root).unwrap();
+        assert_eq!(known.len(), 1);
+        fs::remove_file(dir.join("vanished.md")).unwrap();
+        let mut stale = known[0].clone();
+        stale.status = "pending".into();
+        let again = index_file(&store, root, &found, Some(&stale), 0).unwrap();
+        assert!(matches!(again, Outcome::Gone));
+        assert_eq!(store.document_state(root, "vanished.md").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory junction `link` pointing at `target` (no elevation needed).
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn a_path_through_a_junction_inside_the_root_is_not_followed() {
+        let dir = scratch("junction-ancestor");
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.md"), "# S\nsecretword\n").unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real").join("ok.md"), "# O\nokword\n").unwrap();
+        assert!(junction(&root.join("jump"), &outside), "mklink /J failed");
+
+        // The control: a real subfolder is looked at.
+        assert!(matches!(probe(&root, "real/ok.md"), Probe::File(_)));
+        // The same shape through the junction resolves outside the root.
+        assert!(
+            matches!(probe(&root, "jump/secret.md"), Probe::Ignored),
+            "an ancestor that is a link must not be followed"
+        );
+        assert!(matches!(probe(&root, "jump"), Probe::Ignored));
+        // Remove the junction itself first so nothing is deleted through it.
+        let _ = fs::remove_dir(root.join("jump"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

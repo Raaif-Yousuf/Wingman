@@ -550,7 +550,7 @@ fn wide(s: &str) -> Vec<u16> {
 /// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`. `None` on any
 /// registry failure (best-effort, same as `autostart.rs`'s value reads);
 /// the report shows "unknown" rather than failing to build at all.
-fn windows_build_number() -> Option<String> {
+pub(crate) fn windows_build_number() -> Option<String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
