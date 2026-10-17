@@ -692,15 +692,6 @@ fn read_time(text: &str, toks: &[Tok], from: usize) -> Option<(usize, Time)> {
                 },
             ))
         }
-        "midnight" => {
-            return Some((
-                j,
-                Time {
-                    minute_of_day: 0,
-                    assumed: false,
-                },
-            ))
-        }
         "end" => {
             let (of, day) = (toks.get(j + 1)?, toks.get(j + 2)?);
             let spaced = space_between(text, t, of) && space_between(text, of, day);
@@ -769,11 +760,12 @@ pub fn resolve(phrase: &str, today: CivilDate, week: WeekStart) -> Option<Resolu
 /// week" is Friday or the last day of the week.
 ///
 /// A date phrase can be followed by a time (#706): `EOD` or `COB` or `end of
-/// day` (taken as 17:00, and marked [`Time::assumed`]), `noon`, `midnight`
-/// (00:00 on that date), or a clock time such as `5pm`, `5 p.m.`, `9:30 am` or
+/// day` (taken as 17:00, and marked [`Time::assumed`]), `noon`, or a clock
+/// time such as `5pm`, `5 p.m.`, `9:30 am` or
 /// `17:00`, with an optional `at` or `by`, and an optional comma after the date
 /// (`tomorrow, 5pm`).
-/// A time that could be read two ways ("at 5") is left out and the date still
+/// A time that could be read two ways ("at 5", or "midnight", which can mean
+/// either end of the day) is left out and the date still
 /// stands. `in N hours|minutes`, `N hours ago` and `N minutes from now` need
 /// `now_minute`, the minutes since local midnight; without it they are not
 /// resolved. An out-of-range `now_minute` counts as without.
@@ -1662,11 +1654,18 @@ mod tests {
     }
 
     #[test]
-    fn midnight_is_the_start_of_the_day() {
-        assert_eq!(time_of("tomorrow at midnight"), Some((0, false)));
-        assert_eq!(time_of("tomorrow, midnight"), Some((0, false)));
-        assert_eq!(time_of("tomorrow MIDNIGHT"), Some((0, false)));
-        assert_eq!(time_of("tomorrow at midnights"), None);
+    fn midnight_is_not_guessed() {
+        // "Friday midnight" usually means the end of Friday, not 00:00 at its
+        // start, so no time is shown and the date stands.
+        for text in [
+            "Friday midnight",
+            "tomorrow at midnight",
+            "tomorrow, midnight",
+        ] {
+            let f = at(text);
+            assert_eq!(f.len(), 1, "{text}");
+            assert_eq!(f[0].time, None, "{text}");
+        }
     }
 
     #[test]
