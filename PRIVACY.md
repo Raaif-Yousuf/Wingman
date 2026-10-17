@@ -81,6 +81,32 @@ refused in Offline and Local mode, is one row in the egress log (the site
 name and the bytes received, never the path, the query or the page), and
 lives in `src/inputs/web_page.rs`.
 
+## Your documents folder
+
+If you set a folder under `[knowledge]` in the config file, Wingman reads the
+text files in it and keeps a searchable copy in its local store. Nothing is
+sent anywhere to do that: reading and indexing make no network request.
+
+A file's text leaves your computer in one case only: you type a question in
+the palette and choose **Ask my documents**. Wingman then looks up the few
+excerpts that match your question and puts them in that one request to your
+model, marked as untrusted data. Email addresses, card numbers, IBANs and
+key-like tokens in the excerpts are replaced with markers first, whatever the
+screenshot-redaction setting says. Nothing else in the folder is sent, and
+nothing is sent without your question.
+
+- Where it goes: to the provider that answers, like any other request. With a
+  local model (Ollama on this computer) it stays on this computer.
+- **Offline** blocks it like every cloud request. Local mode sends it only to
+  a local model.
+- The egress log records every such request. It lists one label per excerpt,
+  such as `resume.pdf#chunk 12:ab12cd34` (file name, chunk number and the start
+  of the chunk's hash), and never the excerpt text. A file name can be
+  sensitive in itself, and the log shows it so you can see what was attached.
+  The send preview, when it is on, shows the same labels.
+- The answer card shows the quotes it relied on and the file each came from.
+  Wingman checks every quote against the excerpt before showing it.
+
 ## Modes and the Offline guard
 
 The tray's **Mode** submenu is Cloud / Local / Auto (default) / Offline.
