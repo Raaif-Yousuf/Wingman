@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
+
+/// The start of the load problem when the copilot-ask settings could not be
+/// copied forward (#1018). The card wording keys off it (#1037).
+pub const COPY_FAILED_PREFIX: &str = "Your copilot-ask settings could not be copied";
 use crate::mode::Mode;
 use crate::provider::openai_compat::{CompatAuth, Structured};
 use crate::provider::{
@@ -1238,7 +1242,7 @@ impl Config {
             // for them, so no key moves anywhere.
             let folder = old_path.parent().unwrap_or(old_path);
             return Ok(Self::not_loaded(format!(
-                "Your copilot-ask settings could not be copied to the Wingman folder ({}). \
+                "{COPY_FAILED_PREFIX} to the Wingman folder ({}). \
                  They are still in {} (to start fresh instead, rename config.toml there to \
                  config.toml.old)",
                 format!("{e:#}").chars().take(200).collect::<String>(),
