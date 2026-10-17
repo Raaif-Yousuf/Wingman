@@ -334,6 +334,10 @@ const STUCK_TIMER_ID: usize = 4;
 /// single press from a double (rule 5: never while idle), killed when it
 /// fires or a second press arrives.
 const KEY_WINDOW_TIMER_ID: usize = 5;
+/// #901: one-shot, armed only while a Reload settings is in flight (rule 5),
+/// killed when its answer arrives. If the writer never answers it fires once
+/// and the Working card becomes an error card.
+const RELOAD_TIMER_ID: usize = 6;
 
 /// #307: the options card on screen, as the app side knows it. The card holds
 /// the buttons; this holds what each one runs. Its `generation` must equal the
@@ -5071,7 +5075,34 @@ impl App {
     fn reload(&mut self) {
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
+        // The writer answers in well under a second when it is alive; if it
+        // never does, the Working card must not stay forever.
+        unsafe {
+            let _ = SetTimer(
+                Some(self.hwnd()),
+                RELOAD_TIMER_ID,
+                SAVE_STUCK_AFTER.as_millis() as u32,
+                None,
+            );
+        }
         self.persist_changes_with(crate::config_writer::Outcome::reload(), Vec::new(), None);
+    }
+
+    /// #901: the one-shot timer of `reload` fired. When the Working card is
+    /// still up and a write is still unanswered, the writer is stuck: say so.
+    fn on_reload_stuck(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID);
+        }
+        let in_flight = self
+            .pending_writes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
+        if reload_is_stuck(pending, in_flight) {
+            let (headline, detail) = reload_stuck_card();
+            self.card.show_error(headline, detail);
+            self.set_watch(true);
+        }
     }
     /// Opens the Settings window (or brings the open one to the front).
     ///
@@ -5682,6 +5713,11 @@ impl App {
             key_error,
         } = written;
         let last = crate::config_writer::finish(&self.pending_writes);
+        if outcome.from_reload {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID);
+            }
+        }
         if outcome.from_settings {
             crate::config_writer::finish(&self.settings_saves);
         }
@@ -5709,6 +5745,18 @@ impl App {
                 Some(crate::config_writer::Loaded {
                     config: Ok(config), ..
                 }) if config.load_problem.is_none() => {
+                    if reload_reply(outcome.from_reload, last) == ReloadReply::Superseded {
+                        // A write sent after the reload is still in flight and
+                        // its reply reads the file later, so it is the one to
+                        // swap the config in. Nothing is cleared or claimed
+                        // here; the Working card goes so it cannot outlive
+                        // the answer (a later save keeps a card that is up).
+                        if matches!(self.card.state(), crate::ui::card::CardState::Pending) {
+                            self.hide_card();
+                            self.set_watch(false);
+                        }
+                        return;
+                    }
                     if last {
                         if outcome.from_reload {
                             // The file is the truth again; an old failed write
@@ -8731,6 +8779,39 @@ const SAVE_STUCK_AFTER: Duration = Duration::from_secs(30);
 
 /// Whether the oldest save still in flight has gone unanswered for too long
 /// (`since` is when the count last rose from zero).
+/// What `on_config_written` does with a reload's reply (#901). A reload that
+/// is not the last reply to arrive is `Superseded`: a write sent after it will
+/// read the file later, so only that reply swaps the config, and the reload
+/// neither clears `unsaved` nor says "Settings reloaded" over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadReply {
+    NotAReload,
+    Apply,
+    Superseded,
+}
+
+fn reload_reply(from_reload: bool, last: bool) -> ReloadReply {
+    match (from_reload, last) {
+        (false, _) => ReloadReply::NotAReload,
+        (true, true) => ReloadReply::Apply,
+        (true, false) => ReloadReply::Superseded,
+    }
+}
+
+/// The reload's timer fired: stuck when the Working card is still up and a
+/// write is still unanswered.
+fn reload_is_stuck(working_card_up: bool, writes_in_flight: u32) -> bool {
+    working_card_up && writes_in_flight > 0
+}
+
+/// No em dash (rule 11).
+fn reload_stuck_card() -> (&'static str, &'static str) {
+    (
+        "Couldn't reload settings",
+        "Wingman did not get an answer in time. If it keeps happening, quit Wingman from the tray and start it again.",
+    )
+}
+
 fn save_is_stuck(saves_in_flight: u32, since: Option<Instant>, now: Instant) -> bool {
     saves_in_flight > 0
         && since.is_some_and(|s| now.saturating_duration_since(s) >= SAVE_STUCK_AFTER)
@@ -8870,6 +8951,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
             }
             KEY_WINDOW_STALE.with(|c| c.set(true));
+            return LRESULT(0);
+        }
+        if msg == WM_TIMER && wparam.0 == RELOAD_TIMER_ID {
+            // Not killed here: it fires again once the menu or dialog is over,
+            // and `on_reload_stuck` kills it then.
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
@@ -9192,6 +9278,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 app.on_busy_stuck();
             } else if wparam.0 == KEY_WINDOW_TIMER_ID {
                 app.on_key_window_expired();
+            } else if wparam.0 == RELOAD_TIMER_ID {
+                app.on_reload_stuck();
             }
             LRESULT(0)
         }
@@ -9773,6 +9861,29 @@ mod tests {
 
     /// #901: Reload settings reads the file, the secret store and any repair on
     /// the writer thread; the UI thread only takes the finished `Config`.
+    #[test]
+    fn a_reload_that_is_not_the_last_reply_is_superseded() {
+        use super::{reload_is_stuck, reload_reply, reload_stuck_card, ReloadReply};
+        assert_eq!(reload_reply(false, true), ReloadReply::NotAReload);
+        assert_eq!(reload_reply(false, false), ReloadReply::NotAReload);
+        assert_eq!(reload_reply(true, true), ReloadReply::Apply);
+        assert_eq!(reload_reply(true, false), ReloadReply::Superseded);
+        assert!(reload_is_stuck(true, 1));
+        assert!(!reload_is_stuck(false, 1), "the card moved on");
+        assert!(!reload_is_stuck(true, 0), "the answer arrived");
+        let (h, d) = reload_stuck_card();
+        assert!(!h.contains('\u{2014}') && !d.contains('\u{2014}'));
+        // Wired: the handler consults the rule, kills the timer, and the timer
+        // reaches the stuck handler.
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        assert!(handler.contains("reload_reply(outcome.from_reload, last)"));
+        assert!(handler.contains("KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID)"));
+        assert!(src.contains("app.on_reload_stuck()"));
+        let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(reload.contains("RELOAD_TIMER_ID"));
+    }
+
     #[test]
     fn reload_does_its_load_off_the_ui_thread() {
         let src = lf(include_str!("app.rs"));

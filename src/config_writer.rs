@@ -684,6 +684,8 @@ impl Outcome {
     pub fn reload() -> Self {
         Self {
             ok_headline: "Settings reloaded".to_string(),
+            fail_headline: "Couldn't reload settings".to_string(),
+            fail_note: "Wingman is still using the settings it had.".to_string(),
             from_reload: true,
             ..Self::simple("Settings reloaded")
         }
@@ -975,6 +977,10 @@ x = 1
         let o = Outcome::reload();
         assert!(o.from_reload && !o.from_settings && !o.ok_setup);
         assert_eq!(o.ok_headline, "Settings reloaded");
+        assert_eq!(o.fail_headline, "Couldn't reload settings");
+        assert!(!o.fail_headline.contains("Using"), "{}", o.fail_headline);
+        assert!(!o.fail_note.contains("revert"), "{}", o.fail_note);
+        assert!(!o.fail_headline.contains('\u{2014}') && !o.fail_note.contains('\u{2014}'));
         assert!(!Outcome::simple("x").from_reload);
         assert!(!Outcome::settings_save().from_reload);
     }
