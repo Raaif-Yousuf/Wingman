@@ -55,7 +55,9 @@ pub struct Contact {
 fn clean_line(raw: &str) -> String {
     let kept: String = raw
         .chars()
-        .filter(|c| (!c.is_control() || c.is_whitespace()) && *c != '\u{feff}')
+        .filter(|c| {
+            (!c.is_control() || c.is_whitespace()) && *c != '\u{feff}' && !is_hidden_format(*c)
+        })
         .collect();
     cut(kept.split_whitespace().collect::<Vec<_>>().join(" "))
 }
@@ -70,7 +72,7 @@ fn clean_block(raw: &str) -> String {
             '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}' => Some('\n'),
             '\t' => Some(' '),
             '\u{feff}' => None,
-            c if c.is_control() => None,
+            c if c.is_control() || is_hidden_format(c) => None,
             c => Some(c),
         })
         .collect();
@@ -119,31 +121,81 @@ pub fn parse_contact(value: &Value) -> Result<Contact> {
     Ok(contact)
 }
 
-/// `(family, given, display)` for a name: "Smith, Jane" is family Smith,
-/// given Jane; otherwise the last word is the family name and the rest the
-/// given names. A single word is the family name. The display form is the
-/// name as people say it ("Jane Smith").
-fn split_name(name: &str) -> (String, String, String) {
-    if let Some((family, given)) = name.split_once(',') {
-        let (family, given) = (family.trim(), given.trim());
-        if !family.is_empty() && !given.is_empty() {
-            return (
-                family.to_string(),
-                given.to_string(),
-                format!("{given} {family}"),
-            );
+/// Words that end a company name, so "Smith and Sons Ltd" is not a person.
+const COMPANY_SUFFIXES: [&str; 14] = [
+    "inc", "inc.", "llc", "ltd", "ltd.", "corp", "corp.", "co", "co.", "gmbh", "plc", "llp", "ag",
+    "company",
+];
+
+/// `(family, given, suffix, display)` for a name.
+///
+/// - A business (the name is the org, or ends in a company suffix such as
+///   "Corp" or "Ltd") goes whole into the family slot, never split in two.
+/// - "Smith, Jane" (one word before the comma) is family-first: family Smith,
+///   given Jane, displayed "Jane Smith".
+/// - Any other comma is a trailing credential: "Jane Smith, MD" is family
+///   Smith, given Jane, suffix MD, and the display name is kept exactly.
+/// - Otherwise the last word is the family name and the rest the given names.
+///   A single word is the family name.
+fn split_name(name: &str, org: &str) -> (String, String, String, String) {
+    let whole = || {
+        (
+            name.to_string(),
+            String::new(),
+            String::new(),
+            name.to_string(),
+        )
+    };
+    let last_word = name.rsplit(' ').next().unwrap_or("").to_lowercase();
+    if name.eq_ignore_ascii_case(org) || COMPANY_SUFFIXES.contains(&last_word.as_str()) {
+        return whole();
+    }
+    let (person, suffix) = match name.split_once(',') {
+        Some((before, after)) => {
+            let (before, after) = (before.trim(), after.trim());
+            if !before.is_empty() && !after.is_empty() && !before.contains(' ') {
+                return (
+                    before.to_string(),
+                    after.to_string(),
+                    String::new(),
+                    format!("{after} {before}"),
+                );
+            }
+            (before, after)
         }
+        None => (name, ""),
+    };
+    match person.rsplit_once(' ') {
+        Some((given, family)) => (
+            family.to_string(),
+            given.to_string(),
+            suffix.to_string(),
+            name.to_string(),
+        ),
+        None => whole(),
     }
-    match name.rsplit_once(' ') {
-        Some((given, family)) => (family.to_string(), given.to_string(), name.to_string()),
-        None => (name.to_string(), String::new(), name.to_string()),
-    }
+}
+
+/// True for the format characters that reorder or hide text (bidi overrides,
+/// isolates, marks and zero-width or invisible operators). The joiners ZWJ
+/// and ZWNJ are not in it: scripts need them.
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{061c}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// The vCard 3.0 text for `contact`, CRLF line endings, folded. `uid` is the
 /// card's `UID`.
 pub fn render_vcard(contact: &Contact, uid: &str) -> String {
-    let (family, given, display) = split_name(&contact.name);
+    let (family, given, suffix, display) = split_name(&contact.name, &contact.org);
     // FN is required: with no name, fall back to the email, then the phone.
     let display = [display, contact.email.clone(), contact.phone.clone()]
         .into_iter()
@@ -154,7 +206,12 @@ pub fn render_vcard(contact: &Contact, uid: &str) -> String {
         "BEGIN:VCARD".to_string(),
         "VERSION:3.0".to_string(),
         format!("UID:{}", escape_text(uid)),
-        format!("N:{};{};;;", escape_text(&family), escape_text(&given)),
+        format!(
+            "N:{};{};;;{}",
+            escape_text(&family),
+            escape_text(&given),
+            escape_text(&suffix)
+        ),
         format!("FN:{}", escape_text(&display)),
     ];
     if !contact.org.is_empty() {
@@ -519,6 +576,56 @@ mod tests {
             )),
             "unfolding must give back the whole address"
         );
+    }
+
+    fn card_for(name: &str, org: &str) -> String {
+        let c = Contact {
+            name: name.into(),
+            org: org.into(),
+            ..Contact::default()
+        };
+        render_vcard(&c, "u")
+    }
+
+    #[test]
+    fn a_trailing_credential_stays_in_the_name_and_is_not_swapped_to_the_front() {
+        let out = card_for("Jane Smith, MD", "");
+        assert!(out.contains("\r\nFN:Jane Smith\\, MD\r\n"), "{out}");
+        assert!(out.contains("\r\nN:Smith;Jane;;;MD\r\n"), "{out}");
+        let out = card_for("John Doe, PhD", "");
+        assert!(out.contains("\r\nFN:John Doe\\, PhD\r\n"), "{out}");
+        assert!(out.contains("\r\nN:Doe;John;;;PhD\r\n"), "{out}");
+    }
+
+    #[test]
+    fn a_business_name_is_not_split_into_a_person() {
+        // Same as the org, and a name ending in a company suffix.
+        for (name, org) in [
+            ("Acme Corp", "Acme Corp"),
+            ("acme corp", "ACME CORP"),
+            ("Acme Corp", ""),
+            ("Smith and Sons Ltd", ""),
+        ] {
+            let out = card_for(name, org);
+            assert!(
+                out.contains(&format!("\r\nN:{name};;;;\r\n")),
+                "{name}: {out}"
+            );
+            assert!(out.contains(&format!("\r\nFN:{name}\r\n")), "{name}: {out}");
+        }
+    }
+
+    #[test]
+    fn format_characters_that_reorder_or_hide_text_are_dropped_but_joiners_stay() {
+        let v = serde_json::json!({
+            "name": "Jane\u{202e}Smith\u{200b}\u{2066}x\u{2069}\u{200e}",
+            "title": "a\u{200d}b\u{200c}c",
+            "address": "1\u{202a} Road\u{2067}\n2\u{200b}"
+        });
+        let c = parse_contact(&v).unwrap();
+        assert_eq!(c.name, "JaneSmithx");
+        assert_eq!(c.title, "a\u{200d}b\u{200c}c");
+        assert_eq!(c.address, "1 Road\n2");
     }
 
     #[test]

@@ -1743,6 +1743,23 @@ END:VCALENDAR\r\n";
     }
 
     #[test]
+    fn cleanup_deletes_an_old_vcf_and_keeps_an_old_txt() {
+        let dir = test_temp_dir("cleanup-vcf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let age = MAX_ICS_FILE_AGE.as_secs() + 60;
+        let old_vcf = write_file_with_age(&dir, "old.vcf", age);
+        let fresh_vcf = write_file_with_age(&dir, "fresh.vcf", 60);
+        let old_txt = write_file_with_age(&dir, "old.txt", age);
+
+        cleanup_stale_ics_files(&dir);
+
+        assert!(!old_vcf.exists(), "a stale .vcf must be deleted");
+        assert!(fresh_vcf.exists(), "a recent .vcf must stay");
+        assert!(old_txt.exists(), "a .txt must never be touched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn cleanup_on_a_directory_that_does_not_exist_does_nothing_and_never_panics() {
         let dir = test_temp_dir("cleanup-missing-dir");
         // Deliberately never created.
