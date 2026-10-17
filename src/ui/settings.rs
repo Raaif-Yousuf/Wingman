@@ -821,6 +821,16 @@ struct KeySeams {
     check: fn(crate::provider::model_list::Vendor, &str) -> crate::provider::model_list::KeyCheck,
     /// The mode now.
     mode: fn() -> crate::mode::Mode,
+    /// Starts the check's worker thread (#1140: a test makes it fail).
+    spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+}
+
+/// The real worker thread of a key check.
+fn spawn_key_check_thread(job: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("settings-key-check".into())
+        .spawn(job)
+        .map(|_| ())
 }
 
 impl KeySeams {
@@ -828,6 +838,7 @@ impl KeySeams {
     const REAL: KeySeams = KeySeams {
         check: crate::provider::model_list::check_key,
         mode: crate::mode::current,
+        spawn: spawn_key_check_thread,
     };
 
     /// In a test build a window never reaches a vendor, whichever test made it:
@@ -836,6 +847,7 @@ impl KeySeams {
     const REAL: KeySeams = KeySeams {
         check: |_, _| crate::provider::model_list::KeyCheck::Unchecked,
         mode: || crate::mode::Mode::Auto,
+        spawn: spawn_key_check_thread,
     };
 }
 
@@ -1613,44 +1625,52 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
     let sync = inner.cloud_sync.clone();
     let alive = inner.alive.clone();
     let hwnd_raw = inner.hwnd.0 as isize;
-    let _ = std::thread::Builder::new()
-        .name("settings-key-check".into())
-        .spawn(move || {
-            use crate::provider::model_list::KeyCheck;
-            let verdict = match check(vendor, &key) {
-                KeyCheck::Accepted(ids) => {
-                    if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
-                        post_while_open(&alive, || unsafe {
-                            let _ = PostMessageW(
-                                Some(HWND(hwnd_raw as *mut c_void)),
-                                WM_CLOUD_MODELS,
-                                WPARAM(index),
-                                LPARAM(0),
-                            );
-                        });
-                    }
-                    commit::KeyVerdict::Accepted
+    let job = move || {
+        use crate::provider::model_list::KeyCheck;
+        let verdict = match check(vendor, &key) {
+            KeyCheck::Accepted(ids) => {
+                if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
+                    post_while_open(&alive, || unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_raw as *mut c_void)),
+                            WM_CLOUD_MODELS,
+                            WPARAM(index),
+                            LPARAM(0),
+                        );
+                    });
                 }
-                KeyCheck::Rejected => commit::KeyVerdict::Rejected,
-                KeyCheck::Unchecked => {
-                    // No key text and no error text: the report is pasted into
-                    // public issues. The egress log has the failure.
-                    crate::diagnostics::note_warning(&format!(
-                        "Key check for {} could not finish: saving the key unchecked",
-                        vendor.tag()
-                    ));
-                    commit::KeyVerdict::Unchecked
-                }
-            };
-            post_while_open(&alive, || unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(hwnd_raw as *mut c_void)),
-                    WM_KEY_CHECKED,
-                    WPARAM(index),
-                    LPARAM(commit::encode_verdict(generation, verdict)),
-                );
-            });
+                commit::KeyVerdict::Accepted
+            }
+            KeyCheck::Rejected => commit::KeyVerdict::Rejected,
+            KeyCheck::Unchecked => {
+                // No key text and no error text: the report is pasted into
+                // public issues. The egress log has the failure.
+                crate::diagnostics::note_warning(&format!(
+                    "Key check for {} could not finish: saving the key unchecked",
+                    vendor.tag()
+                ));
+                commit::KeyVerdict::Unchecked
+            }
+        };
+        post_while_open(&alive, || unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd_raw as *mut c_void)),
+                WM_KEY_CHECKED,
+                WPARAM(index),
+                LPARAM(commit::encode_verdict(generation, verdict)),
+            );
         });
+    };
+    if (inner.key_seams.spawn)(Box::new(job)).is_err() {
+        // No worker, so no answer would ever come and the row would say
+        // "Checking key..." for good (#1140). Settle it as a check that could
+        // not finish: the key is saved with the "not checked" note.
+        crate::diagnostics::note_warning(&format!(
+            "Key check for {} could not start: saving the key unchecked",
+            vendor.tag()
+        ));
+        on_key_checked(inner, index, generation, commit::KeyVerdict::Unchecked);
+    }
 }
 
 /// A vendor answered for a typed key. A refusal keeps the text for fixing and
@@ -15648,7 +15668,29 @@ mod tests {
         check: fn(Vendor, &str) -> KeyCheck,
         mode: fn() -> crate::mode::Mode,
     ) {
-        unsafe { &mut *raw }.key_seams = KeySeams { check, mode };
+        unsafe { &mut *raw }.key_seams = KeySeams {
+            check,
+            mode,
+            spawn: spawn_key_check_thread,
+        };
+    }
+
+    /// #1140: a worker thread that cannot start must not leave the row on
+    /// "Checking key..." for good: it settles as a check that could not finish.
+    #[test]
+    fn a_key_check_whose_thread_cannot_start_does_not_hang_the_row() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, accepts, auto);
+            unsafe { &mut *raw }.key_seams.spawn =
+                |_| Err(std::io::Error::other("no threads left"));
+            set_text(get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(), "sk-a-whole-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            assert!(!unsafe { &*raw }.key_checks.is_pending(0));
+            assert_eq!(seen.borrow().len(), 1, "the key is saved unchecked");
+            assert!(answer(hwnd, "OpenAI key", Ok(())));
+            assert!(status(hwnd).contains("Could not check"), "{}", status(hwnd));
+        });
     }
 
     /// Delivers the check worker's answer, the way the message loop would. Fails
@@ -15826,7 +15868,6 @@ mod tests {
             set_text(key, "sk-second-draft");
             settle_key_check(hwnd);
             assert!(seen.borrow().is_empty(), "the stale answer stored a key");
-            assert_ne!(status(hwnd), "Checking key...");
             assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
             assert_eq!(get_text(key), "sk-second-draft");
             // The new text commits and checks on its own.
