@@ -205,6 +205,9 @@ pub enum GalleryState {
     /// The preview's title line replaced by an error message, drawn in the
     /// error colour (a number field holding text).
     CardPreviewError,
+    /// #885: the setup cards a new user sees, which show their detail line.
+    CardSetupNoModel,
+    CardSetupOllamaDown,
     PaletteDefault,
     PaletteRouterSuggestion,
     PaletteNoMatches,
@@ -243,6 +246,8 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardPreviewCalendar,
         CardPreviewFormLongLabels,
         CardPreviewError,
+        CardSetupNoModel,
+        CardSetupOllamaDown,
         PaletteDefault,
         PaletteRouterSuggestion,
         PaletteNoMatches,
@@ -278,6 +283,8 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardPreviewCalendar => "card-preview-calendar",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
         CardPreviewError => "card-preview-error",
+        CardSetupNoModel => "card-setup-no-model",
+        CardSetupOllamaDown => "card-setup-ollama-down",
         PaletteDefault => "palette-default",
         PaletteRouterSuggestion => "palette-router-suggestion",
         PaletteNoMatches => "palette-no-matches",
@@ -733,6 +740,24 @@ mod driver {
                     "The request timed out. Check your connection and try again.",
                 );
             }
+            CardSetupNoModel | CardSetupOllamaDown => {
+                card.hide();
+                palette.hide();
+                let mut providers = crate::config::Providers {
+                    order: vec!["openai".to_string()],
+                    ..Default::default()
+                };
+                if state == CardSetupOllamaDown {
+                    providers.order = vec!["ollama".to_string()];
+                    providers.ollama.base_url = "http://127.0.0.1:11434".to_string();
+                }
+                let (headline, detail) = crate::app::empty_chain_card(
+                    crate::mode::Mode::Auto,
+                    &providers,
+                    "config.toml",
+                );
+                card.show_settings_needed(&headline, &detail);
+            }
             CardWelcome => {
                 card.hide();
                 palette.hide();
@@ -1150,8 +1175,9 @@ mod tests {
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) + the region overlay (#580) + the welcome card (#831) = 25.
-        assert_eq!(states.len(), 25);
+        // (#560) + the region overlay (#580) + the welcome card (#831) = 25,
+        // + the two setup cards (#885) = 27.
+        assert_eq!(states.len(), 27);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

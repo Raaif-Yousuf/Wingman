@@ -425,8 +425,8 @@ impl Card {
     /// up yet", "Local mode needs Ollama configured") -- the actionable next
     /// step for those is Settings, not more text to read.
     pub fn show_settings_needed(&mut self, headline: &str, detail: &str) {
-        self.inner.show_collapsed(headline, detail, 0, None);
-        self.inner.open_settings_on_click = true;
+        self.inner
+            .show_collapsed_with(headline, detail, 0, None, true);
     }
 
     pub fn hide(&mut self) {
@@ -595,12 +595,13 @@ impl Card {
         self.inner.move_footer_focus(false);
     }
 
-    /// The UI gallery's preview error title: puts `message` where the
-    /// preview's title goes, as a rejected edit does.
+    /// The UI gallery's preview error: shows `message` under the preview's
+    /// title, as a rejected edit does.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_preview_error_for_gallery(&mut self, message: &str) {
         if let Some(preview) = self.inner.preview.as_mut() {
             preview.error = Some(message.to_string());
+            self.inner.relayout_current_state();
             self.inner.invalidate();
         }
     }
@@ -1077,6 +1078,9 @@ const CARD_WIDTH_DP: i32 = 384;
 /// never silently `DT_END_ELLIPSIS`'d. (The card is as wide as it is so
 /// the larger type keeps the 50-character budget the prompts promise.)
 pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
+/// #885: the most lines of detail a setup card shows; the rest ends in an
+/// ellipsis, so a long config path cannot make the card taller than the screen.
+const SETUP_DETAIL_MAX_LINES: i32 = 6;
 /// Characters that fit on one collapsed headline line once the chevron's
 /// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
@@ -1183,7 +1187,43 @@ fn next_footer_focus(
     Some(links[next])
 }
 
-/// The title line of a preview that rejected an edit. High contrast has one
+/// Draws a solid frame `thickness` px wide just inside `rect`, in `color`.
+unsafe fn frame_rect(hdc: HDC, rect: &RECT, thickness: i32, color: u32) {
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(color));
+    let t = thickness.max(1);
+    let edges = [
+        RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.top + t,
+        },
+        RECT {
+            left: rect.left,
+            top: rect.bottom - t,
+            right: rect.right,
+            bottom: rect.bottom,
+        },
+        RECT {
+            left: rect.left,
+            top: rect.top + t,
+            right: rect.left + t,
+            bottom: rect.bottom - t,
+        },
+        RECT {
+            left: rect.right - t,
+            top: rect.top + t,
+            right: rect.right,
+            bottom: rect.bottom - t,
+        },
+    ];
+    for edge in &edges {
+        FillRect(hdc, edge, brush);
+    }
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+/// The message of a preview that rejected an edit. High contrast has one
 /// ink for everything (#648), so the message says it is an error in words.
 fn preview_error_title(message: &str, theme: Theme) -> String {
     if theme == Theme::HighContrast && !message.starts_with("Error") {
@@ -1667,6 +1707,19 @@ impl CardInner {
         auto_dismiss_secs: u32,
         difficulty: Option<Difficulty>,
     ) {
+        self.show_collapsed_with(headline, detail, auto_dismiss_secs, difficulty, false);
+    }
+
+    /// `open_settings` must be known before the layout runs: a setup card
+    /// shows its detail line (#885), so its height depends on it.
+    fn show_collapsed_with(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        difficulty: Option<Difficulty>,
+        open_settings: bool,
+    ) {
         self.leave_preview_if_active();
         self.reset_activation_and_timers();
         self.headline = headline.to_string();
@@ -1679,12 +1732,17 @@ impl CardInner {
         // reasoning as `set_window_text_for_pending_stage` (#354) -- covers
         // show_answer, show_error, show_error_with_details and
         // show_settings_needed, every one of which funnels through here.
-        self.set_window_text(&answer_accessible_name(headline, difficulty));
+        // #885: a setup card's detail is on screen, so Narrator reads it too.
+        if open_settings && !detail.is_empty() {
+            self.set_window_text(&format!("{headline}. {detail}"));
+        } else {
+            self.set_window_text(&answer_accessible_name(headline, difficulty));
+        }
         // Issue #347: every ordinary show_answer/show_error call starts a
         // plain card, not a "click to open Settings" prompt -- only
         // `Card::show_settings_needed` sets this, right after this call
-        // returns.
-        self.open_settings_on_click = false;
+        // returns (through `show_collapsed_with`).
+        self.open_settings_on_click = open_settings;
         // Issue #425: same reasoning -- only `Card::show_error` sets this,
         // right after this call returns, so an answer card never inherits a
         // "Copy details" affordance for an error it isn't.
@@ -2321,7 +2379,13 @@ impl CardInner {
 
         // No affordance line: the card is just the headline. Clicking it
         // still expands when there is detail to show.
-        let height = padding * 2 + headline_h;
+        let mut height = padding * 2 + headline_h;
+        // #885: a setup card also shows its detail, measured the same way
+        // `paint_collapsed` draws it.
+        if self.shows_setup_detail() {
+            let gap = self.scale(GAP_DP);
+            height += gap + self.setup_detail_height(content_width);
+        }
 
         self.place_bottom_right(work, width, height);
     }
@@ -2568,10 +2632,26 @@ impl CardInner {
         (content_w - self.badge_reserve(self.difficulty) - self.chevron_reserve()).max(1)
     }
 
+    /// #885: a collapsed click-to-open-Settings card draws its detail line
+    /// under the headline, because a click opens Settings, not the detail.
+    fn shows_setup_detail(&self) -> bool {
+        self.state == CardState::Collapsed && self.open_settings_on_click && !self.detail.is_empty()
+    }
+
+    /// Height of the setup card's detail: measured, capped at
+    /// [`SETUP_DETAIL_MAX_LINES`] lines. Layout and paint both use it.
+    fn setup_detail_height(&self, content_w: i32) -> i32 {
+        let cap = self.line_height(self.fonts.caption).max(1) * SETUP_DETAIL_MAX_LINES;
+        self.measure_wrapped(self.fonts.caption, &self.detail, content_w)
+            .min(cap)
+    }
+
     /// Space kept free at the right of a collapsed headline for the "click
     /// for more" chevron (#353); zero when there is nothing more to show.
     fn chevron_reserve(&self) -> i32 {
-        if card_has_more_to_show(self.state, self.detail.is_empty()) {
+        // A setup card shows its detail itself and a click opens Settings,
+        // so a "click for more" chevron would promise the wrong thing (#885).
+        if card_has_more_to_show(self.state, self.detail.is_empty()) && !self.shows_setup_detail() {
             self.scale(CHEVRON_RESERVE_DP)
         } else {
             0
@@ -2732,9 +2812,19 @@ impl CardInner {
         let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
 
         // Dim full ring underneath (also the whole glyph when static).
+        // High contrast has one ink, so the track and the arc would be the
+        // same line: the track goes hairline so the thick arc still shows
+        // progress (#817).
+        let track_stroke = if self.theme == Theme::HighContrast
+            && pending_glyph_should_spin(self.animations_enabled)
+        {
+            1
+        } else {
+            stroke
+        };
         let ring_pen = CreatePen(
             PS_SOLID,
-            stroke,
+            track_stroke,
             windows::Win32::Foundation::COLORREF(palette.border),
         );
         if !ring_pen.0.is_null() {
@@ -2837,6 +2927,24 @@ impl CardInner {
             let cx = headline_rect.right + self.chevron_reserve() / 2;
             let cy = headline_rect.top + headline_line_h / 2;
             self.draw_chevron(hdc, cx, cy, palette.hint);
+        }
+
+        if self.shows_setup_detail() {
+            let top = headline_rect.bottom + self.scale(GAP_DP);
+            let detail_rect = RECT {
+                left: rc.left + padding,
+                top,
+                right: rc.left + padding + content_w,
+                bottom: top + self.setup_detail_height(content_w),
+            };
+            SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.detail));
+            draw_text_line(
+                hdc,
+                &self.detail,
+                detail_rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
         }
 
         self.paint_difficulty_badge(hdc, rc);
@@ -2963,17 +3071,25 @@ impl CardInner {
                 );
             }
         }
-        // #606: the system focus rectangle round the link Tab has reached.
-        // It inverts what is under it, so it shows in light, dark and high
-        // contrast alike.
+        // #606, #817: a 2 px solid ring round the link Tab has reached, in the
+        // text ink with a thin ring of the surface inside it, so it shows on
+        // the card in light, dark and high contrast alike.
         if let Some(rect) = self.focus_link.and_then(|l| self.link_rect(l)) {
             let ring = RECT {
-                left: rect.left - 2,
-                top: rect.top - 1,
-                right: rect.right + 2,
-                bottom: rect.bottom + 1,
+                left: rect.left - 3,
+                top: rect.top - 2,
+                right: rect.right + 3,
+                bottom: rect.bottom + 2,
             };
-            let _ = windows::Win32::Graphics::Gdi::DrawFocusRect(hdc, &ring);
+            let thickness = self.scale(2).max(2);
+            frame_rect(hdc, &ring, thickness, palette.headline);
+            let inner = RECT {
+                left: ring.left + thickness,
+                top: ring.top + thickness,
+                right: ring.right - thickness,
+                bottom: ring.bottom - thickness,
+            };
+            frame_rect(hdc, &inner, 1, palette.bg);
         }
     }
 
@@ -3466,6 +3582,8 @@ impl CardInner {
                     let _ = SetFocus(Some(hwnd));
                 }
             }
+            // The message takes a line of its own, so the card grows.
+            self.relayout_current_state();
             unsafe {
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(self.hwnd), None, false);
             }
@@ -3853,6 +3971,27 @@ impl CardInner {
         };
         y += title_h + gap;
 
+        // #817: a rejected edit keeps the title and shows its message on a
+        // line of its own under it, instead of replacing the title.
+        let error_rect = self
+            .preview
+            .as_ref()
+            .and_then(|p| p.error.as_deref())
+            .map(|message| {
+                let text = preview_error_title(message, self.theme);
+                let h = self
+                    .measure_wrapped(self.fonts.body, &text, content_width)
+                    .max(self.line_height(self.fonts.body).max(1));
+                let rect = RECT {
+                    left: content_left,
+                    top: y,
+                    right: content_right,
+                    bottom: y + h,
+                };
+                y += h + gap;
+                rect
+            });
+
         // The row is also an editable field's box: at least the design
         // height, and always the text line plus the padding above and below
         // (a larger text scale must not squeeze the padding away, #811).
@@ -4009,6 +4148,7 @@ impl CardInner {
             width,
             window_h,
             title_rect,
+            error_rect,
             note_rect,
             rows,
             buttons: PreviewButtonMetrics { do_it, edit },
@@ -4086,18 +4226,22 @@ impl CardInner {
         let title_rect = metrics.title_rect;
         SelectObject(hdc, HGDIOBJ(self.fonts.headline.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-        if preview.error.is_some() {
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
-        }
         draw_text_line(
             hdc,
-            &preview.error.as_deref().map_or_else(
-                || preview.title.clone(),
-                |e| preview_error_title(e, self.theme),
-            ),
+            &preview.title,
             title_rect,
             DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
+        if let (Some(rect), Some(message)) = (metrics.error_rect, preview.error.as_deref()) {
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.danger));
+            draw_text_line(
+                hdc,
+                &preview_error_title(message, self.theme),
+                rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
+            );
+        }
 
         for (field, row) in fields.iter().zip(metrics.rows.iter()) {
             let label_rect = row.label_rect;
@@ -4300,6 +4444,8 @@ struct PreviewLayoutMetrics {
     width: i32,
     window_h: i32,
     title_rect: RECT,
+    /// #817: where a rejected edit's message goes, `None` when there is none.
+    error_rect: Option<RECT>,
     /// #228: where the footer note goes, `None` when there is none.
     note_rect: Option<RECT>,
     /// Same length and order as the `fields` slice `compute_preview_layout`
@@ -4896,6 +5042,50 @@ mod tests {
     }
 
     #[test]
+    fn a_settings_needed_card_is_taller_for_its_detail_and_has_no_chevron() {
+        // #885: the detail of a click-to-open-Settings card is drawn on the
+        // collapsed card, so the window must have room for it.
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let height = |card: &Card| {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut r);
+            }
+            r.bottom - r.top
+        };
+        let detail = "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.";
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_settings_needed("No AI model set up yet", "");
+        let headline_only = height(&card);
+        assert_eq!(card.inner.chevron_reserve(), 0);
+        card.show_settings_needed("No AI model set up yet", detail);
+        assert!(height(&card) > headline_only, "detail must add height");
+        assert!(card.inner.shows_setup_detail());
+        assert_eq!(
+            card.inner.chevron_reserve(),
+            0,
+            "a click opens Settings, so no expand chevron"
+        );
+        // Narrator reads the detail too (the window text is the accessible name).
+        assert!(window_text(card.hwnd()).contains("paste an API key"));
+        // A very long detail is capped, not taller than a few lines.
+        let normal = height(&card);
+        card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
+        let long = height(&card);
+        let line = card.inner.line_height(card.inner.fonts.caption);
+        assert!(long > normal);
+        assert!(
+            long <= normal + line * SETUP_DETAIL_MAX_LINES,
+            "{long} vs {normal}"
+        );
+        // An ordinary answer card with the same text is unchanged: it keeps
+        // the chevron and shows no detail until expanded.
+        card.show_answer("No AI model set up yet", detail, 0, None);
+        assert!(!card.inner.shows_setup_detail());
+        assert!(card.inner.chevron_reserve() > 0);
+    }
+
+    #[test]
     fn clicking_a_settings_needed_card_opens_settings_instead_of_expanding() {
         // Issue #347: the old "No API key: open Edit settings" card named a
         // menu item that no longer exists. The fix is that the card's own
@@ -5031,6 +5221,18 @@ mod tests {
         assert_eq!(
             answer_accessible_name("x = 3", Some(Difficulty::Ultra)),
             "x = 3. Difficulty ultra, harder than 10"
+        );
+    }
+
+    #[test]
+    fn a_setup_card_window_name_is_still_headline_and_detail() {
+        // #885 must survive the difficulty name: no badge on a setup card.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_settings_needed("Set up Wingman", "Add a key in Settings.");
+        assert_eq!(
+            window_text(card.hwnd()),
+            "Set up Wingman. Add a key in Settings."
         );
     }
 
@@ -5721,6 +5923,34 @@ mod tests {
         assert!(card.inner.focus_link.is_some());
         card.show_model_answer("next", "detail", 0, None);
         assert_eq!(card.inner.focus_link, None);
+    }
+
+    #[test]
+    fn a_rejected_edit_keeps_the_title_and_adds_a_message_line_below_it() {
+        // #817: the message used to replace the title.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let fields = card.inner.preview.as_ref().unwrap().model.fields().to_vec();
+        let plain = card.inner.compute_preview_layout(&fields, false);
+        assert!(plain.error_rect.is_none());
+
+        card.set_preview_error_for_gallery("Start must be a time, like 09:00.");
+        let with_error = card.inner.compute_preview_layout(&fields, false);
+        let err = with_error.error_rect.expect("an error row");
+        assert_eq!(with_error.title_rect.top, plain.title_rect.top);
+        assert!(err.top >= with_error.title_rect.bottom, "under the title");
+        assert!(
+            with_error.rows[0].label_rect.top >= err.bottom,
+            "above the fields"
+        );
+        assert!(with_error.window_h > plain.window_h, "the card grows");
+        assert_eq!(
+            card.inner.preview.as_ref().unwrap().title,
+            "Add to calendar",
+            "the title text is untouched"
+        );
     }
 
     #[test]

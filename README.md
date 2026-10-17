@@ -26,7 +26,7 @@ about Wingman is checked against the code in this repo, not aspirational.
 
 | | Wingman | Copilot on Windows |
 |---|---|---|
-| **Footprint** | A tray icon, about 3.5 MB, 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
+| **Footprint** | A tray icon, about 4 MB (3.98 MB measured in CI, with a 4.5 MB limit), 0% CPU until you press the key. No taskbar button, no notifications, no sign-in nags | A taskbar surface, an account wall, a WebView2 app, periodic prompts |
 | **Verifiable** | Offline mode refuses any non-loopback network call in code, enforced before a socket ever opens (see [`docs/offline.md`](docs/offline.md)). Open source under MIT: read the code yourself | Copilot Vision sends the screen to Microsoft's servers. Windows Recall shipped plaintext screenshots and had to be pulled twice before relaunching opt-in |
 | **Extensible** | An action is a small, readable definition: a prompt, an input list and an executor. More than two dozen built-in actions ship today (check my work, add event from screen, review this email, fill this form, copy text from screen, read QR code from screen, action items to checklist, and more, listed in `docs/actions.md`); a hand-written `actions.toml` entry shows in the palette and runs like a built-in one. The framework is the product, actions are the contribution surface | Closed |
 | **Never the final button** | Fills, drafts and proposes. Never presses Send, Submit, Buy or Pay: a permanent rule, not a version-1 limit to be relaxed later | Copilot Actions and other "agent" products sell autonomy |
@@ -186,8 +186,8 @@ if you tick it yourself in Settings.
 Launch it. A tray icon appears and `%APPDATA%\Wingman\config.toml` is
 created. Left-click the tray icon to open **Settings**, and paste your key
 into **OpenAI API key** or **Anthropic API key**, both in the Providers group
-at the top. Everything else lives there too: model, effort, capture size,
-card timeout, text size and the prompt. A saved key moves into Windows
+at the top. Everything else lives there too: model, thinking time,
+screenshot detail, card corner, monitor and timeout, and the prompt. A saved key moves into Windows
 Credential Manager, not the file; Settings shows only its last four
 characters afterward.
 
@@ -207,7 +207,12 @@ otherwise cloud) or Offline (loopback only, enforced in code). See
 [`docs/offline.md`](docs/offline.md) for exactly what each mode does.
 
 The config file is still there (`Open config.toml` in the tray menu) if you
-want to edit it by hand.
+want to edit it by hand. If it has a mistake that stops it parsing, Wingman
+starts in Offline mode, tells you so on a card, and does not save over the
+file; fix it and choose **Reload settings**. Settings also refuses to save
+over a file that changed while it was open, and one backup copy
+(`config.toml.bak`, keys blanked) is kept before a save replaces the file. See
+[`docs/offline.md`](docs/offline.md#a-config-file-that-does-not-parse).
 
 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` in the environment
 override the file, so you can keep keys out of the config entirely if you
@@ -297,22 +302,25 @@ which one.
 
 ## Tray menu
 
+- A greyed first line with the running version
 - **Ask now (same as the key)**: trigger without the hotkey
-- **Actions ▸**: **Quick Ask** (a palette of every action) plus each action
-  directly: copy text, read a QR code, copy a region, calculate, add an
-  event, review an email, fill a form, restore the last form
+- **Actions ▸**: **Quick Ask (pick an action)** (a palette of every action)
+  plus each action directly: copy text, read a QR code, copy a region,
+  calculate, add an event, review an email, fill a form, restore the last form
 - **Copy last answer**: headline and working to the clipboard
 - **Pause ▸**: 1 hour / until tomorrow / until resumed; shown as **Resume**
   instead while already paused
 - **Mode ▸**: Cloud / Local / Auto / Offline, radio-checked
 - **Providers and keys ▸**: **Provider** (which service answers),
-  **ChatGPT model** / **Claude model** (saved immediately), and **Set
+  **ChatGPT model** / **Claude model** / **Ollama model** (saved
+  immediately), and **Set
   Copilot key...** / **Set secondary key...** / **Set pause key...** to
   rebind by pressing the key
 - **Settings...**: the settings window (left-clicking the tray icon opens
   this too)
-- **Help and diagnostics ▸**: open `config.toml`, reload settings, copy
-  diagnostics, copy the egress log, check this PC for local models
+- **Help and diagnostics ▸**: open `config.toml`, import or export an action
+  as a file, reload settings, copy diagnostics, copy the egress log, check
+  this PC for local models
 - **Quit**
 
 ## Settings worth knowing
@@ -325,10 +333,11 @@ which one.
 | `capture.monitor` | `"active"` | `"active"` follows the focused window; `"primary"` pins it |
 | `capture.redact` | `true` | one switch, also a checkbox in Settings. When on: card numbers, IBANs, key-like tokens, email addresses and password fields are painted over in the screenshot before a cloud or remote request; the same details in any text sent too (selected text, page text, field values) become numbered markers such as `[email 1]`; and the real values are put back into the answer. The screenshot step adds about 0.2 to 0.3 s. Requests to 127.0.0.1 skip it. If the screenshot check cannot run, nothing is sent |
 | `capture.extra_password_managers` | `[]` | program names such as `"myvault.exe"` to add to the built-in list (1Password, Bitwarden, KeePass, KeePassXC, LastPass, Dashlane, Keeper, NordPass, Proton Pass, Enpass, RoboForm). While one is the front window, a key press shows a card and Wingman captures and sends nothing. A password manager that is only visible beside the front window is still in the screenshot; Store versions are not recognised |
-| `egress_preview.enabled` | `false` | before any request leaves this computer, show a card with what will be sent (the image size, the prompt and the text) and the provider it goes to; **Send** sends it, Esc cancels and nothing is sent. Requests to Ollama on 127.0.0.1 stay on this machine and are not shown. The Quick Ask suggestion that reads your screen when the palette opens is skipped while this is on |
+| `egress_preview.enabled` | `false` | before any request leaves this computer, show a card with what will be sent (the image size, the prompt and the text) and the provider it goes to; **Send** sends it, Esc cancels and nothing is sent. Requests to Ollama on 127.0.0.1 stay on this machine and are not shown. Opening the Quick Ask palette sends nothing |
 | `providers.order` | `["openai", "anthropic"]` | fallback order; Settings and the tray set the first entry; add `"compat:<name>"` by hand, see [`docs/providers.md`](docs/providers.md) |
 | `providers.*.effort` | `"low"` | reasoning depth; raise for harder problems |
 | `providers.ollama.base_url` | `"http://127.0.0.1:11434"` | never `localhost`, see [`docs/providers.md`](docs/providers.md#ollama) |
+| `options.max_options` | `4` | how many options the model is asked to write. Only the first is acted on today; the options card ([#305](https://github.com/Raaif-Yousuf/Wingman/issues/305)) will show them all |
 | `ui.card_seconds` | `12` | auto-dismiss for the collapsed card; `0` = never |
 | `ui.text_scale` | `1.0` | multiplies the card's font size; lower is smaller |
 | `ui.card_corner` | `"bottom_right"` | where the card sits: `bottom_right`, `bottom_left`, `top_right`, `top_left`, or `follow_mouse` (next to the pointer) |

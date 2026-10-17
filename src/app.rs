@@ -768,7 +768,7 @@ fn should_show_welcome(
 /// opens Settings. No em dash (rule 11).
 pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
     (
-        "Wingman is running. Press the Copilot key. The icon is in the tray (^).".to_string(),
+        "Wingman is running".to_string(),
         format!(
             "Press the Copilot key or {secondary}. The icon may be under the ^ arrow in the tray; \
              drag it out to keep it in view. Click here to open Settings."
@@ -783,6 +783,37 @@ pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
 /// read, so the check cannot itself fail open.
 fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
     mode == Mode::Offline || load_problem.is_none()
+}
+
+/// #890: applies a Settings save all or nothing. `save` runs on the edited
+/// copy first; only when it succeeds does the edit replace `current`, so a
+/// refused save leaves the running config exactly as it was.
+fn commit_edited_config(
+    current: &mut Config,
+    mut edited: Config,
+    save: impl FnOnce(&Config) -> Result<()>,
+) -> Result<()> {
+    // #793: the save is refused while the file does not parse, so an edited
+    // mode must not outlive it in memory (requests read it).
+    let problem = edited
+        .load_problem
+        .clone()
+        .or_else(|| current.load_problem.clone());
+    if !mode_allowed(edited.mode, problem.as_deref()) {
+        edited.mode = Mode::Offline;
+    }
+    save(&edited)?;
+    *current = edited;
+    Ok(())
+}
+
+/// #890: the card text for a Settings save that was refused. The edits are
+/// dropped (a key typed there is not stored either), and it says so.
+fn refused_save_detail(human: &str) -> String {
+    format!(
+        "{human}\n\nYour changes were not applied and Wingman is still using its previous \
+         settings. A key you typed was not stored, so enter it again after fixing this."
+    )
 }
 
 /// #711: config.toml exists but did not parse. Names the line and column
@@ -1201,7 +1232,7 @@ impl App {
         if let Some(d) = first_run_detail(&found) {
             detail = d;
         }
-        self.card.show_settings_needed(&headline, &detail);
+        self.show_setup_card(&headline, &detail);
     }
 
     /// #339: a password manager is in front now, or was when Wingman's own
@@ -1322,7 +1353,7 @@ impl App {
             if self.start_first_run_probe() {
                 return None;
             }
-            self.card.show_settings_needed(&headline, &detail);
+            self.show_setup_card(&headline, &detail);
             return None;
         }
 
@@ -1520,11 +1551,6 @@ impl App {
             return;
         }
 
-        // #506: the window under the palette, read before the palette takes
-        // the foreground. The router's capture looks for password fields
-        // there, not in Wingman's own palette.
-        let underlying =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
         let resolved = match actions::load_actions_report() {
             Ok(report) => {
                 self.show_skipped_notice(&report);
@@ -1555,24 +1581,20 @@ impl App {
             self.first_provider_model_label().as_deref(),
         );
 
-        // #24: candidates are built from the SAME catalogue about to be
-        // shown, before it moves into `Palette::show` below.
-        let candidates = router::candidates_from_catalogue(&catalogue);
-        // #339: asked BEFORE the palette takes the foreground. The router
-        // sends a screenshot, so it must not run over a password manager.
-        let password_manager_in_front = self.password_manager_now();
-        self.palette_password_manager = password_manager_in_front;
+        // #339: asked BEFORE the palette takes the foreground, read when the
+        // palette runs an action.
+        self.palette_password_manager = self.password_manager_now();
+        // #805: opening the palette sends nothing, no screenshot and no
+        // model request. A request starts only when the user picks an
+        // action (or, later, from the options card), never from this call.
         self.palette.show(catalogue, model_configured, footer);
-        self.maybe_start_router(candidates, password_manager_in_front, underlying);
     }
 
-    /// #24: the intent router's hook, called right after
-    /// [`App::toggle_palette`]'s `Palette::show` -- the palette is already
-    /// visible and painted by the time this runs (`Palette::show` forces a
-    /// synchronous first paint), so nothing here can add to the palette's
-    /// own sub-100ms show latency; only the eventual card-free suggestion
-    /// arrives late. Mirrors `App::ask`'s own capture-on-main-thread-then-
-    /// spawn ordering.
+    /// #24: starts the intent router: a small screenshot and one cheap model
+    /// call. Since #805 nothing calls this: opening the palette sends no
+    /// request, and the router belongs to the key press and the options card
+    /// (#307). Mirrors `App::ask`'s own capture-on-main-thread-then-spawn
+    /// ordering.
     ///
     /// A silent no-op (never a card, never a hint) when: Paused; no
     /// provider is ready at all (the cheap, optimistic "is anything
@@ -1583,6 +1605,7 @@ impl App {
     /// failure the user is told about (rule 7's "every failure ends in a
     /// card" is about the action the user actually asked for; the router
     /// never was one).
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     fn maybe_start_router(
         &mut self,
         candidates: Vec<router::RouterCandidate>,
@@ -3455,8 +3478,7 @@ impl App {
                 let (headline, detail) = self.empty_chain_card_now();
                 let chain = unpack_error(packed).1.to_string();
                 let _ = self.record_last(Err(pack_error(&headline, &chain)));
-                self.card.show_settings_needed(&headline, &detail);
-                self.set_watch(true);
+                self.show_setup_card(&headline, &detail);
                 return;
             }
         }
@@ -3607,9 +3629,16 @@ impl App {
         }
         let (headline, detail) = self.empty_chain_card_now();
         self.record_run_failure(&headline, &headline, unpack_error(packed).1);
-        self.card.show_settings_needed(&headline, &detail);
-        self.set_watch(true);
+        self.show_setup_card(&headline, &detail);
         true
+    }
+
+    /// #893: the one way to show a setup card. It persists until dismissed, so
+    /// it also arms the click-away hook; a call site that showed it directly
+    /// could forget, and the card would then only go away by a click on it.
+    fn show_setup_card(&mut self, headline: &str, detail: &str) {
+        self.card.show_settings_needed(headline, detail);
+        self.set_watch(true);
     }
 
     fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
@@ -3943,6 +3972,8 @@ impl App {
                     .show_error_with_details("Couldn't reload settings", &detail);
             }
         }
+        // Every card above but "Settings reloaded" persists.
+        self.set_watch(true);
     }
 
     /// Open the GUI settings window. Modal: it runs its own message loop, so
@@ -4029,13 +4060,7 @@ impl App {
             return;
         };
 
-        self.config = edited;
-        // #793: the save below is refused while the file does not parse, so
-        // an edited mode must not outlive it in memory (requests read it).
-        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
-            self.config.mode = Mode::Offline;
-        }
-        if let Err(e) = self.config.save() {
+        if let Err(e) = commit_edited_config(&mut self.config, edited, Config::save) {
             // Rule 7: neither failure may be silently dropped. Every
             // deferred message is delivered for real (its executor runs,
             // its own card shows) even though the unrelated config save
@@ -4044,7 +4069,8 @@ impl App {
             // the single card slot's final content (`final_settings_card`'s
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
-            let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            let human = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            let detail = refused_save_detail(&human);
             self.card
                 .show_error_with_details("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
@@ -4209,6 +4235,7 @@ impl App {
         let Ok(path) = Config::path() else {
             self.card
                 .show_error("Couldn't locate config.toml", "%APPDATA% is not readable.");
+            self.set_watch(true);
             return;
         };
         // Make sure the file exists before asking the shell to open it.
@@ -4227,6 +4254,7 @@ impl App {
                 let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't save settings", &detail);
+                self.set_watch(true);
             }
             return;
         }
@@ -4327,7 +4355,7 @@ impl App {
             // press, so say so now and point at Settings.
             Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
                 let (headline, detail) = missing_key_card(provider);
-                self.card.show_settings_needed(&headline, &detail);
+                self.show_setup_card(&headline, &detail);
             }
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => {
@@ -5058,6 +5086,7 @@ fn encode_for_upload(
 /// repair attempt), but there is no multi-provider fallback: the router
 /// only ever tries the one cheapest ready provider, and if that fails, this
 /// press simply gets no suggestion.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_worker(
     providers: &Providers,
     mode: Mode,
@@ -5108,6 +5137,7 @@ fn router_worker(
 /// `Chain::complete_parsed_with_fallback`'s caller); router failures are
 /// silent by the time they reach the user regardless (see
 /// `App::maybe_start_router`'s doc comment), so this never becomes a card.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
     let ocr_output = crate::ocr::recognize(
         &raw.rgba,
@@ -5128,6 +5158,7 @@ fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::N
 /// one-line call into [`Providers::models_for`] (`config.rs`), which used
 /// to be hand-mirrored here -- see that function's doc for why keeping
 /// exactly one copy of this name-to-model-list mapping matters.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
     providers.models_for(name)
 }
@@ -5138,6 +5169,7 @@ fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
 /// [`Providers::provider_for_named_model`] (`config.rs`) with
 /// `Some(model)`, which used to be a hand-mirrored match with the same five
 /// arms here -- see that function's doc for the drift this closed off.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn provider_for_router(
     providers: &Providers,
     name: &str,
@@ -6467,7 +6499,11 @@ fn is_no_providers(packed: &str) -> bool {
 /// cannot probe Ollama, so it lets an Ollama-only setup through; when the
 /// worker then finds nothing answering, this says what to do. Any other
 /// setup gets the gate's own card.
-fn empty_chain_card(mode: Mode, providers: &Providers, config_path: &str) -> (String, String) {
+pub(crate) fn empty_chain_card(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+) -> (String, String) {
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
@@ -7615,6 +7651,39 @@ mod tests {
         assert!(seen >= 7, "expected the result post sites, found {seen}");
     }
 
+    /// #805: opening the palette sends nothing. The router's request (a
+    /// screenshot to a model) used to start at the end of `toggle_palette`;
+    /// it now belongs to the key press and the options card. Scans the body
+    /// of `toggle_palette` for anything that captures the screen or starts a
+    /// model request.
+    #[test]
+    fn opening_the_palette_sends_no_model_request() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("    fn toggle_palette(&mut self) {")
+            .expect("toggle_palette exists");
+        let body = &src[start..];
+        let end = body.find("\n    }\n").expect("toggle_palette ends");
+        let body = &body[..end];
+        assert!(
+            body.contains("self.palette.show("),
+            "the scan found the wrong body"
+        );
+        for forbidden in [
+            "maybe_start_router",
+            "router_worker",
+            "capture::",
+            "grab_raw",
+            "thread::spawn",
+            "set_router_pending",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "toggle_palette starts a request again: {forbidden}"
+            );
+        }
+    }
+
     /// #723: the stuck bound covers every provider in a chain at its own
     /// wall clock, so a healthy run is never called stuck.
     #[test]
@@ -8392,6 +8461,56 @@ mod tests {
             assert!(!mode_allowed(m, problem), "{m:?}");
             assert!(mode_allowed(m, None), "{m:?}");
         }
+    }
+
+    /// #890: a refused Settings save leaves the running config exactly as it
+    /// was; a saved one replaces it.
+    #[test]
+    fn a_refused_settings_save_leaves_the_running_config_untouched() {
+        let mut current = crate::config::Config {
+            mode: Mode::Cloud,
+            ..Default::default()
+        };
+        let before = current.clone();
+        let mut edited = current.clone();
+        edited.mode = Mode::Local;
+        edited.ui.card_seconds += 5;
+        let refused = super::commit_edited_config(&mut current, edited, |_| {
+            Err(anyhow::anyhow!("config.toml changed on disk"))
+        });
+        assert!(refused.is_err());
+        assert_eq!(current, before);
+
+        let mut edited = before.clone();
+        edited.ui.card_seconds += 5;
+        let want = edited.clone();
+        super::commit_edited_config(&mut current, edited, |_| Ok(())).expect("saved");
+        assert_eq!(current, want);
+    }
+
+    #[test]
+    fn an_edited_mode_is_held_to_offline_while_the_file_does_not_parse() {
+        let mut current = crate::config::Config {
+            load_problem: Some("config.toml has an error at line 1, column 1".into()),
+            ..Default::default()
+        };
+        let mut edited = current.clone();
+        edited.mode = Mode::Cloud;
+        super::commit_edited_config(&mut current, edited, |saved| {
+            assert_eq!(saved.mode, Mode::Offline);
+            Ok(())
+        })
+        .expect("saved");
+        assert_eq!(current.mode, Mode::Offline);
+    }
+
+    #[test]
+    fn a_refused_save_card_says_nothing_was_applied() {
+        let detail = super::refused_save_detail("config.toml changed on disk");
+        assert!(detail.starts_with("config.toml changed on disk"));
+        assert!(detail.contains("not applied"), "{detail}");
+        assert!(detail.contains("key"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
     }
 
     #[test]
@@ -10610,6 +10729,52 @@ mod tests {
             );
         }
     }
+    /// #893: a setup card is persistent, so showing one must also arm the
+    /// click-away hook. That happens in `show_setup_card`, the only place
+    /// outside startup (the watcher is not installed yet there) that calls
+    /// `Card::show_settings_needed`; `reload` and `edit_settings` arm their own
+    /// persistent cards.
+    #[test]
+    fn setup_cards_are_shown_through_the_one_helper_that_arms_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        // Split on the real test module: a bare "#[cfg(test)]" also appears in
+        // doc comments and on test-only items well before it.
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        assert!(
+            production.contains("fn show_setup_card("),
+            "production not scanned"
+        );
+        assert!(production.contains("fn wnd_proc("), "production cut short");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let direct = production.matches("card.show_settings_needed(").count();
+        // The helper itself and the startup welcome card.
+        assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
+        assert!(body_of("show_setup_card").contains("set_watch(true)"));
+        assert!(body_of("reload").contains("set_watch(true)"));
+        // Every early return in edit_settings that follows a card arms it.
+        let edit = body_of("edit_settings");
+        let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
+        assert!(returns.len() >= 2, "edit_settings candidates not found");
+        for at in returns {
+            let before = &edit[at.saturating_sub(120)..at];
+            if before.contains(".show_error") {
+                assert!(
+                    before.contains("set_watch(true)"),
+                    "edit_settings returns after a card without arming click-away"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
         let _g = ATTRIBUTION_TEST_LOCK

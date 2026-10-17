@@ -26,8 +26,9 @@ a real `actions.toml` entry against the shipped framework end to end.
 Contributions that work against the app as it exists today (the hotkey
 path, capture, the settings window, the card, the tray, provider code, or a
 new catalogue action) are welcome right now. See the
-[good first issue list](https://github.com/Raaif-Yousuf/Wingman/labels/good%20first%20issue)
-for a place to start.
+[Start here issue (#318)](https://github.com/Raaif-Yousuf/Wingman/issues/318)
+for a short list of small issues, or the
+[good first issue label](https://github.com/Raaif-Yousuf/Wingman/labels/good%20first%20issue).
 
 ## Prerequisites
 
