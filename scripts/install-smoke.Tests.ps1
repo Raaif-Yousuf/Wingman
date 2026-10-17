@@ -90,6 +90,26 @@ Describe 'the documented install commands (#1021)' {
     }
 }
 
+Describe 'the smoke runs the documented command (#1050)' {
+    BeforeAll {
+        $script:smoke = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''
+    }
+    It 'builds the README argument list: no profile, Bypass, -File, then the script and its switches' {
+        Get-DocumentedScriptCommand -Script 'C:\x\install.ps1' -ScriptArgs @('-SkipBuild') |
+            Should -Be @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\x\install.ps1', '-SkipBuild')
+        Get-DocumentedScriptCommand -Script 'C:\x\uninstall.ps1' |
+            Should -Be @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\x\uninstall.ps1')
+    }
+    It 'starts install.ps1 and uninstall.ps1 through it, in a child powershell.exe, never in process' {
+        $script:smoke.Contains("Invoke-DocumentedScript -Script (Join-Path `$repo 'install.ps1')") | Should -BeTrue
+        $script:smoke.Contains("Invoke-DocumentedScript -Script (Join-Path `$repo 'uninstall.ps1')") | Should -BeTrue
+        $script:smoke | Should -Not -Match "(?m)^\s*& \(Join-Path \`$repo '(un)?install\.ps1'\)"
+    }
+    It 'makes the child start from a Restricted policy, so only the flag lets the script run' {
+        $script:smoke.Contains("PSExecutionPolicyPreference = 'Restricted'") | Should -BeTrue
+    }
+}
+
 Describe 'the safety rails' {
     It 'refuses to run off a CI runner' {
         $text = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install-smoke.ps1') -Raw) -replace "`r", ''

@@ -508,6 +508,31 @@ pub fn global() -> Result<Arc<Store>, StoreError> {
     global_with(&GLOBAL, open_default)
 }
 
+/// The shared store if an earlier call already opened it, without opening it
+/// and without waiting for an open that is under way: `None` means "not ready
+/// yet". For the UI thread (#1010), where the first open (an `icacls` spawn
+/// and SQLite) would stall the keyboard hook. [`open_in_background`] does the
+/// open at start-up.
+pub fn global_if_ready() -> Option<Result<Arc<Store>, StoreError>> {
+    ready_in(&GLOBAL)
+}
+
+fn ready_in(slot: &Slot) -> Option<Result<Arc<Store>, StoreError>> {
+    slot.try_lock().ok()?.clone()
+}
+
+/// Opens the shared store once on a short-lived thread, so no UI-thread caller
+/// ever pays for the first open (#1010). One shot at start-up, no timer. If
+/// the open fails, the failure is kept and reported on the next card, exactly
+/// as when a request opens it; a request still calls [`global`] itself.
+pub fn open_in_background() {
+    let _ = std::thread::Builder::new()
+        .name("store-open".into())
+        .spawn(|| {
+            let _ = global();
+        });
+}
+
 type Slot = Mutex<Option<Result<Arc<Store>, StoreError>>>;
 
 fn global_with(
@@ -973,6 +998,36 @@ mod tests {
             }
         }
         assert!(checked > 20, "only {checked} files scanned");
+    }
+
+    #[test]
+    fn global_if_ready_never_opens_the_store() {
+        // #1010: the UI thread asks this way, so it must not open anything.
+        let slot: Slot = Mutex::new(None);
+        assert!(ready_in(&slot).is_none(), "an unopened store is not ready");
+        assert!(slot.lock().unwrap().is_none(), "asking must not open it");
+    }
+
+    #[test]
+    fn global_if_ready_does_not_wait_for_an_open_in_progress() {
+        let slot: Slot = Mutex::new(None);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let slot_ref = &slot;
+            s.spawn(move || {
+                let _ = global_with(slot_ref, || {
+                    started_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Err(StoreError::Acl("slow".to_string()))
+                });
+            });
+            started_rx.recv().unwrap();
+            // The open holds the lock; the caller gets "not ready", not a wait.
+            assert!(ready_in(&slot).is_none());
+            go_tx.send(()).unwrap();
+        });
+        assert!(matches!(ready_in(&slot), Some(Err(StoreError::Acl(_)))));
     }
 
     #[test]
