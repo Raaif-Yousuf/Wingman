@@ -881,7 +881,7 @@ pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
     (
         "Wingman is running".to_string(),
         format!(
-            "Press the Copilot key or {secondary}. The icon may be under the ^ arrow in the tray; \
+            "Press the Copilot key or {secondary}. If you do not see the icon, look under Show hidden icons in the tray and \
              drag it out to keep it in view. Click here to open Settings."
         ),
     )
@@ -8837,6 +8837,9 @@ mod tests {
         assert!(detail.contains("Ctrl+Shift+/"), "{detail}");
         assert!(detail.contains("tray"), "{detail}");
         assert!(detail.contains("Click here"), "{detail}");
+        // #936: the overflow button by its Windows name, not a typed caret.
+        assert!(detail.contains("Show hidden icons"), "{detail}");
+        assert!(!detail.contains('^'), "{detail}");
         assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
     }
 
