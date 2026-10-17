@@ -79,8 +79,9 @@ pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
     }
 }
 
-/// UTF-8 (with or without a BOM) and UTF-16 with a BOM. A NUL byte in
-/// anything else, or mostly undecodable bytes, means a binary file.
+/// UTF-8 (with or without a BOM) and UTF-16 with a BOM. Bytes that are not
+/// valid UTF-8 are read in the system ANSI code page. A NUL byte in anything
+/// else, or bytes that do not decode to mostly letters, means a binary file.
 ///
 /// Only the first `MAX_TEXT_BYTES` bytes are decoded (the text is cut to that
 /// size anyway), so a 25 MB file never costs 25 MB of copies. The flag says the
@@ -105,7 +106,7 @@ fn decode(bytes: &[u8]) -> Result<(String, bool), ParseError> {
         if bytes.contains(&0) {
             return Err(ParseError::NotText);
         }
-        String::from_utf8_lossy(bytes).into_owned()
+        decode_8bit(bytes, cut, ansi_code_page())?
     };
     // Mostly undecodable means a binary file, in either encoding. A cut that
     // lands inside a character adds one replacement, far under the ratio.
@@ -114,6 +115,83 @@ fn decode(bytes: &[u8]) -> Result<(String, bool), ParseError> {
         return Err(ParseError::NotText);
     }
     Ok((text, cut))
+}
+
+/// The system ANSI code page (`GetACP`), 1252 on a Western install.
+fn ansi_code_page() -> u32 {
+    // SAFETY: GetACP takes no arguments and only reads system state.
+    unsafe { windows::Win32::Globalization::GetACP() }
+}
+
+/// Valid UTF-8 as is. Anything else (no NULs, checked by the caller) is taken
+/// to be saved in `code_page`, as old notes and exports often are, unless the
+/// result does not look like text, which means a binary file.
+///
+/// `cut` says the input was cut at the size cap, so a character split at the
+/// very end is a cut, not a sign of another encoding.
+fn decode_8bit(bytes: &[u8], cut: bool, code_page: u32) -> Result<String, ParseError> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok(s.to_string()),
+        Err(e) if cut && e.error_len().is_none() => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Err(_) if code_page == CP_UTF8 || is_mostly_utf8(bytes) => {
+            // Already UTF-8 as far as it goes (the ANSI page is UTF-8, or a
+            // few stray bytes sit in a UTF-8 file): keep it, lossy.
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            // The replacements are expected here; `decode` bounds their share.
+            if looks_like_text(bytes, &text.replace('\u{FFFD}', "")) {
+                Ok(text)
+            } else {
+                Err(ParseError::NotText)
+            }
+        }
+        Err(_) => {
+            let text = crate::inputs::web_page::decode_code_page(bytes, code_page)
+                .ok_or(ParseError::NotText)?;
+            if looks_like_text(bytes, &text) {
+                Ok(text)
+            } else {
+                Err(ParseError::NotText)
+            }
+        }
+    }
+}
+
+/// The UTF-8 code page id.
+const CP_UTF8: u32 = 65001;
+
+/// True when the bytes hold valid multibyte UTF-8 and no more invalid bytes
+/// than valid multibyte characters: a UTF-8 file with a stray byte, not a
+/// single-byte file whose accents happen to look like a lead byte.
+fn is_mostly_utf8(bytes: &[u8]) -> bool {
+    let (mut multibyte, mut invalid) = (0usize, 0usize);
+    for chunk in bytes.utf8_chunks() {
+        multibyte += chunk.valid().chars().filter(|c| !c.is_ascii()).count();
+        invalid += chunk.invalid().len();
+    }
+    multibyte > 0 && invalid <= multibyte
+}
+
+/// A code-page decode never fails, so binary data must be told apart by what
+/// came out: real text is mostly letters, and has few control bytes.
+fn looks_like_text(bytes: &[u8], decoded: &str) -> bool {
+    let controls = bytes
+        .iter()
+        .filter(|&&b| (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0c)) || b == 0x7f)
+        .count();
+    if controls * 50 > bytes.len() {
+        return false;
+    }
+    let (mut letters, mut others) = (0usize, 0usize);
+    for c in decoded.chars().filter(|c| !c.is_whitespace()) {
+        if c.is_alphanumeric() {
+            letters += 1;
+        } else {
+            others += 1;
+        }
+    }
+    // Digits and punctuation are fine in a log or a table, so the bar is low;
+    // replacement characters and symbol runs are what binary data produces.
+    letters * 2 >= letters + others && !decoded.contains('\u{FFFD}')
 }
 
 fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
@@ -403,6 +481,85 @@ mod tests {
     #[test]
     fn crlf_and_lone_cr_become_newlines() {
         assert_eq!(txt(b"a\r\nb\rc\n").text, "a\nb\nc\n");
+    }
+
+    #[test]
+    fn a_windows_1252_file_keeps_its_accents() {
+        // "café, naïve, 5 € and “quotes”" as Windows-1252 bytes.
+        let bytes = b"caf\xe9, na\xefve, 5 \x80 and \x93quotes\x94";
+        assert_eq!(
+            decode_8bit(bytes, false, 1252).as_deref(),
+            Ok("café, naïve, 5 € and “quotes”")
+        );
+        // Through the public entry point. This only says something on a
+        // machine whose ANSI page is 1252, so it is skipped elsewhere; the
+        // assertion above is the machine-independent one.
+        if ansi_code_page() == 1252 {
+            assert_eq!(txt(bytes).text, "café, naïve, 5 € and “quotes”");
+        }
+    }
+
+    #[test]
+    fn the_utf8_ansi_page_reads_a_non_utf8_file_lossily() {
+        // "Beta: Use Unicode UTF-8" makes the ANSI page 65001.
+        assert!(decode_8bit(b"caf\xe9", false, 65001).is_ok());
+    }
+
+    #[test]
+    fn one_stray_byte_does_not_send_a_utf8_file_through_the_ansi_page() {
+        let mut b = "日本語".repeat(20).into_bytes();
+        b.push(0xff);
+        let text = decode_8bit(&b, false, 1252).unwrap();
+        assert!(text.starts_with("日本語日本語"));
+    }
+
+    #[test]
+    fn other_code_pages_decode_by_the_page_given() {
+        // Cyrillic "привет мир" in Windows-1251 (page 1251).
+        let bytes = b"\xef\xf0\xe8\xe2\xe5\xf2 \xec\xe8\xf0";
+        assert_eq!(decode_8bit(bytes, false, 1251).as_deref(), Ok("привет мир"));
+    }
+
+    #[test]
+    fn valid_utf8_is_never_reread_as_a_code_page() {
+        let s = "café ünï 日本語";
+        assert_eq!(decode_8bit(s.as_bytes(), false, 1252).as_deref(), Ok(s));
+        // With a BOM, through parse().
+        let mut b = vec![0xEF, 0xBB, 0xBF];
+        b.extend_from_slice(s.as_bytes());
+        assert_eq!(txt(&b).text, s);
+    }
+
+    #[test]
+    fn a_character_split_by_the_size_cap_is_a_cut_not_a_code_page() {
+        // "é" is C3 A9; cut after C3.
+        assert_eq!(
+            decode_8bit(b"abc\xc3", true, 1252).as_deref(),
+            Ok("abc\u{FFFD}")
+        );
+        // Not cut: a lone C3 at the end is a Windows-1252 "Ã".
+        assert_eq!(decode_8bit(b"abc\xc3", false, 1252).as_deref(), Ok("abcÃ"));
+    }
+
+    #[test]
+    fn binary_with_high_bytes_is_still_refused() {
+        // Control bytes.
+        let mut b = vec![0xE9u8; 10];
+        b.extend((1..8u8).cycle().take(100));
+        assert_eq!(decode_8bit(&b, false, 1252), Err(ParseError::NotText));
+        // Symbols only.
+        let junk: Vec<u8> = (0..500u32).map(|i| 0xA1 + (i % 0x10) as u8).collect();
+        assert_eq!(decode_8bit(&junk, false, 1252), Err(ParseError::NotText));
+    }
+
+    #[test]
+    fn utf16_without_a_bom_is_not_read_as_a_code_page() {
+        // Every other byte is NUL, so it never reaches the code-page path.
+        let b: Vec<u8> = "hello world"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        assert_eq!(parse(Parser::Text, &b), Err(ParseError::NotText));
     }
 
     #[test]
