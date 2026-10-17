@@ -5,6 +5,7 @@ pub(crate) mod card_uia;
 pub(crate) mod confirm;
 pub(crate) mod file_dialog;
 pub mod gallery;
+pub mod overlay;
 pub mod palette;
 pub mod palette_model;
 mod palette_paint;

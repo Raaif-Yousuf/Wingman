@@ -298,6 +298,10 @@ pub enum GalleryState {
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
+    /// #809: the in-place overlay over a fixture page: three notes, one of
+    /// them flipped below its text and one spanning a line break. Drawn
+    /// straight to a PNG (no window), so a screenshot run only.
+    OverlayNotes,
     /// #825: the real tray menu, drawn from fixture data.
     TrayMenu,
     /// #825: the same with a row selected and its submenu open.
@@ -357,6 +361,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsInvalid,
         SettingsNotSaved,
         RegionOverlay,
+        OverlayNotes,
         TrayMenu,
         TrayMenuSubmenu,
     ]
@@ -416,6 +421,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsInvalid => "settings-invalid",
         SettingsNotSaved => "settings-not-saved",
         RegionOverlay => "region-overlay",
+        OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
         TrayMenuSubmenu => "tray-menu-submenu",
     }
@@ -677,7 +683,13 @@ mod driver {
         path: &std::path::Path,
     ) -> anyhow::Result<HWND> {
         apply_variant(card, palette, variant);
-        if matches!(
+        if state == GalleryState::OverlayNotes {
+            // No window: the overlay is a layered window, which `PrintWindow`
+            // renders black (#626). Its picture is the frame it would show.
+            card.hide();
+            palette.hide();
+            crate::ui::overlay::gallery_png(variant.theme, variant.dpi.unwrap_or(96), path)?;
+        } else if matches!(
             state,
             GalleryState::TrayMenu | GalleryState::TrayMenuSubmenu
         ) {
@@ -1213,6 +1225,12 @@ mod driver {
                 let theme = variant.theme.unwrap_or_else(crate::ui::theme::detect_theme);
                 let dpi = variant.dpi.unwrap_or(96);
                 *region = Some(Overlay::open_for_gallery(instance, theme, dpi)?);
+            }
+            OverlayNotes => {
+                // Screenshot runs only (see `shoot`): interactively there is
+                // nothing to show, so the card and palette are just cleared.
+                card.hide();
+                palette.hide();
             }
             TrayMenu | TrayMenuSubmenu => {
                 card.hide();
@@ -1899,8 +1917,8 @@ mod tests {
         // Models page with Claude active and with every provider shown (#874)
         // = 41, + the palette with a widened thumb (#988) = 42, + the preview's
         // button states (#818) = 46, + the status line saved, not valid and not
-        // saved (#875) = 49.
-        assert_eq!(states.len(), 49);
+        // saved (#875) = 49, + the in-place overlay (#809) = 50.
+        assert_eq!(states.len(), 50);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

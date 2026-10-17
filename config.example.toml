@@ -111,6 +111,11 @@ min_confidence = 0.2
 auto_dismiss_secs = 20
 claim_keys = true
 
+[overlay]
+max_annotations = 20
+auto_dismiss_secs = 30
+capturable = false
+
 [forms]
 require_tick_for = "sensitive"
 

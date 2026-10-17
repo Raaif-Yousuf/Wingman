@@ -59,6 +59,7 @@ use crate::ui::card::{
     WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
 };
 use crate::ui::confirm;
+use crate::ui::overlay::{OverlayWindow, Win32Steps, OVERLAY_TIMER_ID, WM_APP_OVERLAY_INPUT};
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
 use crate::ui::palette_model::{self, DispatchTarget};
 use crate::ui::settings;
@@ -590,6 +591,26 @@ fn option_rows(options: &[router::RouterOption]) -> Vec<OptionRow> {
         .collect()
 }
 
+/// One overlay on screen (#809): the pure state machine, the real hooks and
+/// timer behind it, and the window. Dropping it removes every hook and the
+/// timer and destroys the window, so a path that forgets to hide cannot leave
+/// either behind.
+struct OverlaySession {
+    state: crate::overlay::state::Overlay,
+    steps: Win32Steps,
+    /// Held for its `Drop`: destroys the window.
+    _window: OverlayWindow,
+    /// The marks as text, for the summary card when it has to be rewritten.
+    findings: String,
+}
+
+impl Drop for OverlaySession {
+    fn drop(&mut self) {
+        let teardown = self.state.hide();
+        crate::overlay::session::finish(&teardown, &mut self.steps);
+    }
+}
+
 struct App {
     /// Kept so the settings window can be created on demand.
     instance: HINSTANCE,
@@ -688,6 +709,9 @@ struct App {
     /// Global click watcher. Armed only while an answer is on screen, so a
     /// click during the request cannot dismiss the pending spinner.
     watcher: Option<ClickWatcher>,
+    /// #809: the overlay on screen, if any. It never outlives its summary
+    /// card: every path that takes the card away drops it too.
+    overlay: Option<OverlaySession>,
     /// A request is in flight; further triggers are ignored until it lands.
     busy: bool,
     last: Option<Answer>,
@@ -1007,6 +1031,7 @@ pub fn run() -> Result<()> {
         tray,
         hook: None,
         watcher: None,
+        overlay: None,
         password_manager_hint: false,
         ollama_models: OllamaModelCache::default(),
         palette_password_manager: false,
@@ -2325,6 +2350,8 @@ impl App {
             palette.hide();
             return;
         }
+        // #809: the palette is a newer surface than the marks.
+        self.drop_overlay();
         if pause::is_paused_now() {
             return;
         }
@@ -3063,6 +3090,44 @@ impl App {
         });
     }
 
+    /// #809: the model-free overlay branch of the generic runner: the same
+    /// gates, capture and pending card as the other model-free screen actions
+    /// (no provider, no readiness check, no `Mode`), then OCR and the named
+    /// detector on the worker. The marks wait in `overlay::handoff` for the main
+    /// thread, which draws them when the run's result arrives.
+    fn run_overlay_detector(&mut self, detector: String) {
+        let max = self.config.overlay.max_annotations();
+        self.run_model_free_screen_action(move |raw| {
+            let run = crate::ui::send_gate::worker_run();
+            let found = crate::overlay::run::detect_on_shot(raw, &detector, max, &|r| {
+                crate::actions::extract_text::TextRecognizer::recognize(
+                    &crate::actions::extract_text::WindowsOcr,
+                    r,
+                )
+            })?;
+            if found.annotations.is_empty() {
+                let (headline, detail) = crate::overlay::annotation::nothing_to_mark();
+                return Ok(Answer {
+                    headline,
+                    detail,
+                    difficulty: None,
+                });
+            }
+            let (headline, detail) =
+                crate::overlay::annotation::summary(&found.annotations, found.annotations.len());
+            crate::overlay::handoff::put(crate::overlay::handoff::Ready {
+                run,
+                annotations: found.annotations,
+                monitor: found.monitor,
+            });
+            Ok(Answer {
+                headline,
+                detail,
+                difficulty: None,
+            })
+        });
+    }
+
     /// "Copy region to clipboard" (#29): opens the region/window-selection
     /// overlay and, on confirm, copies the crop to the clipboard as
     /// `CF_DIB` via the `"image_clipboard"` executor. Unlike `ask`/
@@ -3370,6 +3435,12 @@ impl App {
                 .show_error_with_details("Couldn't run that action", &detail);
             return;
         };
+        // #809: an overlay action with a built-in detector has no proposal and
+        // no model: capture, OCR, detect and draw, with Paused the only gate.
+        if let Some(detector) = action.overlay_detector() {
+            self.run_overlay_detector(detector.to_string());
+            return;
+        }
         let Some(schema) = actions::schema::schema_for(&action.proposal, action.rate_difficulty)
         else {
             let detail = self.track_error(
@@ -4728,6 +4799,10 @@ impl App {
         if is_err {
             self.card
                 .show_error_with_details(&answer.headline, &answer.detail);
+        } else if let Some(ready) = crate::overlay::handoff::take(self.run_generation) {
+            // #809: a detector run. The marks go up first, the summary card
+            // after, so it sits above them.
+            self.show_overlay_result(ready);
         } else {
             let detail = with_fallback_footer(&answer.detail, self.fallback_footer.as_deref());
             self.card.show_model_answer(
@@ -4738,6 +4813,203 @@ impl App {
             );
         }
         self.set_watch(true);
+    }
+
+    /// #809: draws a finished detector run's marks and shows the summary card.
+    /// If the overlay cannot be shown (nothing found a place, a guard could not
+    /// run), the card alone carries every mark as text.
+    fn show_overlay_result(&mut self, ready: crate::overlay::handoff::Ready) {
+        use crate::overlay::annotation as words;
+        let placed = self.show_overlay(&ready);
+        let (headline, detail) = match placed {
+            Some(n) => words::summary(&ready.annotations, n),
+            None => words::fallback(&ready.annotations),
+        };
+        if let Some(session) = self.overlay.as_mut() {
+            session.findings = words::findings(&ready.annotations);
+        }
+        self.card.show_answer(
+            &headline,
+            &detail,
+            (self.config.overlay.auto_dismiss_ms() / 1000) as u32,
+            None,
+        );
+    }
+
+    /// #809: puts the marks on screen. `Some(n)` with `n` the number that
+    /// found a place, or `None`, having shown nothing and left nothing behind,
+    /// when anything could not be arranged: no label fits, the window cannot be
+    /// kept out of captures, a hook or the timer cannot be installed. An
+    /// overlay with no way to go stale, or one that would land in a screenshot,
+    /// is the outcome to avoid.
+    fn show_overlay(&mut self, ready: &crate::overlay::handoff::Ready) -> Option<usize> {
+        use crate::ui::overlay as ui;
+        self.overlay = None;
+        let dpi = ui::dpi_near(ready.monitor);
+        let look = ui::Look::current(dpi, self.config.ui.text_scale);
+        let frame = ui::render(&ready.annotations, ready.monitor, &look)?;
+        let window = match OverlayWindow::create(
+            self.instance,
+            frame.rect,
+            self.config.overlay.capturable,
+        ) {
+            Ok(w) => w,
+            Err(why) => {
+                let _ = self.track_error("Couldn't show the marks on screen", why);
+                return None;
+            }
+        };
+        let targets = ui::targets_under(&ready.annotations);
+        let own = vec![
+            self.hwnd_isize(),
+            self.card.hwnd().0 as isize,
+            window.hwnd().0 as isize,
+        ];
+        let age_ms = self.config.overlay.auto_dismiss_ms();
+        let mut steps = Win32Steps::new(self.hwnd(), age_ms, &targets);
+        let mut state = match crate::overlay::session::start(
+            targets,
+            own,
+            Vec::new(),
+            ui::tick_ms(),
+            age_ms,
+            &mut steps,
+        ) {
+            Ok(state) => state,
+            Err(refused) => {
+                let _ = self.track_error(
+                    "Couldn't show the marks on screen",
+                    &format!("the overlay was refused: {:?}", refused.why),
+                );
+                return None;
+            }
+        };
+        if !window.present(&frame) {
+            let teardown = state.hide();
+            crate::overlay::session::finish(&teardown, &mut steps);
+            let _ = self.track_error(
+                "Couldn't show the marks on screen",
+                "Windows would not draw the overlay window",
+            );
+            return None;
+        }
+        let placed = frame.labels.len();
+        self.overlay = Some(OverlaySession {
+            state,
+            steps,
+            _window: window,
+            findings: String::new(),
+        });
+        Some(placed)
+    }
+
+    /// #809: one overlay input, posted by a hook callback, decoded here on the
+    /// main thread (the window lookups a hook callback must never make).
+    fn on_overlay_input(&mut self, wparam: usize, lparam: isize) {
+        use crate::overlay::wire::Kind;
+        if self.overlay.is_none() {
+            return;
+        }
+        let Some(input) =
+            crate::overlay::wire::to_input(wparam, lparam, &crate::ui::overlay::WinLookup)
+        else {
+            return;
+        };
+        let click =
+            (Kind::from_wparam(wparam) == Some(Kind::Click)).then(|| unpack_point(lparam as u32));
+        self.apply_overlay_input(input, click);
+    }
+
+    /// #809: feeds one input to the overlay's state machine. A hide undoes
+    /// every install through `session::handle` before anything else happens.
+    fn apply_overlay_input(
+        &mut self,
+        input: crate::overlay::state::Input,
+        click: Option<(i32, i32)>,
+    ) {
+        use crate::overlay::state::Decision;
+        let Some(session) = self.overlay.as_mut() else {
+            return;
+        };
+        let decision =
+            crate::overlay::session::handle(&mut session.state, input, &mut session.steps);
+        // A click on a label is for the clickable slice: nothing to do yet.
+        if let Decision::Hide(reason, _) = decision {
+            self.finish_overlay(reason, click);
+        }
+    }
+
+    /// #809: after the overlay hid for `reason`, what the summary card does.
+    /// Esc closes it too. A click away from the card is left to the card's own
+    /// click-away, which the same click is about to reach. Anything else that
+    /// leaves the card on screen rewrites its line so it never claims marks
+    /// that are gone, and keeps the list as text.
+    fn finish_overlay(
+        &mut self,
+        reason: crate::overlay::state::HideReason,
+        click: Option<(i32, i32)>,
+    ) {
+        use crate::overlay::state::HideReason;
+        use crate::ui::card::CardState;
+        let findings = self
+            .overlay
+            .as_ref()
+            .map(|s| s.findings.clone())
+            .unwrap_or_default();
+        self.overlay = None;
+        if matches!(self.card.state(), CardState::Hidden) {
+            return;
+        }
+        let rewrite = match reason {
+            HideReason::Esc => {
+                self.hide_card();
+                self.set_watch(false);
+                return;
+            }
+            HideReason::OwnerGone => return,
+            HideReason::Click => click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+            HideReason::Changed | HideReason::Age => true,
+        };
+        if rewrite {
+            self.card
+                .show_answer(overlay_hidden_line(reason), &findings, 8, None);
+            self.set_watch(true);
+        }
+    }
+
+    /// #809: the overlay's one-shot age timer fired while a menu or dialog
+    /// was open (killed there), so its age is up: the marks go now, with the
+    /// card rewritten as for any age hide.
+    fn on_overlay_age_stale(&mut self) {
+        self.apply_overlay_input(crate::overlay::state::Input::AgeElapsed, None);
+    }
+
+    /// #809: the overlay's summary card (or the surface it belongs to) went
+    /// away, so the overlay goes too. Nothing else changes.
+    fn drop_overlay(&mut self) {
+        self.apply_overlay_input(crate::overlay::state::Input::OwnerGone, None);
+    }
+
+    /// #809: the overlay's one-shot age timer fired. Killed first, so it can
+    /// never repeat; then the state machine decides (it hides for age).
+    fn on_overlay_age(&mut self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), OVERLAY_TIMER_ID);
+        }
+        self.apply_overlay_input(crate::overlay::state::Input::AgeElapsed, None);
+    }
+
+    /// #809: the Wingman key (or the activation message) while an overlay is
+    /// showing dismisses it and its summary card and runs nothing, as for any
+    /// card: the key acts on the highest surface. `true` if it did.
+    fn dismiss_overlay_for_key(&mut self) -> bool {
+        if self.overlay.is_none() {
+            return false;
+        }
+        self.drop_overlay();
+        self.hide_card();
+        self.set_watch(false);
+        true
     }
 
     /// The part of `on_result` that doesn't touch the card: clears `busy`
@@ -4810,6 +5082,9 @@ impl App {
             let _ = KillTimer(Some(hwnd), STUCK_TIMER_ID);
         }
         if busy {
+            // #809: a new run replaces whatever the last one marked.
+            self.drop_overlay();
+            crate::overlay::handoff::clear();
             self.run_generation = self.run_generation.wrapping_add(1);
             CURRENT_RUN.with(|c| c.set(self.run_generation));
             unsafe {
@@ -5402,6 +5677,9 @@ impl App {
         let stuck = self.saves_stuck(saves);
         match settings_hold_card(stops, saves, stuck) {
             Some((headline, detail)) => {
+                // #809: this card replaces an overlay's summary card, and the
+                // marks must not outlive the card they belong to.
+                self.drop_overlay();
                 self.card.show_answer(headline, detail, 3, None);
                 // #1013: a click in Settings (or anywhere) clears it, like any
                 // card that is waiting to be read.
@@ -5509,6 +5787,12 @@ impl App {
         // #901: after the replies above, so one that arrived meanwhile counts.
         if RELOAD_STUCK.with(|c| c.replace(false)) {
             self.on_reload_stuck();
+        }
+        // #809: an overlay whose age ran out, or that heard a click or key,
+        // behind a menu or dialog: its timer was killed and its input dropped
+        // there, so it is hidden now rather than left up with nothing to end it.
+        if OVERLAY_STALE.with(|c| c.replace(false)) {
+            self.on_overlay_age_stale();
         }
     }
 
@@ -8169,6 +8453,23 @@ thread_local! {
     /// cannot be touched there (see `SETTINGS_OPEN`), so the wait is
     /// forgotten by the next press, through `disarm_key_window`.
     static KEY_WINDOW_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// #809: the overlay's age timer fired, or an overlay input arrived, while
+    /// a menu or dialog was open. Neither can reach `App` there; the overlay
+    /// is hidden by `finish_modal_deferrals` once the modal is over.
+    static OVERLAY_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #809: the card's first line when the marks hide and the summary card stays
+/// up. A click inside the card is the user's own doing, so it never says the
+/// screen changed.
+fn overlay_hidden_line(reason: crate::overlay::state::HideReason) -> &'static str {
+    use crate::overlay::state::HideReason;
+    match reason {
+        HideReason::Age => "Marks timed out. Press the key to mark again",
+        HideReason::Click => "Marks hidden. Press the key to mark again",
+        _ => "Marks hidden, the screen changed. Press the key to mark again",
+    }
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -8636,6 +8937,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_ROUTER_RESULT
+        // #809: an overlay input needs no payload freed; the overlay is
+        // hidden once the modal is over (`OVERLAY_STALE`, set where the
+        // Ignore arm drops it).
+        | WM_APP_OVERLAY_INPUT
         // #307: the options card is hidden whenever Settings opens (so its
         // key claim is already cleared), so a late choice has nothing to
         // act on. No payload to free.
@@ -9402,6 +9707,17 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             BUSY_STUCK.with(|c| c.set(true));
             return LRESULT(0);
         }
+        // #809: the overlay's age timer is one-shot too (the tray menu does
+        // not hide the overlay, so it can fire behind the menu).
+        if msg == WM_TIMER && wparam.0 == OVERLAY_TIMER_ID {
+            // A one-shot: killed at once so it cannot repeat behind the modal,
+            // and the overlay is hidden once the modal is over.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), OVERLAY_TIMER_ID);
+            }
+            OVERLAY_STALE.with(|c| c.set(true));
+            return LRESULT(0);
+        }
         if msg == WM_POWERBROADCAST {
             if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC {
                 PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
@@ -9430,6 +9746,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 // WM_APP_REVIEW_RESULT and WM_APP_FORM_FILL_RESULT are all
                 // Defer, not Ignore -- issue #213/#40.)
                 free_boxed_payload(msg, lparam);
+                // #809: an overlay input behind a menu or dialog is not
+                // acted on (it was read against a screen the modal changed),
+                // but the overlay must not outlive it: hide it afterwards.
+                if msg == WM_APP_OVERLAY_INPUT {
+                    OVERLAY_STALE.with(|c| c.set(true));
+                }
                 return LRESULT(0);
             }
             SettingsReentrancy::Defer => {
@@ -9503,9 +9825,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                                    // Before any dispatch: the key's press captures the screen and
                                    // asks the router, so with Settings in front (or a save still
                                    // being applied) it is refused with a card, never kept.
+                                   // #809: with an overlay showing, the key dismisses it and its
+                                   // summary card and runs nothing.
             if app.refuse_for_settings() {
                 // The card says why.
-            } else if !app.cancel_pending_send_preview() {
+            } else if !app.cancel_pending_send_preview() && !app.dismiss_overlay_for_key() {
                 app.on_primary_key(Trigger::Hotkey);
             }
             LRESULT(0)
@@ -9516,9 +9840,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // that it cancels a waiting send preview (#105). Any process can
             // post this message (#236), so unlike the hotkey it is rate
             // limited, and a refusal is counted for the diagnostics report.
+            // #809: an overlay showing is dismissed by the press, not re-asked.
             if app.refuse_for_settings() {
                 // The card says why; no allowance is spent.
-            } else if !app.cancel_pending_send_preview() {
+            } else if !app.cancel_pending_send_preview() && !app.dismiss_overlay_for_key() {
                 // The limiter is only consulted when an ask would really run:
                 // busy and paused make `ask` a no-op (or a Paused card), and
                 // must not cost the user an allowance.
@@ -9710,11 +10035,19 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_router_result(generation, result);
             LRESULT(0)
         }
+        WM_APP_OVERLAY_INPUT => {
+            // #809: a hook callback saw input while an overlay shows; decode
+            // it and let the state machine decide, here on the main thread.
+            app.on_overlay_input(wparam.0, lparam.0);
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == PAUSE_TIMER_ID {
                 app.on_pause_timer(hwnd);
             } else if wparam.0 == STUCK_TIMER_ID {
                 app.on_busy_stuck();
+            } else if wparam.0 == OVERLAY_TIMER_ID {
+                app.on_overlay_age(hwnd);
             } else if wparam.0 == KEY_WINDOW_TIMER_ID {
                 app.on_key_window_expired();
             } else if wparam.0 == RELOAD_TIMER_ID {
@@ -9880,6 +10213,7 @@ mod tests {
         WM_APP_PREVIEW_DECIDED,
     };
     use crate::ui::confirm;
+    use crate::ui::overlay::WM_APP_OVERLAY_INPUT;
     use crate::ui::palette::WM_APP_PALETTE_RUN;
     use crate::ui::palette_model;
     use crate::ui::tray::WM_APP_TRAY;
@@ -13409,6 +13743,7 @@ mod tests {
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
+        ("WM_APP_OVERLAY_INPUT", WM_APP_OVERLAY_INPUT),
         ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
         ("WM_APP_SETTINGS_LEFT", WM_APP_SETTINGS_LEFT),
         ("WM_APP_SETTINGS_SAVE", WM_APP_SETTINGS_SAVE),
@@ -13517,6 +13852,7 @@ mod tests {
             + count_declarations(include_str!("ui/tray.rs"))
             + count_declarations(include_str!("ui/card.rs"))
             + count_declarations(include_str!("ui/palette.rs"))
+            + count_declarations(include_str!("ui/overlay.rs"))
             + count_declarations(include_str!("options_keys.rs"));
 
         assert_eq!(
@@ -13741,6 +14077,7 @@ mod tests {
             include_str!("hotkey.rs"),
             include_str!("single_instance.rs"),
             include_str!("ui/card.rs"),
+            include_str!("ui/overlay.rs"),
             include_str!("ui/palette.rs"),
             include_str!("ui/region.rs"),
             include_str!("ui/send_gate.rs"),
@@ -14165,6 +14502,94 @@ mod tests {
         );
     }
 
+    /// #809: a click inside the card is the user's own doing, so its line
+    /// never claims the screen changed; an age hide and a real change keep
+    /// their own words.
+    #[test]
+    fn the_overlay_card_line_says_what_really_hid_the_marks() {
+        use crate::overlay::state::HideReason;
+        let click = super::overlay_hidden_line(HideReason::Click);
+        assert_eq!(click, "Marks hidden. Press the key to mark again");
+        assert!(!click.contains("screen changed"));
+        assert!(super::overlay_hidden_line(HideReason::Age).contains("timed out"));
+        assert!(super::overlay_hidden_line(HideReason::Changed).contains("screen changed"));
+    }
+
+    /// #809: behind a menu or dialog the overlay's timer is killed and its
+    /// input dropped; both must leave a flag that hides it afterwards, and a
+    /// Settings refusal replaces the summary card, so it drops the overlay.
+    #[test]
+    fn an_overlay_behind_a_modal_is_hidden_afterwards_and_a_refusal_drops_it() {
+        let src = lf(include_str!("app.rs"));
+        let timer = body_between(
+            &src,
+            "if msg == WM_TIMER && wparam.0 == OVERLAY_TIMER_ID {",
+            "\n        }\n",
+        );
+        assert!(
+            timer.contains("KillTimer(Some(hwnd), OVERLAY_TIMER_ID)"),
+            "{timer}"
+        );
+        assert!(
+            timer.contains("OVERLAY_STALE.with(|c| c.set(true))"),
+            "{timer}"
+        );
+        let ignore = body_between(
+            &src,
+            "            SettingsReentrancy::Ignore => {",
+            "\n            }\n",
+        );
+        assert!(ignore.contains("msg == WM_APP_OVERLAY_INPUT"), "{ignore}");
+        assert!(
+            ignore.contains("OVERLAY_STALE.with(|c| c.set(true))"),
+            "{ignore}"
+        );
+        let deliver = body_between(&src, "    fn deliver_deferred(", "\n    }\n");
+        assert!(
+            deliver.contains("OVERLAY_STALE.with(|c| c.replace(false))")
+                && deliver.contains("self.on_overlay_age_stale()"),
+            "{deliver}"
+        );
+        let refuse = body_between(&src, "    fn refuse_for_settings(", "\n    }\n");
+        let drop = refuse
+            .find("self.drop_overlay()")
+            .expect("a refusal keeps the marks");
+        let show = refuse.find("self.card.show_answer").expect("no card");
+        assert!(drop < show, "{refuse}");
+    }
+
+    /// Every `SetTimer` id used on the main window must be distinct: two
+    /// one-shot timers sharing an id would silently replace each other.
+    /// (The card's own ids live on the card window and do not count.)
+    #[test]
+    fn main_window_timer_ids_are_distinct() {
+        use super::{KEY_WINDOW_TIMER_ID, PAUSE_TIMER_ID, RELOAD_TIMER_ID, STUCK_TIMER_ID};
+        use crate::ui::overlay::OVERLAY_TIMER_ID;
+        let ids = [
+            ("PAUSE_TIMER_ID", PAUSE_TIMER_ID),
+            ("STUCK_TIMER_ID", STUCK_TIMER_ID),
+            ("KEY_WINDOW_TIMER_ID", KEY_WINDOW_TIMER_ID),
+            ("RELOAD_TIMER_ID", RELOAD_TIMER_ID),
+            ("OVERLAY_TIMER_ID", OVERLAY_TIMER_ID),
+        ];
+        for (i, (a, x)) in ids.iter().enumerate() {
+            for (b, y) in &ids[i + 1..] {
+                assert_ne!(x, y, "{a} and {b} share a SetTimer id on the main window");
+            }
+        }
+        // A new `*_TIMER_ID` const in app.rs must be added to the list above.
+        let src = include_str!("app.rs").replace('\r', "");
+        let declared = src
+            .lines()
+            .filter(|l| l.starts_with("const ") && l.contains("_TIMER_ID: usize"))
+            .count();
+        assert_eq!(
+            declared,
+            ids.len() - 1,
+            "a timer id is missing from the list"
+        );
+    }
+
     /// #1011: what `tray_menu_policy` does with every `WM_APP_*` id. The tray
     /// menu does not hide the card, so every id whose card can be up while it
     /// is open must be delivered afterwards, never dropped. Keyed on
@@ -14184,6 +14609,11 @@ mod tests {
             WM_APP_CARD_COPY_DETAILS,
             WM_APP_CARD_REPORT_PROBLEM,
             WM_APP_OPTIONS_CHOICE,
+            // #809: a hook-posted overlay click or key is stale once the menu has
+            // taken the mouse; delivering it afterwards would act on a screen that
+            // has moved on. The Ignore arm marks the overlay stale instead, and it
+            // is hidden when the menu closes.
+            WM_APP_OVERLAY_INPUT,
         ];
         let mut ignored = 0;
         for (name, id) in ALL_WM_APP_IDS {
@@ -14441,6 +14871,11 @@ mod tests {
             "WM_APP_EXECUTOR_DONE",
             WM_APP_EXECUTOR_DONE,
             SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_OVERLAY_INPUT",
+            WM_APP_OVERLAY_INPUT,
+            SettingsReentrancy::Ignore,
         ),
         (
             "WM_APP_CONFIG_WRITTEN",

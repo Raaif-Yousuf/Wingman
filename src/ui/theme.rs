@@ -175,6 +175,10 @@ pub(crate) struct Tokens {
     /// Error text and the error mark: the Windows 11 Fluent critical colour,
     /// `#C42B1C` on light and `#FF99A4` on dark (#819).
     pub(crate) danger: u32,
+    /// The overlay's note mark and its label's outline: drawn straight on
+    /// the page and on the label pill, so it is held to 3:1 against the
+    /// surface (a graphic, not text).
+    pub(crate) mark_note: u32,
     /// The fill of a text box, one step off the surface it sits on (Windows 11
     /// `ControlFillColorDefault`). High contrast has no tints: the window
     /// colour, with the border carrying the shape.
@@ -189,6 +193,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text_dim: rgb(90, 90, 90),
     text_faint: rgb(112, 112, 112),
     link: rgb(112, 112, 112),
+    mark_note: rgb(0, 95, 184),
     danger: rgb(0xC4, 0x2B, 0x1C),
     control_fill: rgb(255, 255, 255),
 };
@@ -200,6 +205,7 @@ pub(crate) const DARK: Tokens = Tokens {
     text_dim: rgb(190, 190, 190),
     text_faint: rgb(140, 140, 140),
     link: rgb(140, 140, 140),
+    mark_note: rgb(96, 170, 255),
     danger: rgb(0xFF, 0x99, 0xA4),
     control_fill: rgb(45, 45, 45),
 };
@@ -253,6 +259,7 @@ impl Tokens {
                 text_faint: sys.window_text,
                 link: sys.hotlight,
                 danger: sys.window_text,
+                mark_note: sys.highlight,
                 control_fill: sys.window,
             },
         }
@@ -459,6 +466,13 @@ pub(crate) const FALLBACK_FONT_FACE: &str = "Segoe UI";
 pub(crate) fn type_height_px(ramp_px: i32, dpi: u32, text_scale: f32) -> i32 {
     let v = (ramp_px as f32 * dpi as f32 / 96.0 * text_scale).round() as i32;
     -v.max(1)
+}
+
+/// Converts a 96-DPI design pixel to a physical pixel at `dpi`, rounding to
+/// the nearest pixel: the `(dp * dpi + 48) / 96` rounding the card's own
+/// `Card::dp` uses. Shared by the region overlay and the in-place overlay.
+pub(crate) fn scale_for_dpi(dp: i32, dpi: u32) -> i32 {
+    (dp * dpi as i32 + 48) / 96
 }
 
 /// Spacing on the 4 px grid, in dp (logical pixels at 96 DPI).
@@ -854,6 +868,37 @@ mod tests {
             }
         }
         assert_eq!(checked, 28, "the test must look at every pair");
+    }
+
+    #[test]
+    fn the_overlay_mark_stands_out_on_the_surface_in_every_theme() {
+        let themes = [
+            (Theme::Light, LIGHT),
+            (Theme::Dark, DARK),
+            (
+                Theme::HighContrast,
+                Tokens::for_theme(Theme::HighContrast, &HC_WHITE),
+            ),
+            (
+                Theme::HighContrast,
+                Tokens::for_theme(Theme::HighContrast, &HC_BLACK),
+            ),
+        ];
+        for (theme, t) in themes {
+            let ratio = contrast_between(t.mark_note, t.surface);
+            assert!(
+                ratio >= AA_LARGE,
+                "{theme:?} mark_note: {ratio:.2}:1 is under {AA_LARGE}:1"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_for_dpi_rounds_to_the_nearest_pixel() {
+        assert_eq!(scale_for_dpi(10, 96), 10);
+        assert_eq!(scale_for_dpi(10, 144), 15);
+        assert_eq!(scale_for_dpi(3, 120), 4);
+        assert_eq!(scale_for_dpi(0, 240), 0);
     }
 
     #[test]

@@ -156,8 +156,12 @@ pub fn underline(anchor: ScreenRect, thickness: i32) -> ScreenRect {
     }
 }
 
+// Ghost text and the "skipped" tag (#329) are not drawn until that slice, so
+// they are built for the tests only; the slice drops the `cfg`.
+
 /// Ghost text (#329): a pill of `size` inside `field`, left-aligned and
 /// vertically centred, clipped to the field. `None` for an empty field.
+#[cfg(test)]
 pub fn ghost_rect(field: ScreenRect, size: (i32, i32)) -> Option<ScreenRect> {
     if is_empty(&field) || size.0 <= 0 || size.1 <= 0 {
         return None;
@@ -168,6 +172,7 @@ pub fn ghost_rect(field: ScreenRect, size: (i32, i32)) -> Option<ScreenRect> {
 }
 
 /// A "skipped" tag: a pill of `size` at the field's right edge, inside it.
+#[cfg(test)]
 pub fn skipped_tag(field: ScreenRect, size: (i32, i32)) -> Option<ScreenRect> {
     if is_empty(&field) || size.0 <= 0 || size.1 <= 0 {
         return None;
@@ -177,6 +182,7 @@ pub fn skipped_tag(field: ScreenRect, size: (i32, i32)) -> Option<ScreenRect> {
     clip_to(at(field.right.saturating_sub(size.0), top, size), field)
 }
 
+#[cfg(test)]
 fn clip_to(r: ScreenRect, bounds: ScreenRect) -> Option<ScreenRect> {
     let out = ScreenRect {
         left: r.left.max(bounds.left),
