@@ -164,6 +164,13 @@ pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 /// Registered in `app.rs`'s `ALL_WM_APP_IDS` (issue #163).
 pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 25;
 
+/// Posted to the card's owner window when the user activates the one extra
+/// link an answer card can carry ([`Card::show_answer_with_action`], #699).
+/// Carries no payload: the owner knows which card it showed. A stale post
+/// after another card replaced it is harmless, the owner re-checks its own
+/// state. Registered in `app.rs`'s `ALL_WM_APP_IDS` (issue #163).
+pub const WM_APP_CARD_ACTION: u32 = WM_APP + 29;
+
 mod options;
 #[cfg(test)]
 mod uia_tests;
@@ -292,6 +299,8 @@ impl Card {
             copy_feedback: CopyFeedback::None,
             read_aloud_available: false,
             read_aloud_rect: None,
+            action_label: None,
+            action_rect: None,
             speaker: None,
             reading: false,
             reading_stream: 0,
@@ -406,6 +415,23 @@ impl Card {
             .show_collapsed(headline, detail, auto_dismiss_secs, difficulty);
         // Issue #77: an answer card offers "Read aloud" once expanded.
         self.inner.read_aloud_available = true;
+    }
+
+    /// #699: a status answer that also offers one action as a footer link
+    /// (after the card is expanded). The link takes the place of "Read
+    /// aloud"; activating it posts [`WM_APP_CARD_ACTION`] to the owner. Only
+    /// for an opt-in step the user must ask for, like the PC check's timed
+    /// request.
+    pub fn show_answer_with_action(
+        &mut self,
+        headline: &str,
+        detail: &str,
+        auto_dismiss_secs: u32,
+        action_label: &'static str,
+    ) {
+        self.show_answer(headline, detail, auto_dismiss_secs, None);
+        self.inner.read_aloud_available = false;
+        self.inner.action_label = Some(action_label);
     }
 
     /// Issue #531: like [`Card::show_answer`], and the card also offers
@@ -1286,6 +1312,8 @@ enum FooterLink {
     Report,
     ReadAloud,
     Copy,
+    /// The one extra action link (#699).
+    Action,
 }
 
 impl FooterLink {
@@ -1296,6 +1324,7 @@ impl FooterLink {
             FooterLink::Report => 2,
             FooterLink::ReadAloud => 3,
             FooterLink::Copy => 4,
+            FooterLink::Action => 5,
         }
     }
 
@@ -1305,6 +1334,7 @@ impl FooterLink {
             FooterLink::Report,
             FooterLink::ReadAloud,
             FooterLink::Copy,
+            FooterLink::Action,
         ]
         .into_iter()
         .find(|l| l.uia_id() == id)
@@ -1450,6 +1480,7 @@ fn footer_glyph(label: &str) -> char {
         "Stop reading" => '\u{E71A}',
         "Report a problem" => '\u{E939}',
         "Copied" => '\u{E73E}',
+        "Time a request" => '\u{E916}',
         // "Copy", "Copy details" and "Couldn't copy".
         _ => '\u{E8C8}',
     }
@@ -1710,6 +1741,12 @@ struct CardInner {
     /// The "Read aloud" footer's hit-test rect while Expanded, same
     /// coordinates and same no-scroll-math reasoning as `copy_details_rect`.
     read_aloud_rect: Option<RECT>,
+    /// #699: the label of the one extra action link, set only by
+    /// [`Card::show_answer_with_action`] and cleared by every other card.
+    action_label: Option<&'static str>,
+    /// Its hit rectangle in the pinned footer, same coordinates as
+    /// `read_aloud_rect`.
+    action_rect: Option<RECT>,
     /// Issue #531: `true` while the card is an answer card, i.e. one with a
     /// "Copy" link in the footer once Expanded.
     copy_available: bool,
@@ -1990,6 +2027,9 @@ impl CardInner {
         // on, right after this call returns.
         self.read_aloud_available = false;
         self.read_aloud_rect = None;
+        // #699: and the extra action link.
+        self.action_label = None;
+        self.action_rect = None;
         // Issue #531: same for "Copy"; `reset_activation_and_timers` above
         // already killed its timer.
         self.copy_available = false;
@@ -2325,6 +2365,24 @@ impl CardInner {
         }
     }
 
+    /// #699: `true` when `(x, y)` lands on the extra action link.
+    fn point_hits_action(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.action_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// #699: click, Enter or Space on the extra action link. Only notifies
+    /// the owner, which does the work off the UI thread.
+    fn action_activated(&mut self) {
+        if let Some(owner) = self.owner {
+            unsafe {
+                let _ = PostMessageW(Some(owner), WM_APP_CARD_ACTION, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
     /// Issue #77: `true` when `(x, y)` (client-window coordinates) lands on
     /// the pinned "Read aloud" footer; `false` when there is no such footer.
     fn point_hits_read_aloud(&self, x: i32, y: i32) -> bool {
@@ -2413,6 +2471,7 @@ impl CardInner {
             (FooterLink::Report, self.report_rect),
             (FooterLink::ReadAloud, self.read_aloud_rect),
             (FooterLink::Copy, self.copy_rect),
+            (FooterLink::Action, self.action_rect),
         ]
         .into_iter()
         .filter_map(|(link, rect)| rect.map(|_| link))
@@ -2426,6 +2485,7 @@ impl CardInner {
             FooterLink::Report => "Report a problem",
             FooterLink::ReadAloud => self.read_aloud_label(),
             FooterLink::Copy => self.copy_label(),
+            FooterLink::Action => self.action_label.unwrap_or(""),
         }
     }
 
@@ -2606,6 +2666,7 @@ impl CardInner {
             Some(FooterLink::Report) => self.report_activated(),
             Some(FooterLink::ReadAloud) => self.read_aloud_activated(),
             Some(FooterLink::Copy) => self.copy_activated(),
+            Some(FooterLink::Action) => self.action_activated(),
             None => return false,
         }
         true
@@ -2617,6 +2678,7 @@ impl CardInner {
             .or(self.report_rect)
             .or(self.read_aloud_rect)
             .or(self.copy_rect)
+            .or(self.action_rect)
     }
 
     /// Issue #531: `true` when `(x, y)` lands on the "Copy" link.
@@ -2880,12 +2942,15 @@ impl CardInner {
         // needs no scroll_offset math (see `copy_details_rect`'s doc
         // comment). Only an error card (`copy_details_available`) reserves
         // the space at all.
-        let footer_h =
-            if self.copy_details_available || self.read_aloud_available || self.copy_available {
-                self.line_height(self.fonts.caption).max(1)
-            } else {
-                0
-            };
+        let footer_h = if self.copy_details_available
+            || self.read_aloud_available
+            || self.copy_available
+            || self.action_label.is_some()
+        {
+            self.line_height(self.fonts.caption).max(1)
+        } else {
+            0
+        };
         let footer_gap = if footer_h > 0 { gap } else { 0 };
 
         let work_h = (work.bottom - work.top).max(1);
@@ -2952,6 +3017,14 @@ impl CardInner {
             let (read, copy) = footer_links_layout(f, read_w, copy_w, gap);
             self.read_aloud_rect = read;
             self.copy_rect = (self.copy_available && rect_has_area(copy)).then_some(copy);
+        }
+        // #699: the extra action link takes the first slot of the row.
+        self.action_rect = None;
+        if let (Some(f), Some(label)) = (footer, self.action_label) {
+            let w = self.measure_label(self.fonts.caption, label).0 + self.footer_icon_indent();
+            let gap = self.scale(FOOTER_LINK_GAP_DP);
+            let (rect, _) = footer_links_layout(f, Some(w), 0, gap);
+            self.action_rect = rect.filter(|r| rect_has_area(*r));
         }
         // #606: a re-layout (a DPI change) can drop the focused link.
         if self
@@ -3616,6 +3689,7 @@ impl CardInner {
             (self.report_rect, "Report a problem"),
             (self.read_aloud_rect, self.read_aloud_label()),
             (self.copy_rect, self.copy_label()),
+            (self.action_rect, self.action_label.unwrap_or("")),
         ];
         let _ = SelectClipRgn(hdc, None);
         SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
@@ -3687,6 +3761,7 @@ impl CardInner {
             FooterLink::Report => self.report_rect,
             FooterLink::ReadAloud => self.read_aloud_rect,
             FooterLink::Copy => self.copy_rect,
+            FooterLink::Action => self.action_rect,
         }
     }
 
@@ -3861,6 +3936,8 @@ impl CardInner {
                         self.read_aloud_activated();
                     } else if self.point_hits_copy(x, y) {
                         self.copy_activated();
+                    } else if self.point_hits_action(x, y) {
+                        self.action_activated();
                     }
                 } else {
                     self.try_expand();
@@ -3950,6 +4027,12 @@ impl CardInner {
                 {
                     // Issue #77: Enter toggles "Read aloud" the same way.
                     self.read_aloud_activated();
+                } else if self.state == CardState::Expanded
+                    && wparam.0 as u16 == VK_RETURN.0
+                    && self.action_rect.is_some()
+                {
+                    // #699: Enter runs the extra action link.
+                    self.action_activated();
                 } else if self.state == CardState::Preview {
                     let enter_confirms = self.preview.as_ref().map_or(true, |p| p.enter_confirms);
                     if let Some(command_id) = preview_key_command(wparam.0 as u16, enter_confirms) {
@@ -6306,6 +6389,77 @@ mod tests {
         assert!(!card.inner.point_hits_copy(read.left, read.top));
         assert!(!card.inner.point_hits_read_aloud(copy.left, copy.top));
         assert_eq!(card.inner.copy_label(), "Copy");
+    }
+
+    // -- the one extra action link on an answer card (#699) ----------------
+
+    #[test]
+    fn an_answer_with_an_action_offers_that_link_instead_of_read_aloud() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer_with_action("Local models: slow", "detail text", 0, "Time a request");
+        card.inner.try_expand();
+        let rect = card.inner.action_rect.expect("action link");
+        assert!(card.inner.read_aloud_rect.is_none());
+        assert!(card.inner.copy_rect.is_none());
+        assert_eq!(card.inner.footer_links(), vec![FooterLink::Action]);
+        assert_eq!(card.inner.link_label(FooterLink::Action), "Time a request");
+        assert!(card.inner.point_hits_action(rect.left, rect.top));
+        assert!(!card.inner.point_hits_action(rect.left, rect.top - 40));
+        let label = card
+            .inner
+            .measure_label(card.inner.fonts.caption, "Time a request")
+            .0;
+        assert!(rect.right - rect.left >= label + card.inner.footer_icon_indent());
+    }
+
+    #[test]
+    fn a_later_plain_card_drops_the_action_link() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer_with_action("Local models: slow", "detail text", 0, "Time a request");
+        card.show_answer("Paused", "Resume.", 0, None);
+        card.inner.try_expand();
+        assert!(card.inner.action_rect.is_none());
+        assert!(!card.inner.footer_links().contains(&FooterLink::Action));
+        card.show_answer_with_action("Local models: slow", "detail text", 0, "Time a request");
+        card.show_error("Oops", "detail");
+        card.inner.try_expand();
+        assert!(card.inner.action_rect.is_none());
+    }
+
+    #[test]
+    fn activating_the_action_link_posts_wm_app_card_action_to_the_owner() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer_with_action("Local models: slow", "detail text", 0, "Time a request");
+        card.inner.try_expand();
+        card.inner.focus_link = Some(FooterLink::Action);
+        assert!(card.inner.activate_focused_link());
+        let mut msg = MSG::default();
+        let found = unsafe { PeekMessageW(&mut msg, Some(card.hwnd()), 0, 0, PM_REMOVE).as_bool() };
+        assert!(found, "the link must post to the owner");
+        assert_eq!(msg.message, WM_APP_CARD_ACTION);
+    }
+
+    #[test]
+    fn the_action_link_is_reachable_by_screen_reader() {
+        assert_eq!(
+            FooterLink::from_uia_id(FooterLink::Action.uia_id()),
+            Some(FooterLink::Action)
+        );
+        let ids = [
+            FooterLink::CopyDetails,
+            FooterLink::Report,
+            FooterLink::ReadAloud,
+            FooterLink::Copy,
+            FooterLink::Action,
+        ]
+        .map(FooterLink::uia_id);
+        let mut sorted = ids.to_vec();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "UIA ids must be distinct");
     }
 
     #[test]

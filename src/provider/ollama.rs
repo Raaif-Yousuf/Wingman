@@ -25,12 +25,12 @@ const DEFAULT_MAX_TOKENS: u32 = 2500;
 /// `options.num_ctx` is always sent explicitly -- the server default is
 /// 4096 (see the 2026-09-16 expansion plan, "Providers and models"), which
 /// is tight once a screenshot's image tokens are added in.
-const DEFAULT_NUM_CTX: u32 = 8192;
+pub(crate) const DEFAULT_NUM_CTX: u32 = 8192;
 /// `keep_alive` is a top-level request field, not inside `options`
 /// (AGENTS.md rule 6: nested there it is silently ignored). This default
 /// matches the expansion plan's "default 30 m"; the live-check test
 /// overrides it to unload the model immediately after use.
-const DEFAULT_KEEP_ALIVE: &str = "30m";
+pub(crate) const DEFAULT_KEEP_ALIVE: &str = "30m";
 
 /// Model family prefixes known to support vision, from the 2026-09-16
 /// expansion plan's hardware table and confirmed live via `/api/tags`

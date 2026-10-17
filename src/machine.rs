@@ -8,10 +8,16 @@
 //! hand. Nothing here runs unless the user picks the tray item (rule 5: no
 //! timers, no power-change watcher).
 //!
-//! No benchmark: the verdict is built from what was seen, and says so. A
-//! 10-second timed request is a separate, opt-in follow-up.
+//! No benchmark by default: the verdict is built from what was seen, and says
+//! so. The timed request (#699) is a separate, opt-in step: one small request
+//! with a built-in synthetic image against the installed local model, sent
+//! only after the user picks the link on the card ([`TIMING_ACTION_LABEL`]),
+//! to Ollama on this PC only.
 
+use crate::provider::ollama::{DEFAULT_KEEP_ALIVE, DEFAULT_NUM_CTX};
 use crate::provider::ollama_admin::{self, ListenerKind, OllamaHealth, PsEntry};
+use serde_json::{json, Value};
+use std::time::Duration;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -74,6 +80,32 @@ pub enum Power {
     OnBattery { percent: Option<u8> },
 }
 
+/// What the opt-in timed request found (#699).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Measured {
+    /// The user has not asked for it. The default.
+    NotRun,
+    Timed(Timing),
+    /// The request could not be made or answered. Plain words for the card.
+    Failed(String),
+}
+
+/// One timed request, from Ollama's own nanosecond counters (rounded to
+/// milliseconds): no streaming, no wall-clock guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timing {
+    pub model: String,
+    /// Loading the model into memory. Zero when it was already loaded.
+    pub load_ms: u64,
+    /// Reading the prompt and image: the wait for the first token once the
+    /// model is loaded.
+    pub prompt_ms: u64,
+    pub eval_ms: u64,
+    pub eval_count: u64,
+    /// `/api/ps` after the request: `size_vram > 0`. None when unreadable.
+    pub on_gpu: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineFacts {
     /// None when Windows would not say. An unreadable value is unknown,
@@ -86,6 +118,7 @@ pub struct MachineFacts {
     pub gpus: Option<Vec<GpuInfo>>,
     pub ollama: OllamaState,
     pub power: Power,
+    pub measured: Measured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +267,24 @@ fn hardware_verdict(f: &MachineFacts) -> (Level, &'static str, String) {
 
 /// The honest one-line verdict for running local models on this machine.
 pub fn verdict(f: &MachineFacts) -> Verdict {
+    if let Measured::Timed(t) = &f.measured {
+        let (level, headline, line) = timed_verdict(t);
+        return Verdict {
+            level,
+            headline: headline.to_string(),
+            line,
+            numbers: numbers_text(f),
+            battery_note: battery_note(f.power),
+        };
+    }
+    let mut v = hardware_or_ps_verdict(f);
+    if let Measured::Failed(why) = &f.measured {
+        v.line = format!("{} Timed request failed: {why}", v.line);
+    }
+    v
+}
+
+fn hardware_or_ps_verdict(f: &MachineFacts) -> Verdict {
     let (level, headline, line) = match f.ollama {
         OllamaState::StockTray => (
             Level::Slow,
@@ -298,7 +349,208 @@ pub fn gather(ollama_base_url: &str) -> MachineFacts {
         gpus: win::gpus(),
         ollama: ollama_state(ollama_base_url),
         power: win::power(),
+        measured: Measured::NotRun,
     }
+}
+
+/// The link the PC check card offers (#699). Never run automatically.
+pub const TIMING_ACTION_LABEL: &str = "Time a request";
+
+/// Whether the card should offer [`TIMING_ACTION_LABEL`]: an Ollama server
+/// answers (the stock tray app too: timing it shows how slow it is), and no
+/// timing succeeded yet. A failed run can be retried.
+pub fn can_offer_timing(f: &MachineFacts) -> bool {
+    f.ollama != OllamaState::NotRunning && !matches!(f.measured, Measured::Timed(_))
+}
+
+/// First answer in under this long, and at least [`GOOD_TOKENS_PER_SEC`],
+/// counts as good. THEORY (unverified): these cut-offs are a judgment of what
+/// feels fine for one press that shows one card; they have not been tuned
+/// against user reports.
+const GOOD_FIRST_ANSWER_MS: u64 = 4_000;
+const GOOD_TOKENS_PER_SEC: f64 = 15.0;
+/// Slower than this on either count is not recommended.
+const BAD_FIRST_ANSWER_MS: u64 = 15_000;
+const BAD_TOKENS_PER_SEC: f64 = 4.0;
+/// A load this long means the model was not in memory yet.
+const COLD_LOAD_MS: u64 = 500;
+
+fn tokens_per_sec(t: &Timing) -> Option<f64> {
+    (t.eval_ms > 0 && t.eval_count > 0).then(|| t.eval_count as f64 * 1000.0 / t.eval_ms as f64)
+}
+
+fn secs_text(ms: u64) -> String {
+    format!("{:.1} s", ms as f64 / 1000.0)
+}
+
+fn timed_verdict(t: &Timing) -> (Level, &'static str, String) {
+    let Some(tps) = tokens_per_sec(t) else {
+        return (
+            Level::Unknown,
+            "Local models: unclear",
+            format!(
+                "Timed one small request on {}, but Ollama reported no speed for it.",
+                t.model
+            ),
+        );
+    };
+    // A request that had to load the model also pays one-time warm-up in its
+    // first answer. MEASURED 2026-10-17 (gemma3:4b, Arc iGPU): 26.2 s to the
+    // first answer when cold, 1.3 s the next time, at the same 21 tokens per
+    // second. So a cold run is judged on speed alone.
+    let cold = t.load_ms >= COLD_LOAD_MS;
+    let first_ms = if cold { 0 } else { t.prompt_ms };
+    let (level, headline) = if tps < BAD_TOKENS_PER_SEC || first_ms >= BAD_FIRST_ANSWER_MS {
+        (Level::NotRecommended, "Local models: not recommended")
+    } else if tps >= GOOD_TOKENS_PER_SEC && first_ms <= GOOD_FIRST_ANSWER_MS {
+        (Level::Good, "Local models: good")
+    } else {
+        (Level::Slow, "Local models: slow")
+    };
+    let load = if cold {
+        format!(" ({} to load the model first)", secs_text(t.load_ms))
+    } else {
+        String::new()
+    };
+    let rerun = if cold {
+        " The first request includes loading, so time it again for the everyday wait."
+    } else {
+        ""
+    };
+    let speed = if tps >= 10.0 {
+        format!("{tps:.0}")
+    } else {
+        format!("{tps:.1}")
+    };
+    let cpu = if t.on_gpu == Some(false) {
+        " It ran on the CPU."
+    } else {
+        ""
+    };
+    (
+        level,
+        headline,
+        format!(
+            "Timed one small request on {}: first answer in {}{load}, {speed} tokens per second.{cpu}{rerun}",
+            t.model,
+            secs_text(t.prompt_ms)
+        ),
+    )
+}
+
+/// A 128 px gradient, built in: the timed request never sends anything from
+/// the user's screen.
+fn synthetic_png() -> Vec<u8> {
+    let img = image::RgbImage::from_fn(128, 128, |x, y| {
+        image::Rgb([(x * 2) as u8, (y * 2) as u8, ((x + y) % 256) as u8])
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    // Encoding to memory cannot fail for a valid buffer; an empty image would
+    // simply make the timed request fail, which ends in a card.
+    let _ = img.write_to(&mut out, image::ImageFormat::Png);
+    out.into_inner()
+}
+
+/// The request body for one timed request. Same `num_ctx` and `keep_alive`
+/// as a real request, so timing does not unload or reload the user's model.
+/// AGENTS.md rule 6: `think` explicit, `keep_alive` top level.
+fn timing_body(model: &str) -> Value {
+    use base64::Engine as _;
+    let image = base64::engine::general_purpose::STANDARD.encode(synthetic_png());
+    json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": "Describe this picture in one short sentence.",
+            "images": [image]
+        }],
+        "stream": false,
+        "think": false,
+        "keep_alive": DEFAULT_KEEP_ALIVE,
+        "options": {"num_ctx": DEFAULT_NUM_CTX, "num_predict": 32}
+    })
+}
+
+fn ms_of(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(Value::as_u64).unwrap_or(0) / 1_000_000
+}
+
+/// Reads Ollama's `/api/chat` answer. An `error` field or a body with no
+/// counters is an `Err` in plain words.
+fn parse_timing(body: &str, model: &str, on_gpu: Option<bool>) -> Result<Timing, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|_| "Ollama sent an answer that is not JSON.".to_string())?;
+    if let Some(err) = v.get("error").and_then(Value::as_str) {
+        return Err(format!("Ollama said: {err}"));
+    }
+    if v.get("eval_duration").is_none() || v.get("eval_count").is_none() {
+        return Err("Ollama did not report any timings.".to_string());
+    }
+    Ok(Timing {
+        model: model.to_string(),
+        load_ms: ms_of(&v, "load_duration"),
+        prompt_ms: ms_of(&v, "prompt_eval_duration"),
+        eval_ms: ms_of(&v, "eval_duration"),
+        eval_count: v.get("eval_count").and_then(Value::as_u64).unwrap_or(0),
+        on_gpu,
+    })
+}
+
+/// Sends the one timed request. Blocks (up to two minutes on a cold load):
+/// call it from a worker thread only. Every failure is a
+/// [`Measured::Failed`] with words for the card.
+pub fn run_timed(base_url: &str, model: &str) -> Measured {
+    match try_timed(base_url, model) {
+        Ok(t) => Measured::Timed(t),
+        Err(why) => Measured::Failed(why),
+    }
+}
+
+fn try_timed(base_url: &str, model: &str) -> Result<Timing, String> {
+    // Local Ollama only: never a remote host, and never `localhost`.
+    if crate::mode::classify_host(base_url) != crate::mode::HostClass::Loopback {
+        return Err(
+            "Timing only runs against Ollama on this PC. Set the Ollama address to 127.0.0.1."
+                .to_string(),
+        );
+    }
+    let tags = ollama_admin::list_tags_with_timeout(base_url, Duration::from_secs(5))
+        .map_err(|e| format!("Could not list Ollama's models: {e:#}"))?;
+    let Some(entry) = tags.iter().find(|m| m.name == model) else {
+        return Err(format!(
+            "{model} is not installed in Ollama. Pull it from Settings, then try again."
+        ));
+    };
+    if !ollama_admin::vision_from_tags_entry(entry) {
+        return Err(format!(
+            "{model} cannot read images, so it cannot be timed. Pick a vision model in Settings."
+        ));
+    }
+    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+    let body = crate::provider::common::post_json_with_connect_timeout(
+        &url,
+        &[("Content-Type", "application/json")],
+        timing_body(model),
+        Duration::from_secs(3),
+        Duration::from_secs(120),
+        "ollama",
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let on_gpu = ollama_admin::ps_with_timeout(base_url, Duration::from_secs(2))
+        .ok()
+        .and_then(|e| on_gpu_from_ps(&e));
+    parse_timing(&body, model, on_gpu)
+}
+
+/// [`gather`], then (only when asked for) the timed request.
+pub fn gather_timed(base_url: &str, model: &str) -> MachineFacts {
+    let mut f = gather(base_url);
+    f.measured = if f.ollama == OllamaState::NotRunning {
+        Measured::Failed("Ollama is not running. Start it, then try again.".to_string())
+    } else {
+        run_timed(base_url, model)
+    };
+    f
 }
 
 fn ollama_state(base_url: &str) -> OllamaState {
@@ -421,6 +673,7 @@ mod tests {
             gpus: Some(gpus),
             ollama,
             power,
+            measured: Measured::NotRun,
         }
     }
 
@@ -566,6 +819,7 @@ mod tests {
             gpus: Some(vec![arc()]),
             ollama: OllamaState::NotRunning,
             power: Power::PluggedIn,
+            measured: Measured::NotRun,
         };
         let v = verdict(&f);
         assert_eq!(v.level, Level::Unknown);
@@ -581,6 +835,7 @@ mod tests {
             gpus: None,
             ollama: OllamaState::NotRunning,
             power: Power::PluggedIn,
+            measured: Measured::NotRun,
         };
         let v = verdict(&f);
         assert_eq!(v.level, Level::Unknown);
@@ -596,6 +851,7 @@ mod tests {
             gpus: None,
             ollama: running(Some(false)),
             power: Power::PluggedIn,
+            measured: Measured::NotRun,
         };
         let v = verdict(&f);
         assert_eq!(v.level, Level::Slow);
@@ -609,6 +865,7 @@ mod tests {
             gpus: Some(vec![gpu("NVIDIA GeForce RTX 4060", 8, 8)]),
             ollama: OllamaState::NotRunning,
             power: Power::PluggedIn,
+            measured: Measured::NotRun,
         };
         assert_eq!(verdict(&f).level, Level::Good);
     }
@@ -680,6 +937,181 @@ mod tests {
         assert_eq!(gib_text(7 * GIB + 600 * MIB), "7.6 GB");
     }
 
+    fn timing(load_ms: u64, prompt_ms: u64, eval_ms: u64, eval_count: u64) -> Timing {
+        Timing {
+            model: "gemma3:4b".to_string(),
+            load_ms,
+            prompt_ms,
+            eval_ms,
+            eval_count,
+            on_gpu: Some(true),
+        }
+    }
+
+    fn timed(t: Timing) -> MachineFacts {
+        let mut f = facts(
+            16,
+            vec![gpu("NVIDIA GeForce RTX 4060", 8, 0)],
+            running(Some(true)),
+            Power::PluggedIn,
+        );
+        f.measured = Measured::Timed(t);
+        f
+    }
+
+    #[test]
+    fn fast_timing_is_good_and_quotes_the_numbers() {
+        let v = verdict(&timed(timing(900, 400, 1000, 30)));
+        assert_eq!(v.level, Level::Good);
+        assert!(v.line.contains("gemma3:4b"), "{}", v.line);
+        assert!(v.line.contains("0.4 s"), "first answer: {}", v.line);
+        assert!(v.line.contains("30 tokens per second"), "{}", v.line);
+        assert!(!v.line.contains("Not measured"), "{}", v.line);
+    }
+
+    #[test]
+    fn the_model_load_is_reported_apart_from_the_first_answer() {
+        let v = verdict(&timed(timing(2500, 400, 1000, 30)));
+        assert!(v.line.contains("2.5 s to load"), "{}", v.line);
+        let warm = verdict(&timed(timing(0, 400, 1000, 30)));
+        assert!(!warm.line.contains("to load"), "{}", warm.line);
+    }
+
+    #[test]
+    fn a_cold_first_answer_is_judged_on_speed_alone_and_says_to_time_again() {
+        // MEASURED 2026-10-17: 26 s to the first answer cold, 1.3 s warm.
+        let v = verdict(&timed(timing(14500, 26000, 1000, 21)));
+        assert_eq!(v.level, Level::Good);
+        assert!(v.line.contains("time it again"), "{}", v.line);
+        let slow = verdict(&timed(timing(14500, 26000, 16000, 32)));
+        assert_eq!(slow.level, Level::NotRecommended, "2 tokens per second");
+        let warm = verdict(&timed(timing(0, 400, 1000, 30)));
+        assert!(!warm.line.contains("time it again"), "{}", warm.line);
+    }
+
+    #[test]
+    fn middling_timing_is_slow() {
+        // 8 tokens per second, 2 s to the first answer.
+        let v = verdict(&timed(timing(0, 2000, 4000, 32)));
+        assert_eq!(v.level, Level::Slow);
+    }
+
+    #[test]
+    fn very_slow_timing_is_not_recommended() {
+        // 2 tokens per second.
+        let v = verdict(&timed(timing(0, 9000, 16000, 32)));
+        assert_eq!(v.level, Level::NotRecommended);
+    }
+
+    #[test]
+    fn a_slow_first_answer_alone_is_not_good() {
+        // Fast decoding but 12 s before the first token.
+        let v = verdict(&timed(timing(0, 12000, 1000, 30)));
+        assert_ne!(v.level, Level::Good);
+    }
+
+    #[test]
+    fn a_timed_run_on_the_cpu_says_so() {
+        let mut t = timing(0, 400, 1000, 30);
+        t.on_gpu = Some(false);
+        let v = verdict(&timed(t));
+        assert!(v.line.contains("CPU"), "{}", v.line);
+    }
+
+    #[test]
+    fn zero_eval_time_does_not_divide_by_zero() {
+        let v = verdict(&timed(timing(0, 400, 0, 0)));
+        assert!(!v.line.is_empty());
+        assert_ne!(v.level, Level::Good, "no measured speed is not good");
+    }
+
+    #[test]
+    fn a_failed_timed_run_keeps_the_hardware_verdict_and_names_the_failure() {
+        let mut f = timed(timing(0, 1, 1, 1));
+        f.measured = Measured::Failed("Ollama did not answer.".to_string());
+        let v = verdict(&f);
+        assert!(v.line.contains("Ollama did not answer."), "{}", v.line);
+        assert!(v.line.contains("Timed request failed"), "{}", v.line);
+    }
+
+    #[test]
+    fn timing_is_offered_only_when_an_ollama_server_answers_and_not_yet_timed() {
+        let f = |o| facts(16, vec![], o, Power::Unknown);
+        assert!(can_offer_timing(&f(running(None))));
+        assert!(can_offer_timing(&f(running(Some(true)))));
+        assert!(can_offer_timing(&f(OllamaState::StockTray)));
+        assert!(!can_offer_timing(&f(OllamaState::NotRunning)));
+        assert!(!can_offer_timing(&timed(timing(0, 1, 1, 1))));
+        let mut failed = f(running(None));
+        failed.measured = Measured::Failed("x".to_string());
+        assert!(can_offer_timing(&failed), "a failed run can be retried");
+    }
+
+    #[test]
+    fn parse_timing_reads_ollamas_own_nanosecond_counters() {
+        let body = r#"{"model":"gemma3:4b","message":{"role":"assistant","content":"A gradient."},"done":true,
+            "total_duration":3500000000,"load_duration":2000000000,"prompt_eval_count":270,
+            "prompt_eval_duration":500000000,"eval_count":20,"eval_duration":1000000000}"#;
+        let t = parse_timing(body, "gemma3:4b", Some(true)).expect("timing");
+        assert_eq!(t.load_ms, 2000);
+        assert_eq!(t.prompt_ms, 500);
+        assert_eq!(t.eval_ms, 1000);
+        assert_eq!(t.eval_count, 20);
+        assert_eq!(t.on_gpu, Some(true));
+    }
+
+    #[test]
+    fn parse_timing_rejects_a_body_without_counters_or_json() {
+        assert!(parse_timing("not json", "m", None).is_err());
+        assert!(parse_timing(r#"{"done":true}"#, "m", None).is_err());
+        assert!(parse_timing(r#"{"error":"model not found"}"#, "m", None)
+            .unwrap_err()
+            .contains("model not found"));
+    }
+
+    #[test]
+    fn timing_request_follows_the_ollama_rules() {
+        let body = timing_body("gemma3:4b");
+        assert_eq!(body["model"], "gemma3:4b");
+        assert_eq!(body["stream"], false);
+        // AGENTS.md rule 6: think explicit, keep_alive top level.
+        assert_eq!(body["think"], false);
+        assert!(body["keep_alive"].is_string());
+        assert!(body["options"].get("keep_alive").is_none());
+        // Same num_ctx as a real request, so timing does not reload the model.
+        assert_eq!(body["options"]["num_ctx"], 8192);
+        assert!(body["options"]["num_predict"].as_u64().unwrap() <= 64);
+        let images = body["messages"][0]["images"].as_array().expect("one image");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn the_synthetic_image_is_a_small_valid_png() {
+        let png = synthetic_png();
+        assert!(png.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert!(png.len() < 20_000, "{} bytes", png.len());
+        let img = image::load_from_memory(&png).expect("decodes");
+        assert!(img.width() >= 64 && img.width() <= 512);
+    }
+
+    #[test]
+    fn a_non_loopback_url_is_refused_before_any_request() {
+        match run_timed("https://example.com", "gemma3:4b") {
+            Measured::Failed(msg) => assert!(msg.contains("this PC"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timing_texts_have_no_em_dash() {
+        let mut f = timed(timing(2500, 400, 1000, 30));
+        let v = verdict(&f);
+        assert!(!format!("{} {}", v.headline, v.line).contains('\u{2014}'));
+        f.measured = Measured::Failed("x".to_string());
+        assert!(!verdict(&f).line.contains('\u{2014}'));
+        assert!(!TIMING_ACTION_LABEL.contains('\u{2014}'));
+    }
+
     #[test]
     fn no_text_contains_an_em_dash() {
         let v = verdict(&facts(
@@ -690,6 +1122,24 @@ mod tests {
         ));
         let all = format!("{} {} {}", v.headline, v.detail(), v.numbers);
         assert!(!all.contains('\u{2014}'));
+    }
+
+    /// Hand check for [`run_timed`] (#699, rule 8). Sends ONE small request to
+    /// the local model: `cargo test timed_live -- --ignored --nocapture`.
+    /// Compare the printed load, first answer and tokens per second with
+    /// `ollama run <model> --verbose`, and `on_gpu` with `/api/ps`.
+    #[test]
+    #[ignore = "live: loads the local model; run manually, see this test's doc comment"]
+    fn timed_live_prints_one_timing() {
+        let measured = run_timed("http://127.0.0.1:11434", "gemma3:4b");
+        eprintln!("{measured:#?}");
+        if let Measured::Timed(t) = &measured {
+            let mut f = facts(16, vec![], running(None), Power::Unknown);
+            f.measured = Measured::Timed(t.clone());
+            let v = verdict(&f);
+            eprintln!("{}: {}", v.headline, v.line);
+        }
+        assert!(matches!(measured, Measured::Timed(_)), "{measured:?}");
     }
 
     /// Hand check for [`gather`] (rule 8). Run manually, one filtered test:

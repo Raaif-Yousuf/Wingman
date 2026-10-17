@@ -55,8 +55,8 @@ use crate::provider::{
 };
 use crate::router;
 use crate::ui::card::{
-    Card, OptionRow, OptionsBehavior, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS,
-    WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
+    Card, OptionRow, OptionsBehavior, WM_APP_CARD_ACTION, WM_APP_CARD_COPY_DETAILS,
+    WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
 };
 use crate::ui::confirm;
 use crate::ui::overlay::{OverlayWindow, Win32Steps, OVERLAY_TIMER_ID, WM_APP_OVERLAY_INPUT};
@@ -5524,6 +5524,34 @@ impl App {
     /// socket), then `on_machine_check_result` shows the verdict. Nothing is
     /// kept and nothing polls.
     fn check_machine(&mut self) {
+        self.spawn_machine_check(None);
+    }
+
+    /// #699: the opt-in "Time a request" link on the PC check card. One small
+    /// request with a built-in image to the local model, on a worker thread,
+    /// then the same result path as the check itself. Still honours Pause
+    /// (it loads the GPU) and a run in flight.
+    fn time_machine_check(&mut self) {
+        if self.busy_now() {
+            self.show_busy_card();
+            return;
+        }
+        if pause::is_paused_now() {
+            self.card.show_answer(
+                "Paused",
+                "Resume from the tray menu to time a request.",
+                3,
+                None,
+            );
+            return;
+        }
+        let model = self.config.providers.ollama.model.clone();
+        self.spawn_machine_check(Some(model));
+    }
+
+    /// Runs the check on a worker thread; with `Some(model)` it also sends the
+    /// one timed request to that model (#699).
+    fn spawn_machine_check(&mut self, time_model: Option<String>) {
         use std::sync::atomic::Ordering;
         if MACHINE_CHECK_RUNNING.swap(true, Ordering::SeqCst) {
             return;
@@ -5533,7 +5561,13 @@ impl App {
         let target = self.hwnd_isize();
         let base_url = self.config.providers.ollama.base_url.clone();
         std::thread::spawn(move || {
-            let facts = crate::machine::gather(&base_url);
+            let mut facts = match &time_model {
+                Some(model) => crate::machine::gather_timed(&base_url, model),
+                None => crate::machine::gather(&base_url),
+            };
+            if let crate::machine::Measured::Failed(why) = &facts.measured {
+                facts.measured = crate::machine::Measured::Failed(humanize_error_chain(why));
+            }
             MACHINE_CHECK_RUNNING.store(false, Ordering::SeqCst);
             let payload = Box::into_raw(Box::new(facts));
             unsafe {
@@ -5559,8 +5593,17 @@ impl App {
             return;
         }
         let verdict = crate::machine::verdict(facts);
-        self.card
-            .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+        if crate::machine::can_offer_timing(facts) {
+            self.card.show_answer_with_action(
+                &verdict.headline,
+                &verdict.detail(),
+                20,
+                crate::machine::TIMING_ACTION_LABEL,
+            );
+        } else {
+            self.card
+                .show_answer(&verdict.headline, &verdict.detail(), 20, None);
+        }
     }
 
     /// Issue #115: "Calculate selection" tray item. Model-free: reads the
@@ -9255,6 +9298,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_CARD_COPY_DETAILS
         // #373: same treatment as "Copy details" above.
         | WM_APP_CARD_REPORT_PROBLEM
+        // #699: same again: a card link, no payload, and the card cannot be
+        // showing while Settings is modal-open.
+        | WM_APP_CARD_ACTION
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -10311,6 +10357,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.report_problem();
             LRESULT(0)
         }
+        WM_APP_CARD_ACTION => {
+            // #699: the PC check card's "Time a request" link. No payload.
+            app.time_machine_check();
+            LRESULT(0)
+        }
         WM_APP_CARD_COPY_DETAILS => {
             // Issue #425: a click/Enter on an expanded error card's "Copy
             // details" affordance. No payload.
@@ -10552,8 +10603,8 @@ mod tests {
     use crate::provider::Provider;
     use crate::router;
     use crate::ui::card::{
-        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM,
-        WM_APP_PREVIEW_DECIDED,
+        WM_APP_CARD_ACTION, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS,
+        WM_APP_CARD_REPORT_PROBLEM, WM_APP_PREVIEW_DECIDED,
     };
     use crate::ui::confirm;
     use crate::ui::overlay::WM_APP_OVERLAY_INPUT;
@@ -12955,6 +13006,7 @@ mod tests {
             gpus: None,
             ollama: crate::machine::OllamaState::NotRunning,
             power: crate::machine::Power::Unknown,
+            measured: crate::machine::Measured::NotRun,
         }));
         assert!(super::free_boxed_payload(
             super::WM_APP_MACHINE_CHECK_RESULT,
@@ -14391,6 +14443,7 @@ mod tests {
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
         ("WM_APP_CARD_REPORT_PROBLEM", WM_APP_CARD_REPORT_PROBLEM),
+        ("WM_APP_CARD_ACTION", WM_APP_CARD_ACTION),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
@@ -15262,6 +15315,7 @@ mod tests {
             WM_APP_CARD_OPEN_SETTINGS,
             WM_APP_CARD_COPY_DETAILS,
             WM_APP_CARD_REPORT_PROBLEM,
+            WM_APP_CARD_ACTION,
             WM_APP_OPTIONS_CHOICE,
             // #809: a hook-posted overlay click or key is stale once the menu has
             // taken the mouse; delivering it afterwards would act on a screen that
@@ -15516,6 +15570,11 @@ mod tests {
         (
             "WM_APP_CARD_REPORT_PROBLEM",
             WM_APP_CARD_REPORT_PROBLEM,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_CARD_ACTION",
+            WM_APP_CARD_ACTION,
             SettingsReentrancy::Ignore,
         ),
         (
