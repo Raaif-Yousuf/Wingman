@@ -1869,6 +1869,14 @@ impl App {
             return;
         }
 
+        // #918: the router sends the screenshot too, and does not go through
+        // `begin_action`, so it asks the same remote-Ollama question: the
+        // first time for an address that is not on this PC, show the card
+        // and send nothing.
+        if self.show_remote_ollama_notice() {
+            return;
+        }
+
         // A heavily downscaled capture, see `router::ROUTER_IMAGE_LONG_EDGE`.
         // Grabbed on the main thread (Win32 capture must not run on a worker);
         // the PNG encode happens on the worker.
@@ -2149,7 +2157,8 @@ impl App {
     /// network). Today's local date is read here, on the main thread, and
     /// handed to the worker.
     fn resolve_dates(&mut self) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
         let today = match local_today_and_utc_offset() {
@@ -8336,6 +8345,16 @@ mod tests {
             seen += 1;
         }
         assert!(seen >= 3, "expected the busy gates, found {seen}");
+        // The raw flag must not gate a press either: it skips the stuck-run
+        // abandon and returns with no card.
+        let raw = "if self.".to_owned() + "busy {";
+        for (i, _) in src.match_indices(&raw) {
+            let after = src.get(i..i + 120).unwrap_or(&src[i..]);
+            assert!(
+                after.contains("self.card.show_answer(") || after.contains("self.show_busy_card()"),
+                "a raw busy check returns without a card: {after}"
+            );
+        }
         let gate = src
             .find("ModelActionGate::Busy => {")
             .expect("begin_action has no Busy arm");
@@ -11397,6 +11416,26 @@ mod tests {
         let capture = body.find("capture::grab_raw_for").expect("capture call");
         assert!(notice < capture, "the notice must come before the capture");
         assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
+    }
+
+    /// #918: the intent router builds its own chain and never passes through
+    /// `begin_action`, so it must ask the same remote-Ollama question itself,
+    /// before it captures or sends anything.
+    #[test]
+    fn the_router_shows_the_remote_ollama_notice_before_capture() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let begin = src
+            .find("fn show_options_card(")
+            .expect("show_options_card exists");
+        let rest = &src[begin..];
+        let end = rest.find("\n    fn ").expect("a later fn");
+        let body = &rest[..end];
+        let notice = body
+            .find("show_remote_ollama_notice()")
+            .expect("the router must call the notice");
+        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        // The worker that sends is started by a later fn, after the capture.
+        assert!(notice < capture, "the notice must come before the capture");
     }
 
     /// #541: every handler that ends a run on a result card must consult the
