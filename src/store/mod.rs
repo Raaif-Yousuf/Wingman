@@ -854,7 +854,9 @@ pub fn global() -> Result<Arc<Store>, StoreError> {
 /// and without waiting for an open that is under way: `None` means "not ready
 /// yet". For the UI thread (#1010), where the first open (an `icacls` spawn
 /// and SQLite) would stall the keyboard hook. [`open_in_background`] does the
-/// open at start-up.
+/// open at start-up. No caller right now (the tooltip read moved to a worker,
+/// #1181); kept for the next UI-thread reader.
+#[allow(dead_code)]
 pub fn global_if_ready() -> Option<Result<Arc<Store>, StoreError>> {
     ready_in(&GLOBAL)
 }

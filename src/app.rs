@@ -253,6 +253,13 @@ impl SpendRefreshGate {
         }
     }
 
+    /// The worker could not be started: allow the next request to try again.
+    fn abort(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.again.store(false, SeqCst);
+        self.running.store(false, SeqCst);
+    }
+
     /// Called by the worker after each read. True when it must read again.
     fn finish(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
@@ -6006,6 +6013,7 @@ impl App {
                 DeferredMessage::SettingsCommand(command) => self.on_settings_command(command),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
                 DeferredMessage::NeedScreen(run) => self.on_need_screen(run as usize),
+                DeferredMessage::TooltipSpend => self.on_tooltip_spend(),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
                 }
@@ -6792,21 +6800,27 @@ impl App {
             return;
         }
         let target = self.hwnd_isize();
-        std::thread::spawn(move || loop {
-            store_tooltip_spend(crate::usage::tooltip_part());
-            unsafe {
-                // A failed post (window gone) is harmless: no payload.
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(HWND(target as *mut _)),
-                    WM_APP_TOOLTIP_SPEND,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
-            if !gate.finish() {
-                break;
-            }
-        });
+        let spawned = std::thread::Builder::new()
+            .name("tooltip-spend".into())
+            .spawn(move || loop {
+                store_tooltip_spend(crate::usage::tooltip_part());
+                unsafe {
+                    // A failed post (window gone) is harmless: no payload.
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(HWND(target as *mut _)),
+                        WM_APP_TOOLTIP_SPEND,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                if !gate.finish() {
+                    break;
+                }
+            });
+        if spawned.is_err() {
+            // No thread: keep the old text and let the next request try again.
+            gate.abort();
+        }
     }
 
     /// The worker's result is in `TOOLTIP_SPEND`: show it. Does not ask for
@@ -8943,6 +8957,9 @@ enum DeferredMessage {
     /// `WM_APP_NEED_SCREEN` (#709): the run it was posted for. Checked again
     /// when delivered (`on_need_screen`), so a stale one captures nothing.
     NeedScreen(u64),
+    /// `WM_APP_TOOLTIP_SPEND` (#1181): re-apply the stored spend text once the
+    /// menu or dialog is gone, so the tooltip does not lag a request.
+    TooltipSpend,
 }
 
 /// The card for a key the hook captured for a shortcut change that could not be
@@ -9292,6 +9309,9 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_SETTINGS_COMMAND
         // #709: no payload; checked again (run, busy, Pause) when delivered.
         | WM_APP_NEED_SCREEN
+        // #1181: no payload; delivered after the modal so the tooltip does not
+        // lag a request.
+        | WM_APP_TOOLTIP_SPEND
         // #1013: the hook swallowed the key, so it ends in a card.
         | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
@@ -9341,9 +9361,6 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // key claim is already cleared), so a late choice has nothing to
         // act on. No payload to free.
         | WM_APP_OPTIONS_CHOICE
-        // #1181: no payload, and the worker left the text in TOOLTIP_SPEND, so
-        // the next tooltip update shows it; nothing is lost by dropping this.
-        | WM_APP_TOOLTIP_SPEND
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
@@ -9534,6 +9551,7 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         }
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
         WM_APP_NEED_SCREEN => DeferredMessage::NeedScreen(wparam.0 as u64),
+        WM_APP_TOOLTIP_SPEND => DeferredMessage::TooltipSpend,
         // #1011: tray menu only; see `tray_menu_policy`.
         WM_APP_ROUTER_RESULT => {
             let (generation, result) = unsafe {
@@ -14460,6 +14478,16 @@ mod tests {
         assert!(gate.request(), "after it ended a new worker may start");
     }
 
+    #[test]
+    fn spend_refresh_gate_is_released_when_no_thread_could_start() {
+        let gate = super::SpendRefreshGate::default();
+        assert!(gate.request());
+        assert!(!gate.request());
+        gate.abort();
+        assert!(gate.request(), "a failed start must not wedge the gate");
+        assert!(!gate.finish(), "and the stale mark was cleared");
+    }
+
     /// The reason for #1181: the UI thread (which also hosts the keyboard hook)
     /// must never read the store for the tooltip.
     #[test]
@@ -14470,12 +14498,18 @@ mod tests {
         for banned in ["tooltip_part", "store::", "day_total"] {
             assert!(!body.contains(banned), "update_tooltip calls {banned}");
         }
+        let apply = body_between(&src, "    fn apply_tooltip(&mut self) {", "\n    }\n");
+        assert!(apply.len() > 100, "slicing broke: {apply}");
+        for banned in ["tooltip_part", "store::", "day_total", "thread::"] {
+            assert!(!apply.contains(banned), "apply_tooltip calls {banned}");
+        }
         let worker = body_between(
             &src,
             "    fn refresh_tooltip_spend(&mut self) {",
             "\n    }\n",
         );
-        assert!(worker.contains("std::thread::spawn"), "{worker}");
+        assert!(worker.contains("thread::Builder::new()"), "{worker}");
+        assert!(!worker.contains("thread::spawn"), "a spawn that can panic");
         assert!(worker.contains("crate::usage::tooltip_part()"), "{worker}");
         assert!(worker.contains("WM_APP_TOOLTIP_SPEND"), "{worker}");
     }
@@ -14493,11 +14527,22 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_spend_message_is_dropped_behind_a_modal() {
-        assert_eq!(
+    fn a_spend_message_behind_a_modal_is_kept_and_applied_afterwards() {
+        for policy in [
             settings_reentrancy_policy(WM_APP_TOOLTIP_SPEND, FAKE_TASKBAR_CREATED_MSG),
-            SettingsReentrancy::Ignore
-        );
+            super::tray_menu_policy(WM_APP_TOOLTIP_SPEND, FAKE_TASKBAR_CREATED_MSG),
+            super::file_dialog_policy(WM_APP_TOOLTIP_SPEND, FAKE_TASKBAR_CREATED_MSG),
+        ] {
+            assert_eq!(policy, SettingsReentrancy::Defer);
+        }
+        assert!(matches!(
+            super::take_deferred(
+                WM_APP_TOOLTIP_SPEND,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0)
+            ),
+            Some(super::DeferredMessage::TooltipSpend)
+        ));
         assert_eq!(
             super::settings_foreground_policy(WM_APP_TOOLTIP_SPEND),
             super::ForegroundPolicy::Pass
@@ -15367,8 +15412,6 @@ mod tests {
             // has moved on. The Ignore arm marks the overlay stale instead, and it
             // is hidden when the menu closes.
             WM_APP_OVERLAY_INPUT,
-            // #1181: no card involved; the text is already stored.
-            WM_APP_TOOLTIP_SPEND,
         ];
         let mut ignored = 0;
         for (name, id) in ALL_WM_APP_IDS {
@@ -15682,7 +15725,7 @@ mod tests {
         (
             "WM_APP_TOOLTIP_SPEND",
             WM_APP_TOOLTIP_SPEND,
-            SettingsReentrancy::Ignore,
+            SettingsReentrancy::Defer,
         ),
     ];
 
