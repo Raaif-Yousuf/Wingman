@@ -115,6 +115,10 @@ fn sensitive_spans_labeled(text: &str) -> Vec<(Range<usize>, &'static str)> {
     add(crate::egress::find_opaque_tokens(text), KEY);
     add(shared_key_spans(text), KEY);
     add(email_spans(text), EMAIL);
+    // `password: x` on the screen is hidden like it is in text. Same rule as
+    // text: no `PIN 3` form, so a circuit problem stays readable. This only
+    // adds spans, so it can never mask less than before.
+    add(crate::secret_labels::secret_spans(text, false), SECRET);
     spans.sort_by_key(|(r, _)| (r.start, r.end));
     spans
 }
@@ -133,8 +137,8 @@ const CARD: &str = "card number";
 const IBAN: &str = "IBAN";
 const KEY: &str = "key";
 const EMAIL: &str = "email";
-/// The value after a label such as `password:` or `PIN` (#1121). Text only:
-/// a screenshot's OCR lines are not scanned for labels.
+/// The value after a label such as `password:` or `PIN` (#1121). Text and the
+/// screenshot's OCR lines (#1136), with the narrower screen rule.
 const SECRET: &str = "secret";
 
 /// Vendor key prefixes. A run starting with one of these is a key from
@@ -676,7 +680,11 @@ impl Redactions {
     /// reveal" must reach the model intact. User content keeps label masking.
     fn redact_value_under(&mut self, v: &mut serde_json::Value, key: &str, labels: bool) -> bool {
         use serde_json::Value;
-        let labels = labels && !matches!(key, "system" | "instructions" | "system_instruction");
+        let labels = labels
+            && !matches!(
+                key,
+                "system" | "instructions" | "system_instruction" | "systemInstruction"
+            );
         match v {
             Value::String(s) => {
                 if crate::egress::is_structural_key(key) || crate::egress::is_embedded_png(s) {
@@ -783,8 +791,18 @@ fn regions_with_kinds(
     height: u32,
 ) -> Vec<(PixelRect, &'static str)> {
     let mut out = Vec::new();
+    // The line above ended in a bare `Password:`: this line holds the value.
+    let mut value_below = false;
     for line in lines {
-        let spans = sensitive_spans_labeled(&line.text);
+        let mut spans = sensitive_spans_labeled(&line.text);
+        let bare_label = crate::secret_labels::ends_with_open_label(&line.text);
+        if value_below
+            && !line.text.trim_end().ends_with(':')
+            && line.text.chars().any(char::is_alphanumeric)
+        {
+            spans.push((0..line.text.len(), SECRET));
+        }
+        value_below = bare_label;
         if spans.is_empty() {
             continue;
         }
@@ -1227,6 +1245,43 @@ mod tests {
         assert_eq!(body["system"], "Password: never reveal");
         assert_eq!(body["messages"][0]["content"], "Pin: keep this");
         assert_eq!(body["messages"][1]["content"], "password: [secret 1]");
+    }
+
+    #[test]
+    fn gemini_and_other_camel_case_system_keys_are_not_label_masked() {
+        let mut body = serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "Pin: keep this. token=abc"}]},
+            "system_instruction": {"parts": [{"text": "Password: never reveal"}]},
+            "contents": [{"role": "user", "parts": [{"text": "password: hunter2"}]}]
+        });
+        let mut r = Redactions::default();
+        assert!(r.redact_value(&mut body));
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "Pin: keep this. token=abc"
+        );
+        assert_eq!(
+            body["system_instruction"]["parts"][0]["text"],
+            "Password: never reveal"
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][0]["text"],
+            "password: [secret 1]"
+        );
+    }
+
+    #[test]
+    fn text_masks_the_new_label_shapes_and_restores_them() {
+        let mut r = Redactions::default();
+        let out = r.redact_text("password is hunter2\nOTP: 123456\nPassword:\nXk3pQ9\nanswer:\n42");
+        assert_eq!(
+            out,
+            "password is [secret 1]\nOTP: [secret 2]\nPassword:\n[secret 3]\nanswer:\n42"
+        );
+        assert_eq!(
+            r.restore_in_json("[Secret 3] and [SECRET 1]".to_string()),
+            "Xk3pQ9 and hunter2"
+        );
     }
 
     #[test]
@@ -1736,6 +1791,71 @@ mod tests {
         // are outside it, padded by PAD.
         assert_eq!((r.x0, r.x1), (147, 343));
         assert_eq!((r.y0, r.y1), (7, 25));
+    }
+
+    /// An OCR line whose words are laid out 50 px apart from `x`.
+    fn laid_out(text: &str, x: f32, y: f32) -> OcrLine {
+        let words: Vec<OcrWord> = text
+            .split(' ')
+            .enumerate()
+            .map(|(i, t)| OcrWord {
+                y,
+                ..word(t, x + 50.0 * i as f32)
+            })
+            .collect();
+        OcrLine {
+            text: text.to_string(),
+            x,
+            y,
+            width: 50.0 * words.len() as f32,
+            height: 12.0,
+            words,
+        }
+    }
+
+    #[test]
+    fn a_labelled_secret_is_painted_on_the_screenshot() {
+        // "password: hunter2": the value word only (x 150..190, padded).
+        let rects = regions_with_kinds(&[laid_out("password: hunter2", 100.0, 10.0)], 1000, 200);
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        assert_eq!(rects[0].1, SECRET);
+        assert_eq!((rects[0].0.x0, rects[0].0.x1), (147, 193));
+        // No value, no region; a circuit problem and a worksheet stay readable.
+        for text in [
+            "password:",
+            "pin 3 connects to pin 4",
+            "Answer: 42 m/s",
+            "the password policy",
+        ] {
+            assert!(
+                regions_for_lines(&[laid_out(text, 100.0, 10.0)], 1000, 200).is_empty(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_on_the_line_below_a_bare_label_is_painted() {
+        let lines = [
+            laid_out("Password:", 100.0, 10.0),
+            laid_out("hunter2", 100.0, 40.0),
+            laid_out("more text", 100.0, 70.0),
+        ];
+        let rects = regions_for_lines(&lines, 1000, 200);
+        assert_eq!(rects.len(), 1, "{rects:?}");
+        assert_eq!((rects[0].y0, rects[0].y1), (37, 55));
+        // A worksheet label above the next problem paints nothing.
+        let lines = [
+            laid_out("Answer:", 100.0, 10.0),
+            laid_out("Problem 4 A block", 100.0, 40.0),
+        ];
+        assert!(regions_for_lines(&lines, 1000, 200).is_empty());
+        // A label that already has its value does not reach the next line.
+        let lines = [
+            laid_out("Password: hunter2", 100.0, 10.0),
+            laid_out("next line", 100.0, 40.0),
+        ];
+        assert_eq!(regions_for_lines(&lines, 1000, 200).len(), 1);
     }
 
     #[test]
