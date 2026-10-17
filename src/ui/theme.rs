@@ -554,6 +554,24 @@ pub(crate) const RAIL_ICON_X_DP: i32 = 16;
 pub(crate) const RAIL_TEXT_X_DP: i32 = 44;
 
 // ---------------------------------------------------------------------------
+// The Settings rows (#877)
+// ---------------------------------------------------------------------------
+// A row is a title, an optional description under it, and the control in a
+// column on the right, with a hairline above it. Nothing else in the window
+// has its own pixel size.
+
+/// Height of the control in a row, in dp.
+pub(crate) const ROW_CONTROL_H_DP: i32 = 22;
+/// Space above and below a row's content, in dp.
+pub(crate) const ROW_PAD_DP: i32 = 6;
+/// Height of a row's title when a description sits under it, in dp.
+pub(crate) const ROW_TITLE_H_DP: i32 = 20;
+/// Height of one line of a row's description (the 12 px caption), in dp.
+pub(crate) const ROW_DESC_LINE_DP: i32 = 16;
+/// Width of the column the controls sit in, in dp.
+pub(crate) const ROW_CONTROL_W_DP: i32 = 240;
+
+// ---------------------------------------------------------------------------
 // Menus (the tray menu, #825)
 // ---------------------------------------------------------------------------
 
