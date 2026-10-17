@@ -46,6 +46,7 @@ use crate::hotkey::{
     WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::mode::{self, Mode};
+use crate::options_keys::{self, Choice, WM_APP_OPTIONS_CHOICE};
 use crate::pause::{self, PauseChoice, PauseState};
 use crate::provider::ollama_admin::{self, FirstRun};
 use crate::provider::{
@@ -54,7 +55,8 @@ use crate::provider::{
 };
 use crate::router;
 use crate::ui::card::{
-    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+    Card, OptionRow, OptionsBehavior, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS,
+    WM_APP_PREVIEW_DECIDED,
 };
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
@@ -111,12 +113,10 @@ pub const WM_APP_FORM_FILL_RESULT: u32 = WM_APP + 13;
 /// #24: posted by the intent router's worker thread when its classification
 /// call finishes (success or failure). `lparam` is
 /// `Box::into_raw(Box::new((u64, Result<router::RouterResult, String>)))` --
-/// the `u64` is the generation the request was built for
-/// (`Palette::router_generation()`, read right after `Palette::show`), so
-/// the handler can tell a result for an already-hidden-or-reshown palette
-/// from one for the session still on screen (`router::is_stale`, applied
-/// inside `Palette::apply_router_suggestion`). The receiver takes ownership
-/// and must reconstruct the `Box` to free it. `WM_APP + 14`: `+9` through
+/// the `u64` is the generation of the options card (#307) the request was
+/// started for, so the handler can tell a result for a card that is gone or
+/// replaced from one for the card still on screen (`App::on_router_result`).
+/// The receiver takes ownership and must reconstruct the `Box` to free it. `WM_APP + 14`: `+9` through
 /// `+13` are already `WM_APP_PREVIEW_DECIDED`/`WM_APP_PALETTE_TOGGLE`/
 /// `WM_APP_PALETTE_RUN`/`WM_APP_REVIEW_RESULT`/`WM_APP_FORM_FILL_RESULT`.
 pub const WM_APP_ROUTER_RESULT: u32 = WM_APP + 14;
@@ -301,6 +301,109 @@ const PAUSE_TIMER_ID: usize = 1;
 /// the run has outlasted `provider::worst_case_run_secs` for its chain.
 const STUCK_TIMER_ID: usize = 4;
 
+/// #307: the options card on screen, as the app side knows it. The card holds
+/// the buttons; this holds what each one runs. Its `generation` must equal the
+/// card's own before anything the card says is acted on.
+struct OptionsSession {
+    generation: u32,
+    /// The action id each button runs, in order. Empty while the router works.
+    ids: Vec<String>,
+    /// The catalogue the router's answer is checked against and topped up from.
+    /// Only held while the router works.
+    catalogue: Vec<palette_model::PaletteAction>,
+}
+
+/// What an options-card choice message asks for, once checked against the card
+/// and the session it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptionsChoiceAction {
+    /// Stale, malformed, or nothing to run yet: do nothing.
+    Ignore,
+    /// Esc: close the card, run nothing.
+    Close,
+    /// Run this action id.
+    Run(String),
+}
+
+/// Decides what a `WM_APP_OPTIONS_CHOICE` (`wparam` choice, `lparam`
+/// generation) does. Pure, so the stale cases are tested without a window:
+/// a choice runs only when the card on screen and the session both carry the
+/// generation the choice was made on, and a pick names a button that exists.
+fn options_choice_action(
+    wparam: usize,
+    lparam: isize,
+    card_generation: Option<u32>,
+    session: Option<&OptionsSession>,
+) -> OptionsChoiceAction {
+    let generation = (lparam as u32) & options_keys::GENERATION_MASK;
+    let Some(choice) = Choice::from_wparam(wparam) else {
+        return OptionsChoiceAction::Ignore;
+    };
+    let Some(session) = session else {
+        return OptionsChoiceAction::Ignore;
+    };
+    if card_generation != Some(generation) || session.generation != generation {
+        return OptionsChoiceAction::Ignore;
+    }
+    match choice {
+        Choice::Dismiss => OptionsChoiceAction::Close,
+        Choice::Pick(n) => match session.ids.get(n.saturating_sub(1)) {
+            Some(id) => OptionsChoiceAction::Run(id.clone()),
+            // No buttons yet: the router is still working.
+            None => OptionsChoiceAction::Ignore,
+        },
+    }
+}
+
+/// The keyboard layout (`HKL`) of the thread that owns the foreground window,
+/// as an integer; `0` when there is no foreground window (not a CJK layout, so
+/// the claim stays as configured).
+fn foreground_keyboard_layout() -> usize {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return 0;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(fg, None) };
+    unsafe { GetKeyboardLayout(thread) }.0 as usize
+}
+
+/// The foreground window as an integer (`0` = none) and whether it belongs to
+/// this process (the card, the palette, Settings): the claim cannot follow
+/// either of those.
+fn foreground_window_and_ownership() -> (isize, bool) {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return (0, false);
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    (fg.0 as isize, pid == unsafe { GetCurrentProcessId() })
+}
+
+/// Whether a choice leaves the card up with its claim spent, so the claim must
+/// be put back. A choice that closes the card or runs an action ends the card
+/// and needs nothing.
+fn rearm_after(decided: &OptionsChoiceAction) -> bool {
+    matches!(decided, OptionsChoiceAction::Ignore)
+}
+
+/// #307: the card's buttons for a ranked shortlist: the action id each runs and
+/// the label it shows.
+fn option_rows(options: &[router::RouterOption]) -> Vec<OptionRow> {
+    options
+        .iter()
+        .take(options_keys::MAX_OPTIONS)
+        .map(|o| OptionRow {
+            id: o.intent.clone(),
+            label: o.label.clone(),
+        })
+        .collect()
+}
+
 struct App {
     /// Kept so the settings window can be created on demand.
     instance: HINSTANCE,
@@ -320,10 +423,16 @@ struct App {
     password_manager_hint: bool,
     /// #567: the pulled Ollama models, refreshed off the UI thread.
     ollama_models: OllamaModelCache,
-    /// #339: the palette's own answer, taken in `toggle_palette` before it
-    /// showed. Read only when the palette runs an action, so a stale value
-    /// from an earlier session can never apply: every open overwrites it.
+    /// #339: the picker's own answer, taken in `toggle_palette` before the
+    /// palette showed. Read only when a picker (the palette, the options card)
+    /// runs an action, so a stale value from an earlier session can never
+    /// apply: every open overwrites it, and the options card clears it.
     palette_password_manager: bool,
+    /// #307: the options card on screen, if any. Checked against the card's
+    /// own generation before anything it says is acted on.
+    options: Option<OptionsSession>,
+    /// #307: the generation of the latest options card, bumped on every show.
+    options_generation: u32,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -580,6 +689,8 @@ pub fn run() -> Result<()> {
         password_manager_hint: false,
         ollama_models: OllamaModelCache::default(),
         palette_password_manager: false,
+        options: None,
+        options_generation: 0,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1036,9 +1147,11 @@ fn busy_press_card(card: crate::ui::card::CardState) -> BusyPress {
     use crate::ui::card::CardState;
     match card {
         // Never cover a card the user may be reading, or one waiting on them.
-        CardState::Pending | CardState::Preview | CardState::Collapsed | CardState::Expanded => {
-            BusyPress::Leave
-        }
+        CardState::Pending
+        | CardState::Preview
+        | CardState::Collapsed
+        | CardState::Expanded
+        | CardState::Options => BusyPress::Leave,
         CardState::Hidden => BusyPress::ShowStillWorking,
     }
 }
@@ -1613,6 +1726,10 @@ impl App {
     /// is greyed while paused, but this guard is the one place both of
     /// those paths (plus any future caller) actually converge, so it stays
     /// here rather than trusting every caller to check first.
+    ///
+    /// #805: opening the palette sends nothing. No capture, no model request:
+    /// the screen is read only after the user picks an action or types
+    /// something, by that action's own flow.
     fn toggle_palette(&mut self) {
         if self.palette.is_visible() {
             self.palette.hide();
@@ -1622,20 +1739,9 @@ impl App {
             return;
         }
 
-        let resolved = match actions::load_actions_report() {
-            Ok(report) => {
-                self.show_skipped_notice(&report);
-                report.actions
-            }
-            Err(e) => {
-                actions::queue_skipped(&[]);
-                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't load actions.toml", &detail);
-                return;
-            }
+        let Some(catalogue) = self.load_catalogue(true) else {
+            return;
         };
-        let catalogue = palette_model::catalogue(&resolved);
 
         // Same mode-aware, network-free "is anything configured" selection
         // `ask()`'s `readiness_gate` and `worker`'s downscale-limit lookup
@@ -1652,88 +1758,182 @@ impl App {
             self.first_provider_model_label().as_deref(),
         );
 
-        // #339: asked BEFORE the palette takes the foreground, read when the
-        // palette runs an action.
+        // #339: asked BEFORE the palette takes the foreground.
         self.palette_password_manager = self.password_manager_now();
-        // #805: opening the palette sends nothing, no screenshot and no
-        // model request. A request starts only when the user picks an
-        // action (or, later, from the options card), never from this call.
         self.palette.show(catalogue, model_configured, footer);
     }
 
-    /// #24: starts the intent router: a small screenshot and one cheap model
-    /// call. Since #805 nothing calls this: opening the palette sends no
-    /// request, and the router belongs to the key press and the options card
-    /// (#307). Mirrors `App::ask`'s own capture-on-main-thread-then-spawn
-    /// ordering.
+    /// The actions a picker (the palette, the options card) chooses from: the
+    /// built-ins and `actions.toml`, as `palette_model::catalogue` builds
+    /// them. A broken `actions.toml` shows its own card and returns `None`.
+    /// `notify` also shows the once-per-change "some actions were skipped"
+    /// card; the options card passes `false` so that card is not drawn over
+    /// by the options it is about to show, and the palette still shows it.
+    fn load_catalogue(&mut self, notify: bool) -> Option<Vec<palette_model::PaletteAction>> {
+        match actions::load_actions_report() {
+            Ok(report) => {
+                if notify {
+                    self.show_skipped_notice(&report);
+                }
+                Some(palette_model::catalogue(&report.actions))
+            }
+            Err(e) => {
+                actions::queue_skipped(&[]);
+                let detail = self.track_error("Couldn't load actions.toml", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't load actions.toml", &detail);
+                None
+            }
+        }
+    }
+
+    /// How the options card behaves, from `[options]`. One press of the key
+    /// does not run option 1 yet (the bare key still runs Check my work), so
+    /// no row is drawn as the default.
+    fn options_behavior(&self) -> OptionsBehavior {
+        // Read once: the claim follows this window for the card's whole life.
+        let (fg, fg_is_own) = foreground_window_and_ownership();
+        OptionsBehavior {
+            dismiss_secs: self.config.options.card_dismiss_secs(),
+            // Off under a CJK input method: its digits pick candidates, so
+            // the card must not eat them. Read on this thread, once, while
+            // the user's window is still in front.
+            claim_keys: options_keys::claim_enabled(
+                self.config.options.claim_keys,
+                foreground_keyboard_layout(),
+                options_keys::foreground_usable(fg, fg_is_own),
+            ),
+            key_runs_first: false,
+            foreground: fg,
+        }
+    }
+
+    /// #307: the options card, from the tray item "What can I do here?". The
+    /// screen is captured first (on this thread, small, before the card
+    /// exists, so the card is never in it), then the card shows at once as a
+    /// shell ("Looking at your screen") while the router works, and its
+    /// buttons drop in when the answer arrives. With no model ready the router
+    /// never runs and the card is the static list of actions that need none.
     ///
-    /// A silent no-op (never a card, never a hint) when: Paused; no
-    /// provider is ready at all (the cheap, optimistic "is anything
-    /// configured" check `ask`'s `readiness_gate` also uses); or the
-    /// screenshot capture fails. Issue #24's "skip entirely when no
-    /// provider is ready (no hint needed)" applies to every one of these --
-    /// the router is a background convenience, never something whose
-    /// failure the user is told about (rule 7's "every failure ends in a
-    /// card" is about the action the user actually asked for; the router
-    /// never was one).
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
-    fn maybe_start_router(
-        &mut self,
-        candidates: Vec<router::RouterCandidate>,
-        password_manager_in_front: bool,
-        underlying_window: isize,
-    ) {
-        if pause::is_paused_now() || password_manager_in_front {
+    /// Gates, in order: busy, paused, a password manager in front (the
+    /// capture-gate card is shown instead, and nothing is captured). A router
+    /// failure of any kind is not an error card: the card shows the floor.
+    /// Nothing runs until a row is picked ([`App::on_options_choice`]).
+    fn show_options_card(&mut self, trigger: Trigger) {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
+        }
+        if pause::is_paused_now() {
+            self.card
+                .show_answer("Paused", "Resume from the tray menu to ask.", 3, None);
+            return;
+        }
+        // #339: before the card is touched and before anything is read.
+        if self.refuse_if_password_manager() {
+            return;
+        }
+        let Some(catalogue) = self.load_catalogue(false) else {
+            return;
+        };
+
+        if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
+            self.card.hide();
+            self.set_watch(false);
+            std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
         let providers = self.config.providers.clone();
         let mode = self.config.mode;
-        let optimistic_ready = !providers
+        // The same optimistic, network-free "is anything configured" check
+        // `ask`'s readiness gate uses: configured, not reachable right now.
+        let model_ready = !providers
             .build_chain_for_mode(mode, true)
             .ready_provider_names()
             .is_empty();
-        if !optimistic_ready {
+        self.options_generation = options_keys::next_generation(self.options_generation);
+        let generation = self.options_generation;
+        let behavior = self.options_behavior();
+
+        if !model_ready {
+            let content = router::options_content(None, &catalogue, false);
+            let rows = option_rows(&content.options);
+            self.options = Some(OptionsSession {
+                generation,
+                ids: rows.iter().map(|r| r.id.clone()).collect(),
+                catalogue: Vec::new(),
+            });
+            self.card
+                .show_options(generation, &content.summary, &rows, behavior);
+            self.set_watch(true);
             return;
         }
 
-        // #24: a heavily downscaled capture -- see `router::ROUTER_IMAGE_LONG_EDGE`'s
-        // doc comment for why this is far smaller than the real action's
-        // capture. Runs on the MAIN thread (Win32 capture must not run on a
-        // worker thread, same constraint `ask` documents at its own capture
-        // call site); encoding to PNG happens below, on the worker thread,
-        // exactly like `ask` defers its own (more expensive) encode.
-        let mut raw = match capture::grab_raw_for(
+        // #918: the router sends the screenshot too, and does not go through
+        // `begin_action`, so it asks the same remote-Ollama question: the
+        // first time for an address that is not on this PC, show the card
+        // and send nothing.
+        if self.show_remote_ollama_notice() {
+            return;
+        }
+
+        // A heavily downscaled capture, see `router::ROUTER_IMAGE_LONG_EDGE`.
+        // Grabbed on the main thread (Win32 capture must not run on a worker);
+        // the PNG encode happens on the worker.
+        let raw = match capture::grab_raw_for(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
             capture::LookupWindow::when(
                 capture::needs_password_lookup(self.config.capture.redact, &providers, mode),
-                capture::LookupWindow::Window(underlying_window),
+                capture::LookupWindow::Foreground,
             ),
             &self.config.capture.extra_password_managers,
         ) {
             Ok(r) => r,
-            Err(_) => return,
+            Err(e) => {
+                let detail = self.track_error("Couldn't capture the screen", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't capture the screen", &detail);
+                return;
+            }
         };
 
-        let generation = self.palette.router_generation();
+        let candidates = router::candidates_from_catalogue(&catalogue);
+        self.options = Some(OptionsSession {
+            generation,
+            ids: Vec::new(),
+            catalogue,
+        });
+        self.card
+            .show_options(generation, router::LOOKING_SUMMARY, &[], behavior);
+        self.set_watch(true);
+        self.start_options_router(raw, candidates, generation, trigger);
+    }
+
+    /// Starts the router for the options card showing `generation`. The call
+    /// runs on its own thread so the wait can be capped: past
+    /// `ROUTER_WALL_CLOCK` the card gets the floor and a late answer is
+    /// dropped with the channel. The result always arrives as
+    /// `WM_APP_ROUTER_RESULT`, a failure included.
+    fn start_options_router(
+        &mut self,
+        mut raw: capture::RawShot,
+        candidates: Vec<router::RouterCandidate>,
+        generation: u32,
+        trigger: Trigger,
+    ) {
+        let providers = self.config.providers.clone();
+        let mode = self.config.mode;
         let target = self.hwnd_isize();
         let redact = self.config.capture.redact;
         let limits = self.config.options.router_limits();
 
-        // #359: a request is actually starting now (every earlier bail-out
-        // above -- Paused, no ready provider, capture failure -- must never
-        // reach this line), so show the placeholder instead of leaving the
-        // reserved summary band blank until the result arrives.
-        self.palette.set_router_pending(generation);
-
         std::thread::spawn(move || {
-            // The call runs on its own thread so the wait can be capped: past
-            // `ROUTER_WALL_CLOCK` the placeholder is cleared and the late
-            // answer, if any, is dropped with the channel.
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                // #236: the egress row this call writes names its trigger.
+                crate::activation::set_worker_trigger(trigger);
                 let result: std::result::Result<router::RouterResult, String> =
                     catch_worker(|| {
                         router_worker(&providers, mode, &mut raw, redact, &candidates, limits)
@@ -1754,7 +1954,7 @@ impl App {
                         "router: no answer within the wall-clock cap",
                     ))
                 });
-            let payload = Box::into_raw(Box::new((generation, result)));
+            let payload = Box::into_raw(Box::new((u64::from(generation), result)));
             unsafe {
                 if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                     Some(HWND(target as *mut _)),
@@ -1771,29 +1971,94 @@ impl App {
         });
     }
 
-    /// #24: applies (or drops) the router's result against the palette's
-    /// CURRENT session. `Palette::apply_router_suggestion` performs the
-    /// actual staleness/threshold/interacted decision (`crate::router`'s
-    /// pure functions) -- this method only unwraps the worker's `Result`
-    /// and reads the live threshold from config. An `Err` (the router
-    /// failed, or no provider ended up ready by the time the worker thread
-    /// ran) is silently dropped, never a card -- see `maybe_start_router`'s
-    /// doc comment for why.
+    /// The router answered for the options card showing `generation`: the
+    /// shell becomes the real card. A result for a card that is gone (hidden,
+    /// replaced, or a newer one showing) is dropped. A failure is not a card
+    /// of its own (the router is advisory): the card shows the floor, and the
+    /// reason goes to the diagnostics log.
     fn on_router_result(
         &mut self,
         generation: u64,
         result: std::result::Result<router::RouterResult, String>,
     ) {
-        match result {
-            Ok(result) => {
-                let threshold = self.config.palette.router_threshold;
-                self.palette
-                    .apply_router_suggestion(generation, &result, threshold);
-            }
-            // #359: the request that started the "Looking at your screen..."
-            // placeholder failed -- clear it rather than leaving it stuck.
-            Err(_) => self.palette.clear_router_pending(generation),
+        let Ok(generation) = u32::try_from(generation) else {
+            return;
+        };
+        let looking = self
+            .options
+            .as_ref()
+            .is_some_and(|s| s.generation == generation && s.ids.is_empty());
+        if !looking || self.card.options_generation() != Some(generation) {
+            return;
         }
+        let Some(session) = self.options.take() else {
+            return;
+        };
+        let routed = match result {
+            Ok(r) => Some(r),
+            Err(packed) => {
+                // The human half only: it carries no screen content or key.
+                crate::diagnostics::note_warning(&format!(
+                    "Options card: the router failed, showing the fallback options ({})",
+                    unpack_error(&packed).0
+                ));
+                None
+            }
+        };
+        let content = router::options_content(routed.as_ref(), &session.catalogue, true);
+        let rows = option_rows(&content.options);
+        if self.card.set_options(generation, &content.summary, &rows) {
+            self.options = Some(OptionsSession {
+                generation,
+                ids: rows.iter().map(|r| r.id.clone()).collect(),
+                catalogue: Vec::new(),
+            });
+        }
+    }
+
+    /// The user chose on the options card: a row picked by click or by a
+    /// claimed digit, or Esc. `lparam` is the generation of the card the
+    /// choice was made on; a choice for any other card runs nothing, so a
+    /// click that outlived its card (or a digit typed as the router's answer
+    /// replaced the buttons) cannot run the wrong thing.
+    ///
+    /// A pick hides the card first and lets it settle, exactly as the palette
+    /// does, so the card is never in the screenshot or the OCR input of the
+    /// action it chose, then runs the action through the one dispatch
+    /// ([`App::dispatch_palette_action`]). Everything that writes goes through
+    /// that action's own preview and waits for Enter.
+    fn on_options_choice(&mut self, wparam: usize, lparam: isize) {
+        let decided = options_choice_action(
+            wparam,
+            lparam,
+            self.card.options_generation(),
+            self.options.as_ref(),
+        );
+        match decided {
+            // The hook spent the claim taking this key, but the card is still
+            // up (stale generation, or the buttons were not there yet): put
+            // the claim back so the hint on the card stays true.
+            OptionsChoiceAction::Ignore => {
+                if rearm_after(&decided) {
+                    self.card.rearm_options_claim();
+                }
+            }
+            OptionsChoiceAction::Close => self.close_options_card(),
+            OptionsChoiceAction::Run(id) => {
+                self.close_options_card();
+                std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
+                self.palette_password_manager = false;
+                self.dispatch_palette_action(&id);
+            }
+        }
+    }
+
+    /// Hides the options card and forgets it. The card's own `hide` stops the
+    /// key claim and the auto-dismiss.
+    fn close_options_card(&mut self) {
+        self.options = None;
+        self.card.hide();
+        self.set_watch(false);
     }
 
     /// `"<name>:<model>"` for the first entry `self.config.mode` would
@@ -1892,7 +2157,8 @@ impl App {
     /// network). Today's local date is read here, on the main thread, and
     /// handed to the worker.
     fn resolve_dates(&mut self) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
         let today = match local_today_and_utc_offset() {
@@ -5152,7 +5418,7 @@ fn encode_for_upload(
 }
 
 /// #24: the intent router's worker-thread body, called from
-/// `App::maybe_start_router`'s spawned thread. Mirrors [`worker`]'s
+/// `App::start_options_router`'s spawned thread. Mirrors [`worker`]'s
 /// mode-aware chain construction (same Auto-mode Ollama probe, same
 /// "network I/O never happens on the main thread" reasoning), but picks the
 /// router's own cheapest ready provider/model
@@ -5160,9 +5426,8 @@ fn encode_for_upload(
 /// chain, and runs it through a single-provider [`Chain`] -- issue #99's
 /// one-shot repair pass still applies (a schema-invalid response gets one
 /// repair attempt), but there is no multi-provider fallback: the router
-/// only ever tries the one cheapest ready provider, and if that fails, this
-/// press simply gets no suggestion.
-#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
+/// only ever tries the one cheapest ready provider, and if that fails, the
+/// options card shows its fallback options.
 fn router_worker(
     providers: &Providers,
     mode: Mode,
@@ -5188,11 +5453,11 @@ fn router_worker(
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
     let shot = encode_for_upload(raw, providers, mode, redact)?;
-    // #105: the router runs by itself when the palette opens, so it never
+    // #105: the router runs by itself when the options card opens, so it never
     // shows the send preview; with the toggle on, a cloud request is refused
-    // by the send guard instead and the press simply gets no suggestion.
+    // by the send guard instead and the card shows its fallback options.
     // #792: and it stops starting calls (the repair request included) once
-    // the palette has stopped waiting.
+    // the card has stopped waiting.
     let chain = router::router_chain(provider, started);
     let raw: &capture::RawShot = raw;
     router::route(&chain, shot.png, candidates, limits, || {
@@ -5204,7 +5469,7 @@ fn router_worker(
 /// -- OCR text of the router's own downscaled capture, and NO UIA snapshot.
 /// Unlike `worker`/`calendar_worker`/`review_worker`/`form_fill_worker`, the
 /// router has no `foreground_hwnd` handy at this call site (it runs off
-/// `App::maybe_start_router`'s own capture, not `App::ask`'s), and its
+/// `App::show_options_card`'s own capture, not `App::ask`'s), and its
 /// schema (`router::router_schema`) never asks about editable-field
 /// contents the way `fill_form` does -- so paying for a second COM
 /// apartment thread just to snapshot UIA fields the router would never use
@@ -5212,8 +5477,7 @@ fn router_worker(
 /// `non_vision_inputs` (surfaced as a named skip reason to
 /// `Chain::complete_parsed_with_fallback`'s caller); router failures are
 /// silent by the time they reach the user regardless (see
-/// `App::maybe_start_router`'s doc comment), so this never becomes a card.
-#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
+/// `App::show_options_card`'s doc comment), so this never becomes a card.
 fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::NonVisionInputs> {
     let ocr_output = crate::ocr::recognize(
         &raw.rgba,
@@ -5234,7 +5498,6 @@ fn router_non_vision_inputs(raw: &capture::RawShot) -> Result<crate::provider::N
 /// one-line call into [`Providers::models_for`] (`config.rs`), which used
 /// to be hand-mirrored here -- see that function's doc for why keeping
 /// exactly one copy of this name-to-model-list mapping matters.
-#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
     providers.models_for(name)
 }
@@ -5245,7 +5508,6 @@ fn router_models_for(providers: &Providers, name: &str) -> Vec<String> {
 /// [`Providers::provider_for_named_model`] (`config.rs`) with
 /// `Some(model)`, which used to be a hand-mirrored match with the same five
 /// arms here -- see that function's doc for the drift this closed off.
-#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 fn provider_for_router(
     providers: &Providers,
     name: &str,
@@ -6664,8 +6926,8 @@ enum SettingsReentrancy {
     /// dropped, not queued), and the two palette messages (#25: the palette
     /// cannot be shown while Settings is modal-open anyway; `WM_APP_PALETTE_RUN`'s
     /// boxed `String` payload is freed rather than leaked, same as
-    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the palette a
-    /// router suggestion belongs to cannot be visible while Settings is
+    /// `WM_APP_LEARNED`'s), and `WM_APP_ROUTER_RESULT` (#24: the options
+    /// card a router suggestion belongs to cannot be visible while Settings is
     /// modal-open either, so there is nothing left to apply it to -- a
     /// router suggestion is advisory, unlike a finished action's own
     /// result, so rule 7 does not require it to survive Settings the way
@@ -6778,6 +7040,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PALETTE_TOGGLE
         | WM_APP_PALETTE_RUN
         | WM_APP_ROUTER_RESULT
+        // #307: the options card is hidden whenever Settings opens (so its
+        // key claim is already cleared), so a late choice has nothing to
+        // act on. No payload to free.
+        | WM_APP_OPTIONS_CHOICE
         // #551: advisory, and the pending card is hidden while Settings is
         // open; the boxed stage is freed below.
         | WM_APP_PENDING_STAGE
@@ -6910,13 +7176,21 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
             was_menu = true;
             SETTINGS_OPEN.with(|c| c.set(true));
             TRAY_MENU_OPEN.with(|c| c.set(true));
+            // #307: Esc closes the menu, so the options card must not hold it.
+            options_keys::clear();
             let chosen = menu.track();
             TRAY_MENU_OPEN.with(|c| c.set(false));
             SETTINGS_OPEN.with(|c| c.set(false));
+            // #307: the menu cleared the options card's key claim. Whatever
+            // was chosen, the card (if it is still up) gets it back first, so
+            // its hint stays true; a command that hides the card clears it
+            // again. A no-op when the card is gone or the claim has lapsed.
+            unsafe { &mut *ptr }.card.rearm_options_claim();
             match chosen {
                 Some(id) => id,
                 None => {
-                    unsafe { &mut *ptr }.finish_modal_deferrals();
+                    let app = unsafe { &mut *ptr };
+                    app.finish_modal_deferrals();
                     return LRESULT(0);
                 }
             }
@@ -6954,6 +7228,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::COPY_LAST) => app.copy_last(),
         MenuChoice::Command(cmd::ADD_TO_CALENDAR) => app.add_event_from_screen(),
         MenuChoice::Command(cmd::QUICK_ASK) => app.toggle_palette(),
+        MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card(Trigger::Tray),
         MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
         MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
         MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
@@ -7311,6 +7586,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_first_run_result(wparam.0 as u64, found);
             LRESULT(0)
         }
+        WM_APP_OPTIONS_CHOICE => {
+            // #307: a row clicked, a claimed digit, or Esc on the options
+            // card. No payload; `lparam` is the card's generation.
+            app.on_options_choice(wparam.0, lparam.0);
+            LRESULT(0)
+        }
         WM_APP_ROUTER_RESULT => {
             // #24: take ownership of the (generation, result) box the
             // router's worker thread leaked into the message (this
@@ -7448,6 +7729,7 @@ mod tests {
         WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
     };
     use crate::mode::Mode;
+    use crate::options_keys::WM_APP_OPTIONS_CHOICE;
     use crate::provider::ollama_admin::FirstRun;
     use crate::provider::Provider;
     use crate::router;
@@ -7676,9 +7958,278 @@ mod tests {
             (CardState::Hidden, super::BusyPress::ShowStillWorking),
             (CardState::Collapsed, super::BusyPress::Leave),
             (CardState::Expanded, super::BusyPress::Leave),
+            // #307: a card the user is choosing from is never covered.
+            (CardState::Options, super::BusyPress::Leave),
         ] {
             assert_eq!(super::busy_press_card(state), expected, "{state:?}");
         }
+    }
+
+    // -- #307: the options card's choices ---------------------------------
+
+    fn session(generation: u32, ids: &[&str]) -> super::OptionsSession {
+        super::OptionsSession {
+            generation,
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+            catalogue: Vec::new(),
+        }
+    }
+
+    fn choose(
+        wparam: usize,
+        lparam: isize,
+        card: Option<u32>,
+        s: Option<&super::OptionsSession>,
+    ) -> super::OptionsChoiceAction {
+        super::options_choice_action(wparam, lparam, card, s)
+    }
+
+    #[test]
+    fn a_pick_runs_the_action_at_that_position() {
+        use super::OptionsChoiceAction::Run;
+        let s = session(7, &["check-my-work", "explain-screen", "translate"]);
+        assert_eq!(choose(1, 7, Some(7), Some(&s)), Run("check-my-work".into()));
+        assert_eq!(
+            choose(2, 7, Some(7), Some(&s)),
+            Run("explain-screen".into())
+        );
+        assert_eq!(choose(3, 7, Some(7), Some(&s)), Run("translate".into()));
+    }
+
+    #[test]
+    fn esc_closes_the_card_and_runs_nothing() {
+        let s = session(7, &["a", "b"]);
+        assert_eq!(
+            choose(0, 7, Some(7), Some(&s)),
+            super::OptionsChoiceAction::Close
+        );
+    }
+
+    #[test]
+    fn a_choice_made_on_another_card_runs_nothing() {
+        use super::OptionsChoiceAction::Ignore;
+        let s = session(7, &["a", "b"]);
+        // The card on screen is a newer one, or none, or the session is gone.
+        assert_eq!(choose(1, 7, Some(8), Some(&s)), Ignore);
+        assert_eq!(choose(1, 7, None, Some(&s)), Ignore);
+        assert_eq!(choose(1, 7, Some(7), None), Ignore);
+        // The click was made on an older card than the one showing.
+        assert_eq!(choose(1, 6, Some(7), Some(&s)), Ignore);
+        assert_eq!(choose(0, 6, Some(7), Some(&s)), Ignore, "a stale Esc too");
+    }
+
+    #[test]
+    fn a_pick_with_no_button_there_runs_nothing() {
+        use super::OptionsChoiceAction::Ignore;
+        // Still looking: no ids yet, so a digit cannot name an action.
+        let looking = session(3, &[]);
+        assert_eq!(choose(1, 3, Some(3), Some(&looking)), Ignore);
+        // Past the last of two buttons.
+        let two = session(3, &["a", "b"]);
+        assert_eq!(choose(3, 3, Some(3), Some(&two)), Ignore);
+        assert_eq!(choose(4, 3, Some(3), Some(&two)), Ignore);
+    }
+
+    #[test]
+    fn a_malformed_choice_runs_nothing() {
+        let s = session(3, &["a", "b", "c", "d"]);
+        for w in [5usize, 6, 99, usize::MAX] {
+            assert_eq!(
+                choose(w, 3, Some(3), Some(&s)),
+                super::OptionsChoiceAction::Ignore,
+                "wparam {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generation_is_compared_within_24_bits() {
+        // A card generation is 24 bits; the message carries it in a wider
+        // word, so stray high bits must not make a live card look stale, and
+        // must not make a stale one look live.
+        let s = session(0x00AB_CDEF, &["a"]);
+        let live = 0x00AB_CDEFisize;
+        assert!(matches!(
+            choose(1, live, Some(0x00AB_CDEF), Some(&s)),
+            super::OptionsChoiceAction::Run(_)
+        ));
+        assert_eq!(
+            choose(1, live + 1, Some(0x00AB_CDEF), Some(&s)),
+            super::OptionsChoiceAction::Ignore
+        );
+    }
+
+    #[test]
+    fn option_rows_carry_the_id_and_label_and_cap_at_four() {
+        let options: Vec<router::RouterOption> = (0..6)
+            .map(|n| router::RouterOption {
+                intent: format!("id{n}"),
+                label: format!("Label {n}"),
+                confidence: 0.5,
+            })
+            .collect();
+        let rows = super::option_rows(&options);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            (rows[0].id.as_str(), rows[0].label.as_str()),
+            ("id0", "Label 0")
+        );
+        assert_eq!(rows[3].id, "id3");
+        assert!(super::option_rows(&[]).is_empty());
+    }
+
+    /// The body of the `impl App` method `name`, from its signature to its
+    /// closing brace (`    }` at the method indent). CRLF-normalised.
+    fn app_method_body(name: &str) -> String {
+        let src = lf(include_str!("app.rs"));
+        let sig = format!("\n    fn {name}(");
+        let start = src
+            .find(&sig)
+            .unwrap_or_else(|| panic!("app.rs has no method {name}"));
+        let rest = &src[start + 1..];
+        let end = rest.find("\n    }\n").expect("method has no end");
+        let body = rest[..end].to_string();
+        assert!(!body.is_empty(), "scanned an empty body for {name}");
+        body
+    }
+
+    /// The one dispatch (spec "Implementation shape"): picking an option runs
+    /// the action through `dispatch_palette_action`, with no second `match` on
+    /// action ids that could drift from the palette's.
+    #[test]
+    fn an_option_runs_through_the_one_palette_dispatch() {
+        let body = app_method_body("on_options_choice");
+        assert!(body.contains("self.dispatch_palette_action("), "{body}");
+        for second in [
+            "dispatch_palette_target",
+            "dispatch_target_for",
+            "DispatchTarget",
+            "self.ask(",
+            "self.extract_text(",
+        ] {
+            assert!(!body.contains(second), "a second dispatch: {second}");
+        }
+        // And the card is gone, and settled, before the action captures.
+        let close = body
+            .find("self.close_options_card()")
+            .expect("never closes");
+        let settle = body.find("CARD_SETTLE_MS").expect("never settles");
+        let run = body.find("self.dispatch_palette_action(").unwrap();
+        assert!(close < settle && settle < run);
+    }
+
+    /// #805: opening the palette sends nothing. It reads no screen and starts
+    /// no model request: the action the user picks or types does that later.
+    #[test]
+    fn opening_the_palette_captures_and_sends_nothing() {
+        let body = app_method_body("toggle_palette");
+        for forbidden in [
+            "grab_raw",
+            "capture::",
+            "router::",
+            "router_worker",
+            "start_options_router",
+            "show_options_card",
+            "thread::spawn",
+            "WM_APP_ROUTER_RESULT",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "toggle_palette must not use {forbidden}"
+            );
+        }
+        assert!(body.contains("self.palette.show("));
+    }
+
+    /// The options card is reachable and answered: the tray item runs it, the
+    /// window procedure routes its choices and the router's reply to it.
+    #[test]
+    fn the_options_card_is_wired_to_the_tray_and_the_window_procedure() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        let arm = proc_src
+            .split("WM_APP_OPTIONS_CHOICE => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_OPTIONS_CHOICE arm");
+        let arm = &arm[..arm.find("LRESULT(0)").expect("arm has no end")];
+        assert!(arm.contains("app.on_options_choice("), "{arm}");
+        let reply = proc_src
+            .split("WM_APP_ROUTER_RESULT => {")
+            .nth(1)
+            .expect("wnd_proc has no WM_APP_ROUTER_RESULT arm");
+        let reply = &reply[..reply.find("LRESULT(0)").expect("arm has no end")];
+        assert!(reply.contains("app.on_router_result("), "{reply}");
+        assert!(
+            src.contains("MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card("),
+            "the tray item must open the options card"
+        );
+    }
+
+    /// An ignored choice (stale generation, or no buttons yet) leaves the card
+    /// up with its claim spent, so it must be put back; a choice that closes
+    /// the card or runs an action must not be.
+    #[test]
+    fn only_an_ignored_choice_puts_the_claim_back() {
+        use super::{options_choice_action, rearm_after, OptionsChoiceAction, OptionsSession};
+        let session = OptionsSession {
+            generation: 5,
+            ids: vec!["a".to_string(), "b".to_string()],
+            catalogue: Vec::new(),
+        };
+        // A digit made on an older card: ignored, card still up.
+        let stale = options_choice_action(1, 4, Some(5), Some(&session));
+        assert_eq!(stale, OptionsChoiceAction::Ignore);
+        assert!(rearm_after(&stale));
+        // A digit naming no button yet: ignored.
+        let none_yet = options_choice_action(3, 5, Some(5), Some(&session));
+        assert_eq!(none_yet, OptionsChoiceAction::Ignore);
+        assert!(rearm_after(&none_yet));
+        // A real pick and Esc end the card.
+        let pick = options_choice_action(2, 5, Some(5), Some(&session));
+        assert_eq!(pick, OptionsChoiceAction::Run("b".to_string()));
+        assert!(!rearm_after(&pick));
+        let esc = options_choice_action(0, 5, Some(5), Some(&session));
+        assert_eq!(esc, OptionsChoiceAction::Close);
+        assert!(!rearm_after(&esc));
+    }
+
+    /// The tray menu clears the claim; it is put back right after the menu
+    /// ends, before the chosen command is dispatched, and not only when
+    /// nothing was chosen. (The window procedure needs a live window, so this
+    /// one pins the order in the source; the card's own behaviour is tested in
+    /// `ui::card::options`.)
+    #[test]
+    fn the_tray_menu_puts_the_options_claim_back_before_dispatching() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("no handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        let track = body.find(".track()").expect("the menu is never tracked");
+        let rearm = body
+            .find("rearm_options_claim()")
+            .expect("the claim is never put back");
+        let dispatch = body.find("match chosen {").expect("no dispatch on chosen");
+        assert!(track < rearm && rearm < dispatch, "wrong order");
+        assert_eq!(body.matches("rearm_options_claim()").count(), 1);
+    }
+
+    /// The tray menu loop runs a nested message loop, and Esc closes a menu:
+    /// the options card must not hold the key while it runs.
+    #[test]
+    fn the_tray_menu_releases_the_options_key_claim_before_it_runs() {
+        let src = lf(include_str!("app.rs"));
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("app.rs has no fn handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        let clear = body
+            .find("options_keys::clear()")
+            .expect("the menu never releases the claim");
+        let track = body.find(".track()").expect("the menu is never tracked");
+        assert!(clear < track);
     }
 
     /// #723: a run flagged stuck is abandoned by the next press; a healthy
@@ -7752,7 +8303,7 @@ mod tests {
             "the scan found the wrong body"
         );
         for forbidden in [
-            "maybe_start_router",
+            "show_options_card",
             "router_worker",
             "capture::",
             "grab_raw",
@@ -7794,6 +8345,16 @@ mod tests {
             seen += 1;
         }
         assert!(seen >= 3, "expected the busy gates, found {seen}");
+        // The raw flag must not gate a press either: it skips the stuck-run
+        // abandon and returns with no card.
+        let raw = "if self.".to_owned() + "busy {";
+        for (i, _) in src.match_indices(&raw) {
+            let after = src.get(i..i + 120).unwrap_or(&src[i..]);
+            assert!(
+                after.contains("self.card.show_answer(") || after.contains("self.show_busy_card()"),
+                "a raw busy check returns without a card: {after}"
+            );
+        }
         let gate = src
             .find("ModelActionGate::Busy => {")
             .expect("begin_action has no Busy arm");
@@ -8861,6 +9422,7 @@ mod tests {
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
+        ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
     ];
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -8963,13 +9525,14 @@ mod tests {
             + count_declarations(include_str!("hotkey.rs"))
             + count_declarations(include_str!("ui/tray.rs"))
             + count_declarations(include_str!("ui/card.rs"))
-            + count_declarations(include_str!("ui/palette.rs"));
+            + count_declarations(include_str!("ui/palette.rs"))
+            + count_declarations(include_str!("options_keys.rs"));
 
         assert_eq!(
             declared,
             ALL_WM_APP_IDS.len(),
             "found {declared} `pub const WM_APP_* = WM_APP + n;` declarations across \
-             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs/ui/palette.rs but \
+             app.rs/dismiss.rs/hotkey.rs/ui/tray.rs/ui/card.rs/ui/palette.rs/options_keys.rs but \
              ALL_WM_APP_IDS lists {}; add the new constant to ALL_WM_APP_IDS too",
             ALL_WM_APP_IDS.len()
         );
@@ -9623,6 +10186,11 @@ mod tests {
             "WM_APP_EXECUTOR_DONE",
             WM_APP_EXECUTOR_DONE,
             SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_OPTIONS_CHOICE",
+            WM_APP_OPTIONS_CHOICE,
+            SettingsReentrancy::Ignore,
         ),
     ];
 
@@ -10612,7 +11180,7 @@ mod tests {
 
         // Rendered directly at ROUTER_IMAGE_LONG_EDGE (not a larger canvas
         // downscaled afterward): this is the actual pixel budget
-        // `App::maybe_start_router` sends in production, so a passing
+        // `App::show_options_card` sends in production, so a passing
         // result here is real evidence for -- and a failing one real
         // evidence against -- `router::ROUTER_IMAGE_LONG_EDGE`'s doc
         // comment's THEORY that 512 stays legible enough for this kind of
@@ -10848,6 +11416,26 @@ mod tests {
         let capture = body.find("capture::grab_raw_for").expect("capture call");
         assert!(notice < capture, "the notice must come before the capture");
         assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
+    }
+
+    /// #918: the intent router builds its own chain and never passes through
+    /// `begin_action`, so it must ask the same remote-Ollama question itself,
+    /// before it captures or sends anything.
+    #[test]
+    fn the_router_shows_the_remote_ollama_notice_before_capture() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let begin = src
+            .find("fn show_options_card(")
+            .expect("show_options_card exists");
+        let rest = &src[begin..];
+        let end = rest.find("\n    fn ").expect("a later fn");
+        let body = &rest[..end];
+        let notice = body
+            .find("show_remote_ollama_notice()")
+            .expect("the router must call the notice");
+        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        // The worker that sends is started by a later fn, after the capture.
+        assert!(notice < capture, "the notice must come before the capture");
     }
 
     /// #541: every handler that ends a run on a result card must consult the

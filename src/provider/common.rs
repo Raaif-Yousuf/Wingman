@@ -448,10 +448,53 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The error codes a vendor uses to say it declined the content itself:
+/// OpenAI's `content_policy_violation` and `invalid_prompt`, and the
+/// `content_filter` that Azure-style endpoints send.
+const POLICY_DECLINE_CODES: [&str; 3] = [
+    "content_policy_violation",
+    "invalid_prompt",
+    "content_filter",
+];
+
+/// Azure's own name for the same thing, found one level down in
+/// `error.innererror.code`.
+const AZURE_POLICY_CODE: &str = "ResponsibleAIPolicyViolation";
+
+/// #920: the policy-decline code in an error body, if it carries one. Only
+/// the structured `error.code`, `error.type` and `error.innererror.code`
+/// count: a body that is not JSON, or that only mentions a filter in prose,
+/// is an ordinary failure. Pure.
+fn content_policy_code(body: &str) -> Option<&'static str> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let inner = error.get("innererror").and_then(|i| i.get("code"));
+    for field in [error.get("code"), error.get("type"), inner] {
+        let Some(text) = field.and_then(Value::as_str) else {
+            continue;
+        };
+        if text == AZURE_POLICY_CODE {
+            return Some(AZURE_POLICY_CODE);
+        }
+        if let Some(code) = POLICY_DECLINE_CODES.iter().copied().find(|c| *c == text) {
+            return Some(code);
+        }
+    }
+    None
+}
+
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
 fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
+    // #920: a 400 that says the content was declined is a decline (it stops
+    // the chain), not a failure to retry on the next vendor. Read from the
+    // raw body: the redaction below rewrites these underscore words.
+    if status == 400 {
+        if let Some(code) = content_policy_code(body) {
+            return super::blocked_error(tag, code);
+        }
+    }
     let truncated = redact_and_truncate(body);
     anyhow!("{tag}: HTTP {status}: {truncated}")
 }
@@ -3183,6 +3226,60 @@ mod tests {
         let msg = run(&transport, &sleeper, &clock).unwrap_err().to_string();
 
         assert_eq!(msg, "anthropic: HTTP 400: {\"error\": \"model not found\"}");
+    }
+
+    /// #920: a 400 whose error code says the content was declined is a
+    /// decline, not a plain failure, so the chain stops instead of sending
+    /// the same screenshot to the next vendor. Covers OpenAI's two codes and
+    /// the Azure-style one, in the places each puts them.
+    #[test]
+    fn an_http_400_content_policy_code_is_a_decline() {
+        let bodies = [
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"content_policy_violation"}}"#,
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"invalid_prompt"}}"#,
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":"prompt","code":"content_filter"}}"#,
+            r#"{"error":{"message":"m","type":"content_filter"}}"#,
+            r#"{"error":{"code":"BadRequest","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#,
+        ];
+        for body in bodies {
+            let _g = network_guard();
+            let transport = ScriptedTransport::new(vec![status(400, vec![], body)]);
+            let err = run(&transport, &RecordingSleeper::new(), &FixedClock(0)).unwrap_err();
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_some(),
+                "{body}: {err:#}"
+            );
+            assert_eq!(
+                transport.call_count(),
+                1,
+                "{body}: a decline is never retried"
+            );
+        }
+    }
+
+    /// #920: only a code decides. Other 400s, a prose mention of a filter, a
+    /// body that is not JSON and a non-400 status stay plain failures.
+    #[test]
+    fn other_http_errors_are_not_declines() {
+        let cases = [
+            (400, r#"{"error":{"code":"invalid_api_key"}}"#),
+            (
+                400,
+                r#"{"error":{"message":"the content_filter setting is off"}}"#,
+            ),
+            (400, "content_policy_violation"),
+            (400, ""),
+            (401, r#"{"error":{"code":"content_filter"}}"#),
+        ];
+        for (code, body) in cases {
+            let _g = network_guard();
+            let transport = ScriptedTransport::new(vec![status(code, vec![], body)]);
+            let err = run(&transport, &RecordingSleeper::new(), &FixedClock(0)).unwrap_err();
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_none(),
+                "{code} {body}: {err:#}"
+            );
+        }
     }
 
     /// A transport error's text is network-derived too: it carries the URL,
