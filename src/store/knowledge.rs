@@ -32,7 +32,50 @@ pub struct DocumentUpdate<'a> {
     pub ingested_unix: Option<i64>,
 }
 
+/// One full-text match: a chunk with where it came from. `span` is the raw
+/// JSON the chunker wrote.
+#[derive(Debug, Clone)]
+pub struct ChunkHit {
+    pub doc_id: i64,
+    pub ordinal: i64,
+    pub text: String,
+    pub span: Option<String>,
+    pub rel_path: String,
+}
+
 impl Store {
+    /// The best `limit` chunks for an FTS5 `MATCH` expression, best first
+    /// (`bm25`), from enabled roots only. The caller builds `fts_query` from
+    /// quoted terms (`knowledge::retrieve::fts_query`), never from raw text.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub fn search_chunks(
+        &self,
+        fts_query: &str,
+        limit: usize,
+    ) -> Result<Vec<ChunkHit>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT c.doc_id, c.ordinal, c.text, c.span, d.rel_path
+             FROM chunk_fts
+             JOIN chunk c ON c.id = chunk_fts.rowid
+             JOIN document d ON d.id = c.doc_id
+             JOIN knowledge_root r ON r.id = d.root_id
+             WHERE chunk_fts MATCH ?1 AND r.enabled = 1
+             ORDER BY bm25(chunk_fts), c.id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], |r| {
+            Ok(ChunkHit {
+                doc_id: r.get(0)?,
+                ordinal: r.get(1)?,
+                text: r.get(2)?,
+                span: r.get(3)?,
+                rel_path: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// The id of the root at `path`, creating it as a `default` root if new.
     pub fn ensure_root(&self, path: &str, now_unix: i64) -> Result<i64, StoreError> {
         let conn = self.lock();
@@ -201,6 +244,16 @@ impl Store {
             params![root_id, rel_path],
             |r| r.get(0),
         )?)
+    }
+
+    /// Turns a root on or off by its path.
+    #[cfg(test)]
+    pub(crate) fn set_root_enabled(&self, path: &str, enabled: bool) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE knowledge_root SET enabled = ?2 WHERE path = ?1",
+            params![path, enabled],
+        )?;
+        Ok(())
     }
 
     /// How many roots, documents and chunks the store holds.
