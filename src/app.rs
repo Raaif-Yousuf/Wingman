@@ -785,6 +785,62 @@ fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
     mode == Mode::Offline || load_problem.is_none()
 }
 
+/// #892: [`config_problem_card`] with where the file is, for the cards that
+/// replace a setup card: the user must be told which file to open.
+fn broken_file_card(problem: &str, config_path: &str) -> (String, String) {
+    let (headline, detail) = config_problem_card(problem);
+    (
+        headline,
+        format!("{detail}\n\nThe file is here (tray menu, Open config.toml):\n{config_path}"),
+    )
+}
+
+/// #892: [`App::readiness_gate`], except that when config.toml did not parse
+/// the blocked card names the file instead of the mode's setup text.
+fn setup_gate(
+    mode: Mode,
+    providers: &Providers,
+    config_path: &str,
+    load_problem: Option<&str>,
+) -> Option<(String, String)> {
+    let blocked = App::readiness_gate(mode, providers, config_path)?;
+    Some(match load_problem {
+        Some(problem) => broken_file_card(problem, config_path),
+        None => blocked,
+    })
+}
+
+/// #890: applies a Settings save all or nothing. `save` runs on the edited
+/// copy first; only when it succeeds does the edit replace `current`, so a
+/// refused save leaves the running config exactly as it was.
+fn commit_edited_config(
+    current: &mut Config,
+    mut edited: Config,
+    save: impl FnOnce(&Config) -> Result<()>,
+) -> Result<()> {
+    // #793: the save is refused while the file does not parse, so an edited
+    // mode must not outlive it in memory (requests read it).
+    let problem = edited
+        .load_problem
+        .clone()
+        .or_else(|| current.load_problem.clone());
+    if !mode_allowed(edited.mode, problem.as_deref()) {
+        edited.mode = Mode::Offline;
+    }
+    save(&edited)?;
+    *current = edited;
+    Ok(())
+}
+
+/// #890: the card text for a Settings save that was refused. The edits are
+/// dropped (a key typed there is not stored either), and it says so.
+fn refused_save_detail(human: &str) -> String {
+    format!(
+        "{human}\n\nYour changes were not applied and Wingman is still using its previous \
+         settings. A key you typed was not stored, so enter it again after fixing this."
+    )
+}
+
 /// #711: config.toml exists but did not parse. Names the line and column
 /// (`problem` already carries them), never file text. No em dash (rule 11).
 fn config_problem_card(problem: &str) -> (String, String) {
@@ -932,6 +988,20 @@ fn first_run_adopted_card(
         );
     }
     ("Using Ollama on this PC".to_string(), detail)
+}
+
+/// #892: the detail the first-run card shows. The probe's Ollama text is only
+/// for a setup that is merely empty; when config.toml did not parse, the card
+/// is the broken-file one and must keep saying so.
+fn first_run_card_detail(
+    gate_detail: String,
+    found: &FirstRun,
+    load_problem: Option<&str>,
+) -> String {
+    if load_problem.is_some() {
+        return gate_detail;
+    }
+    first_run_detail(found).unwrap_or(gate_detail)
 }
 
 /// #133: the readiness card's detail when Ollama is running but has nothing
@@ -1163,9 +1233,12 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let Some((headline, mut detail)) =
-            Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-        else {
+        let Some((headline, mut detail)) = setup_gate(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        ) else {
             let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
             if should_hide_after_first_run(pending, self.busy) {
                 self.card.hide();
@@ -1198,10 +1271,8 @@ impl App {
             self.set_watch(true);
             return;
         }
-        if let Some(d) = first_run_detail(&found) {
-            detail = d;
-        }
-        self.card.show_settings_needed(&headline, &detail);
+        detail = first_run_card_detail(detail, &found, self.config.load_problem.as_deref());
+        self.show_setup_card(&headline, &detail);
     }
 
     /// #806: the first press that would ask an Ollama that is not on this PC
@@ -1336,8 +1407,13 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        let blocked = Self::readiness_gate(self.config.mode, &self.config.providers, &path)
-            .filter(|_| plan.require_provider);
+        let blocked = setup_gate(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        )
+        .filter(|_| plan.require_provider);
         if let Some((headline, detail)) = blocked {
             // #133: nothing is set up. Look for a local Ollama on a worker
             // (never here: this is the keyboard hook's thread), once per
@@ -1345,7 +1421,7 @@ impl App {
             if self.start_first_run_probe() {
                 return None;
             }
-            self.card.show_settings_needed(&headline, &detail);
+            self.show_setup_card(&headline, &detail);
             return None;
         }
 
@@ -3475,8 +3551,7 @@ impl App {
                 let (headline, detail) = self.empty_chain_card_now();
                 let chain = unpack_error(packed).1.to_string();
                 let _ = self.record_last(Err(pack_error(&headline, &chain)));
-                self.card.show_settings_needed(&headline, &detail);
-                self.set_watch(true);
+                self.show_setup_card(&headline, &detail);
                 return;
             }
         }
@@ -3614,7 +3689,12 @@ impl App {
         let path = Config::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "config.toml".into());
-        empty_chain_card(self.config.mode, &self.config.providers, &path)
+        empty_chain_card(
+            self.config.mode,
+            &self.config.providers,
+            &path,
+            self.config.load_problem.as_deref(),
+        )
     }
 
     /// #832: for the action result handlers. When the run failed only
@@ -3627,9 +3707,16 @@ impl App {
         }
         let (headline, detail) = self.empty_chain_card_now();
         self.record_run_failure(&headline, &headline, unpack_error(packed).1);
-        self.card.show_settings_needed(&headline, &detail);
-        self.set_watch(true);
+        self.show_setup_card(&headline, &detail);
         true
+    }
+
+    /// #893: the one way to show a setup card. It persists until dismissed, so
+    /// it also arms the click-away hook; a call site that showed it directly
+    /// could forget, and the card would then only go away by a click on it.
+    fn show_setup_card(&mut self, headline: &str, detail: &str) {
+        self.card.show_settings_needed(headline, detail);
+        self.set_watch(true);
     }
 
     fn record_run_failure(&mut self, action: &str, human: &str, raw_chain: &str) {
@@ -3963,6 +4050,8 @@ impl App {
                     .show_error_with_details("Couldn't reload settings", &detail);
             }
         }
+        // Every card above but "Settings reloaded" persists.
+        self.set_watch(true);
     }
 
     /// Open the GUI settings window. Modal: it runs its own message loop, so
@@ -4049,13 +4138,7 @@ impl App {
             return;
         };
 
-        self.config = edited;
-        // #793: the save below is refused while the file does not parse, so
-        // an edited mode must not outlive it in memory (requests read it).
-        if !mode_allowed(self.config.mode, self.config.load_problem.as_deref()) {
-            self.config.mode = Mode::Offline;
-        }
-        if let Err(e) = self.config.save() {
+        if let Err(e) = commit_edited_config(&mut self.config, edited, Config::save) {
             // Rule 7: neither failure may be silently dropped. Every
             // deferred message is delivered for real (its executor runs,
             // its own card shows) even though the unrelated config save
@@ -4064,7 +4147,8 @@ impl App {
             // the single card slot's final content (`final_settings_card`'s
             // `SaveError` case, unchanged by #213).
             let had_pending = !pending.is_empty();
-            let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            let human = self.track_error("Couldn't save settings", &format!("{e:#}"));
+            let detail = refused_save_detail(&human);
             self.card
                 .show_error_with_details("Couldn't save settings", &detail);
             self.deliver_deferred(pending);
@@ -4229,6 +4313,7 @@ impl App {
         let Ok(path) = Config::path() else {
             self.card
                 .show_error("Couldn't locate config.toml", "%APPDATA% is not readable.");
+            self.set_watch(true);
             return;
         };
         // Make sure the file exists before asking the shell to open it.
@@ -4247,6 +4332,7 @@ impl App {
                 let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't save settings", &detail);
+                self.set_watch(true);
             }
             return;
         }
@@ -4347,7 +4433,7 @@ impl App {
             // press, so say so now and point at Settings.
             Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
                 let (headline, detail) = missing_key_card(provider);
-                self.card.show_settings_needed(&headline, &detail);
+                self.show_setup_card(&headline, &detail);
             }
             Ok(()) => self.card.show_answer(name, "", 3, None),
             Err(e) => {
@@ -6495,7 +6581,13 @@ pub(crate) fn empty_chain_card(
     mode: Mode,
     providers: &Providers,
     config_path: &str,
+    load_problem: Option<&str>,
 ) -> (String, String) {
+    // #892: the defaults standing in for an unreadable file are not what the
+    // user needs to hear about.
+    if let Some(problem) = load_problem {
+        return broken_file_card(problem, config_path);
+    }
     if mode == Mode::Auto
         && crate::mode::should_probe_ollama(&providers.order, &providers.ollama.base_url)
     {
@@ -8226,11 +8318,56 @@ mod tests {
     #[test]
     fn empty_chain_card_says_ollama_is_not_running_when_only_ollama_is_listed() {
         let (headline, detail) =
-            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml");
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), "config.toml", None);
         assert_eq!(headline, "Ollama is not running");
         assert!(detail.contains("Start Ollama"), "{detail}");
         assert!(detail.contains("Settings"), "{detail}");
         assert!(!detail.contains("Try again"), "{detail}");
+    }
+
+    /// #892: a config.toml that did not parse starts the run on default
+    /// providers; the setup card must name the file, not tell the user to
+    /// edit `providers.order` in the file Wingman could not read.
+    #[test]
+    fn a_file_that_did_not_parse_is_named_by_the_gate_and_the_empty_chain_card() {
+        let problem = Some("config.toml has an error at line 3, column 1");
+        let path = "C:\\Users\\me\\config.toml";
+        let providers = nothing_configured_providers();
+        let cards = [
+            super::setup_gate(Mode::Offline, &providers, path, problem).expect("blocked"),
+            super::empty_chain_card(Mode::Offline, &providers, path, problem),
+            super::empty_chain_card(Mode::Auto, &ollama_only_providers(), path, problem),
+        ];
+        for (headline, detail) in cards {
+            assert_eq!(headline, "Settings file not read");
+            assert!(detail.contains("line 3, column 1"), "{detail}");
+            assert!(detail.contains(path), "{detail}");
+            assert!(detail.contains("Open config.toml"), "{detail}");
+            assert!(!detail.contains("providers.order"), "{detail}");
+            assert!(!detail.contains('\u{2014}'));
+        }
+        // No problem: the old cards, unchanged. A ready provider still passes.
+        assert_eq!(
+            super::setup_gate(Mode::Offline, &providers, path, None),
+            App::readiness_gate(Mode::Offline, &providers, path)
+        );
+        assert!(super::setup_gate(Mode::Cloud, &cloud_ready_providers(), path, problem).is_none());
+    }
+
+    #[test]
+    fn a_broken_file_card_keeps_its_detail_whatever_the_ollama_probe_found() {
+        let broken = "The file is here".to_string();
+        for found in [FirstRun::NoVisionModel, FirstRun::VisionUnknown] {
+            assert_eq!(
+                super::first_run_card_detail(broken.clone(), &found, Some("line 3")),
+                broken
+            );
+            assert_ne!(
+                super::first_run_card_detail(broken.clone(), &found, None),
+                broken,
+                "without a load problem the probe's detail still applies"
+            );
+        }
     }
 
     #[test]
@@ -8240,7 +8377,8 @@ mod tests {
             Some(super::empty_chain_card(
                 Mode::Auto,
                 &providers,
-                "config.toml"
+                "config.toml",
+                None
             )),
             App::readiness_gate(Mode::Auto, &providers, "config.toml")
         );
@@ -8249,7 +8387,8 @@ mod tests {
     #[test]
     fn empty_chain_cards_have_no_em_dash() {
         for providers in [ollama_only_providers(), nothing_configured_providers()] {
-            let (headline, detail) = super::empty_chain_card(Mode::Auto, &providers, "c.toml");
+            let (headline, detail) =
+                super::empty_chain_card(Mode::Auto, &providers, "c.toml", None);
             assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         }
     }
@@ -8453,6 +8592,56 @@ mod tests {
             assert!(!mode_allowed(m, problem), "{m:?}");
             assert!(mode_allowed(m, None), "{m:?}");
         }
+    }
+
+    /// #890: a refused Settings save leaves the running config exactly as it
+    /// was; a saved one replaces it.
+    #[test]
+    fn a_refused_settings_save_leaves_the_running_config_untouched() {
+        let mut current = crate::config::Config {
+            mode: Mode::Cloud,
+            ..Default::default()
+        };
+        let before = current.clone();
+        let mut edited = current.clone();
+        edited.mode = Mode::Local;
+        edited.ui.card_seconds += 5;
+        let refused = super::commit_edited_config(&mut current, edited, |_| {
+            Err(anyhow::anyhow!("config.toml changed on disk"))
+        });
+        assert!(refused.is_err());
+        assert_eq!(current, before);
+
+        let mut edited = before.clone();
+        edited.ui.card_seconds += 5;
+        let want = edited.clone();
+        super::commit_edited_config(&mut current, edited, |_| Ok(())).expect("saved");
+        assert_eq!(current, want);
+    }
+
+    #[test]
+    fn an_edited_mode_is_held_to_offline_while_the_file_does_not_parse() {
+        let mut current = crate::config::Config {
+            load_problem: Some("config.toml has an error at line 1, column 1".into()),
+            ..Default::default()
+        };
+        let mut edited = current.clone();
+        edited.mode = Mode::Cloud;
+        super::commit_edited_config(&mut current, edited, |saved| {
+            assert_eq!(saved.mode, Mode::Offline);
+            Ok(())
+        })
+        .expect("saved");
+        assert_eq!(current.mode, Mode::Offline);
+    }
+
+    #[test]
+    fn a_refused_save_card_says_nothing_was_applied() {
+        let detail = super::refused_save_detail("config.toml changed on disk");
+        assert!(detail.starts_with("config.toml changed on disk"));
+        assert!(detail.contains("not applied"), "{detail}");
+        assert!(detail.contains("key"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
     }
 
     #[test]
@@ -10689,6 +10878,52 @@ mod tests {
             );
         }
     }
+    /// #893: a setup card is persistent, so showing one must also arm the
+    /// click-away hook. That happens in `show_setup_card`, the only place
+    /// outside startup (the watcher is not installed yet there) that calls
+    /// `Card::show_settings_needed`; `reload` and `edit_settings` arm their own
+    /// persistent cards.
+    #[test]
+    fn setup_cards_are_shown_through_the_one_helper_that_arms_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        // Split on the real test module: a bare "#[cfg(test)]" also appears in
+        // doc comments and on test-only items well before it.
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        assert!(
+            production.contains("fn show_setup_card("),
+            "production not scanned"
+        );
+        assert!(production.contains("fn wnd_proc("), "production cut short");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let direct = production.matches("card.show_settings_needed(").count();
+        // The helper itself and the startup welcome card.
+        assert_eq!(direct, 2, "a setup card bypasses show_setup_card");
+        assert!(body_of("show_setup_card").contains("set_watch(true)"));
+        assert!(body_of("reload").contains("set_watch(true)"));
+        // Every early return in edit_settings that follows a card arms it.
+        let edit = body_of("edit_settings");
+        let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
+        assert!(returns.len() >= 2, "edit_settings candidates not found");
+        for at in returns {
+            let before = &edit[at.saturating_sub(120)..at];
+            if before.contains(".show_error") {
+                assert!(
+                    before.contains("set_watch(true)"),
+                    "edit_settings returns after a card without arming click-away"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_worker_result_hands_its_attribution_to_the_main_thread_once() {
         let _g = ATTRIBUTION_TEST_LOCK
