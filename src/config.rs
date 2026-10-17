@@ -2046,6 +2046,35 @@ impl Config {
         store: &dyn SecretStore,
         env_is_set: &dyn Fn(&str) -> bool,
     ) -> Result<()> {
+        // #1225: a key edited on a shared name has no slot to go to. Say so
+        // (rule 7) before anything is written, instead of dropping it.
+        let shared = shared_compat_names(&edited.providers.compat);
+        let keys_of = |c: &Config| -> Vec<(String, String)> {
+            c.providers
+                .compat
+                .iter()
+                .filter(|e| is_shared_name(&shared, &e.name))
+                .map(|e| (e.name.clone(), e.api_key.clone()))
+                .collect()
+        };
+        if keys_of(original) != keys_of(edited) {
+            let mut names: Vec<String> = keys_of(edited)
+                .into_iter()
+                .map(|(n, _)| {
+                    if n.is_empty() {
+                        "an endpoint with no name".to_string()
+                    } else {
+                        format!("\"{n}\"")
+                    }
+                })
+                .collect();
+            names.dedup();
+            anyhow::bail!(
+                "The key for {} was not saved because another endpoint has the same name. \
+                 Rename one in config.toml, then choose Reload settings",
+                names.join(", ")
+            );
+        }
         let mut changed = Self::only_changed_secrets(original, edited);
         let mut undo = Vec::new();
         let result = changed.push_secrets_logged(store, env_is_set, &mut undo);
@@ -5409,18 +5438,40 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         Config::push_changed_secrets_with(&config, &config, &store, &|_| false).unwrap();
         assert_eq!(store.get(&slot).unwrap(), None);
 
-        // One entry is retyped: still nothing is written.
+        // One entry is retyped: nothing is written, and the save says why.
         let mut edited = config.clone();
         edited.providers.compat[1].api_key = "k3".into();
-        Config::push_changed_secrets_with(&config, &edited, &store, &|_| false).unwrap();
+        let err = Config::push_changed_secrets_with(&config, &edited, &store, &|_| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not saved"), "{err}");
+        assert!(err.contains("same name"), "{err}");
+        assert!(err.contains("config.toml"), "{err}");
+        assert!(err.contains("lab"), "{err}");
+        assert!(!err.contains("k3"), "{err}");
         assert_eq!(store.get(&slot).unwrap(), None);
 
-        // A slot that already holds a key is not wiped by a cleared duplicate.
+        // A slot that already holds a key is not wiped by a cleared duplicate,
+        // which is reported the same way.
         store.set(&slot, "kept").unwrap();
         let mut cleared = config.clone();
         cleared.providers.compat[1].api_key.clear();
-        Config::push_changed_secrets_with(&config, &cleared, &store, &|_| false).unwrap();
+        assert!(Config::push_changed_secrets_with(&config, &cleared, &store, &|_| false).is_err());
         assert_eq!(store.get(&slot).unwrap().as_deref(), Some("kept"));
+
+        // A different, unshared endpoint edited alongside is not blocked.
+        let mut mixed = config.clone();
+        mixed
+            .providers
+            .compat
+            .push(compat_entry("solo", "http://127.0.0.1:3/v1"));
+        let mut mixed_edit = mixed.clone();
+        mixed_edit.providers.compat[2].api_key = "k-solo".into();
+        Config::push_changed_secrets_with(&mixed, &mixed_edit, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get(&target_name("compat:solo")).unwrap().as_deref(),
+            Some("k-solo")
+        );
     }
 
     #[test]
