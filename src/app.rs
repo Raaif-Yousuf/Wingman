@@ -5009,41 +5009,16 @@ impl App {
         self.persist_diff(&before, outcome);
     }
 
+    /// "Reload settings". The read, the secret store and any repair run on the
+    /// writer thread (#901): the keyboard hook shares this thread, and a slow
+    /// store or disk must not stall the key. The finished `Config` comes back
+    /// as `WM_APP_CONFIG_WRITTEN` and `on_config_written` applies it, or says
+    /// why it could not.
     fn reload(&mut self) {
-        match Config::load() {
-            // #711: a file that does not parse must not replace the settings
-            // already running; keep them and say what is wrong.
-            Ok(config) if config.load_problem.is_some() => {
-                let (headline, detail) =
-                    config_problem_card(config.load_problem.as_deref().unwrap_or_default());
-                self.card.show_error(&headline, &detail);
-            }
-            Ok(config) => {
-                // #175: report before self.config is overwritten, since the
-                // freshly loaded config is the one whose hydrate ran.
-                let unreadable = config.unreadable_secrets.clone();
-                self.config = config;
-                // The file is the truth again; an old failed write must not be
-                // re-applied over it later.
-                self.unsaved.clear();
-                self.apply_config();
-                if unreadable.is_empty() {
-                    self.card.show_answer("Settings reloaded", "", 3, None);
-                } else {
-                    let (headline, detail) = unreadable_secrets_card(&unreadable);
-                    self.card.show_error(&headline, &detail);
-                }
-            }
-            Err(e) => {
-                let detail = self.track_error("Couldn't reload settings", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't reload settings", &detail);
-            }
-        }
-        // Every card above but "Settings reloaded" persists.
-        self.set_watch(true);
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        self.persist_changes_with(crate::config_writer::Outcome::reload(), Vec::new(), None);
     }
-
     /// Opens the Settings window (or brings the open one to the front).
     ///
     /// #871: Settings is modeless. It creates its window and returns; it runs no
@@ -5640,9 +5615,22 @@ impl App {
                     config: Ok(config), ..
                 }) if config.load_problem.is_none() => {
                     if last {
+                        if outcome.from_reload {
+                            // The file is the truth again; an old failed write
+                            // must not be re-applied over it later.
+                            self.unsaved.clear();
+                        }
+                        // #175: read before the config is moved.
+                        let unreadable = config.unreadable_secrets.clone();
                         self.config = crate::config_writer::reapply(&config, &self.unsaved)
                             .unwrap_or(*config);
                         self.apply_config();
+                        if outcome.from_reload && !unreadable.is_empty() {
+                            let (headline, detail) = unreadable_secrets_card(&unreadable);
+                            self.card.show_error(&headline, &detail);
+                            self.set_watch(true);
+                            return;
+                        }
                     }
                     let card_idle = matches!(self.card.state(), crate::ui::card::CardState::Hidden);
                     let shown = saved_card(outcome.from_settings, key_error.is_some(), card_idle);
@@ -9486,6 +9474,18 @@ mod tests {
             assert!(body.contains("take_pending_messages(settings::is_foreground())"));
             assert!(!body.contains("std::mem::take"), "{head}");
         }
+    }
+
+    /// #901: Reload settings reads the file, the secret store and any repair on
+    /// the writer thread; the UI thread only takes the finished `Config`.
+    #[test]
+    fn reload_does_its_load_off_the_ui_thread() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(!body.is_empty());
+        assert!(!body.contains("Config::load"), "{body}");
+        assert!(body.contains("persist_changes_with("), "{body}");
+        assert!(body.contains("Outcome::reload()"), "{body}");
     }
 
     /// The gate is in the one place every model action starts, before the

@@ -504,6 +504,11 @@ fn effective_on_disk(text: &str, changes: &[FieldChange]) -> Option<toml::Value>
 /// Reads `path` fresh, applies `changes`, writes atomically. See the module doc
 /// for the rules.
 pub fn write_changes(path: &Path, changes: &[FieldChange]) -> Result<()> {
+    // No changes (a reload, #901) is no write: not even a file that does not
+    // parse is refused for it.
+    if changes.is_empty() {
+        return Ok(());
+    }
     write_changes_with(path, changes, &mut |_| {})
 }
 
@@ -648,6 +653,10 @@ pub struct Outcome {
     /// an answer already on screen, and a press of the Wingman key is refused until
     /// its answer has been applied.
     pub from_settings: bool,
+    /// The job is the tray's Reload settings: a reload is the file as the truth
+    /// again, so a change that failed to save earlier is dropped, and a key the
+    /// store could not give back is said.
+    pub from_reload: bool,
 }
 
 impl Outcome {
@@ -662,6 +671,16 @@ impl Outcome {
             fail_headline: format!("Using {label}: not saved"),
             fail_note: "It will revert when you quit.".to_string(),
             from_settings: false,
+            from_reload: false,
+        }
+    }
+
+    /// "Reload settings" from the tray (#901): no field changes, only the read.
+    pub fn reload() -> Self {
+        Self {
+            ok_headline: "Settings reloaded".to_string(),
+            from_reload: true,
+            ..Self::simple("Settings reloaded")
         }
     }
 
@@ -679,6 +698,7 @@ impl Outcome {
                         fixing this."
                 .to_string(),
             from_settings: true,
+            from_reload: false,
         }
     }
 }
@@ -916,6 +936,32 @@ x = 1
 
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #901: a reload sends no changes, so it must neither refuse nor touch a
+    /// file that does not parse (the load then reports it as a problem card).
+    #[test]
+    fn no_changes_write_nothing_and_do_not_refuse_a_broken_file() {
+        let path = scratch("no-changes");
+        std::fs::write(&path, "mode = [unclosed\r\n").unwrap();
+        write_changes(&path, &[]).expect("an empty job is not a write");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mode = [unclosed\r\n"
+        );
+        let missing = path.with_file_name("absent.toml");
+        write_changes(&missing, &[]).expect("nothing to write");
+        assert!(!missing.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_reload_outcome_is_marked_and_worded() {
+        let o = Outcome::reload();
+        assert!(o.from_reload && !o.from_settings && !o.ok_setup);
+        assert_eq!(o.ok_headline, "Settings reloaded");
+        assert!(!Outcome::simple("x").from_reload);
+        assert!(!Outcome::settings_save().from_reload);
     }
 
     fn crlf(s: &str) -> String {
@@ -2104,8 +2150,13 @@ x = 1
     #[test]
     fn a_reload_forgets_the_unsaved_changes() {
         let app = include_str!("app.rs").replace('\r', "");
-        let reload = body_of(&app, "    fn reload(&mut self) {");
-        assert!(reload.contains("unsaved.clear()"), "{reload}");
+        // #901: the reload's answer is applied by the write handler, which
+        // clears them when the job is a reload.
+        let handler = body_of(&app, "    fn on_config_written(");
+        let at = handler
+            .find("outcome.from_reload")
+            .expect("no reload branch");
+        assert!(handler[at..].contains("unsaved.clear()"), "{handler}");
     }
 
     /// Settings saves through the writer: its Save builds the changes with
