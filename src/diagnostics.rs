@@ -192,7 +192,7 @@ fn env_overrides_present() -> Vec<String> {
     crate::config::ENV_OVERRIDE_VARS
         .iter()
         .map(|(_, var)| *var)
-        .filter(|var| std::env::var(var).is_ok())
+        .filter(|var| crate::config::env_var_usable(var))
         .map(|var| var.to_string())
         .collect()
 }

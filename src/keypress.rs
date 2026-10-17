@@ -52,6 +52,15 @@ impl KeyMode {
             _ => Self::Dynamic,
         }
     }
+
+    /// The config value that [`KeyMode::parse`] reads back as this mode.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dynamic => "dynamic",
+            Self::Pick => "pick",
+            Self::Close => "close",
+        }
+    }
 }
 
 /// What is on screen when the key is pressed.
@@ -361,6 +370,13 @@ mod tests {
         assert_eq!(double_press_window_ms(300), Some(300));
         assert_eq!(double_press_window_ms(1), Some(150));
         assert_eq!(double_press_window_ms(9999), Some(600));
+    }
+
+    #[test]
+    fn a_key_mode_name_parses_back_to_the_same_mode() {
+        for mode in [Dynamic, Pick, Close] {
+            assert_eq!(KeyMode::parse(mode.name()), mode);
+        }
     }
 
     #[test]

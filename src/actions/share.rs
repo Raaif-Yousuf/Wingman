@@ -275,14 +275,26 @@ pub fn prepare(user_path: &Path, import: Import) -> Result<Prepared> {
     let entry = toml::to_string(&ShareOut { actions: [&action] })
         .context("could not write the action as TOML")?;
     let existing_text = existing.clone();
+    // The same dominant-ending rule `config_writer` uses for config.toml, but
+    // only the appended part is converted: the user's own text stays as is.
+    let crlf = existing.matches("\r\n").count();
+    let ending = if crlf * 2 > existing.matches('\n').count() {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut new_contents = existing;
     if !new_contents.is_empty() && !new_contents.ends_with('\n') {
-        new_contents.push('\n');
+        new_contents.push_str(ending);
     }
     if !new_contents.is_empty() {
-        new_contents.push('\n');
+        new_contents.push_str(ending);
     }
-    new_contents.push_str(&entry);
+    if ending == "\n" {
+        new_contents.push_str(&entry);
+    } else {
+        new_contents.push_str(&entry.replace("\r\n", "\n").replace('\n', ending));
+    }
 
     // The combined file must still load, and must hold the new id exactly once.
     let check: super::UserActionsFile = toml::from_str(&new_contents)
@@ -603,6 +615,26 @@ prompt = "Tidy these notes."
         let report = crate::actions::load_actions_report_from(&path).unwrap();
         assert!(report.actions.iter().any(|r| r.action.id == "tidy-notes"));
         assert!(!path.with_extension("toml.new").exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn adding_to_a_crlf_file_appends_crlf_and_keeps_the_file_byte_for_byte() {
+        let path = scratch("crlf");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mine = "# my notes\r\ndisabled_groups = [\"Study\"]\r\n\r\n[[actions]]\r\nid = \"mine\"\r\nname = \"Mine\"\r\ninputs = [\"screen\"]\r\nproposal = \"text_answer\"\r\nexecutor = \"none\"\r\nconfirm = false\r\nprompt = \"Hi\"\r\n";
+        fs::write(&path, mine).unwrap();
+        let p = prepare(&path, parse_import(GOOD).unwrap()).unwrap();
+        assert!(p.new_contents.starts_with(mine));
+        let tail = &p.new_contents[mine.len()..];
+        assert!(!tail.is_empty());
+        assert!(
+            !tail.replace("\r\n", "").contains('\n'),
+            "a bare LF in the appended entry: {tail:?}"
+        );
+        p.commit(&path).unwrap();
+        let report = crate::actions::load_actions_report_from(&path).unwrap();
+        assert!(report.actions.iter().any(|r| r.action.id == "tidy-notes"));
         cleanup(&path);
     }
 
