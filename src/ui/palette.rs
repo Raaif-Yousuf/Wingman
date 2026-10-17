@@ -396,6 +396,7 @@ impl Palette {
             state: crate::ui::palette_model::PaletteState::new(Vec::new()),
             visible: false,
             hover: None,
+            ignore_mouse: false,
             tracking_leave: false,
             suppress_en_change: false,
             theme,
@@ -610,6 +611,15 @@ impl Palette {
             self.inner.state.rows.len(),
             crate::ui::palette_model::MAX_VISIBLE_ROWS,
         );
+    }
+
+    /// #949: from now on the real pointer cannot hover a row (see
+    /// `PaletteInner::ignore_mouse`). The gallery and the pixel tests call this
+    /// so two runs of the same state draw the same picture.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn ignore_mouse_for_test(&mut self) {
+        self.inner.ignore_mouse = true;
+        self.inner.hover = None;
     }
 
     /// The UI gallery's hovered row, as if the mouse were over it.
@@ -1151,6 +1161,11 @@ struct PaletteInner {
     /// forget the keyboard/last-click selection Enter would still run, only
     /// clear the hover highlight (see `WM_MOUSELEAVE` below).
     hover: Option<usize>,
+    /// #949: set by the gallery and by pixel tests so the real pointer, which
+    /// the system reports to any window it is over, cannot change which row
+    /// is hovered. Mouse moves and leaves are then ignored; a state that
+    /// wants a hover sets it explicitly. Always false in the live app.
+    ignore_mouse: bool,
     /// #357: whether `TrackMouseEvent(TME_LEAVE)` is currently armed for
     /// this window. `TrackMouseEvent` disarms itself the moment it fires
     /// (`WM_MOUSELEAVE`) or the mouse leaves, so it must be re-armed on
@@ -2003,6 +2018,7 @@ impl PaletteInner {
             // itself the moment `WM_MOUSELEAVE` fires -- a one-shot device,
             // not a subscription (no polling timer either way, rule 5: this
             // only runs in response to a real mouse message).
+            WM_MOUSEMOVE | WM_MOUSELEAVE if self.ignore_mouse => Some(LRESULT(0)),
             WM_MOUSEMOVE => {
                 if !self.tracking_leave {
                     let mut tme = TRACKMOUSEEVENT {
@@ -2650,21 +2666,22 @@ mod tests {
     #[test]
     fn wm_print_paints_the_rows_into_the_given_dc() {
         use windows::Win32::Graphics::Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
-            SelectObject, HDC,
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject, HDC,
         };
         use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
         let mut p = Palette::new_for_test(instance()).unwrap();
+        p.ignore_mouse_for_test();
         p.show(free_actions(), true, "mode: Auto".to_string());
         pump_pending(p.hwnd());
         let dpi = unsafe { GetDpiForWindow(p.hwnd()) };
         let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
-        let (screen, mem, bmp);
+        let (screen, mem, bmp, old);
         unsafe {
             screen = GetDC(None);
             mem = CreateCompatibleDC(Some(screen));
             bmp = CreateCompatibleBitmap(screen, w, h);
-            SelectObject(mem, bmp.into());
+            old = SelectObject(mem, bmp.into());
             // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
             SendMessageW(
                 p.hwnd(),
@@ -2681,6 +2698,8 @@ mod tests {
         let selected = pixel(w - scale(PADDING, dpi) - 4, selected_y);
         let empty = pixel(w / 2, h - scale(FOOTER_HEIGHT, dpi) - 4);
         unsafe {
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
         }
@@ -2787,6 +2806,7 @@ mod tests {
         use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.force_theme_for_gallery(Theme::Dark);
+        p.ignore_mouse_for_test();
         p.show(free_actions(), true, "mode: Auto".to_string());
         // Rows: header, action (selected), header, action.
         p.inner.hover = Some(3);
@@ -2960,6 +2980,25 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(owner);
         }
+    }
+
+    /// #949: with the real pointer ignored, a mouse move over an action row
+    /// does not hover it and a mouse leave does not clear an explicit hover.
+    #[test]
+    fn an_ignored_mouse_cannot_change_the_hovered_row() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.ignore_mouse_for_test();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let over_row_1 = LPARAM(((85u32 << 16) | 50u32) as isize);
+        unsafe {
+            SendMessageW(p.hwnd(), WM_MOUSEMOVE, Some(WPARAM(0)), Some(over_row_1));
+        }
+        assert_eq!(p.inner.hover, None, "a mouse move must not hover");
+        p.set_hover_for_test(Some(3));
+        unsafe {
+            SendMessageW(p.hwnd(), WM_MOUSELEAVE, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        assert_eq!(p.inner.hover, Some(3), "a leave must not clear it");
     }
 
     /// #357: real Win32 test mirroring
