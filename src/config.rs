@@ -226,8 +226,9 @@ pub struct Hotkeys {
     /// #308: what one press of the Wingman key does. `"options"` (the
     /// default) shows the options card; an action id (`"check-my-work"` for
     /// the old one-press flow) runs that action at once, with no router call.
-    /// An id that is not in the catalogue ends in that action's own error
-    /// card the first time the key is pressed. See [`Hotkeys::primary_target`].
+    /// An id that is not in the catalogue shows one card naming this setting
+    /// and the id the first time the key is pressed; later presses show the
+    /// options card. See [`Hotkeys::primary_target`].
     pub primary_action: String,
 }
 

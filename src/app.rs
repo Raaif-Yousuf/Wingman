@@ -341,22 +341,72 @@ fn keypress_runs_first(key_pickable: &[bool]) -> bool {
     key_pickable.first().copied().unwrap_or(false)
 }
 
-/// #308, #859: for each shown option, whether the key may run it. An id the
+/// #308, #859: for each button on the card, whether the key may run it. Built
+/// from the card's own rows, so flag N always describes button N. An id the
 /// catalogue does not know is not key-pickable.
 fn option_key_pickable(
-    options: &[router::RouterOption],
+    rows: &[OptionRow],
     catalogue: &[palette_model::PaletteAction],
 ) -> Vec<bool> {
-    options
-        .iter()
-        .take(options_keys::MAX_OPTIONS)
-        .map(|o| {
+    rows.iter()
+        .map(|r| {
             catalogue
                 .iter()
-                .find(|a| a.id == o.intent)
+                .find(|a| a.id == r.id)
                 .is_some_and(|a| palette_model::key_pickable(a.effect))
         })
         .collect()
+}
+
+/// What one press of the key does with no options card up, from
+/// `hotkeys.primary_action` (#308).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrimaryDispatch {
+    /// Show the options card.
+    Options,
+    /// Run Check my work, keeping the key as the egress trigger.
+    CheckMyWork,
+    /// Run this other action through the palette's dispatch.
+    Other(String),
+    /// The setting names an id that is not in the catalogue: show the card
+    /// that says so.
+    Unknown(String),
+}
+
+/// Decides [`PrimaryDispatch`]. `known_ids` is the catalogue's ids (not
+/// consulted for Check my work). `reported` is the bad id already shown to the
+/// user: that mistake is shown once, and the key then falls back to the
+/// options card (the default) instead of failing on every press.
+fn primary_dispatch(
+    target: &crate::config::PrimaryAction,
+    known_ids: &[String],
+    reported: Option<&str>,
+) -> PrimaryDispatch {
+    use crate::config::PrimaryAction;
+    match target {
+        PrimaryAction::Options => PrimaryDispatch::Options,
+        PrimaryAction::Action(id) if id == actions::DEFAULT_ACTION_ID => {
+            PrimaryDispatch::CheckMyWork
+        }
+        PrimaryAction::Action(id) if known_ids.iter().any(|k| k == id) => {
+            PrimaryDispatch::Other(id.clone())
+        }
+        PrimaryAction::Action(id) if reported == Some(id.as_str()) => PrimaryDispatch::Options,
+        PrimaryAction::Action(id) => PrimaryDispatch::Unknown(id.clone()),
+    }
+}
+
+/// The card for a `hotkeys.primary_action` that names no action: (title,
+/// reason). Names the setting and the id, and what to do about it.
+fn unknown_primary_action_text(id: &str) -> (String, String) {
+    (
+        "The Wingman key setting names an unknown action".to_string(),
+        format!(
+            "hotkeys.primary_action is \"{id}\", and there is no action with that id. \
+             Set it to \"options\" or to an action id in config.toml. \
+             Until then the key shows the options card."
+        ),
+    )
 }
 
 /// What an options-card choice message asks for, once checked against the card
@@ -479,6 +529,9 @@ struct App {
     options: Option<OptionsSession>,
     /// #307: the generation of the latest options card, bumped on every show.
     options_generation: u32,
+    /// #308: the bad `hotkeys.primary_action` id already shown on a card, so
+    /// the mistake is shown once and later presses fall back to the options card.
+    primary_action_reported: Option<String>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -756,6 +809,7 @@ pub fn run() -> Result<()> {
         palette_password_manager: false,
         options: None,
         options_generation: 0,
+        primary_action_reported: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1951,7 +2005,7 @@ impl App {
         if !model_ready {
             let content = router::options_content(None, &catalogue, false);
             let rows = option_rows(&content.options);
-            let key_pickable = option_key_pickable(&content.options, &catalogue);
+            let key_pickable = option_key_pickable(&rows, &catalogue);
             let behavior = self.options_behavior(keypress_runs_first(&key_pickable));
             self.options = Some(OptionsSession {
                 generation,
@@ -2106,7 +2160,7 @@ impl App {
         };
         let content = router::options_content(routed.as_ref(), &session.catalogue, true);
         let rows = option_rows(&content.options);
-        let key_pickable = option_key_pickable(&content.options, &session.catalogue);
+        let key_pickable = option_key_pickable(&rows, &session.catalogue);
         self.card
             .set_options_key_runs_first(generation, keypress_runs_first(&key_pickable));
         if self.card.set_options(generation, &content.summary, &rows) {
@@ -2177,26 +2231,41 @@ impl App {
                     None => self.close_options_card(),
                 }
             }
-            keypress::KeyAction::Proceed => match self.config.hotkeys.primary_target() {
-                crate::config::PrimaryAction::Options => self.show_options_card(trigger, true),
-                crate::config::PrimaryAction::Action(id) => self.run_pinned_action(&id, trigger),
-            },
+            keypress::KeyAction::Proceed => self.run_primary_action(trigger),
         }
     }
 
-    /// A pinned `primary_action`: the action runs at once. Check my work keeps
-    /// its own trigger (the egress log still says what started the call); every
-    /// other id goes through the palette's dispatch, which ends an id it does
-    /// not know in that action's own error card.
-    fn run_pinned_action(&mut self, id: &str, trigger: Trigger) {
-        if matches!(
-            palette_model::dispatch_target_for(id),
-            Some(DispatchTarget::CheckMyWork)
-        ) {
-            self.ask(trigger);
-        } else {
-            self.palette_password_manager = false;
-            self.dispatch_palette_action(id);
+    /// The key with no options card up: what `hotkeys.primary_action` says
+    /// ([`primary_dispatch`]). Check my work keeps the key as its trigger (the
+    /// egress log says what started the call). Another id goes through the
+    /// palette's dispatch. An id the catalogue does not know shows one card
+    /// naming the setting and the id; later presses show the options card.
+    fn run_primary_action(&mut self, trigger: Trigger) {
+        let target = self.config.hotkeys.primary_target();
+        // Check my work and "options" need no catalogue; only another id does.
+        let known: Vec<String> = match &target {
+            crate::config::PrimaryAction::Action(id) if id != actions::DEFAULT_ACTION_ID => {
+                match self.load_catalogue(false) {
+                    Some(c) => c.into_iter().map(|a| a.id).collect(),
+                    // `load_catalogue` showed its own card.
+                    None => return,
+                }
+            }
+            _ => Vec::new(),
+        };
+        match primary_dispatch(&target, &known, self.primary_action_reported.as_deref()) {
+            PrimaryDispatch::Options => self.show_options_card(trigger, true),
+            PrimaryDispatch::CheckMyWork => self.ask(trigger),
+            PrimaryDispatch::Other(id) => {
+                self.palette_password_manager = false;
+                self.dispatch_palette_action(&id);
+            }
+            PrimaryDispatch::Unknown(id) => {
+                let (title, reason) = unknown_primary_action_text(&id);
+                let detail = self.track_error(&title, &reason);
+                self.card.show_error_with_details(&title, &detail);
+                self.primary_action_reported = Some(id);
+            }
         }
     }
 
@@ -8389,19 +8458,90 @@ mod tests {
             .collect();
         assert!(clip.len() >= 3);
         for a in clip {
-            let picks = super::option_key_pickable(&[routed(&a.id, 1.0)], &cat);
+            let rows = super::option_rows(&[routed(&a.id, 1.0)]);
+            let picks = super::option_key_pickable(&rows, &cat);
             assert_eq!(picks, vec![false], "{}", a.id);
         }
         // A read-only action is; an id the catalogue does not know is not.
-        let picks = super::option_key_pickable(
-            &[
-                routed(crate::actions::DEFAULT_ACTION_ID, 0.1),
-                routed("not-an-action", 1.0),
-            ],
-            &cat,
-        );
-        assert_eq!(picks, vec![true, false]);
+        let rows = super::option_rows(&[
+            routed(crate::actions::DEFAULT_ACTION_ID, 0.1),
+            routed("not-an-action", 1.0),
+        ]);
+        assert_eq!(super::option_key_pickable(&rows, &cat), vec![true, false]);
         assert!(!super::keypress_runs_first(&[]));
+    }
+
+    /// The flags are read off the very rows the card shows, so button 1 and
+    /// flag 1 can never describe different options: same length, and each flag
+    /// matches its own row's id, including when the first reply is empty or
+    /// invalid and when the reply is longer than the card holds.
+    #[test]
+    fn key_pickable_is_built_from_the_rows_the_card_shows() {
+        let cat = catalogue_with_builtins();
+        let clip = cat
+            .iter()
+            .find(|a| a.effect == crate::ui::palette_model::Effect::Clipboard)
+            .expect("a clipboard action")
+            .id
+            .clone();
+        let options = vec![
+            routed("", 1.0),
+            routed(&clip, 0.9),
+            routed(crate::actions::DEFAULT_ACTION_ID, 0.8),
+            routed("bogus", 0.7),
+            routed(crate::actions::DEFAULT_ACTION_ID, 0.6),
+            routed(crate::actions::DEFAULT_ACTION_ID, 0.5),
+        ];
+        let rows = super::option_rows(&options);
+        let picks = super::option_key_pickable(&rows, &cat);
+        assert_eq!(picks.len(), rows.len());
+        assert_eq!(picks.len(), crate::options_keys::MAX_OPTIONS);
+        for (row, pick) in rows.iter().zip(&picks) {
+            let want = cat
+                .iter()
+                .find(|a| a.id == row.id)
+                .is_some_and(|a| crate::ui::palette_model::key_pickable(a.effect));
+            assert_eq!(*pick, want, "{:?}", row.id);
+        }
+        // The empty first option is not runnable, so the key does not run it.
+        assert!(!super::keypress_runs_first(&picks));
+        assert!(!super::option_key_pickable(&[], &cat).iter().any(|p| *p));
+    }
+
+    // -- #308: what the key does when `primary_action` is pinned ----------
+
+    #[test]
+    fn the_pinned_action_decision_covers_every_case() {
+        use super::{primary_dispatch as d, PrimaryDispatch as D};
+        use crate::config::PrimaryAction as P;
+        let ids = vec!["extract-text".to_string(), "my-action".to_string()];
+        assert_eq!(d(&P::Options, &ids, None), D::Options);
+        // Check my work needs no catalogue lookup and keeps the trigger path.
+        let check = P::Action(crate::actions::DEFAULT_ACTION_ID.to_string());
+        assert_eq!(d(&check, &[], None), D::CheckMyWork);
+        assert_eq!(
+            d(&P::Action("my-action".into()), &ids, None),
+            D::Other("my-action".into())
+        );
+        // An id that is not there is reported the first time ...
+        let bad = P::Action("nope".into());
+        assert_eq!(d(&bad, &ids, None), D::Unknown("nope".into()));
+        // ... and once reported, the key falls back to the options card.
+        assert_eq!(d(&bad, &ids, Some("nope")), D::Options);
+        // A different bad id is a new mistake and is reported again.
+        assert_eq!(d(&bad, &ids, Some("other")), D::Unknown("nope".into()));
+    }
+
+    #[test]
+    fn the_bad_primary_action_card_names_the_setting_and_the_id() {
+        let (title, reason) = super::unknown_primary_action_text("nope");
+        for s in [&title, &reason] {
+            assert!(!s.contains('\u{2014}'), "{s}");
+        }
+        let both = format!("{title} {reason}");
+        assert!(both.contains("hotkeys.primary_action"), "{both}");
+        assert!(both.contains("\"nope\""), "{both}");
+        assert!(!both.contains("Couldn't run that action"), "{both}");
     }
 
     /// The single-press table, read off the app's own state.
@@ -8464,7 +8604,16 @@ mod tests {
             .expect("no on_primary_key");
         let key = &key[..key.find("\n    }\n").unwrap()];
         assert!(key.contains("keypress::on_key("), "{key}");
-        assert!(key.contains("primary_target()"), "{key}");
+        assert!(key.contains("self.run_primary_action("), "{key}");
+        // The decision itself is unit tested (`primary_dispatch`); this only
+        // checks the method acts on it.
+        let run = src
+            .split("fn run_primary_action(")
+            .nth(1)
+            .expect("no run_primary_action");
+        let run = &run[..run.find("\n    }\n").unwrap()];
+        assert!(run.contains("primary_target()"), "{run}");
+        assert!(run.contains("primary_dispatch("), "{run}");
     }
 
     /// The tray menu clears the claim; it is put back right after the menu
