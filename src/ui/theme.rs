@@ -172,7 +172,8 @@ pub(crate) struct Tokens {
     /// Clickable text (the card's footer links). Not greyed in high
     /// contrast, where grey text means disabled.
     pub(crate) link: u32,
-    /// Error text.
+    /// Error text and the error mark: the Windows 11 Fluent critical colour,
+    /// `#C42B1C` on light and `#FF99A4` on dark (#819).
     pub(crate) danger: u32,
     /// The fill of a text box, one step off the surface it sits on (Windows 11
     /// `ControlFillColorDefault`). High contrast has no tints: the window
@@ -188,7 +189,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text_dim: rgb(90, 90, 90),
     text_faint: rgb(112, 112, 112),
     link: rgb(112, 112, 112),
-    danger: rgb(200, 50, 50),
+    danger: rgb(0xC4, 0x2B, 0x1C),
     control_fill: rgb(255, 255, 255),
 };
 
@@ -199,7 +200,7 @@ pub(crate) const DARK: Tokens = Tokens {
     text_dim: rgb(190, 190, 190),
     text_faint: rgb(140, 140, 140),
     link: rgb(140, 140, 140),
-    danger: rgb(240, 100, 100),
+    danger: rgb(0xFF, 0x99, 0xA4),
     control_fill: rgb(45, 45, 45),
 };
 
@@ -481,6 +482,12 @@ pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
 /// Thickness of the accent line under a focused text box, in dp (the
 /// Windows 11 text box underline).
 pub(crate) const FOCUS_LINE_DP: i32 = 2;
+/// Height of a button, in dp (Windows 11 controls are 32 tall).
+pub(crate) const CONTROL_HEIGHT_DP: i32 = 32;
+/// Gap between stacked rows of a form, in dp.
+pub(crate) const FORM_ROW_GAP_DP: i32 = SPACE_MD_DP;
+/// Gap between a form label and its value, in dp.
+pub(crate) const LABEL_VALUE_GAP_DP: i32 = SPACE_SM_DP;
 /// The icon font on Windows 11, and the one it replaced, which Windows 10
 /// still has. Use [`icon_font_face`] to pick one.
 pub(crate) const FLUENT_ICON_FONT_FACE: &str = "Segoe Fluent Icons";
@@ -646,7 +653,7 @@ mod tests {
         assert_eq!(LIGHT.text, rgb(23, 23, 23));
         assert_eq!(LIGHT.text_dim, rgb(90, 90, 90));
         assert_eq!(LIGHT.text_faint, rgb(112, 112, 112));
-        assert_eq!(LIGHT.danger, rgb(200, 50, 50));
+        assert_eq!(LIGHT.danger, rgb(0xC4, 0x2B, 0x1C));
         assert_eq!(LIGHT.control_fill, rgb(255, 255, 255));
         assert_eq!(DARK.control_fill, rgb(45, 45, 45));
         assert_eq!(LIGHT.link, LIGHT.text_faint);
@@ -656,7 +663,7 @@ mod tests {
         assert_eq!(DARK.text, rgb(245, 245, 245));
         assert_eq!(DARK.text_dim, rgb(190, 190, 190));
         assert_eq!(DARK.text_faint, rgb(140, 140, 140));
-        assert_eq!(DARK.danger, rgb(240, 100, 100));
+        assert_eq!(DARK.danger, rgb(0xFF, 0x99, 0xA4));
     }
 
     #[test]
