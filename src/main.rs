@@ -48,6 +48,8 @@ mod secrets;
 mod single_instance;
 mod speech;
 mod store;
+#[cfg(test)]
+mod test_locks;
 mod ui;
 mod ui_thread;
 mod usage;
