@@ -32,6 +32,12 @@ tagged release.
 
 ### Added
 
+- A preview with a "Do it" button no longer closes when you switch to another
+  window, so a half-edited entry is not lost. Esc or a press of the Wingman key
+  closes it. The preview that asks before sending a screenshot still closes when
+  you leave it. New `click_away_dismiss` under `[options]` (default `true`):
+  set it to `false` and a click outside an answer or options card leaves the
+  card up (#324).
 - An error card has a "Report a problem" link. It opens a new GitHub issue in your browser with the version, mode, provider kinds and error class filled in. Nothing is sent by Wingman, and no error text, screen text, keys or paths are in the link (#373).
 
 ### Accessibility

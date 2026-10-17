@@ -179,6 +179,16 @@ pub struct ScanHandle {
 }
 
 impl ScanHandle {
+    /// Asks the scan to stop, without waiting.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// True once the scan's thread has ended (or there never was one).
+    pub fn is_finished(&self) -> bool {
+        !self.thread.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
     /// Waits for the scan to end (tests).
     #[cfg(test)]
     fn join(mut self) -> std::thread::Result<()> {

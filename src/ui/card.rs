@@ -199,7 +199,8 @@ pub enum CardState {
     /// The confirmation state (#26): a proposal rendered as a compact form
     /// (title + one row per schema field), with "Do it" / "Edit" buttons.
     /// No Cancel button (#392): nothing has run yet, so there is nothing to
-    /// undo -- Esc or a click elsewhere dismiss it instead. See
+    /// undo -- Esc or the Wingman key dismiss it instead (#324: it survives
+    /// focus loss and a click elsewhere; only the send preview does not). See
     /// [`Card::show_preview`].
     Preview,
     /// The options card (#307): a summary and 2 to 4 one-click choices for
@@ -753,7 +754,8 @@ impl Drop for Card {
 const WM_CARD_SPEECH_END: u32 = WM_USER + 0x77;
 
 /// #255: a preview command (Do it, Cancel, Edit) posted by a preview child
-/// control's subclass: Enter, Esc, or a click-away `WM_KILLFOCUS`. `wparam`
+/// control's subclass: Enter, Esc, or (send preview only) a click-away
+/// `WM_KILLFOCUS`. `wparam`
 /// is the command id, `lparam` the preview generation that was live when it
 /// was posted. A real button click still arrives as `WM_COMMAND`. The tag is
 /// why this is its own message: a `WM_COMMAND` `lparam` already holds the
@@ -1568,7 +1570,7 @@ const STILL_WORKING_DELAY_MS: u32 = 4000;
 /// (animate) on any Win32 failure, matching this module's existing degrade
 /// pattern of "keep the pre-existing behaviour" rather than inventing a new
 /// failure mode.
-fn client_area_animation_enabled() -> bool {
+pub(crate) fn client_area_animation_enabled() -> bool {
     // SPI_GETCLIENTAREAANIMATION writes a Win32 BOOL (a plain 4-byte int, 0
     // or nonzero) through pvParam -- a raw i32 avoids depending on exactly
     // which module this `windows` crate version exports its BOOL type from.
@@ -5339,8 +5341,17 @@ unsafe fn live_preview_generation(card: HWND) -> u32 {
 /// the card's own and `IsChild` is never true for it, so it already
 /// computes `new_focus_is_card_or_descendant == false` the same as any
 /// other outside window.
-fn preview_focus_left_the_card(new_focus_is_card_or_descendant: bool) -> bool {
-    !new_focus_is_card_or_descendant
+///
+/// #324: only the send preview (#105) cancels. Its worker is blocked on it,
+/// so a forgotten one would hold the app busy, and there is nothing in it to
+/// lose. A Do it / Edit preview can hold edits, so an Alt+Tab to check a date
+/// leaves it up; it closes on Esc, the Wingman key or its own buttons.
+/// `is_send_preview` is `!enter_confirms`, the one flag the card keeps for it.
+fn preview_cancels_on_focus_loss(
+    new_focus_is_card_or_descendant: bool,
+    is_send_preview: bool,
+) -> bool {
+    !new_focus_is_card_or_descendant && is_send_preview
 }
 
 /// Subclass installed on every preview EDIT/BUTTON child control so Enter
@@ -5368,7 +5379,7 @@ fn preview_focus_left_the_card(new_focus_is_card_or_descendant: bool) -> bool {
 /// between THEM, not off the card window itself, until it leaves the whole
 /// group. So this subclass, installed on every one of those children,
 /// checks each `WM_KILLFOCUS`'s own new-focus target (`wparam`) against the
-/// card window group via [`preview_focus_left_the_card`] and posts
+/// card window group via [`preview_cancels_on_focus_loss`] and posts
 /// `ID_PREVIEW_CANCEL` the same way Enter/Esc already do when it has.
 unsafe extern "system" fn preview_control_subclass(
     hwnd: HWND,
@@ -5396,7 +5407,8 @@ unsafe extern "system" fn preview_control_subclass(
         let new_focus = HWND(wparam.0 as *mut c_void);
         let new_focus_is_card_or_descendant =
             new_focus == parent || unsafe { IsChild(parent, new_focus) }.as_bool();
-        if preview_focus_left_the_card(new_focus_is_card_or_descendant) {
+        let is_send_preview = !live_preview_enter_confirms(parent);
+        if preview_cancels_on_focus_loss(new_focus_is_card_or_descendant, is_send_preview) {
             let _ = PostMessageW(
                 Some(parent),
                 WM_CARD_PREVIEW_COMMAND,
@@ -8252,23 +8264,31 @@ mod tests {
         }
     }
 
-    // -- preview_focus_left_the_card: pure decision (#207) -------------------
+    // -- preview_cancels_on_focus_loss: pure decision (#207) -------------------
 
     #[test]
     fn focus_staying_in_the_card_group_does_not_cancel() {
         // Tab between two preview fields, or focus landing on the Do
         // it/Edit button right before its own click fires: the new focus
         // target IS the card or a descendant of it.
-        assert!(!preview_focus_left_the_card(true));
+        for send in [false, true] {
+            assert!(!preview_cancels_on_focus_loss(true, send));
+        }
     }
 
     #[test]
-    fn focus_leaving_the_card_group_cancels() {
+    fn the_send_preview_cancels_when_focus_leaves_the_card_group() {
         // The new focus target is neither the card itself nor a descendant
         // -- covers both "another window" and WM_KILLFOCUS's own
         // wparam == 0 case (see this function's doc comment: both compute
         // new_focus_is_card_or_descendant == false at the call site).
-        assert!(preview_focus_left_the_card(false));
+        assert!(preview_cancels_on_focus_loss(false, true));
+    }
+
+    #[test]
+    fn a_do_it_preview_survives_focus_leaving_the_card_group() {
+        // #324: it can hold edits, and an Alt+Tab must not discard them.
+        assert!(!preview_cancels_on_focus_loss(false, false));
     }
 
     // -- preview state: real Win32 (#26) -------------------------------------
@@ -9348,7 +9368,7 @@ mod tests {
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
-        card.inner.show_preview("Preview A", &schema, &value, false);
+        let _ = card.show_send_preview("Preview A", &schema, &value);
         let start_hwnd = card.inner.preview.as_ref().unwrap().edits[1].1;
         let card_hwnd = card.hwnd();
         unsafe {
@@ -9459,17 +9479,16 @@ mod tests {
     // -- click-away cancels the preview (#207) --------------------------
 
     #[test]
-    fn preview_control_subclass_posts_cancel_when_focus_leaves_the_card() {
+    fn preview_control_subclass_posts_cancel_when_focus_leaves_the_send_preview() {
         // Simulates a real click-away: WM_KILLFOCUS on a preview field whose
         // new focus target (wparam, per the real WM_KILLFOCUS contract) is
         // some other, unrelated window -- not the card, not one of its
-        // children.
+        // children. Only the send preview cancels (#324).
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
-        card.inner
-            .show_preview("Add to calendar", &schema, &value, false);
+        let _ = card.show_send_preview("Send to anthropic?", &schema, &value);
         let start_hwnd = card
             .inner
             .preview
@@ -9526,17 +9545,16 @@ mod tests {
     }
 
     #[test]
-    fn preview_control_subclass_posts_cancel_when_nothing_gains_focus() {
+    fn preview_control_subclass_posts_cancel_when_nothing_gains_focus_in_the_send_preview() {
         // WM_KILLFOCUS's wparam is 0 when no window is gaining the focus at
-        // all (e.g. the whole app losing the foreground) -- must cancel the
-        // same as a click into another window, per preview_focus_left_the_card's
-        // doc comment.
+        // all (e.g. the whole app losing the foreground) -- the send preview
+        // cancels the same as for a click into another window, per
+        // preview_cancels_on_focus_loss's doc comment.
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
-        card.inner
-            .show_preview("Add to calendar", &schema, &value, false);
+        let _ = card.show_send_preview("Send to anthropic?", &schema, &value);
         let start_hwnd = card
             .inner
             .preview
@@ -9568,16 +9586,60 @@ mod tests {
     }
 
     #[test]
-    fn preview_control_subclass_does_not_cancel_on_focus_moving_to_another_preview_control() {
-        // Tab moving focus from the "start" EDIT to the Do it button (both
-        // preview children) must not cancel -- the exact scenario
-        // preview_focus_left_the_card's doc comment names.
+    fn a_do_it_preview_keeps_its_edits_when_focus_leaves_the_card() {
+        // #324: the observable that differs if the cancel is still wired: a
+        // WM_CARD_PREVIEW_COMMAND carrying ID_PREVIEW_CANCEL is posted, or
+        // the card stops being a Preview once it is delivered.
         use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         let (schema, value) = calendar_schema_and_value();
         card.inner
             .show_preview("Add to calendar", &schema, &value, false);
+        let start_hwnd = card.inner.preview.as_ref().unwrap().edits[0].1;
+        let card_hwnd = card.hwnd();
+        for new_focus in [0usize, 0x1234] {
+            unsafe {
+                let _ = preview_control_subclass(
+                    start_hwnd,
+                    WM_KILLFOCUS,
+                    WPARAM(new_focus),
+                    LPARAM(0),
+                    PREVIEW_SUBCLASS_ID,
+                    card_hwnd.0 as usize,
+                );
+            }
+            let mut msg = MSG::default();
+            let found = unsafe {
+                PeekMessageW(
+                    &mut msg,
+                    Some(card_hwnd),
+                    WM_CARD_PREVIEW_COMMAND,
+                    WM_CARD_PREVIEW_COMMAND,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            let cancelled = found && (msg.wParam.0 & 0xFFFF) as i32 == ID_PREVIEW_CANCEL;
+            assert!(
+                !cancelled,
+                "focus {new_focus:#x} must not cancel a Do it preview"
+            );
+        }
+        assert_eq!(card.state(), CardState::Preview);
+    }
+
+    #[test]
+    fn preview_control_subclass_does_not_cancel_on_focus_moving_to_another_preview_control() {
+        // Tab moving focus from the "start" EDIT to the Do it button (both
+        // preview children) must not cancel -- the exact scenario
+        // preview_cancels_on_focus_loss's doc comment names.
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        // The send preview, the one kind that cancels on focus loss at all.
+        let _ = card.show_send_preview("Send to anthropic?", &schema, &value);
         let preview = card.inner.preview.as_ref().unwrap();
         let start_hwnd = preview
             .edits

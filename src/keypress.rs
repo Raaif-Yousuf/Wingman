@@ -62,6 +62,9 @@ pub enum Phase {
     Other,
     /// An answer, error or info card.
     Answer,
+    /// A Do it / Edit preview (#324). It survives focus loss, so the key is
+    /// one of the ways it closes. Never confirmed by the key, in any mode.
+    Preview,
     /// The options shell is up and the router has not answered.
     Looking {
         /// Still inside the double-press window of the press that started the
@@ -108,6 +111,7 @@ pub fn on_key(phase: Phase, mode: KeyMode, press: Press) -> KeyAction {
             KeyMode::Pick => KeyAction::Absorb,
             KeyMode::Dynamic | KeyMode::Close => KeyAction::Close,
         },
+        Phase::Preview => KeyAction::Close,
         Phase::Repeat => KeyAction::Repeat,
         Phase::Looking { early: true } => KeyAction::Absorb,
         Phase::Looking { early: false } => KeyAction::Close,
@@ -299,6 +303,18 @@ mod tests {
         for press in [Single, Double] {
             assert_eq!(on_key(Phase::Answer, Dynamic, press), KeyAction::Close);
             assert_eq!(on_key(Phase::Answer, Pick, press), KeyAction::Absorb);
+        }
+    }
+
+    /// #324: a Do it / Edit preview is dismissed by the key and never
+    /// confirmed, in every mode and for either press, and acts at once.
+    #[test]
+    fn a_preview_card_is_dismissed_by_the_key_in_every_mode() {
+        for mode in [Dynamic, Pick, Close] {
+            for press in [Single, Double] {
+                assert_eq!(on_key(Phase::Preview, mode, press), KeyAction::Close);
+            }
+            assert!(!needs_window(Phase::Preview, mode));
         }
     }
 

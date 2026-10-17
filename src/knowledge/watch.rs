@@ -478,6 +478,25 @@ impl Watcher {
         !self.thread.is_finished()
     }
 
+    /// Asks the thread to stop, without waiting.
+    pub fn request_stop(&self) {
+        // SAFETY: `stop` holds a live event handle.
+        unsafe {
+            let _ = SetEvent(self.stop.0);
+        }
+    }
+
+    /// Asks the thread to stop and waits up to `within` for it to end. For a
+    /// worker thread only: the UI thread must use the bounded drop.
+    pub fn stop_and_wait(&self, within: Duration) -> bool {
+        self.request_stop();
+        let end = Instant::now() + within;
+        while !self.thread.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.thread.is_finished()
+    }
+
     #[cfg(test)]
     fn wait_stopped(&self, within: Duration) -> bool {
         let end = Instant::now() + within;
@@ -712,6 +731,20 @@ fn report_ended(root: &Path, code: Option<u32>) {
     }
 }
 
+/// What a card says when the watch ends on a store error.
+fn store_ended_notice(e: &StoreError) -> String {
+    format!(
+        "Wingman stopped watching your knowledge folder because the store failed: {e}. Choose Reload settings to start watching again."
+    )
+}
+
+/// The watch ended on a store error (#1204). Goes through the scan's own
+/// queue: `store::report` keeps one text per run and would drop this one if
+/// any store notice had already been used.
+fn report_store_ended(e: &StoreError) {
+    notice::report(&store_ended_notice(e));
+}
+
 /// True while `folder` still resolves to the canonical `root` it was started
 /// with. Any failure to look (gone, no access) is false: the safe answer.
 fn root_unchanged(folder: &Path, root: &Path) -> bool {
@@ -781,11 +814,12 @@ fn watch(
     let mut root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
         Ok(id) => id,
         Err(e) => {
-            store::report(&e);
+            report_store_ended(&e);
             return;
         }
     };
     let mut pending = Pending::default();
+    let mut resynced = false;
     let mut tries: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     loop {
         let timeout = wait_millis(pending.wait(Instant::now()));
@@ -804,7 +838,7 @@ fn watch(
             root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
                 Ok(id) => id,
                 Err(e) => {
-                    store::report(&e);
+                    report_store_ended(&e);
                     return;
                 }
             };
@@ -855,6 +889,7 @@ fn watch(
             &stopped,
         ) {
             Ok(busy) => {
+                resynced = false;
                 // The tray shows this count; read here, off the UI thread.
                 if !stopped() {
                     ingest::publish_indexed_files(&store, &root);
@@ -875,10 +910,42 @@ fn watch(
                 }
             }
             Err(e) => {
-                store::report(&e);
+                // #1158: a store whose file went bad fails the work in flight
+                // (a corrupt read, or a root id that the fresh file does not
+                // have). That is the swap, not the end of the watch: take the
+                // swap path above (read the root again, rescan the folder).
+                // Once only: a store that stays broken must still end it.
+                if !resynced && (matches!(e, StoreError::Corrupt(_)) || swap_signalled(&swapped)) {
+                    resynced = true;
+                    #[cfg(test)]
+                    RESYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // SAFETY: the handle stays open while `swapped` lives.
+                    unsafe {
+                        let _ = SetEvent(swapped.0);
+                    }
+                    continue;
+                }
+                report_store_ended(&e);
                 return;
             }
         }
+    }
+}
+
+/// Test-only: how many times a failed store call was turned into a resync.
+#[cfg(test)]
+static RESYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when the store has replaced its file since the swap path last ran. The
+/// event is auto-reset, so looking consumes it: it is set again for the loop.
+fn swap_signalled(swapped: &StopEvent) -> bool {
+    // SAFETY: the handle is a live event owned by the caller's `Arc`.
+    unsafe {
+        let signalled = WaitForSingleObject(swapped.0, 0) == WAIT_OBJECT_0;
+        if signalled {
+            let _ = SetEvent(swapped.0);
+        }
+        signalled
     }
 }
 
@@ -1551,6 +1618,53 @@ mod tests {
         let _ = fs::remove_dir_all(&db_dir);
     }
 
+    /// #1158: the file goes bad while the watcher is idle, and the first thing
+    /// to read it is the watcher's own work on a changed file. That read fails
+    /// with a corrupt error (or, once the store has healed itself, with a
+    /// stale root id). Neither may end the watch: it must read its root again
+    /// and index the folder into the fresh file, including the new file.
+    #[test]
+    fn the_watcher_survives_its_own_read_hitting_the_damaged_store() {
+        let dir = scratch("live-hit");
+        let db_dir = scratch("live-hit-db");
+        let store = Arc::new(Store::open_for_test(&db_dir.join("wingman.db")).unwrap());
+        let for_thread = Arc::clone(&store);
+        let watcher = start_with(&dir.to_string_lossy(), move || Ok(for_thread))
+            .unwrap()
+            .expect("a thread starts for a set folder");
+
+        fs::write(dir.join("a.md"), "# A\nhitfirstword here\n").unwrap();
+        wait_for("a.md indexed", Duration::from_secs(10), || {
+            store.fts_hits("hitfirstword").unwrap_or(0) == 1
+        });
+        // Let the watcher finish what it was doing for a.md before the damage.
+        std::thread::sleep(Duration::from_millis(500));
+
+        store.damage_file_for_test();
+        // One read elsewhere (a card, an ask) meets the damage and records it;
+        // the heal itself waits for the next use of the store, which is the
+        // watcher's own work on b.md, so the swap lands in the middle of it.
+        assert!(store.fts_hits("hitfirstword").is_err());
+        fs::write(dir.join("b.md"), "# B\nhitsecondword here\n").unwrap();
+        // Do not touch the store from this thread (a poll would heal it first):
+        // the watcher acts after its quiet period and is the one to heal it.
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(1500));
+
+        wait_for("both files indexed again", Duration::from_secs(20), || {
+            store.fts_hits("hitfirstword").unwrap_or(0) == 1
+                && store.fts_hits("hitsecondword").unwrap_or(0) == 1
+        });
+        assert!(watcher.is_running(), "the watch must still be running");
+        assert!(
+            RESYNCS.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the watcher must have recovered through its own failed call"
+        );
+        drop(watcher);
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
     /// Drops the watcher (which sets the stop event) and waits for its thread
     /// by watching a clone of the join state through `is_running` beforehand.
     fn drop_and_wait(watcher: Watcher) -> bool {
@@ -1604,6 +1718,36 @@ mod tests {
         assert!(start("").unwrap().is_none());
         assert!(start("Notes").unwrap().is_none(), "a relative path");
         assert!(start(r"C:\").unwrap().is_none(), "a whole drive");
+    }
+
+    /// #1204: a watch that ends on a store error must say so through its own
+    /// queue. `store::report` keeps only the first text per run, so when any
+    /// store notice had already been used the watch ended with no card.
+    #[test]
+    fn a_watch_ended_by_a_store_error_names_the_way_back() {
+        let text = store_ended_notice(&StoreError::Other("disk is full".to_string()));
+        assert!(text.contains("disk is full"), "{text}");
+        assert!(text.contains("stopped watching"), "{text}");
+        assert!(text.contains("Reload settings"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    #[test]
+    fn every_store_error_that_ends_the_watch_goes_through_its_own_queue() {
+        let src = include_str!("watch.rs").replace('\r', "");
+        let body = src
+            .split("\nfn watch(")
+            .nth(1)
+            .and_then(|b| b.split("\n/// Test-only: how many times").next())
+            .expect("the watch body exists");
+        assert!(
+            body.matches("report_store_ended(&e)").count() >= 3,
+            "all three store-error exits must queue a watch notice:\n{body}"
+        );
+        assert!(
+            !body.contains("store::report("),
+            "store::report drops the text once a store notice was used (#1204)"
+        );
     }
 
     #[test]

@@ -110,6 +110,7 @@ max_options = 4
 min_confidence = 0.2
 auto_dismiss_secs = 20
 claim_keys = true
+click_away_dismiss = true
 
 [overlay]
 max_annotations = 20

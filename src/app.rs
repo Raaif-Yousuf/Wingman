@@ -218,6 +218,83 @@ pub const WM_APP_NEED_SCREEN: u32 = WM_APP + 31;
 /// hosts the keyboard hook, which Windows drops if it stalls. `WM_APP + 32`.
 pub const WM_APP_TOOLTIP_SPEND: u32 = WM_APP + 32;
 
+/// #1199: posted by the worker that gathered the text for "Copy diagnostics"
+/// or "Copy egress log". `lparam` is a `Box<CopyTextResult>` the handler takes
+/// (a dropped message frees it). Gathering reads up to 10,000 store rows under
+/// the store's mutex and asks Windows about Ollama's port and process, so it
+/// runs off the message thread, which also hosts the keyboard hook; the
+/// clipboard is still set on the message thread. `WM_APP + 33`.
+pub const WM_APP_COPY_TEXT_RESULT: u32 = WM_APP + 33;
+
+/// Which tray command a [`CopyTextResult`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyKind {
+    Diagnostics,
+    EgressLog,
+}
+
+/// The gathered text of one copy command, on its way to the message thread.
+pub(crate) struct CopyTextResult {
+    pub kind: CopyKind,
+    pub text: String,
+}
+
+/// The card for a copy that reached the clipboard (#124, #106).
+fn copy_done_card(kind: CopyKind) -> (&'static str, &'static str) {
+    match kind {
+        CopyKind::Diagnostics => ("Diagnostics copied", "Paste them into a bug report."),
+        CopyKind::EgressLog => (
+            "Egress log copied",
+            "Every request this app has made, oldest first.",
+        ),
+    }
+}
+
+/// The headline of the card for a copy that failed.
+fn copy_failed_headline(kind: CopyKind) -> &'static str {
+    match kind {
+        CopyKind::Diagnostics => "Couldn't copy diagnostics",
+        CopyKind::EgressLog => "Couldn't copy the egress log",
+    }
+}
+
+/// Which copy gathers are running, one flag per command, so a click on the
+/// other command during a gather still gets its own text. A second click on the
+/// same command is refused and the card says it is still gathering.
+///
+/// A gather has no timeout: it only reads local sources (the store file, the
+/// port table, the registry), so it is expected to end. If one ever hangs, its
+/// flag stays set and that command shows "still working" until restart; the
+/// other command and the rest of the app are unaffected.
+#[derive(Default)]
+struct CopyTextGate([std::sync::atomic::AtomicBool; 2]);
+
+impl CopyTextGate {
+    fn slot(&self, kind: CopyKind) -> &std::sync::atomic::AtomicBool {
+        match kind {
+            CopyKind::Diagnostics => &self.0[0],
+            CopyKind::EgressLog => &self.0[1],
+        }
+    }
+
+    /// `true` when this call took the slot; `false` when `kind` is running.
+    fn claim(&self, kind: CopyKind) -> bool {
+        !self
+            .slot(kind)
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self, kind: CopyKind) {
+        self.slot(kind)
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+static COPY_TEXT_RUNNING: CopyTextGate = CopyTextGate([
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+]);
+
 /// The spend part of the tooltip as the last worker read it (#1181). Written
 /// by the worker, read by `update_tooltip` on the UI thread: no IO there.
 static TOOLTIP_SPEND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -233,6 +310,169 @@ fn tooltip_spend() -> Option<String> {
         .clone()
 }
 
+/// #1203: posted by the one-shot worker that opens `config.toml` or the
+/// knowledge folder, only when that failed. No payload: the worker leaves the
+/// failure in [`SHELL_OPEN_FAILURES`] first, so a message that is dropped or
+/// arrives after the window is gone costs nothing. The file and shell work
+/// runs off the message thread because it can block (a network share, a slow
+/// shell extension, `icacls`), and that thread also hosts the keyboard hook,
+/// which Windows drops if it stalls. `WM_APP + 34`: `+33` is the copy-text
+/// result (#1199).
+pub const WM_APP_SHELL_OPEN_DONE: u32 = WM_APP + 34;
+
+/// What a failed open puts on the card.
+struct ShellOpenFailure {
+    title: String,
+    detail: String,
+    /// A save failure keeps the "Copy details" text; a plain open failure does not.
+    with_details: bool,
+    /// The raw error chain for "Copy diagnostics" (empty when with_details is false).
+    raw: String,
+}
+
+/// A queue, not a slot: two failures close together must both be reported.
+static SHELL_OPEN_FAILURES: std::sync::Mutex<Vec<ShellOpenFailure>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn store_shell_open_failure(failure: ShellOpenFailure) {
+    SHELL_OPEN_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(failure);
+}
+
+fn take_shell_open_failures() -> Vec<ShellOpenFailure> {
+    std::mem::take(
+        &mut *SHELL_OPEN_FAILURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+/// One card for everything that failed since the last one: a single failure
+/// as itself, several as one list.
+fn merge_shell_open_failures(mut failures: Vec<ShellOpenFailure>) -> Option<ShellOpenFailure> {
+    match failures.len() {
+        0 => None,
+        1 => failures.pop(),
+        _ => Some(ShellOpenFailure {
+            title: "Couldn't open it".into(),
+            detail: failures
+                .iter()
+                .map(|f| format!("{}: {}", f.title, f.detail))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            with_details: failures.iter().any(|f| f.with_details),
+            raw: failures
+                .iter()
+                .map(|f| f.raw.as_str())
+                .filter(|r| !r.is_empty())
+                .collect::<Vec<_>>()
+                .join("; "),
+        }),
+    }
+}
+
+/// Makes sure `config.toml` exists before the shell is asked to open it:
+/// `save` runs only when the file was missing, and a failed save is the
+/// failure to show (rule 7). Pure so it is unit-tested with a stand-in save.
+fn ensure_config_file(
+    needed_create: bool,
+    save: impl FnOnce() -> anyhow::Result<()>,
+) -> std::result::Result<(), ShellOpenFailure> {
+    let save_result = if needed_create { save() } else { Ok(()) };
+    if App::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
+        return Ok(());
+    }
+    let (detail, raw) = save_result
+        .err()
+        .map(|e| (human_error_detail(&format!("{e:#}")), format!("{e:#}")))
+        .unwrap_or_default();
+    Err(ShellOpenFailure {
+        title: "Couldn't save settings".into(),
+        detail,
+        raw,
+        with_details: true,
+    })
+}
+
+/// #1203: the file and shell work behind "Edit settings" and "Open knowledge
+/// folder". Runs on a worker.
+enum ShellOpenJob {
+    /// Create `config.toml` from the running config when it is missing, then open it.
+    ConfigFile {
+        config: Box<Config>,
+        path: std::path::PathBuf,
+    },
+    /// Create the folder when it is missing, then open it.
+    Folder { path: std::path::PathBuf },
+}
+
+/// `ShellExecuteW` reports failure as a value of 32 or less.
+fn shell_open_failed(code: isize) -> bool {
+    code <= 32
+}
+
+fn run_shell_open_job(job: ShellOpenJob) -> std::result::Result<(), ShellOpenFailure> {
+    match job {
+        ShellOpenJob::ConfigFile { config, path } => {
+            // Make sure the file exists before asking the shell to open it.
+            ensure_config_file(!path.exists(), || config.save())?;
+            open_with_shell(&path, "Couldn't open config.toml", "Windows")
+        }
+        ShellOpenJob::Folder { path } => {
+            std::fs::create_dir_all(&path).map_err(|e| ShellOpenFailure {
+                title: "Couldn't open the knowledge folder".into(),
+                detail: format!("{} could not be created: {e}", path.display()),
+                with_details: false,
+                raw: String::new(),
+            })?;
+            open_with_shell(&path, "Couldn't open the knowledge folder", "Explorer")
+        }
+    }
+}
+
+fn open_with_shell(
+    path: &std::path::Path,
+    title: &str,
+    opener: &str,
+) -> std::result::Result<(), ShellOpenFailure> {
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call. COM is
+    // initialised for the shell's sake (documented for `ShellExecuteW`) and
+    // balanced here only when this call really initialised it.
+    let code = unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let result = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+        if com {
+            CoUninitialize();
+        }
+        result.0 as isize
+    };
+    if shell_open_failed(code) {
+        return Err(ShellOpenFailure {
+            title: title.into(),
+            detail: format!("{opener} would not open {}.", path.display()),
+            with_details: false,
+            raw: String::new(),
+        });
+    }
+    Ok(())
+}
 /// Keeps at most one spend worker alive; a request that arrives while one runs
 /// makes it read once more instead of starting a second thread.
 #[derive(Default)]
@@ -499,7 +739,35 @@ fn refine_key_phase(
         {
             keypress::Phase::Answer
         }
+        keypress::Phase::Other if matches!(card_state, CardState::Preview) => {
+            keypress::Phase::Preview
+        }
         other => other,
+    }
+}
+
+/// #809, #324: after a click hid the overlay's marks, whether the summary card
+/// stays and so needs its line rewritten: the click landed on it, or the click
+/// is outside it and click-away would not hide this card (the setting is off).
+/// Pure; the click-away rule lives in [`click_away_hides`] only.
+fn click_leaves_card_up(
+    click_in_card: bool,
+    card: crate::ui::card::CardState,
+    click_away_dismiss: bool,
+) -> bool {
+    click_in_card || !click_away_hides(card, click_away_dismiss)
+}
+
+/// #324: whether a click outside the card hides it. `click_away_dismiss` is
+/// `options.click_away_dismiss`; it governs answer and options cards. A
+/// preview never closes on a click (it can hold edits), and a card that is
+/// not showing has nothing to hide. Pure.
+fn click_away_hides(card: crate::ui::card::CardState, click_away_dismiss: bool) -> bool {
+    use crate::ui::card::CardState;
+    match card {
+        CardState::Hidden | CardState::Preview => false,
+        CardState::Collapsed | CardState::Expanded | CardState::Options => click_away_dismiss,
+        CardState::Pending => true,
     }
 }
 
@@ -774,14 +1042,10 @@ struct App {
     /// it spawns can label its egress rows. Set around one dispatch, then cleared.
     run_trigger: Option<Trigger>,
     chain: Arc<Chain>,
-    /// #81: the knowledge folder watcher, while a usable folder is set and the
-    /// watch is alive. Dropping it asks its thread to stop.
-    knowledge_watch: Option<crate::knowledge::watch::Watcher>,
-    /// #81: the start-up scan, while it may still be running. Dropping it asks
-    /// it to stop, so a Reload or quit ends it within one file.
-    knowledge_scan: Option<crate::knowledge::ingest::ScanHandle>,
-    /// The `[knowledge] folder` text the scan and watcher were last started for.
-    knowledge_folder: String,
+    /// #81: the knowledge folder watcher and the start-up scan. A Reload or a
+    /// Settings save restarts them on a worker thread (#1201), so the UI
+    /// thread never waits on the old or the new one.
+    knowledge: crate::knowledge::runner::Runner<crate::knowledge::runner::Live>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
     /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
@@ -1098,13 +1362,18 @@ pub fn run() -> Result<()> {
         card.show_error(&headline, &detail);
     }
 
-    let knowledge_folder = config.knowledge.folder.clone();
+    let knowledge = crate::knowledge::runner::Runner::new(
+        config.knowledge.folder.clone(),
+        Some(crate::knowledge::runner::Live {
+            watch: knowledge_watch,
+            scan: knowledge_scan,
+        }),
+        restart_knowledge,
+    );
     let mut app = Box::new(App {
         instance,
         taskbar_created_msg,
-        knowledge_watch,
-        knowledge_scan,
-        knowledge_folder,
+        knowledge,
         config,
         unsaved: Vec::new(),
         carried_reload: None,
@@ -1345,6 +1614,22 @@ fn startup_card(
 /// folder went away) and Reload is the retry. Pure.
 fn knowledge_needs_restart(started_for: &str, wanted: &str, watch_ended: bool) -> bool {
     started_for != wanted || watch_ended
+}
+
+/// #1201: the restart a Reload or Settings save asks for, run on the
+/// runner's worker thread after the old watch and scan have ended. Problems
+/// have no start-up card to ride, so they wait in the scan's own notice queue
+/// for the next result card.
+fn restart_knowledge(folder: &str) -> Option<crate::knowledge::runner::Live> {
+    crate::knowledge::ingest::reset_indexed_files();
+    let (watch, scan, problem) = start_knowledge(folder);
+    for text in [crate::knowledge::ingest::startup_problem(folder), problem]
+        .into_iter()
+        .flatten()
+    {
+        crate::knowledge::notice::report(&text);
+    }
+    Some(crate::knowledge::runner::Live { watch, scan })
 }
 
 /// #81: starts watching the knowledge folder, then the start-up scan. The
@@ -1891,6 +2176,22 @@ fn is_run_result(msg: u32) -> bool {
     )
 }
 
+/// #1216: whether an executor may start. Pure so the release behaviour is
+/// tested (a `debug_assert` would vanish there).
+#[derive(Debug, PartialEq, Eq)]
+enum ExecutorStart {
+    Run,
+    Refuse,
+}
+
+fn executor_start_gate(busy: bool) -> ExecutorStart {
+    if busy {
+        ExecutorStart::Refuse
+    } else {
+        ExecutorStart::Run
+    }
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -2219,7 +2520,7 @@ impl App {
     fn begin_model_action<T>(
         &mut self,
         extra: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<(capture::RawShot, isize, T)> {
+    ) -> Option<(capture::PendingShot, isize, T)> {
         let (raw, foreground_hwnd, value) = self.begin_action(BeginPlan::MODEL, extra)?;
         Some((raw?, foreground_hwnd, value))
     }
@@ -2232,7 +2533,7 @@ impl App {
         &mut self,
         plan: BeginPlan,
         extra: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<(Option<capture::RawShot>, isize, T)> {
+    ) -> Option<(Option<capture::PendingShot>, isize, T)> {
         // #871: never on settings that are about to change, and never over the
         // window being typed in.
         if self.refuse_for_settings() {
@@ -2298,9 +2599,11 @@ impl App {
 
         let extra_value = extra(self)?;
 
-        // Capture (grab the pixels and downscale) runs here, on the main
-        // thread, and must happen before the pending card is shown --
-        // otherwise the card is in its own screenshot. Encoding those pixels
+        // Capture (grab the pixels) runs here, on the main thread, and must
+        // happen before the pending card is shown -- otherwise the card is in
+        // its own screenshot. The downscale does NOT happen here (#1200,
+        // MEASURED 2026-10-17: ~220 ms from 4K in release): the caller's
+        // worker calls `PendingShot::finish`. Encoding those pixels
         // to PNG does NOT happen here: issue #177 measured
         // `CompressionType::Best` PNG encoding at up to ~1s in a release
         // build on a 1402x876 image, which froze the message loop for that
@@ -2335,7 +2638,7 @@ impl App {
                 ),
                 capture::LookupWindow::Foreground,
             );
-            match capture::grab_raw_for(
+            match capture::grab_full_size_for(
                 &self.config.capture.monitor,
                 max_long_edge,
                 max_pixels,
@@ -2424,7 +2727,7 @@ impl App {
     }
 
     fn ask_inner(&mut self, trigger: Trigger) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
         };
@@ -2453,6 +2756,8 @@ impl App {
             crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 (|| -> Result<Answer> {
+                    // #1200: the downscale runs here, not on the hook's thread.
+                    let mut raw = pending.finish();
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     worker(
                         &providers,
@@ -2675,7 +2980,7 @@ impl App {
         // A heavily downscaled capture, see `router::ROUTER_IMAGE_LONG_EDGE`.
         // Grabbed on the main thread (Win32 capture must not run on a worker);
         // the PNG encode happens on the worker.
-        let raw = match capture::grab_raw_for(
+        let pending = match capture::grab_full_size_for(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
@@ -2706,7 +3011,7 @@ impl App {
         self.card
             .show_options(generation, router::LOOKING_SUMMARY, &[], behavior);
         self.set_watch(true);
-        self.start_options_router(raw, candidates, generation, trigger);
+        self.start_options_router(pending, candidates, generation, trigger);
     }
 
     /// Starts the router for the options card showing `generation`. The call
@@ -2716,7 +3021,7 @@ impl App {
     /// `WM_APP_ROUTER_RESULT`, a failure included.
     fn start_options_router(
         &mut self,
-        mut raw: capture::RawShot,
+        pending: capture::PendingShot,
         candidates: Vec<router::RouterCandidate>,
         generation: u32,
         trigger: Trigger,
@@ -2734,6 +3039,8 @@ impl App {
                 crate::activation::set_worker_trigger(trigger);
                 let result: std::result::Result<router::RouterResult, String> =
                     catch_worker(|| {
+                        // #1200: the downscale runs here, not on the hook's thread.
+                        let mut raw = pending.finish();
                         router_worker(&providers, mode, &mut raw, redact, &candidates, limits)
                             .map_err(|e| {
                                 let chain_text = worker_error_chain_text(&e);
@@ -3505,7 +3812,7 @@ impl App {
     /// that helper's `extra` closure so it still runs exactly where it did
     /// before -- after the readiness gate, before capture.
     fn add_event_from_screen(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, (today, offset_minutes))) = self
+        let Some((pending, foreground_hwnd_isize, (today, offset_minutes))) = self
             .begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -3530,6 +3837,7 @@ impl App {
             crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
+                    let mut raw = pending.finish();
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     calendar_worker(
                         &providers,
@@ -3755,7 +4063,7 @@ impl App {
                 && actions::generic_inputs::screen_may_be_needed(&action.inputs),
             ..BeginPlan::MODEL
         };
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
         else {
             return;
         };
@@ -3812,6 +4120,8 @@ impl App {
             crate::activation::set_worker_trigger_opt(trigger);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
+                    // #1200: the downscale runs here, not on the hook's thread.
+                    let mut raw = pending.map(capture::PendingShot::finish);
                     // #127 step 1: find the link, check it, and hand it back for
                     // confirmation. Nothing is fetched and no model is asked.
                     if link_step == actions::link_summary::Step::Confirm {
@@ -4457,7 +4767,7 @@ impl App {
     /// `begin_model_action`, exactly like `add_event_from_screen`'s already
     /// does.
     fn review_this_email(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
         };
@@ -4474,6 +4784,7 @@ impl App {
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
+                        let mut raw = pending.finish();
                         let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                         review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                     })()
@@ -4655,7 +4966,7 @@ impl App {
                 .unwrap_or_default(),
         )
         .is_none();
-        let Some((raw, foreground_hwnd_isize, ())) =
+        let Some((pending, foreground_hwnd_isize, ())) =
             self.begin_action(BeginPlan::for_fill_form(use_model), |_| Some(()))
         else {
             return;
@@ -4671,8 +4982,9 @@ impl App {
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
             crate::activation::set_worker_trigger_opt(trigger);
-            let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
+                // #1200: the downscale runs here, not on the hook's thread.
+                let mut raw = pending.map(capture::PendingShot::finish);
                 form_fill_worker(
                     &providers,
                     mode,
@@ -4845,10 +5157,21 @@ impl App {
     /// touches the foreground window. The outcome comes back as
     /// `WM_APP_EXECUTOR_DONE` and ends in a card on every path.
     fn spawn_executor(&mut self, work: Box<dyn FnOnce() -> ExecDone + Send + 'static>) {
-        debug_assert!(
-            !self.busy,
-            "an executor must not start over a running action"
-        );
+        // #1216: a real check, present in release builds too.
+        // A confirmed preview is handled from a posted message, so another
+        // press may have started a run in between. Starting over it would
+        // draw the Working card over that run and clear `busy` while it is
+        // still going. The confirmed work is dropped and the card says so.
+        if executor_start_gate(self.busy_now()) == ExecutorStart::Refuse {
+            self.card.show_answer(
+                "Still working",
+                "Nothing was changed. Ask again once the current action has finished.",
+                5,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
         self.exec_in_flight = true;
         self.set_busy(true);
         self.card
@@ -5284,7 +5607,11 @@ impl App {
                 return;
             }
             HideReason::OwnerGone => return,
-            HideReason::Click => click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+            HideReason::Click => click_leaves_card_up(
+                click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+                self.card.state(),
+                self.config.options.click_away_dismiss,
+            ),
             HideReason::Changed | HideReason::Age => true,
         };
         if rewrite {
@@ -5511,7 +5838,26 @@ impl App {
         human_error_detail(raw_chain)
     }
 
+    /// "Copy diagnostics" (#124). The report is gathered on a worker
+    /// ([`Self::start_copy_text`], #1199) and copied by `on_copy_text_result`.
     fn copy_diagnostics(&mut self) {
+        self.start_copy_text(CopyKind::Diagnostics);
+    }
+
+    /// Gathers the text for `kind` on a one-shot worker and posts it back as
+    /// `WM_APP_COPY_TEXT_RESULT` (#1199). The click is never silent: the
+    /// working card shows at once, and the answer or the failure replaces it.
+    fn start_copy_text(&mut self, kind: CopyKind) {
+        if !COPY_TEXT_RUNNING.claim(kind) {
+            // This command is already gathering: say so, never a silent click.
+            self.card
+                .show_pending(crate::ui::card::PendingStage::StillWorking);
+            return;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        // What the worker needs, taken here (the app's own state is not Sync).
+        let config = self.config.clone();
         let last_error = self
             .last_error
             .as_ref()
@@ -5523,21 +5869,54 @@ impl App {
                     .as_secs(),
                 chain: e.chain.clone(),
             });
-        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(
-            &self.config,
-            last_error,
-        ));
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
-            Ok(()) => self.card.show_answer(
-                "Diagnostics copied",
-                "Paste them into a bug report.",
-                6,
-                None,
-            ),
+        let target = self.hwnd_isize();
+        let spawned = std::thread::Builder::new()
+            .name("copy-text".into())
+            .spawn(move || {
+                let text = match kind {
+                    CopyKind::Diagnostics => crate::diagnostics::render_report(
+                        &crate::diagnostics::collect(&config, last_error),
+                    ),
+                    CopyKind::EgressLog => crate::diagnostics::egress_report(),
+                };
+                COPY_TEXT_RUNNING.release(kind);
+                let payload = Box::into_raw(Box::new(CopyTextResult { kind, text }));
+                unsafe {
+                    if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(HWND(target as *mut _)),
+                        WM_APP_COPY_TEXT_RESULT,
+                        WPARAM(0),
+                        LPARAM(payload as isize),
+                    )
+                    .is_err()
+                    {
+                        // Window gone: nobody will take the box, so free it here.
+                        free_boxed_payload(WM_APP_COPY_TEXT_RESULT, LPARAM(payload as isize));
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // No thread: say so on the card the click is looking at.
+            COPY_TEXT_RUNNING.release(kind);
+            let headline = copy_failed_headline(kind);
+            let detail = self.track_error(headline, &format!("starting the worker: {e}"));
+            self.card.show_error_with_details(headline, &detail);
+        }
+    }
+
+    /// The gathered text is here: put it on the clipboard (on this thread) and
+    /// say so.
+    fn on_copy_text_result(&mut self, result: CopyTextResult) {
+        let kind = result.kind;
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(result.text)) {
+            Ok(()) => {
+                let (headline, detail) = copy_done_card(kind);
+                self.card.show_answer(headline, detail, 6, None);
+            }
             Err(e) => {
-                let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
-                self.card
-                    .show_error_with_details("Couldn't copy diagnostics", &detail);
+                let headline = copy_failed_headline(kind);
+                let detail = self.track_error(headline, &format!("{e}"));
+                self.card.show_error_with_details(headline, &detail);
             }
         }
     }
@@ -5618,20 +5997,7 @@ impl App {
     /// `egress::read_all`/`render_human`/`read_all_human` reachable from a
     /// real user gesture rather than from tests only.
     fn copy_egress_log(&mut self) {
-        let report = crate::diagnostics::egress_report();
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
-            Ok(()) => self.card.show_answer(
-                "Egress log copied",
-                "Every request this app has made, oldest first.",
-                6,
-                None,
-            ),
-            Err(e) => {
-                let detail = self.track_error("Couldn't copy the egress log", &format!("{e}"));
-                self.card
-                    .show_error_with_details("Couldn't copy the egress log", &detail);
-            }
-        }
+        self.start_copy_text(CopyKind::EgressLog);
     }
 
     /// Issue #328: "Check this PC for local models". Reads RAM, GPU, battery
@@ -6126,6 +6492,8 @@ impl App {
                 DeferredMessage::PauseToggle => self.toggle_pause(),
                 DeferredMessage::NeedScreen(run) => self.on_need_screen(run as usize),
                 DeferredMessage::TooltipSpend => self.on_tooltip_spend(),
+                DeferredMessage::ShellOpenDone => self.on_shell_open_done(),
+                DeferredMessage::CopyText(result) => self.on_copy_text_result(*result),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
                 }
@@ -6261,30 +6629,11 @@ impl App {
     /// Problems have no start-up card to ride, so they wait for the next
     /// result card like the scan's own notices.
     fn restart_knowledge_if_needed(&mut self) {
-        let folder = self.config.knowledge.folder.clone();
-        let watch_ended = self
-            .knowledge_watch
-            .as_ref()
-            .is_some_and(|w| !w.is_running());
-        if !knowledge_needs_restart(&self.knowledge_folder, &folder, watch_ended) {
-            return;
-        }
-        // Stop the old watch first, so it cannot apply a batch to a root the
-        // new scan is about to retire.
-        // The old start-up scan too: dropping it stops it within one file.
-        self.knowledge_watch = None;
-        self.knowledge_scan = None;
-        crate::knowledge::ingest::reset_indexed_files();
-        self.knowledge_folder = folder.clone();
-        let (watch, scan, problem) = start_knowledge(&folder);
-        self.knowledge_watch = watch;
-        self.knowledge_scan = scan;
-        for text in [crate::knowledge::ingest::startup_problem(&folder), problem]
-            .into_iter()
-            .flatten()
-        {
-            crate::knowledge::notice::report(&text);
-        }
+        // The runner stops the old watch first, so it cannot apply a batch to a
+        // root the new scan is about to retire, and the old start-up scan too.
+        // All of it happens off this thread (#1201).
+        self.knowledge
+            .restart_if_needed(&self.config.knowledge.folder, knowledge_needs_restart);
     }
 
     /// #174: `edit_settings` only needs to save when the file did not exist
@@ -6309,41 +6658,13 @@ impl App {
             self.set_watch(true);
             return;
         };
-        // Make sure the file exists before asking the shell to open it.
-        let needed_create = !path.exists();
-        let save_result = if needed_create {
-            self.config.save()
-        } else {
-            Ok(())
-        };
-        if !Self::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
-            // Rule 7: the save the user's click just caused must not fail
-            // silently -- before this fix, `let _ = self.config.save();`
-            // dropped the error and still tried to open a file that might
-            // not exist.
-            if let Err(e) = &save_result {
-                let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't save settings", &detail);
-                self.set_watch(true);
-            }
-            return;
-        }
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                PCWSTR(wide.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            );
-        }
+        // #1203: the existence check, the first save (Credential Manager and
+        // an `icacls` process) and the shell open all run on a worker. The
+        // message thread also hosts the keyboard hook.
+        self.spawn_shell_open(ShellOpenJob::ConfigFile {
+            config: Box::new(self.config.clone()),
+            path,
+        });
     }
 
     /// #81: opens the knowledge folder in Explorer, creating it first when it
@@ -6359,40 +6680,58 @@ impl App {
             self.set_watch(true);
             return;
         };
-        if let Err(e) = std::fs::create_dir_all(&path) {
+        // #1203: the folder can be on a network share, and the
+        // shell open can block on a slow shell extension: both run on a
+        // worker.
+        self.spawn_shell_open(ShellOpenJob::Folder { path });
+    }
+
+    /// #1203: runs `job` on a one-shot worker and posts `WM_APP_SHELL_OPEN_DONE`
+    /// when it fails. Success posts nothing: the opened window is the answer.
+    fn spawn_shell_open(&mut self, job: ShellOpenJob) {
+        let target = self.hwnd_isize();
+        let spawned = std::thread::Builder::new()
+            .name("shell-open".into())
+            .spawn(move || {
+                if let Err(failure) = run_shell_open_job(job) {
+                    store_shell_open_failure(failure);
+                    unsafe {
+                        // A failed post (window gone) is harmless: no payload.
+                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            Some(HWND(target as *mut _)),
+                            WM_APP_SHELL_OPEN_DONE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Rule 7: no thread is still a card.
             self.card.show_error(
-                "Couldn't open the knowledge folder",
-                &format!("{} could not be created: {e}", path.display()),
-            );
-            self.set_watch(true);
-            return;
-        }
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `wide` is a NUL-terminated path that outlives the call.
-        let result = unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                PCWSTR(wide.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            )
-        };
-        // ShellExecuteW reports failure as a value of 32 or less.
-        if result.0 as isize <= 32 {
-            self.card.show_error(
-                "Couldn't open the knowledge folder",
-                &format!("Explorer would not open {}.", path.display()),
+                "Couldn't open it",
+                "Wingman could not start a background task. Try again.",
             );
             self.set_watch(true);
         }
     }
 
+    /// `WM_APP_SHELL_OPEN_DONE` (#1203): the worker's failure becomes a card.
+    fn on_shell_open_done(&mut self) {
+        let Some(failure) = merge_shell_open_failures(take_shell_open_failures()) else {
+            return;
+        };
+        if failure.with_details {
+            // `detail` was made plain on the worker; the raw chain still
+            // goes to "Copy diagnostics".
+            self.record_last_error(&failure.title, &failure.raw);
+            self.card
+                .show_error_with_details(&failure.title, &failure.detail);
+        } else {
+            self.card.show_error(&failure.title, &failure.detail);
+        }
+        self.set_watch(true);
+    }
     /// Apply a model chosen from a tray submenu. The index addresses the
     /// tray's own list, which is not necessarily the config's — it appends a
     /// hand-edited current model that is missing from `models` — so the name
@@ -6521,6 +6860,12 @@ impl App {
             SettingsCommand::Mode(mode) => self.set_mode_with(mode, true),
             SettingsCommand::Pause(choice) => self.pause_for(choice),
             SettingsCommand::Resume => self.resume(),
+            SettingsCommand::ImportAction => self.import_action(),
+            SettingsCommand::ExportPicked => {
+                if let Some(id) = take_export_pick() {
+                    self.export_action_by_id(&id);
+                }
+            }
         }
     }
 
@@ -7131,6 +7476,11 @@ impl App {
         if self.point_in_card(x, y) {
             return;
         }
+        // #324: with click-away off the card stays, and the watcher stays
+        // armed so a later click still reaches this check.
+        if !click_away_hides(self.card.state(), self.config.options.click_away_dismiss) {
+            return;
+        }
         self.hide_card();
         self.set_watch(false);
     }
@@ -7272,6 +7622,12 @@ impl App {
         let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
             return;
         };
+        self.export_action_by_id(&id);
+    }
+
+    /// #117, #1152: exports the action `id` to a file the user picks. The tray
+    /// item and Settings' Export button both end here.
+    fn export_action_by_id(&mut self, id: &str) {
         let owner = HWND(self.hwnd_isize() as *mut _);
         let mut turned_off = false;
         let text = actions::load_actions().and_then(|all| {
@@ -7285,7 +7641,7 @@ impl App {
             actions::share::export_toml(&found.action)
         });
         let outcome = text.and_then(|text| {
-            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, &id));
+            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, id));
             let Some(path) = picked else {
                 return Ok(None);
             };
@@ -9077,6 +9433,12 @@ enum DeferredMessage {
     /// `WM_APP_TOOLTIP_SPEND` (#1181): re-apply the stored spend text once the
     /// menu or dialog is gone, so the tooltip does not lag a request.
     TooltipSpend,
+    /// `WM_APP_SHELL_OPEN_DONE` (#1203): a failed open still ends in a card once
+    /// the menu, dialog or Settings is gone.
+    ShellOpenDone,
+    /// `WM_APP_COPY_TEXT_RESULT` (#1199): the text a copy command gathered,
+    /// copied once the menu, dialog or Settings is gone.
+    CopyText(Box<CopyTextResult>),
 }
 
 /// The card for a key the hook captured for a shortcut change that could not be
@@ -9475,6 +9837,10 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #1181: no payload; delivered after the modal so the tooltip does not
         // lag a request.
         | WM_APP_TOOLTIP_SPEND
+        // #1203: a failed open is owed a card.
+        | WM_APP_SHELL_OPEN_DONE
+        // #1199: a copy the user asked for must end in a card, not vanish.
+        | WM_APP_COPY_TEXT_RESULT
         // #1013: the hook swallowed the key, so it ends in a card.
         | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
@@ -9612,6 +9978,41 @@ pub(crate) enum SettingsCommand {
     Mode(Mode),
     Pause(PauseChoice),
     Resume,
+    /// #1152: Settings' Import action button, the tray's Import item.
+    ImportAction,
+    /// #1152: Settings' Export button picked an action: its id waits in
+    /// `EXPORT_PICK` (see `post_export_pick`).
+    ExportPicked,
+}
+
+thread_local! {
+    /// #1152: the action id Settings picked for export. A command carries a
+    /// number, not a string, so the id waits here; Settings and the app share
+    /// the one UI thread. One slot, not a queue: every command is preceded by
+    /// a pick that overwrites it, so a command that was dropped can never
+    /// leave an old id for the next one to export. Two picks before the first
+    /// command runs export the newer one once.
+    static EXPORT_PICK: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn push_export_pick(id: String) {
+    EXPORT_PICK.with(|p| *p.borrow_mut() = Some(id));
+}
+
+fn take_export_pick() -> Option<String> {
+    EXPORT_PICK.with(|p| p.borrow_mut().take())
+}
+
+/// #1152: Settings' Export button picked the action `id`. `false` when the
+/// owner is gone (the id is not kept), which the caller says on its own line.
+pub(crate) fn post_export_pick(owner: isize, id: String) -> bool {
+    push_export_pick(id);
+    let posted = post_settings_command(owner, SettingsCommand::ExportPicked);
+    if !posted {
+        take_export_pick();
+    }
+    posted
 }
 
 impl SettingsCommand {
@@ -9626,6 +10027,8 @@ impl SettingsCommand {
             SettingsCommand::Pause(PauseChoice::UntilTomorrow) => 11,
             SettingsCommand::Pause(PauseChoice::UntilResumed) => 12,
             SettingsCommand::Resume => 20,
+            SettingsCommand::ImportAction => 30,
+            SettingsCommand::ExportPicked => 31,
         }
     }
 
@@ -9641,6 +10044,8 @@ impl SettingsCommand {
             11 => SettingsCommand::Pause(PauseChoice::UntilTomorrow),
             12 => SettingsCommand::Pause(PauseChoice::UntilResumed),
             20 => SettingsCommand::Resume,
+            30 => SettingsCommand::ImportAction,
+            31 => SettingsCommand::ExportPicked,
             _ => return None,
         })
     }
@@ -9718,6 +10123,10 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
         WM_APP_NEED_SCREEN => DeferredMessage::NeedScreen(wparam.0 as u64),
         WM_APP_TOOLTIP_SPEND => DeferredMessage::TooltipSpend,
+        WM_APP_SHELL_OPEN_DONE => DeferredMessage::ShellOpenDone,
+        WM_APP_COPY_TEXT_RESULT => {
+            DeferredMessage::CopyText(unsafe { Box::from_raw(lparam.0 as *mut CopyTextResult) })
+        }
         // #1011: tray menu only; see `tray_menu_policy`.
         WM_APP_ROUTER_RESULT => {
             let (generation, result) = unsafe {
@@ -9760,6 +10169,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_MACHINE_CHECK_RESULT => {
                 drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
             }
+            WM_APP_COPY_TEXT_RESULT => drop(Box::from_raw(p as *mut CopyTextResult)),
             WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
@@ -9854,7 +10264,10 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         // Settings is in front. Settings takes its own Change's chord before
         // it gets here, so this one belongs to the tray; it ends in a card.
         | WM_APP_LEARNED
-        | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
+        | WM_APP_SHELL_OPEN_DONE
+        | WM_APP_MACHINE_CHECK_RESULT
+        // #1199: the copy and its card wait until Settings is left.
+        | WM_APP_COPY_TEXT_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
         WM_APP_PENDING_STAGE
@@ -10478,6 +10891,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_tooltip_spend();
             LRESULT(0)
         }
+        WM_APP_SHELL_OPEN_DONE => {
+            // #1203: no payload; the failures are in SHELL_OPEN_FAILURES.
+            app.on_shell_open_done();
+            LRESULT(0)
+        }
+        WM_APP_COPY_TEXT_RESULT => {
+            let result = unsafe { *Box::from_raw(lparam.0 as *mut CopyTextResult) };
+            app.on_copy_text_result(result);
+            LRESULT(0)
+        }
         WM_APP_CALENDAR_RESULT => {
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
@@ -10773,13 +11196,17 @@ mod tests {
     }
 
     use super::append_notices;
+    use super::executor_start_gate;
     use super::first_line;
     use super::resolve_prompt_and_difficulty;
     use super::unreadable_secrets_card;
     use super::App;
     use super::BeginPlan;
+    use super::ExecutorStart;
     use super::WM_APP_CONFIG_WRITTEN;
+    use super::WM_APP_COPY_TEXT_RESULT;
     use super::WM_APP_FIRST_RUN;
+    use super::WM_APP_SHELL_OPEN_DONE;
     use super::WM_APP_TOOLTIP_SPEND;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
@@ -10975,6 +11402,8 @@ mod tests {
             WM_APP_LEARNED,
             // #845: an on-demand verdict is still owed a card.
             WM_APP_MACHINE_CHECK_RESULT,
+            // #1199: a copy the user asked for is still owed its card.
+            WM_APP_COPY_TEXT_RESULT,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Hold, "{id}");
         }
@@ -11937,6 +12366,8 @@ mod tests {
             C::Pause(PauseChoice::UntilTomorrow),
             C::Pause(PauseChoice::UntilResumed),
             C::Resume,
+            C::ImportAction,
+            C::ExportPicked,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {
@@ -11945,6 +12376,38 @@ mod tests {
         }
         assert_eq!(C::from_wparam(999), None);
         assert_eq!(C::from_wparam(usize::MAX), None);
+    }
+
+    /// #1152: the action Settings picked for export waits in a queue, in the
+    /// order it was picked, and an empty queue gives nothing.
+    #[test]
+    fn a_dropped_export_command_never_leaves_an_old_id_for_the_next_pick() {
+        assert_eq!(super::take_export_pick(), None);
+        // A pick whose command was dropped, then a new pick: the new id wins.
+        super::push_export_pick("stale".to_string());
+        super::push_export_pick("fresh".to_string());
+        assert_eq!(super::take_export_pick().as_deref(), Some("fresh"));
+        // The second command of two quick picks finds nothing, not an old id.
+        assert_eq!(super::take_export_pick(), None);
+    }
+
+    /// #1152: the tray's Export item and Settings' Export button share the
+    /// one routine that writes the file.
+    #[test]
+    fn the_tray_export_and_the_settings_export_share_one_routine() {
+        let src = lf(include_str!("app.rs"));
+        let tray = body_between(
+            &src,
+            "    fn export_action(&mut self, index: usize) {",
+            "\n    }\n",
+        );
+        assert!(tray.contains("self.export_action_by_id("), "{tray}");
+        let shared = body_between(
+            &src,
+            "    fn export_action_by_id(&mut self, id: &str) {",
+            "\n    }\n",
+        );
+        assert!(shared.contains("pick_save_path"), "{shared}");
     }
 
     /// #873: the command can wait for a nested loop, and keeps what it carries.
@@ -11970,7 +12433,14 @@ mod tests {
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_COMMAND => {"), "no arm");
         let run = body_between(&src, "    fn on_settings_command(", "\n    }\n");
-        for call in ["self.set_mode_with(", "self.pause_for(", "self.resume()"] {
+        // #1152: Import and Export run the tray's own handlers too.
+        for call in [
+            "self.set_mode_with(",
+            "self.pause_for(",
+            "self.resume()",
+            "self.import_action()",
+            "self.export_action_by_id(",
+        ] {
             assert!(run.contains(call), "{call} is not the tray's path:\n{run}");
         }
         for head in [
@@ -12044,6 +12514,29 @@ mod tests {
             super::model_action_gate(false, true),
             super::ModelActionGate::Paused
         );
+    }
+
+    /// #1216: a busy app refuses to start an executor (release too).
+    #[test]
+    fn executor_start_gate_refuses_when_busy() {
+        assert_eq!(executor_start_gate(true), ExecutorStart::Refuse);
+        assert_eq!(executor_start_gate(false), ExecutorStart::Run);
+    }
+
+    /// #1216: `spawn_executor` consults the gate before it touches state,
+    /// and no `debug_assert` stands in for it.
+    #[test]
+    fn spawn_executor_checks_the_gate_for_real() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "fn spawn_executor(", "\n    }\n");
+        let gate = body
+            .find("executor_start_gate(self.busy_now())")
+            .expect("spawn_executor no longer asks the gate");
+        let flag = body.find("self.exec_in_flight = true").expect("flag moved");
+        let thread = body.find("std::thread::spawn").expect("spawn moved");
+        assert!(gate < flag && gate < thread, "{body}");
+        assert!(!body.contains("debug_assert"), "{body}");
+        assert!(body.contains("show_answer"), "a refusal must end in a card");
     }
 
     /// #723: a press while busy must leave a card on screen, but must not
@@ -12597,7 +13090,7 @@ mod tests {
                     "refuse_for_settings()",
                     "model_action_gate(",
                     "refuse_if_password_manager()",
-                    "grab_raw_for(",
+                    "grab_full_size_for(",
                 ],
             ),
             (
@@ -12703,12 +13196,48 @@ mod tests {
                 Phase::Answer
             );
         }
-        for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
+        for st in [CardState::Hidden, CardState::Pending] {
             assert_eq!(
                 super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Other
             );
         }
+        // #324: a preview survives focus loss, so the key is how it closes.
+        assert_eq!(
+            super::refine_key_phase(Phase::Other, CardState::Preview, None, ms(300), false),
+            Phase::Preview
+        );
+
+        // #324: `options.click_away_dismiss` governs answer and options cards.
+        for st in [
+            CardState::Collapsed,
+            CardState::Expanded,
+            CardState::Options,
+        ] {
+            assert!(super::click_away_hides(st, true), "{st:?}");
+            assert!(!super::click_away_hides(st, false), "{st:?}");
+        }
+        // Nothing else follows the setting: a preview never closes on a click,
+        // a hidden card has nothing to hide, a pending card hides as before.
+        assert!(!super::click_away_hides(CardState::Preview, true));
+        assert!(!super::click_away_hides(CardState::Preview, false));
+        assert!(!super::click_away_hides(CardState::Hidden, true));
+        assert!(super::click_away_hides(CardState::Pending, true));
+        assert!(super::click_away_hides(CardState::Pending, false));
+
+        // #809: the overlay's summary card is rewritten when it stays.
+        use super::click_leaves_card_up as stays;
+        assert!(
+            !stays(false, CardState::Expanded, true),
+            "hides, no rewrite"
+        );
+        assert!(
+            stays(false, CardState::Expanded, false),
+            "setting off: rewrite"
+        );
+        assert!(stays(false, CardState::Collapsed, false));
+        assert!(stays(true, CardState::Expanded, true), "click on the card");
+        assert!(stays(true, CardState::Expanded, false));
         let opts = Phase::Options {
             count: 2,
             pickable: [true, true],
@@ -13276,6 +13805,116 @@ mod tests {
             super::WM_APP_MACHINE_CHECK_RESULT,
             windows::Win32::Foundation::LPARAM(facts as isize)
         ));
+    }
+
+    /// #1199: a copy result dropped unhandled must free its boxed text.
+    #[test]
+    fn free_boxed_payload_frees_a_copy_text_result() {
+        let payload = Box::into_raw(Box::new(super::CopyTextResult {
+            kind: super::CopyKind::EgressLog,
+            text: "row".to_string(),
+        }));
+        assert!(super::free_boxed_payload(
+            super::WM_APP_COPY_TEXT_RESULT,
+            windows::Win32::Foundation::LPARAM(payload as isize)
+        ));
+    }
+
+    /// #1199: while a menu, a dialog or Settings has the loop the result is
+    /// kept (with its text), not dropped, so the click still ends in a card.
+    #[test]
+    fn a_copy_result_during_a_modal_loop_is_deferred_with_its_text() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        let payload = Box::into_raw(Box::new(super::CopyTextResult {
+            kind: super::CopyKind::Diagnostics,
+            text: "report".to_string(),
+        }));
+        let taken = super::take_deferred(
+            super::WM_APP_COPY_TEXT_RESULT,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
+        match taken {
+            Some(super::DeferredMessage::CopyText(r)) => {
+                assert_eq!(r.kind, super::CopyKind::Diagnostics);
+                assert_eq!(r.text, "report");
+            }
+            _ => panic!("the copy result must be deferred"),
+        }
+    }
+
+    /// #1199 review: each command has its own gather, so a click on the other
+    /// one during a gather is not answered with the wrong text; a second click
+    /// on the same one is refused (the card then says it is still gathering).
+    #[test]
+    fn each_copy_command_has_its_own_gather() {
+        let gate = super::CopyTextGate::default();
+        assert!(gate.claim(super::CopyKind::Diagnostics));
+        assert!(!gate.claim(super::CopyKind::Diagnostics), "same twice");
+        assert!(
+            gate.claim(super::CopyKind::EgressLog),
+            "the other command runs alongside"
+        );
+        gate.release(super::CopyKind::Diagnostics);
+        assert!(gate.claim(super::CopyKind::Diagnostics), "free again");
+        assert!(!gate.claim(super::CopyKind::EgressLog));
+    }
+
+    #[test]
+    fn the_copy_cards_say_what_was_copied_without_em_dashes() {
+        for kind in [super::CopyKind::Diagnostics, super::CopyKind::EgressLog] {
+            let (headline, detail) = super::copy_done_card(kind);
+            let failed = super::copy_failed_headline(kind);
+            for text in [headline, detail, failed] {
+                assert!(!text.is_empty() && !text.contains('\u{2014}'), "{text}");
+            }
+        }
+        assert_eq!(
+            super::copy_done_card(super::CopyKind::Diagnostics).0,
+            "Diagnostics copied"
+        );
+        assert_eq!(
+            super::copy_done_card(super::CopyKind::EgressLog).0,
+            "Egress log copied"
+        );
+    }
+
+    /// #1199: the gathering (store rows, Ollama and monitor queries) runs on
+    /// the worker; the tray handlers only start it, and only the result
+    /// handler touches the clipboard. Fails if a handler gathers inline again.
+    #[test]
+    fn the_copy_commands_gather_on_a_worker_and_copy_on_the_message_thread() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} exists"));
+            let rest = &src[at..];
+            let end = rest.find("\n    }\n").expect("fn end");
+            rest[..end].to_string()
+        };
+        for name in ["    fn copy_diagnostics(", "    fn copy_egress_log("] {
+            let body = body_of(name);
+            assert!(body.contains("start_copy_text("), "{name}");
+            for banned in ["collect(", "egress_report(", "arboard"] {
+                assert!(!body.contains(banned), "{name} must not call {banned}");
+            }
+        }
+        let start = body_of("    fn start_copy_text(");
+        assert!(start.contains("thread::Builder"), "{start}");
+        assert!(
+            start.contains("show_pending("),
+            "the click must show feedback"
+        );
+        assert!(start.contains("diagnostics::collect(") && start.contains("egress_report("));
+        assert!(start.contains("WM_APP_COPY_TEXT_RESULT"));
+        assert!(
+            !start.contains("arboard"),
+            "the clipboard is set on the UI thread"
+        );
+        assert!(
+            start.contains("Err(e) = spawned"),
+            "a failed spawn ends in a card"
+        );
+        assert!(body_of("    fn on_copy_text_result(").contains("arboard::Clipboard"));
     }
 
     #[test]
@@ -14769,6 +15408,8 @@ mod tests {
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
         ("WM_APP_NEED_SCREEN", WM_APP_NEED_SCREEN),
         ("WM_APP_TOOLTIP_SPEND", WM_APP_TOOLTIP_SPEND),
+        ("WM_APP_SHELL_OPEN_DONE", WM_APP_SHELL_OPEN_DONE),
+        ("WM_APP_COPY_TEXT_RESULT", WM_APP_COPY_TEXT_RESULT),
     ];
 
     // -- #1181: the tooltip's spend part is read off the UI thread -----------
@@ -14887,6 +15528,147 @@ mod tests {
             super::settings_foreground_policy(WM_APP_TOOLTIP_SPEND),
             super::ForegroundPolicy::Pass
         );
+    }
+
+    // -- #1203: file and shell work stays off the message thread -------------
+
+    /// `edit_settings` and `open_knowledge_folder` run on the thread that also
+    /// hosts the keyboard hook. Saving the config (Credential Manager, an
+    /// `icacls` process), creating a folder on a possibly slow share and
+    /// `ShellExecuteW` (slow shell extensions) all belong on a worker.
+    #[test]
+    fn the_open_commands_do_no_file_or_shell_work_on_the_message_thread() {
+        let src = lf(include_str!("app.rs"));
+        let edit = body_between(&src, "    fn edit_settings(&mut self) {", "\n    }\n");
+        let folder = body_between(
+            &src,
+            "    fn open_knowledge_folder(&mut self) {",
+            "\n    }\n",
+        );
+        for (name, body) in [("edit_settings", &edit), ("open_knowledge_folder", &folder)] {
+            assert!(body.len() > 100, "slicing broke for {name}: {body}");
+            for banned in [
+                ".save()",
+                "ShellExecuteW",
+                "create_dir_all",
+                ".exists()",
+                "std::fs::",
+            ] {
+                assert!(!body.contains(banned), "{name} calls {banned}");
+            }
+            assert!(body.contains("spawn_shell_open("), "{name} never spawns");
+        }
+    }
+    #[test]
+    fn a_refused_shell_open_is_a_failure_and_a_started_one_is_not() {
+        assert!(super::shell_open_failed(0));
+        assert!(super::shell_open_failed(5)); // SE_ERR_ACCESSDENIED
+        assert!(super::shell_open_failed(32));
+        assert!(!super::shell_open_failed(33));
+    }
+
+    /// A folder that cannot be created is a failure with a plain sentence,
+    /// not a silent no-op (rule 7). The path sits under a plain file.
+    #[test]
+    fn an_uncreatable_knowledge_folder_is_reported() {
+        let file = std::env::temp_dir().join(format!("wingman-shell-open-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let result = super::run_shell_open_job(super::ShellOpenJob::Folder {
+            path: file.join("sub"),
+        });
+        let _ = std::fs::remove_file(&file);
+        let Err(failure) = result else {
+            panic!("create_dir_all under a file succeeded");
+        };
+        assert_eq!(failure.title, "Couldn't open the knowledge folder");
+        assert!(
+            failure.detail.contains("could not be created"),
+            "{}",
+            failure.detail
+        );
+        assert!(!failure.with_details);
+    }
+
+    #[test]
+    fn two_close_shell_failures_are_both_kept_and_shown_once() {
+        let fail = |t: &str, d: &str| super::ShellOpenFailure {
+            title: t.into(),
+            detail: d.into(),
+            with_details: false,
+            raw: String::new(),
+        };
+        // Nothing queued by another test: this one owns the queue while it runs.
+        let _ = super::take_shell_open_failures();
+        super::store_shell_open_failure(fail("A", "one"));
+        super::store_shell_open_failure(fail("B", "two"));
+        let all = super::take_shell_open_failures();
+        assert_eq!(all.len(), 2);
+        assert!(super::take_shell_open_failures().is_empty());
+        let merged = super::merge_shell_open_failures(all).unwrap();
+        assert!(merged.detail.contains("A: one"), "{}", merged.detail);
+        assert!(merged.detail.contains("B: two"), "{}", merged.detail);
+        let single = super::merge_shell_open_failures(vec![fail("A", "one")]).unwrap();
+        assert_eq!(
+            (single.title.as_str(), single.detail.as_str()),
+            ("A", "one")
+        );
+        assert!(super::merge_shell_open_failures(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn the_config_file_is_saved_only_when_missing_and_a_save_error_is_the_card_text() {
+        let mut calls = 0;
+        assert!(super::ensure_config_file(false, || {
+            calls += 1;
+            Ok(())
+        })
+        .is_ok());
+        assert_eq!(calls, 0, "saved over an existing config.toml");
+        assert!(super::ensure_config_file(true, || {
+            calls += 1;
+            Ok(())
+        })
+        .is_ok());
+        assert_eq!(calls, 1);
+        let Err(failure) = super::ensure_config_file(true, || anyhow::bail!("disk full")) else {
+            panic!("a failed save was treated as success");
+        };
+        assert_eq!(failure.title, "Couldn't save settings");
+        assert!(failure.raw.contains("disk full"), "{}", failure.raw);
+        assert!(!failure.detail.is_empty());
+        assert!(failure.with_details);
+    }
+
+    #[test]
+    fn a_shell_open_failure_behind_a_modal_is_kept_and_shown_afterwards() {
+        for policy in [
+            settings_reentrancy_policy(WM_APP_SHELL_OPEN_DONE, FAKE_TASKBAR_CREATED_MSG),
+            super::tray_menu_policy(WM_APP_SHELL_OPEN_DONE, FAKE_TASKBAR_CREATED_MSG),
+            super::file_dialog_policy(WM_APP_SHELL_OPEN_DONE, FAKE_TASKBAR_CREATED_MSG),
+        ] {
+            assert_eq!(policy, SettingsReentrancy::Defer);
+        }
+        assert!(matches!(
+            super::take_deferred(
+                WM_APP_SHELL_OPEN_DONE,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0)
+            ),
+            Some(super::DeferredMessage::ShellOpenDone)
+        ));
+        assert_eq!(
+            super::settings_foreground_policy(WM_APP_SHELL_OPEN_DONE),
+            super::ForegroundPolicy::Hold
+        );
+        let src = lf(include_str!("app.rs"));
+        let arm = body_between(&src, "        WM_APP_SHELL_OPEN_DONE => {", "\n        }\n");
+        assert!(arm.contains("app.on_shell_open_done()"), "{arm}");
+        let worker = body_between(
+            &src,
+            "    fn spawn_shell_open(&mut self, job: ShellOpenJob) {",
+            "\n    }\n",
+        );
+        assert!(worker.contains("WM_APP_SHELL_OPEN_DONE"), "{worker}");
     }
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -15330,13 +16112,22 @@ mod tests {
             .nth(1)
             .and_then(|b| b.split("\n    }\n").next())
             .expect("restart_knowledge_if_needed exists");
-        let drop_scan = restart
-            .find("self.knowledge_scan = None")
-            .expect("a Reload stops the old start-up scan (#81)");
-        let new_start = restart.find("start_knowledge(&folder)").expect("restarts");
+        // #1201: the UI thread only asks. The stop-old-then-start-new order
+        // is the runner's (tested in knowledge::runner), and the start itself
+        // runs on its worker, never here.
         assert!(
-            drop_scan < new_start,
-            "the old scan stops before the new one starts"
+            restart.contains(".restart_if_needed("),
+            "a Reload must go through the runner (#1201):
+{restart}"
+        );
+        assert!(
+            !restart.contains("start_knowledge("),
+            "the UI thread must not start the watch itself (#1201):
+{restart}"
+        );
+        assert!(
+            app_src.contains(concat!("        restart_knowledge", ",\n    );")),
+            "the runner must be built with the restart function (#1201)"
         );
     }
 
@@ -16072,6 +16863,16 @@ mod tests {
         (
             "WM_APP_TOOLTIP_SPEND",
             WM_APP_TOOLTIP_SPEND,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_SHELL_OPEN_DONE",
+            WM_APP_SHELL_OPEN_DONE,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_COPY_TEXT_RESULT",
+            WM_APP_COPY_TEXT_RESULT,
             SettingsReentrancy::Defer,
         ),
     ];
@@ -17314,7 +18115,9 @@ mod tests {
         let notice = body
             .find("show_remote_ollama_notice()")
             .expect("begin_action must call the notice");
-        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let capture = body
+            .find("capture::grab_full_size_for")
+            .expect("capture call");
         assert!(notice < capture, "the notice must come before the capture");
         assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
     }
@@ -17334,7 +18137,9 @@ mod tests {
         let notice = body
             .find("show_remote_ollama_notice()")
             .expect("the router must call the notice");
-        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let capture = body
+            .find("capture::grab_full_size_for")
+            .expect("capture call");
         // The worker that sends is started by a later fn, after the capture.
         assert!(notice < capture, "the notice must come before the capture");
     }
@@ -17402,7 +18207,9 @@ mod tests {
         // Every early return in edit_settings that follows a card arms it.
         let edit = body_of("edit_settings");
         let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
-        assert!(returns.len() >= 2, "edit_settings candidates not found");
+        // #1203: the save and the open moved to a worker, so the one return
+        // left is the unreadable-%APPDATA% card.
+        assert!(!returns.is_empty(), "edit_settings candidates not found");
         for at in returns {
             let before = &edit[at.saturating_sub(120)..at];
             if before.contains(".show_error") {
@@ -17496,7 +18303,7 @@ mod tests {
             "on_taskbar_created",
             "copy_region",
             "commit_import",
-            "export_action",
+            "export_action_by_id",
         ];
         for name in names {
             let body = body_of(name);

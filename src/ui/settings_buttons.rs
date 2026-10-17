@@ -214,14 +214,18 @@ pub(crate) enum Kind {
 
 /// The painter for a `BUTTON` of window style `style`, or `None` for anything
 /// this module leaves to the system (radio, group box, owner-drawn, push-like
-/// toggle, icon and bitmap buttons).
+/// toggle, icon and bitmap buttons, and the three-state checkbox, whose
+/// indeterminate box this module does not draw).
+///
+/// A default push button (`BS_DEFPUSHBUTTON`) is drawn as a plain one: no
+/// Settings button has that style, and the dialog default is not a look here.
 pub(crate) fn kind_of(style: u32) -> Option<Kind> {
     if style & BS_PUSHLIKE != 0 {
         return None;
     }
     match style & BS_TYPE_MASK {
         0 | 1 => Some(Kind::Push),
-        2 | 3 | 5 | 6 => Some(Kind::Check),
+        2 | 3 => Some(Kind::Check),
         _ => None,
     }
 }
@@ -273,10 +277,11 @@ pub(crate) unsafe fn handle_custom_draw(
     };
     let font = HFONT(SendMessageW(hwnd, WM_GETFONT, None, None).0 as *mut _);
     let text = window_text(hwnd);
-    FillRect(nm.hdc, &nm.rc, face);
     match kind {
+        // A push button fills its own rect from the surface token first.
         Kind::Push => draw_push(nm, &text, font, state, show_focus, prefix, dpi, palette),
         Kind::Check => {
+            FillRect(nm.hdc, &nm.rc, face);
             let checked = SendMessageW(hwnd, BM_GETCHECK, None, None).0 == BST_CHECKED;
             draw_check(
                 nm, &text, font, state, checked, show_focus, prefix, dpi, palette,
@@ -585,6 +590,8 @@ mod tests {
         assert_eq!(kind_of(2), Some(Kind::Check));
         assert_eq!(kind_of(3), Some(Kind::Check), "auto checkbox");
         assert_eq!(kind_of(4), None, "radio");
+        assert_eq!(kind_of(5), None, "3-state: indeterminate is not drawn here");
+        assert_eq!(kind_of(6), None, "auto 3-state");
         assert_eq!(kind_of(7), None, "group box");
         assert_eq!(kind_of(0xB), None, "owner draw");
         assert_eq!(kind_of(3 | BS_PUSHLIKE), None, "a toggle drawn as a button");
