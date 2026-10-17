@@ -295,6 +295,7 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
             inner_ref.ollama_status.clone(),
             inner_ref.alive.clone(),
         );
+        start_checking_animation(inner_ref, crate::ui::card::client_area_animation_enabled());
         // #183: the model list arrives later, off the UI thread.
         spawn_ollama_models_fetch(
             hwnd,
@@ -717,6 +718,9 @@ struct SettingsInner {
     ollama_fix: bool,
     /// #527: the Ollama status probe's result, filled by its worker.
     ollama_status: OllamaStatusSlot,
+    /// #828: the dot frame of the "Checking Ollama" cue; `Some` only while the
+    /// check runs and the cue's timer is set.
+    checking_frame: Option<usize>,
     /// #183: the pulled-model list the background fetch reports into.
     ollama_tags: OllamaTags,
     /// #380: the cloud providers' live model lists, filled the same way.
@@ -910,6 +914,7 @@ impl SettingsInner {
             ollama_link_shown: false,
             ollama_fix: false,
             ollama_status: Default::default(),
+            checking_frame: None,
             ollama_tags: Default::default(),
             cloud_models: Default::default(),
             cloud_sync: Default::default(),
@@ -1070,6 +1075,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_OLLAMA_STATUS => {
+            stop_checking_animation(inner);
             let section = inner.ollama_status.lock().ok().and_then(|g| g.clone());
             if let Some(section) = section {
                 apply_ollama_section(inner, &section);
@@ -1166,6 +1172,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             learn_timed_out(inner);
             LRESULT(0)
         }
+        WM_TIMER if wparam.0 == CHECK_TIMER_ID => {
+            tick_checking_animation(inner);
+            LRESULT(0)
+        }
         // #934: the text box colours (and the accent in them) are read once
         // per change, not per paint; repaint the boxes with the new ones.
         windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
@@ -1190,6 +1200,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             invalidate_rail_style();
             inner.closing = true;
             inner.alive.store(false, Ordering::SeqCst);
+            stop_checking_animation(inner);
             if inner.owns_itself {
                 OPEN_HWND.store(0, Ordering::SeqCst);
             }
@@ -6798,6 +6809,56 @@ fn open_url(url: &str) -> bool {
 
 /// What the Ollama status shows until the probe reports (#527, #568).
 const OLLAMA_CHECKING_TEXT: &str = "Checking Ollama...";
+
+/// #828: the timer that moves the dots of [`OLLAMA_CHECKING_TEXT`] while the
+/// check runs. Set when the window opens, killed when the result arrives or
+/// the window closes, so nothing ticks once the check is done (AGENTS.md
+/// rule 5).
+const CHECK_TIMER_ID: usize = 0x346;
+const CHECK_TIMER_MS: u32 = 400;
+
+/// The cue's text for `frame`: one, two or three dots. Frame 2 is the static
+/// text the window is built with.
+fn checking_text(frame: usize) -> String {
+    format!("Checking Ollama{}", ".".repeat(frame % 3 + 1))
+}
+
+/// True for any frame of the cue, so a tick never overwrites another message
+/// (a started fix, a result).
+fn is_checking_text(text: &str) -> bool {
+    text.strip_prefix("Checking Ollama")
+        .is_some_and(|dots| matches!(dots, "." | ".." | "..."))
+}
+
+/// Starts the cue unless the user turned client-area animation off (then the
+/// static text stays).
+fn start_checking_animation(inner: &mut SettingsInner, animate: bool) {
+    if !animate || inner.checking_frame.is_some() {
+        return;
+    }
+    inner.checking_frame = Some(2);
+    unsafe { SetTimer(Some(inner.hwnd), CHECK_TIMER_ID, CHECK_TIMER_MS, None) };
+}
+
+fn tick_checking_animation(inner: &mut SettingsInner) {
+    let Some(frame) = inner.checking_frame else {
+        let _ = unsafe { KillTimer(Some(inner.hwnd), CHECK_TIMER_ID) };
+        return;
+    };
+    let next = (frame + 1) % 3;
+    inner.checking_frame = Some(next);
+    if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
+        if is_checking_text(&get_text(status)) {
+            set_text(status, &checking_text(next));
+        }
+    }
+}
+
+fn stop_checking_animation(inner: &mut SettingsInner) {
+    if inner.checking_frame.take().is_some() {
+        let _ = unsafe { KillTimer(Some(inner.hwnd), CHECK_TIMER_ID) };
+    }
+}
 
 /// The most characters the two-row Ollama status label shows without
 /// clipping, with room to spare for word wrapping (#527). Optional parts
@@ -12870,6 +12931,114 @@ mod tests {
 
     // -- clamp_text_scale --------------------------------------------------
 
+    /// #828 (d): the "Checking Ollama" cue cycles one, two, three dots and
+    /// the third frame is the static text the window is built with.
+    #[test]
+    fn checking_frames_cycle_dots_and_end_on_the_static_text() {
+        assert_eq!(checking_text(0), "Checking Ollama.");
+        assert_eq!(checking_text(1), "Checking Ollama..");
+        assert_eq!(checking_text(2), OLLAMA_CHECKING_TEXT);
+        assert_eq!(checking_text(3), checking_text(0));
+        assert_eq!(checking_text(usize::MAX), checking_text(usize::MAX % 3));
+        assert!(is_checking_text(&checking_text(1)));
+        assert!(!is_checking_text("Fixing: stopping Ollama"));
+        assert!(!is_checking_text("Ollama is installed but not running"));
+    }
+
+    /// #828 (d) wired-to-nothing check: a timer message moves the real
+    /// window's Ollama status to the next frame, and the probe's result
+    /// stops the animation for good (nothing ticks once the check is done).
+    #[test]
+    fn the_checking_cue_animates_then_stops_on_the_result() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        ensure_common_controls();
+        let raw = Box::into_raw(Box::new(SettingsInner::new(Config::default())));
+        let class_name = wide_z(TEST_CLASS_NAME);
+        let title = wide_z("Wingman settings (checking cue test)");
+        let hwnd = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WS_CAPTION | WS_SYSMENU,
+                0,
+                0,
+                to_px(WIN_W_DP, 96),
+                to_px(WIN_H_DP, 96),
+                None,
+                None,
+                Some(instance),
+                Some(raw as *const c_void),
+            )
+        }
+        .expect("CreateWindowExW");
+        struct Guard(HWND, *mut SettingsInner);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    drop(Box::from_raw(self.1));
+                }
+            }
+        }
+        let _guard = Guard(hwnd, raw);
+        let font = build_font(96);
+        let client_h_dp = client_size(hwnd).1;
+        let built = build_ui_recorded(hwnd, instance, 96, font, &Config::default(), client_h_dp);
+        {
+            let inner = unsafe { &mut *raw };
+            inner.hwnd = hwnd;
+            inner.font = font;
+            inner.adopt(built);
+            start_checking_animation(inner, true);
+            assert!(inner.checking_frame.is_some(), "the cue is running");
+        }
+        let status = get_dlg_item(hwnd, ID_OLLAMA_STATUS).expect("status label");
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_TIMER,
+                Some(WPARAM(CHECK_TIMER_ID)),
+                Some(LPARAM(0)),
+            );
+        }
+        assert_eq!(get_text(status), checking_text(0));
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_TIMER,
+                Some(WPARAM(CHECK_TIMER_ID)),
+                Some(LPARAM(0)),
+            );
+        }
+        assert_eq!(get_text(status), checking_text(1));
+
+        // The result arrives: the text is the result, and a late tick
+        // changes nothing.
+        let inner = unsafe { &mut *raw };
+        if let Ok(mut g) = inner.ollama_status.lock() {
+            *g = Some(OllamaSection {
+                text: "Ollama is installed but not running.".to_string(),
+                link: None,
+                fix: false,
+            });
+        }
+        unsafe {
+            SendMessageW(hwnd, WM_OLLAMA_STATUS, None, None);
+            SendMessageW(
+                hwnd,
+                WM_TIMER,
+                Some(WPARAM(CHECK_TIMER_ID)),
+                Some(LPARAM(0)),
+            );
+        }
+        assert!(inner.checking_frame.is_none(), "the cue stopped");
+        assert_eq!(get_text(status), "Ollama is installed but not running.");
+    }
+
     /// #828: the slider's value reads as a percent, like the rest of Windows.
     #[test]
     fn text_scale_label_is_a_percent() {
@@ -17102,8 +17271,10 @@ mod tests {
         assert!(command.contains("commit_trigger(id, notify)"));
         assert!(command.contains("ID_UNDO if notify == BN_CLICKED"));
         assert!(command.contains("ID_APPLY_FOCUSED => commit_focused(inner)"));
-        // No timer but the one a pending shortcut needs, and no polling.
-        assert_eq!(code.matches("SetTimer(").count(), 1, "a timer was added");
+        // No timer but the one a pending shortcut needs and the "Checking
+        // Ollama" cue (#828, stopped by the result), and no polling.
+        assert_eq!(code.matches("SetTimer(").count(), 2, "a timer was added");
+        assert!(code.contains("fn stop_checking_animation("));
         // The commit path never touches the file.
         let a = code.find("fn commit_field(").unwrap();
         let b = code.find("fn commit_autostart(").unwrap();
