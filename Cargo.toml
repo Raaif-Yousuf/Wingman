@@ -85,6 +85,9 @@ features = [
   # encryption at rest.
   "Win32_Security_Cryptography",
   "Win32_Storage_Packaging_Appx",
+  # #81: the knowledge folder watcher (ReadDirectoryChangesW, overlapped).
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
   # speech.rs (#77): ISpVoice, the system text-to-speech voice (SAPI).
   "Win32_Media_Speech",
   "Win32_System_Com",
