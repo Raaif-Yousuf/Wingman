@@ -2176,6 +2176,22 @@ fn is_run_result(msg: u32) -> bool {
     )
 }
 
+/// #1216: whether an executor may start. Pure so the release behaviour is
+/// tested (a `debug_assert` would vanish there).
+#[derive(Debug, PartialEq, Eq)]
+enum ExecutorStart {
+    Run,
+    Refuse,
+}
+
+fn executor_start_gate(busy: bool) -> ExecutorStart {
+    if busy {
+        ExecutorStart::Refuse
+    } else {
+        ExecutorStart::Run
+    }
+}
+
 fn model_action_gate(busy: bool, paused: bool) -> ModelActionGate {
     if busy {
         ModelActionGate::Busy
@@ -5141,10 +5157,21 @@ impl App {
     /// touches the foreground window. The outcome comes back as
     /// `WM_APP_EXECUTOR_DONE` and ends in a card on every path.
     fn spawn_executor(&mut self, work: Box<dyn FnOnce() -> ExecDone + Send + 'static>) {
-        debug_assert!(
-            !self.busy,
-            "an executor must not start over a running action"
-        );
+        // #1216: a real check, present in release builds too.
+        // A confirmed preview is handled from a posted message, so another
+        // press may have started a run in between. Starting over it would
+        // draw the Working card over that run and clear `busy` while it is
+        // still going. The confirmed work is dropped and the card says so.
+        if executor_start_gate(self.busy_now()) == ExecutorStart::Refuse {
+            self.card.show_answer(
+                "Still working",
+                "Nothing was changed. Ask again once the current action has finished.",
+                5,
+                None,
+            );
+            self.set_watch(true);
+            return;
+        }
         self.exec_in_flight = true;
         self.set_busy(true);
         self.card
@@ -11169,11 +11196,13 @@ mod tests {
     }
 
     use super::append_notices;
+    use super::executor_start_gate;
     use super::first_line;
     use super::resolve_prompt_and_difficulty;
     use super::unreadable_secrets_card;
     use super::App;
     use super::BeginPlan;
+    use super::ExecutorStart;
     use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_COPY_TEXT_RESULT;
     use super::WM_APP_FIRST_RUN;
@@ -12485,6 +12514,29 @@ mod tests {
             super::model_action_gate(false, true),
             super::ModelActionGate::Paused
         );
+    }
+
+    /// #1216: a busy app refuses to start an executor (release too).
+    #[test]
+    fn executor_start_gate_refuses_when_busy() {
+        assert_eq!(executor_start_gate(true), ExecutorStart::Refuse);
+        assert_eq!(executor_start_gate(false), ExecutorStart::Run);
+    }
+
+    /// #1216: `spawn_executor` consults the gate before it touches state,
+    /// and no `debug_assert` stands in for it.
+    #[test]
+    fn spawn_executor_checks_the_gate_for_real() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "fn spawn_executor(", "\n    }\n");
+        let gate = body
+            .find("executor_start_gate(self.busy_now())")
+            .expect("spawn_executor no longer asks the gate");
+        let flag = body.find("self.exec_in_flight = true").expect("flag moved");
+        let thread = body.find("std::thread::spawn").expect("spawn moved");
+        assert!(gate < flag && gate < thread, "{body}");
+        assert!(!body.contains("debug_assert"), "{body}");
+        assert!(body.contains("show_answer"), "a refusal must end in a card");
     }
 
     /// #723: a press while busy must leave a card on screen, but must not
