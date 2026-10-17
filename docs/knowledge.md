@@ -41,17 +41,21 @@ folder = 'C:\Notes'
 
 ## When it reads
 
-Once, when Wingman starts, on a short background task that ends when it is
-done. Files that have not changed since the last start are not read again, and
+When Wingman starts, on a short background task, and then whenever a file in
+the folder changes. Files that have not changed since the last start are not read again, and
 only the passages of an edited file that changed are redone. A deleted file is
 dropped from the index. If you change the folder setting or clear it, the saved
 text of the old folder is deleted at the next start.
 
-Nothing runs while Wingman is idle, and changes you make while it is running
-are picked up at the next start.
+A new, edited, renamed or deleted file is picked up within about 2 seconds. If
+the folder itself is deleted or renamed while Wingman runs, it stops watching,
+shows a note, and keeps what was already indexed. Choose Reload settings once
+the folder is back. Nothing runs while the folder is quiet: the watch waits for
+Windows to report a change, with no timer.
 
 If some files could not be read, the next answer card says how many. A file that
-was open in another program is tried again at the next start.
+was open in another program is tried again a few times, then at the next
+change or start.
 
 ## Ask a question
 
@@ -72,7 +76,7 @@ and names the closest files, up to three. That is the answer to a question your
 documents do not cover. Wingman does not guess.
 
 Other cards you may see: no folder is set; the folder has no indexed text yet
-(add `.txt` or `.md` files and restart); nothing in your documents matches the
+(add `.txt` or `.md` files and they are picked up shortly); nothing in your documents matches the
 question.
 
 ## What leaves your computer, and when
@@ -112,7 +116,7 @@ documents have none.
 
 ## Limits worth knowing
 
-- Text files only, indexed once per start.
+- Text files only. Changes are picked up while Wingman runs.
 - The answer is one or two sentences, up to 700 characters, with at most five
   quotes shown.
 - Passages are found by the words in your question. A question that shares no
