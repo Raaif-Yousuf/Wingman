@@ -1915,7 +1915,7 @@ impl Providers {
     /// [`Providers::build_chain`]'s own behavior. The list
     /// `diagnostics::provider_rows` iterates (issue #201).
     pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
-        self.order
+        self.effective_order()
             .iter()
             .filter_map(|name| self.describe(name))
             .collect()
@@ -1928,11 +1928,28 @@ impl Providers {
     /// `hotkeys`/`capture`/`ui` along for no reason.
     pub fn build_chain(&self) -> Chain {
         let providers: Vec<Box<dyn Provider>> = self
-            .order
+            .effective_order()
             .iter()
             .filter_map(|name| self.provider_for(name))
             .collect();
         Chain::new(providers)
+    }
+
+    /// #923: `order` as it is used at runtime. Gemini is not in the stock
+    /// order, and #780 stops an untouched Save from adding it, so a Gemini key
+    /// pasted on its own would never be used. While `order` is still the stock
+    /// list (nobody edited it) a Gemini entry with a key is appended here, in
+    /// memory only: the file is not rewritten. An edited order is a choice and
+    /// is returned unchanged, so a vendor the user left out never gets a
+    /// screenshot.
+    fn effective_order(&self) -> Vec<String> {
+        let mut order = self.order.clone();
+        if order == Providers::default().order
+            && !unreadable_as_empty(&self.gemini.api_key).is_empty()
+        {
+            order.push("gemini".to_string());
+        }
+        order
     }
 
     /// #133: whether a first press with no model ready may look for a local
@@ -1999,7 +2016,12 @@ impl Providers {
     /// requests through. Kept as the one place both callers share so they
     /// can never disagree about which providers `mode` allows.
     pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
-        crate::mode::select_providers(mode, &self.order, ollama_ready, &self.local_compat_names())
+        crate::mode::select_providers(
+            mode,
+            &self.effective_order(),
+            ollama_ready,
+            &self.local_compat_names(),
+        )
     }
 
     /// #16: a compat endpoint's locality is decided by its configured
@@ -2814,6 +2836,67 @@ model = "gpt-5.5"
             Mode::Auto => "auto",
             Mode::Offline => "offline",
         }
+    }
+
+    /// #923: a Gemini key on a stock order is reachable without anyone
+    /// editing `providers.order` (#780 keeps an untouched Save from adding it).
+    #[test]
+    fn a_gemini_key_on_the_stock_order_is_reachable_in_every_cloud_path() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        assert_eq!(p.order, Providers::default().order, "the file is untouched");
+        assert_eq!(
+            p.build_chain_for_mode(Mode::Cloud, false).provider_names(),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Auto, false),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.build_chain().ready_provider_names(),
+            vec!["gemini"],
+            "the mode-agnostic chain sees it too"
+        );
+        assert_eq!(p.order, Providers::default().order, "never rewritten");
+    }
+
+    #[test]
+    fn a_gemini_entry_without_a_key_is_not_added_to_the_stock_order() {
+        let p = Config::default().providers;
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+        let mut unreadable = Config::default().providers;
+        unreadable.gemini.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert_eq!(
+            unreadable.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+    }
+
+    /// A hand-edited order is a choice: a keyed vendor the user left out
+    /// stays out, so a screenshot never goes to a vendor they removed.
+    #[test]
+    fn a_hand_edited_order_is_never_widened_by_a_gemini_key() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        p.order = vec!["anthropic".to_string()];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["anthropic"]
+        );
+        p.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+        ];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic", "gemini"],
+            "no duplicate when it is already listed"
+        );
     }
 
     #[test]
