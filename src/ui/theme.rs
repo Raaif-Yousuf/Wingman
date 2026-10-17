@@ -599,6 +599,10 @@ pub(crate) const MENU_HINT_GAP_DP: i32 = SPACE_XL_DP;
 /// Narrowest and widest a menu is allowed to be, in dp.
 pub(crate) const MENU_MIN_WIDTH_DP: i32 = 200;
 pub(crate) const MENU_MAX_WIDTH_DP: i32 = 420;
+/// Gap between a dropped-open combo list's hover pill and the row's top and
+/// bottom, in dp. The rows are only as tall as a Settings control, so it is
+/// thinner than a menu's.
+pub(crate) const COMBO_ITEM_INSET_Y_DP: i32 = 1;
 /// Glyph size of the icon column, in px at 96 DPI.
 pub(crate) const MENU_ICON_PX: i32 = 16;
 /// How far the hover pill is moved from the surface toward the text colour,
