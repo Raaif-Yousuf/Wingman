@@ -1241,13 +1241,13 @@ fn preview_error_title(message: &str, theme: Theme) -> String {
 /// of margin around it.
 const BADGE_EDGE_MARGIN_DP: i32 = 8;
 /// Horizontal/vertical text inset inside the badge shape.
-const BADGE_PAD_X_DP: i32 = 5;
+const BADGE_PAD_X_DP: i32 = 8;
 const BADGE_PAD_Y_DP: i32 = 3;
 /// Floor on both badge dimensions so a single-digit label (e.g. "1") still
 /// reads as a deliberate shape rather than a sliver -- this also makes
 /// single-character badges come out as circles (width == height) while
 /// two-character ones ("10") and "U" come out as pills.
-const BADGE_MIN_DIAMETER_DP: i32 = 18;
+const BADGE_MIN_DIAMETER_DP: i32 = 20;
 /// Minimum clearance kept between the badge and any headline text next to
 /// it, on top of the badge's own width.
 const BADGE_TEXT_GAP_DP: i32 = 6;
@@ -1736,7 +1736,7 @@ impl CardInner {
         if open_settings && !detail.is_empty() {
             self.set_window_text(&format!("{headline}. {detail}"));
         } else {
-            self.set_window_text(headline);
+            self.set_window_text(&answer_accessible_name(headline, difficulty));
         }
         // Issue #347: every ordinary show_answer/show_error call starts a
         // plain card, not a "click to open Settings" prompt -- only
@@ -2595,8 +2595,9 @@ impl CardInner {
         let pad_x = self.scale(BADGE_PAD_X_DP);
         let pad_y = self.scale(BADGE_PAD_Y_DP);
         let min_d = self.scale(BADGE_MIN_DIAMETER_DP);
-        let w = (tw + pad_x * 2).max(min_d);
         let h = (th + pad_y * 2).max(min_d);
+        // Never narrower than tall: a single character is a circle.
+        let w = (tw + pad_x * 2).max(min_d).max(h);
         (w, h)
     }
 
@@ -4866,6 +4867,16 @@ fn create_preview_button(
     }
 }
 
+/// The card's accessible name for an answer (#815): the headline, then what
+/// the difficulty badge says when one is shown, so the rating is not lost to
+/// anyone who cannot see its colour.
+fn answer_accessible_name(headline: &str, difficulty: Option<Difficulty>) -> String {
+    match difficulty {
+        Some(d) => format!("{headline}. {}", d.accessible_name()),
+        None => headline.to_string(),
+    }
+}
+
 /// `GetWindowTextW` into an owned `String`, `""` for a null/invalid handle
 /// rather than a panic -- mirrors `ui::settings::get_text`.
 fn window_text(hwnd: HWND) -> String {
@@ -5254,6 +5265,65 @@ mod tests {
             card.inner.copy_details_rect.is_none(),
             "an answer card must not show \"Copy details\""
         );
+    }
+
+    #[test]
+    fn answer_accessible_name_adds_the_difficulty_only_when_there_is_one() {
+        assert_eq!(answer_accessible_name("x = 3", None), "x = 3");
+        assert_eq!(
+            answer_accessible_name("x = 3", Some(Difficulty::Level(5))),
+            "x = 3. Difficulty 5 of 10"
+        );
+        assert_eq!(
+            answer_accessible_name("x = 3", Some(Difficulty::Ultra)),
+            "x = 3. Difficulty ultra, harder than 10"
+        );
+    }
+
+    #[test]
+    fn a_setup_card_window_name_is_still_headline_and_detail() {
+        // #885 must survive the difficulty name: no badge on a setup card.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_settings_needed("Set up Wingman", "Add a key in Settings.");
+        assert_eq!(
+            window_text(card.hwnd()),
+            "Set up Wingman. Add a key in Settings."
+        );
+    }
+
+    #[test]
+    fn the_card_window_name_carries_the_difficulty() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_answer("2 + 2 = 4", "", 0, Some(Difficulty::Level(10)));
+        assert_eq!(window_text(card.hwnd()), "2 + 2 = 4. Difficulty 10 of 10");
+        card.show_answer("2 + 2 = 4", "", 0, None);
+        assert_eq!(window_text(card.hwnd()), "2 + 2 = 4");
+    }
+
+    #[test]
+    fn the_badge_is_wide_enough_that_ten_has_clear_space_at_every_scale() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        for dpi in [96u32, 144, 192] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let (w, h) = card.inner.badge_size(Difficulty::Level(10));
+            let (tw, _) = card
+                .inner
+                .measure_label(card.inner.fonts.caption, Difficulty::Level(10).label());
+            // The ends are half circles, so the text needs at least a
+            // quarter of the height of room on each side.
+            assert!(
+                (w - tw) / 2 >= h / 4,
+                "dpi {dpi}: 10 is {tw}px in a {w}x{h} badge"
+            );
+            let (w1, h1) = card.inner.badge_size(Difficulty::Level(1));
+            assert!(
+                w1 >= h1,
+                "dpi {dpi}: a single digit is never narrower than tall"
+            );
+        }
     }
 
     #[test]

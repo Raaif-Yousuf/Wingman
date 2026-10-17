@@ -146,6 +146,15 @@ impl Difficulty {
         }
     }
 
+    /// What a screen reader says for the badge (#815), so the meaning is not
+    /// carried by the badge colour or a bare number alone.
+    pub fn accessible_name(&self) -> String {
+        match self {
+            Difficulty::Level(n) => format!("Difficulty {n} of 10"),
+            Difficulty::Ultra => "Difficulty ultra, harder than 10".to_string(),
+        }
+    }
+
     /// 1..=11, where Ultra is 11. Lets the card position a colour on the
     /// gradient without matching on the variant.
     pub fn rank(&self) -> u8 {
