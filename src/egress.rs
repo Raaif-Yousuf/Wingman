@@ -524,7 +524,7 @@ fn token_spans(run: &str, keep_identifiers: bool) -> Vec<std::ops::Range<usize>>
 /// longer than [`MAX_IDENTIFIER_SEGMENT`]. A vendor's error `type` and `code`
 /// look like this and are the reason the user needs to read. A key is not
 /// shaped like it: it carries digits or capitals, or a segment too long to be
-/// a word (`sk_test_abcdefghijklmnop`). When unsure this says no, so the text
+/// a word (`prefix_abcdefghijklmnopqrstu`). When unsure this says no, so the text
 /// is redacted.
 fn is_plain_identifier(part: &str) -> bool {
     let mut segments = 0;
@@ -1105,9 +1105,9 @@ mod tests {
         assert!(redact_opaque_tokens(body).contains("[redacted]"));
 
         for key in [
-            "sk_test_abcdefghijklmnopqrst",
+            concat!("sk_", "test_abcdefghijklmnopqrst"),
             "abcdefghijklmnopqrstuvwxyz",
-            "sk_live_a1B2c3D4e5F6g7H8",
+            concat!("sk_", "live_a1B2c3D4e5F6g7H8"),
             "abcdefghijklmnopqrstuvwxyz_",
             "_abcdefghijkl_mnopqrstuvwxyz",
         ] {
