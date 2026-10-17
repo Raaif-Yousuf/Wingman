@@ -250,9 +250,13 @@ pump gives it `IsDialogMessage`, the single-window guard (`OPEN_HWND`) stays,
 and `WM_APP` replies are ordinary messages to the main proc.
 
 - A change reaches `App` while the window is open, which instant apply needs.
-  The #213 deferral keeps one job: an Ask that arrives while Settings is the
-  foreground window waits, so no card lands on the window (Open question 4).
+  The #213 deferral keeps one job: a card that would land on the window waits
+  until Settings is left. A press of the Wingman key made meanwhile is refused
+  with a short card, not kept (Open question 4).
   Quit, session end, tray and config apply are handled on arrival, closing #673.
+  Quit closes the window; what was typed but not saved is dropped with it, as
+  it was when the window was modal, and a Save already pressed is written
+  before the process exits.
 - `open_settings`' save branch (`self.config = edited; save`) and the "Settings
   saved" card are deleted. The tray keeps its Mode submenu and calls the same
   `App::set_mode`.
@@ -423,6 +427,10 @@ leaves about 430 KB for the options card, overlay and knowledge work.
    Undo covers a slip, and a reset needs its own account of what it keeps (keys,
    hotkeys, actions). File it if people ask once the pages ship.
 4. **Should the Wingman key still ask while Settings is the foreground window?**
-   Recommendation: keep today's behaviour (the Ask waits until another window is
-   active or Settings closes); a card over a window the user is typing in is the
-   case #213 was written for.
+   Decision: no. On the modal window the key was inert (the press was dropped),
+   so there was nothing to keep. A press made while Settings is in front, or
+   while a Settings save is still being applied, is refused with a short card
+   ("Settings is open" or "Saving your settings"). It is not queued: run later it
+   would capture another window, bill a request, and could use settings from
+   before the save (an Offline switch ignored once). Answers that finish while
+   Settings is in front are held and shown when it is left (#213).

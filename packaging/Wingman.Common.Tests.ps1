@@ -897,6 +897,7 @@ Describe 'Confirm-CertTrusted (issue #184)' {
         $script:alreadyTrustedResult = $null  # 1st call: not yet trusted
         $script:verifiedResult       = $cert  # 2nd call: elevated import took
 
+        Mock -ModuleName Wingman.Common Test-ProcessElevated { $false }
         Mock -ModuleName Wingman.Common Export-Certificate { }
         Mock -ModuleName Wingman.Common Remove-Item { }
         Mock -ModuleName Wingman.Common Start-Process { [pscustomobject]@{ ExitCode = 0 } }
@@ -953,6 +954,52 @@ Describe 'Confirm-CertTrusted (issue #184)' {
 }
 
 
+Describe 'Invoke-ElevatedPowerShell (issue #965)' {
+    # Start-Process -Verb RunAs from an already elevated process exited 1 on a
+    # GitHub runner. An elevated caller must run the child directly instead.
+    It 'asks for elevation with RunAs when the caller is not elevated' {
+        Mock -ModuleName Wingman.Common Test-ProcessElevated { $false }
+        Mock -ModuleName Wingman.Common Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+        (Invoke-ElevatedPowerShell -ArgumentList @('-NoProfile', '-Command', 'exit 0')) | Should -Be 0
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 1 -ParameterFilter { $Verb -eq 'RunAs' }
+    }
+
+    It 'never uses RunAs when the caller is already elevated, and returns the real exit code' {
+        Mock -ModuleName Wingman.Common Test-ProcessElevated { $true }
+        Mock -ModuleName Wingman.Common Start-Process { throw 'RunAs must not be used when elevated' }
+        $enc = { param($t) @('-NoProfile', '-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($t))) }
+        (Invoke-ElevatedPowerShell -ArgumentList (& $enc 'exit 0')) | Should -Be 0
+        (Invoke-ElevatedPowerShell -ArgumentList (& $enc 'exit 7')) | Should -Be 7
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+    }
+}
+
+Describe 'Confirm-CertTrusted when already elevated (issue #965)' {
+    BeforeAll {
+        $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+        $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=Wingman Test Signer', $rsa, [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $script:cert = $req.CreateSelfSigned([datetimeoffset]::Now.AddDays(-1), [datetimeoffset]::Now.AddYears(1))
+    }
+
+    It 'imports without RunAs and succeeds' {
+        $script:calls = 0
+        Mock -ModuleName Wingman.Common Test-ProcessElevated { $true }
+        Mock -ModuleName Wingman.Common Export-Certificate { }
+        Mock -ModuleName Wingman.Common Remove-Item { }
+        Mock -ModuleName Wingman.Common Start-Process { throw 'RunAs must not be used when elevated' }
+        # The real child would import into the real store, so it is mocked.
+        Mock -ModuleName Wingman.Common Invoke-ElevatedPowerShell { 0 }
+        Mock -ModuleName Wingman.Common Get-ChildItem {
+            $script:calls++
+            if ($script:calls -gt 1) { $script:cert }
+        }
+        { Confirm-CertTrusted -Cert $cert -CerPath 'TestDrive:\wingman.cer' } | Should -Not -Throw
+        Should -Invoke -ModuleName Wingman.Common Invoke-ElevatedPowerShell -Times 1
+        Should -Invoke -ModuleName Wingman.Common Start-Process -Times 0
+    }
+}
 Describe 'Get-ElevatedPowerShellArgumentList (issue #278)' {
     # The elevated child must never parse path (or thumbprint) content as
     # PowerShell. Data reaches it base64-encoded inside a fixed script, so no
@@ -1007,6 +1054,7 @@ Describe 'Confirm-CertTrusted elevated command (issue #278)' {
 
     BeforeEach {
         $script:calls = 0
+        Mock -ModuleName Wingman.Common Test-ProcessElevated { $false }
         Mock -ModuleName Wingman.Common Export-Certificate { }
         Mock -ModuleName Wingman.Common Remove-Item { }
         Mock -ModuleName Wingman.Common Start-Process { [pscustomobject]@{ ExitCode = 0 } }

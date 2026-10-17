@@ -638,6 +638,12 @@ mod driver {
         }
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
+        if state == GalleryState::PaletteHover {
+            // Windows sends a mouse move when a window appears under the
+            // cursor, which clears the hover set above: set it again so the
+            // picture does not depend on where the cursor happens to be.
+            palette.set_hover_for_test(Some(2));
+        }
         print_window_png(hwnd, path, prints_with_wm_print(state))?;
         Ok(hwnd)
     }
@@ -951,7 +957,11 @@ mod driver {
             PaletteDefault => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
             }
             CardOptionsLooking => {
                 card.hide();
@@ -1012,18 +1022,30 @@ mod driver {
             PaletteNoMatches => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
                 palette.set_query_for_test("zzzzznomatch");
             }
             PaletteNoModel => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    false,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
             }
             PaletteLong | PaletteLongScrolled => {
                 card.hide();
                 palette.hide();
-                palette.show(long_palette_catalogue(), true, "mode: Auto".to_string());
+                palette.show(
+                    long_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
                 if state == PaletteLongScrolled {
                     palette.scroll_for_test(i32::MAX);
                 }
@@ -1031,7 +1053,11 @@ mod driver {
             PaletteHover => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
                 // Row 0 is the "Answer" header, row 1 the selected action:
                 // the hovered one is the action under it.
                 palette.set_hover_for_test(Some(2));

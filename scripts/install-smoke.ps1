@@ -58,17 +58,14 @@ $ReleaseZipExtras = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'PRIVACY.md', 'config
 #   $IsProtected  inheritance is cut (icacls /inheritance:r)
 #   $Rules        objects with Sid (string) and Type ('Allow' or 'Deny')
 #   $AlsoAllowed  SIDs that may hold an entry besides the owner. Default:
-#                 SYSTEM and Administrators. MEASURED 2026-10-17 on a GitHub
-#                 runner (elevated admin): after the app's icacls restriction
-#                 the file still lists SYSTEM, Administrators and the user as
-#                 explicit entries, from the creating token's default DACL.
-#                 Both can take the file anyway; anyone else is a problem.
+#                 none. The app removes the SYSTEM and Administrators entries
+#                 an elevated creator leaves behind (#966).
 function Get-OwnerOnlyAclProblem {
     param(
         [Parameter(Mandatory)] [bool] $IsProtected,
         [AllowEmptyCollection()] [object[]] $Rules = @(),
         [Parameter(Mandatory)] [string] $OwnerSid,
-        [string[]] $AlsoAllowed = @('S-1-5-18', 'S-1-5-32-544')
+        [string[]] $AlsoAllowed = @()
     )
     $problems = @()
     if (-not $IsProtected) { $problems += 'inheritance is not cut, so the folder entries apply too' }
@@ -230,22 +227,9 @@ try {
         $installDir = Get-InstallDirPath -LocalAppData $env:LOCALAPPDATA -InstallDirName $id.Current.InstallDirName
         $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 
-        # MEASURED 2026-10-17 on a GitHub runner: the runner is already an
-        # elevated administrator, and install.ps1's self-elevation (Start-Process
-        # -Verb RunAs, from an elevated process) exits 1 there, while the same
-        # command line run directly succeeds. So the one elevated step is done
-        # here, directly, with the same certificate install.ps1 would make; its
-        # Get-SigningCert then reuses it and Confirm-CertTrusted sees it trusted.
-        # Everything else in install.ps1 runs as written. The self-elevation
-        # itself is the one part this run cannot check.
-        $cert = New-SelfSignedCertificate -Type Custom -Subject $id.Current.CertSubject `
-            -KeyUsage DigitalSignature -FriendlyName 'Wingman package signing' `
-            -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(1) `
-            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
-        $cer = Join-Path $work 'wingman.cer'
-        Export-Certificate -Cert $cert -FilePath $cer | Out-Null
-        Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
-        Write-Fact 'note: certificate created and trusted directly (the self-elevation step is not exercised on a runner)'
+        # The runner is already an elevated administrator. install.ps1 makes and
+        # trusts its own certificate here, which checks that the certificate step
+        # skips RunAs when the caller is elevated (#965).
 
         # install.ps1 signs the exe in place and writes target\msix; it is
         # the real path, so it runs against the repo checkout as it is.

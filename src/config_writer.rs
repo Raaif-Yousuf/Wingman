@@ -50,6 +50,15 @@ pub enum FieldChange {
     },
     /// Remove `path`. Missing is fine.
     Remove { path: Vec<String> },
+    /// Set `path` to `value` only if the file still holds `expected` there (`None`:
+    /// the key is not set). For a whole value (a list, a table) a window changed
+    /// from what it opened with: writing it blind would drop a sibling edit the
+    /// user made by hand in the meantime, so a changed file refuses it instead.
+    SetIfUnchanged {
+        path: Vec<String>,
+        expected: Option<toml::Value>,
+        value: toml::Value,
+    },
 }
 
 impl FieldChange {
@@ -75,7 +84,9 @@ impl FieldChange {
     /// The key this change is about.
     pub fn path(&self) -> &[String] {
         match self {
-            FieldChange::Set { path, .. } | FieldChange::Remove { path } => path,
+            FieldChange::Set { path, .. }
+            | FieldChange::Remove { path }
+            | FieldChange::SetIfUnchanged { path, .. } => path,
         }
     }
 
@@ -84,6 +95,15 @@ impl FieldChange {
     /// (`primary = { vk = 134 }`) is patched in place. The old value's trailing
     /// comment stays with the new one.
     pub fn apply(&self, doc: &mut DocumentMut) -> Result<()> {
+        if let FieldChange::SetIfUnchanged { path, value, .. } = self {
+            // The comparison is made by the caller (`write_changes_with`), which
+            // has the text the doc came from.
+            return FieldChange::Set {
+                path: path.clone(),
+                value: value.clone(),
+            }
+            .apply(doc);
+        }
         let path = self.path();
         let Some((key, parents)) = path.split_last() else {
             bail!("a config change needs a key");
@@ -98,7 +118,7 @@ impl FieldChange {
                 );
             }
         }
-        let create = matches!(self, FieldChange::Set { .. });
+        let create = !matches!(self, FieldChange::Remove { .. });
         let mut table: &mut dyn TableLike = doc.as_table_mut();
         for name in parents {
             if !table.contains_key(name) {
@@ -119,6 +139,8 @@ impl FieldChange {
             FieldChange::Remove { .. } => {
                 table.remove(key);
             }
+            // Returned early above, as a plain `Set`.
+            FieldChange::SetIfUnchanged { .. } => {}
             FieldChange::Set { value, .. } => {
                 let mut item = to_item(value);
                 match table.get_mut(key) {
@@ -387,7 +409,7 @@ fn change_value(root: &mut toml::Value, change: &FieldChange) -> Result<()> {
         .as_table_mut()
         .with_context(|| format!("`{key}` is not in a table"))?;
     match change {
-        FieldChange::Set { value, .. } => {
+        FieldChange::Set { value, .. } | FieldChange::SetIfUnchanged { value, .. } => {
             table.insert(key.clone(), value.clone());
         }
         FieldChange::Remove { .. } => {
@@ -395,6 +417,88 @@ fn change_value(root: &mut toml::Value, change: &FieldChange) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Makes every whole-value change in `changes` (a list or a table) conditional on
+/// the file still holding what `before` held there. `diff` hands a changed list
+/// over as one value, so applying it would also replace anything the user added
+/// to that list by hand since the window opened; with this the write is refused
+/// instead and says so. Leaf changes are left alone: a typed value wins over an
+/// older one.
+pub fn guard_whole_values(changes: Vec<FieldChange>, before: &Config) -> Result<Vec<FieldChange>> {
+    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
+    blank_secrets(&mut before);
+    Ok(changes
+        .into_iter()
+        .map(|change| match change {
+            FieldChange::Set { path, value } if value.is_array() || value.is_table() => {
+                let expected = value_at(&before, &path).cloned();
+                FieldChange::SetIfUnchanged {
+                    path,
+                    expected,
+                    value,
+                }
+            }
+            other => other,
+        })
+        .collect())
+}
+
+/// The settings as `text` (the file's contents) holds them, defaults for every key
+/// it does not spell out: what [`guard_whole_values`] must compare against, since
+/// the writer compares with the file read the same way. The running config is not
+/// that: a tray change not yet written, or a default the file never carried, would
+/// make an untouched list look hand-edited.
+pub fn baseline_from_text(text: &str) -> Config {
+    Config::parse_or_default(text)
+}
+
+/// [`baseline_from_text`] for the file at `path`, read once when Settings opens.
+/// A missing file is all defaults, as the writer treats it. `None` when it cannot
+/// be read: the caller falls back to the running config, and a whole-value change
+/// the file then disagrees with is refused (the safe outcome).
+pub fn file_baseline(path: &Path) -> Option<Config> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(baseline_from_text(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(baseline_from_text("")),
+        Err(_) => None,
+    }
+}
+
+fn value_at<'a>(root: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    path.iter().try_fold(root, |at, key| at.get(key.as_str()))
+}
+
+/// Refuses a [`FieldChange::SetIfUnchanged`] whose key no longer holds what the
+/// change expected. `on_disk` is the file as `Config` reads it, defaults for
+/// missing keys included, so a list the file never spelled out still compares.
+fn check_unchanged(on_disk: &toml::Value, change: &FieldChange) -> Result<()> {
+    let FieldChange::SetIfUnchanged { path, expected, .. } = change else {
+        return Ok(());
+    };
+    if value_at(on_disk, path) != expected.as_ref() {
+        bail!(
+            "`{}` was changed in config.toml while Settings was open, so Wingman did not \
+             overwrite it. Open Settings again and save once more",
+            path.join(".")
+        );
+    }
+    Ok(())
+}
+
+/// The file text as `Config` reads it, as a value with every key blanked, for
+/// [`check_unchanged`]. `None` when no change needs the comparison, or it could
+/// not be made (a guarded change is then refused: the safe outcome).
+fn effective_on_disk(text: &str, changes: &[FieldChange]) -> Option<toml::Value> {
+    if !changes
+        .iter()
+        .any(|c| matches!(c, FieldChange::SetIfUnchanged { .. }))
+    {
+        return None;
+    }
+    let mut value = toml::Value::try_from(Config::parse_or_default(text)).ok()?;
+    blank_secrets(&mut value);
+    Some(value)
 }
 
 /// Reads `path` fresh, applies `changes`, writes atomically. See the module doc
@@ -423,7 +527,18 @@ fn write_changes_with(
         let mut doc: DocumentMut = text
             .parse()
             .map_err(|e: toml_edit::TomlError| anyhow::anyhow!(refusal(&text, e.span())))?;
+        let on_disk = effective_on_disk(&text, changes);
         for change in changes {
+            match &on_disk {
+                Some(on_disk) => check_unchanged(on_disk, change)?,
+                None if matches!(change, FieldChange::SetIfUnchanged { .. }) => {
+                    bail!(
+                        "could not check config.toml before changing `{}`",
+                        change.path().join(".")
+                    )
+                }
+                None => {}
+            }
             change.apply(&mut doc)?;
         }
         let mut out = match_line_endings(&text, doc.to_string());
@@ -528,6 +643,11 @@ pub struct Outcome {
     pub fail_headline: String,
     /// Said under the failure, after "It ...".
     pub fail_note: String,
+    /// The change comes from the Settings window: it is not kept in `unsaved` when
+    /// it fails (the running settings stay as they were), its OK card gives way to
+    /// an answer already on screen, and a press of the Wingman key is refused until
+    /// its answer has been applied.
+    pub from_settings: bool,
 }
 
 impl Outcome {
@@ -541,6 +661,24 @@ impl Outcome {
             ok_setup: false,
             fail_headline: format!("Using {label}: not saved"),
             fail_note: "It will revert when you quit.".to_string(),
+            from_settings: false,
+        }
+    }
+
+    /// A save from the Settings window. On failure nothing was applied, and a key
+    /// typed there was not stored.
+    pub fn settings_save() -> Self {
+        Self {
+            ok_headline: "Settings saved".to_string(),
+            ok_detail: String::new(),
+            ok_secs: 3,
+            ok_setup: false,
+            fail_headline: "Couldn't save settings".to_string(),
+            fail_note: "Your changes were not applied and Wingman is still using its previous \
+                        settings. A key you typed was not stored, so enter it again after \
+                        fixing this."
+                .to_string(),
+            from_settings: true,
         }
     }
 }
@@ -556,6 +694,9 @@ pub struct Written {
     pub outcome: Outcome,
     /// `None` when the write failed, or the app is quitting.
     pub loaded: Option<Loaded>,
+    /// Set when the file was written but an API key then could not be stored in
+    /// Credential Manager (a Settings save with a typed key). A plain sentence.
+    pub key_error: Option<String>,
 }
 
 /// One write's reply has been dealt with (or could not be posted): takes it off
@@ -591,6 +732,15 @@ pub fn track_mtime(
     } else {
         (None, newest)
     }
+}
+
+/// Stores the keys a Settings save changed in Credential Manager (see
+/// `Config::push_changed_secrets`). `Some` is a plain sentence for the failure.
+/// Runs on the writer thread, after the file write has succeeded.
+pub fn store_changed_keys(was: &Config, now: &Config) -> Option<String> {
+    Config::push_changed_secrets(was, now)
+        .err()
+        .map(|e| format!("{e:#}"))
 }
 
 /// `Config::load` for the handler of [`Written`], with the error as a sentence.
@@ -1666,10 +1816,10 @@ x = 1
         assert!(!handler.contains("Config::load"), "{handler}");
         assert!(!handler.contains("load_after_write"), "{handler}");
         let start = app
-            .find("    fn persist_changes(")
-            .expect("persist_changes moved");
+            .find("    fn persist_changes_with(")
+            .expect("persist_changes_with moved");
         let rest = &app[start..];
-        let end = rest.find("\n    }\n").expect("end of persist_changes");
+        let end = rest.find("\n    }\n").expect("end of persist_changes_with");
         assert!(
             rest[..end].contains("load_after_write"),
             "the writer thread must reload"
@@ -1952,25 +2102,232 @@ x = 1
     }
 
     #[test]
-    fn a_reload_or_a_settings_save_forgets_the_unsaved_changes() {
+    fn a_reload_forgets_the_unsaved_changes() {
         let app = include_str!("app.rs").replace('\r', "");
         let reload = body_of(&app, "    fn reload(&mut self) {");
         assert!(reload.contains("unsaved.clear()"), "{reload}");
-        let settings = body_of(&app, "    fn open_settings_inner(&mut self) {");
-        let saved = settings
-            .find("commit_edited_config(")
-            .expect("the Settings commit moved");
-        let clear = settings
-            .find("unsaved.clear()")
-            .expect("unsaved must be cleared");
-        let apply = settings.find("self.apply_config()").expect("apply_config");
-        assert!(saved < clear && clear < apply, "{settings}");
+    }
+
+    /// Settings saves through the writer: its Save builds the changes with
+    /// `diff` and `guard_whole_values`, posts them to the main window, and never
+    /// calls `Config::save` or touches the disk itself.
+    #[test]
+    fn the_settings_window_saves_through_the_writer_thread() {
+        let src = include_str!("ui/settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(!code.is_empty());
+        assert!(
+            code.contains("crate::config_writer::diff("),
+            "Save must send only the changed fields"
+        );
+        assert!(
+            code.contains("crate::config_writer::guard_whole_values("),
+            "a changed list must not replace a hand edit of the same list"
+        );
+        assert!(
+            code.contains("crate::config_writer::file_baseline("),
+            "the guard must compare with the file as read when the window opened"
+        );
+        assert!(code.contains("crate::app::post_settings_save("));
+        assert!(
+            !code.contains(".save("),
+            "Settings must not save the whole config itself"
+        );
+        assert!(
+            !code.contains("fs::write"),
+            "no file writes on the UI thread"
+        );
+    }
+
+    // -- whole values are written only over what the window saw (#871) -----------
+
+    fn order(items: &[&str]) -> toml::Value {
+        toml::Value::Array(items.iter().map(|s| toml::Value::from(*s)).collect())
+    }
+
+    fn change_order(text: &str, expected: &[&str], to: &[&str]) -> (Result<()>, String, PathBuf) {
+        let path = scratch("guard");
+        std::fs::write(&path, text).unwrap();
+        let change = FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: Some(order(expected)),
+            value: order(to),
+        };
+        let result = write_changes(&path, &[change]);
+        let after = std::fs::read_to_string(&path).unwrap();
+        (result, after, path)
+    }
+
+    #[test]
+    fn a_list_is_written_when_the_file_still_holds_what_the_window_saw() {
+        let text = "[providers]\norder = [\"openai\", \"anthropic\"]  # mine\n";
+        let (result, after, path) = change_order(text, &["openai", "anthropic"], &["anthropic"]);
+        result.unwrap();
+        assert!(after.contains("order = [\"anthropic\"]"), "{after}");
+        assert!(after.contains("# mine"), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_list_the_user_added_to_by_hand_meanwhile_is_not_overwritten() {
+        // The window opened with two vendors; the user then added a third in the
+        // file. Saving the window's list would silently drop it.
+        let text = "[providers]\norder = [\"openai\", \"anthropic\", \"gemini\"]\n";
+        let (result, after, path) = change_order(text, &["openai", "anthropic"], &["anthropic"]);
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("providers.order"), "{message}");
+        assert!(message.contains("Open Settings again"), "{message}");
+        assert!(!message.contains('\u{2014}'), "{message}");
+        assert_eq!(after, text, "the file must be left exactly as it was");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_list_the_file_never_spelled_out_compares_as_its_default() {
+        // No `order` in the file: Config reads the default list, which is what
+        // the window opened with.
+        let default = Config::default().providers.order;
+        let names: Vec<&str> = default.iter().map(String::as_str).collect();
+        let path = scratch("guard-absent");
+        std::fs::write(&path, "mode = \"auto\"\n").unwrap();
+        let change = FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: Some(order(&names)),
+            value: order(&["gemini"]),
+        };
+        write_changes(&path, &[change]).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("order = [\"gemini\"]"), "{after}");
+        assert!(after.contains("mode = \"auto\""), "{after}");
+        cleanup(&path);
+    }
+
+    /// The running config has a list the file never spelled out (a tray change
+    /// not yet written): guarding against the running config refuses a save that
+    /// touched nothing in the file; guarding against the file as read does not.
+    #[test]
+    fn a_pending_tray_change_does_not_make_an_untouched_list_look_hand_edited() {
+        let path = scratch("guard-baseline");
+        let text = "mode = \"auto\"\n";
+        std::fs::write(&path, text).unwrap();
+        let mut running = Config::default();
+        running.providers.order = vec!["ollama".into()];
+        let mut edited = running.clone();
+        edited.providers.order = vec!["gemini".into()];
+        let changes = diff(&running, &edited).unwrap();
+
+        let wrong = guard_whole_values(changes.clone(), &running).unwrap();
+        assert!(write_changes(&path, &wrong).is_err(), "the old baseline");
+
+        let baseline = file_baseline(&path).expect("the file reads");
+        assert_eq!(baseline.providers.order, Config::default().providers.order);
+        let right = guard_whole_values(changes, &baseline).unwrap();
+        write_changes(&path, &right).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("order = [\"gemini\"]"), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_missing_file_is_all_defaults_and_an_unreadable_one_has_no_baseline() {
+        let missing = scratch("guard-missing");
+        cleanup(&missing);
+        let baseline = file_baseline(&missing).expect("a missing file is defaults");
+        assert_eq!(baseline.providers.order, Config::default().providers.order);
+        // Bytes that are not text cannot be read as a config.
+        let junk = scratch("guard-junk");
+        std::fs::write(&junk, [0xffu8, 0xfe, 0xfd]).unwrap();
+        assert!(file_baseline(&junk).is_none());
+        cleanup(&junk);
+    }
+
+    #[test]
+    fn a_guarded_change_leaves_the_other_jobs_in_its_batch_alone() {
+        let path = scratch("guard-batch");
+        let text = "[providers]\norder = [\"openai\", \"gemini\"]\n";
+        std::fs::write(&path, text).unwrap();
+        let guarded = vec![FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: Some(order(&["openai"])),
+            value: order(&["anthropic"]),
+        }];
+        let fine = vec![set(&["ui", "card_seconds"], 9u32)];
+        let results = write_batch(&path, &[&guarded, &fine]);
+        assert!(results[0].is_err());
+        assert_eq!(results[1], Ok(()));
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("card_seconds = 9"), "{after}");
+        assert!(after.contains("\"gemini\""), "{after}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn guard_whole_values_wraps_lists_and_tables_and_leaves_leaves_alone() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.providers.order = vec!["gemini".into()];
+        after.ui.card_seconds += 1;
+        let changes = diff(&before, &after).unwrap();
+        let guarded = guard_whole_values(changes, &before).unwrap();
+        let order = guarded
+            .iter()
+            .find(|c| c.path() == ["providers", "order"])
+            .expect("the list change is there");
+        match order {
+            FieldChange::SetIfUnchanged { expected, .. } => {
+                let expected = expected.as_ref().expect("the default list was set");
+                assert_eq!(
+                    expected.as_array().unwrap().len(),
+                    before.providers.order.len()
+                );
+            }
+            other => panic!("a list must be guarded: {other:?}"),
+        }
+        let leaf = guarded
+            .iter()
+            .find(|c| c.path() == ["ui", "card_seconds"])
+            .expect("the leaf change is there");
+        assert!(matches!(leaf, FieldChange::Set { .. }), "{leaf:?}");
+    }
+
+    #[test]
+    fn a_guarded_change_that_could_not_be_checked_is_refused() {
+        // `effective_on_disk` is None only when the comparison cannot be made;
+        // write_changes_with then refuses rather than writing blind.
+        let src = include_str!("config_writer.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(
+            code.contains("could not check config.toml before changing"),
+            "the fail-closed arm moved"
+        );
+    }
+
+    #[test]
+    fn a_settings_outcome_keeps_a_failed_save_out_of_unsaved_and_says_nothing_was_applied() {
+        let o = Outcome::settings_save();
+        assert!(o.from_settings);
+        assert!(!Outcome::simple("x").from_settings);
+        assert!(o.fail_note.contains("not applied"), "{}", o.fail_note);
+        assert!(o.fail_note.contains("key"), "{}", o.fail_note);
+        assert!(!o.fail_note.contains('\u{2014}') && !o.ok_headline.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_guarded_change_is_reapplied_like_a_plain_one() {
+        let config = Config::default();
+        let change = FieldChange::SetIfUnchanged {
+            path: vec!["providers".into(), "order".into()],
+            expected: None,
+            value: order(&["gemini"]),
+        };
+        let out = reapply(&config, &[change]).unwrap();
+        assert_eq!(out.providers.order, vec!["gemini".to_string()]);
     }
 
     #[test]
     fn a_reply_that_cannot_be_posted_settles_its_own_count() {
         let app = include_str!("app.rs").replace('\r', "");
-        let body = body_of(&app, "    fn persist_changes(");
+        let body = body_of(&app, "    fn persist_changes_with(");
         assert!(body.contains("finish("), "{body}");
     }
 
