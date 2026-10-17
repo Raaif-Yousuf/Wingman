@@ -54,7 +54,8 @@ use crate::provider::{
 };
 use crate::router;
 use crate::ui::card::{
-    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+    Card, WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM,
+    WM_APP_PREVIEW_DECIDED,
 };
 use crate::ui::confirm;
 use crate::ui::palette::{Palette, WM_APP_PALETTE_RUN};
@@ -3806,6 +3807,35 @@ impl App {
         }
     }
 
+    /// #373: "Report a problem" on an error card. Opens the browser at a new
+    /// GitHub issue with the version, mode, provider kinds and error class
+    /// filled in (see `report_problem`). Wingman sends nothing: the user reads
+    /// the form and submits it, or closes it. A browser that will not open
+    /// ends in a card (AGENTS.md rule 7), never a silent no-op.
+    fn report_problem(&mut self) {
+        use crate::connectors::oauth::{BrowserOpener, ShellBrowser};
+        let Some(last_error) = self.last_error.as_ref() else {
+            self.card.show_answer(
+                "Nothing to report",
+                "No error details are available.",
+                4,
+                None,
+            );
+            return;
+        };
+        let input = crate::report_problem::ReportInput::from_parts(
+            self.config.mode.label(),
+            &self.config.providers.order,
+            &last_error.chain,
+        );
+        let url = crate::report_problem::build_url(&input);
+        if let Err(e) = ShellBrowser.open(&url) {
+            let detail = self.track_error("Couldn't open the browser", &format!("{e}"));
+            self.card
+                .show_error_with_details("Couldn't open the browser", &detail);
+        }
+    }
+
     /// #106: puts the whole local egress log on the clipboard, human
     /// readable. The on-disk format stays JSON lines (machine readable,
     /// ready for #46's SQLite import); nobody should have to read raw JSON
@@ -6773,6 +6803,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #347's WM_APP_CARD_OPEN_SETTINGS above already relies on), so
         // there is nothing left for a deferred copy to act on either.
         | WM_APP_CARD_COPY_DETAILS
+        // #373: same treatment as "Copy details" above.
+        | WM_APP_CARD_REPORT_PROBLEM
         // #25: the palette cannot be shown while Settings is modal-open
         // anyway (Settings takes the foreground; the hook's own chord check
         // still passes the keydown through per the Ignore branch above), so
@@ -7273,6 +7305,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.open_settings();
             LRESULT(0)
         }
+        WM_APP_CARD_REPORT_PROBLEM => {
+            // #373: a click on "Report a problem". No payload.
+            app.report_problem();
+            LRESULT(0)
+        }
         WM_APP_CARD_COPY_DETAILS => {
             // Issue #425: a click/Enter on an expanded error card's "Copy
             // details" affordance. No payload.
@@ -7462,7 +7499,8 @@ mod tests {
     use crate::provider::Provider;
     use crate::router;
     use crate::ui::card::{
-        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_PREVIEW_DECIDED,
+        WM_APP_CARD_COPY_DETAILS, WM_APP_CARD_OPEN_SETTINGS, WM_APP_CARD_REPORT_PROBLEM,
+        WM_APP_PREVIEW_DECIDED,
     };
     use crate::ui::confirm;
     use crate::ui::palette::WM_APP_PALETTE_RUN;
@@ -8876,6 +8914,7 @@ mod tests {
         ("WM_APP_CARD_OPEN_SETTINGS", WM_APP_CARD_OPEN_SETTINGS),
         ("WM_APP_GENERIC_ACTION_RESULT", WM_APP_GENERIC_ACTION_RESULT),
         ("WM_APP_CARD_COPY_DETAILS", WM_APP_CARD_COPY_DETAILS),
+        ("WM_APP_CARD_REPORT_PROBLEM", WM_APP_CARD_REPORT_PROBLEM),
         ("WM_APP_SEND_PREVIEW", WM_APP_SEND_PREVIEW),
         ("WM_APP_PENDING_STAGE", WM_APP_PENDING_STAGE),
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
@@ -9617,6 +9656,11 @@ mod tests {
         (
             "WM_APP_CARD_COPY_DETAILS",
             WM_APP_CARD_COPY_DETAILS,
+            SettingsReentrancy::Ignore,
+        ),
+        (
+            "WM_APP_CARD_REPORT_PROBLEM",
+            WM_APP_CARD_REPORT_PROBLEM,
             SettingsReentrancy::Ignore,
         ),
         (

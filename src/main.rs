@@ -35,6 +35,7 @@ mod profile;
 mod provider;
 mod redact;
 mod remote_ollama;
+mod report_problem;
 #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 mod router;
 mod secrets;

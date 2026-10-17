@@ -735,10 +735,13 @@ mod driver {
             CardError => {
                 card.hide();
                 palette.hide();
-                card.show_error(
+                // Expanded and tracked, so the footer shows "Copy details"
+                // and "Report a problem" (#373).
+                card.show_error_with_details(
                     "Couldn't reach the model",
                     "The request timed out. Check your connection and try again.",
                 );
+                card.expand_for_gallery();
             }
             CardSetupNoModel | CardSetupOllamaDown => {
                 card.hide();

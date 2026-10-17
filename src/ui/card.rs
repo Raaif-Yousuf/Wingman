@@ -152,6 +152,13 @@ pub const WM_APP_CARD_OPEN_SETTINGS: u32 = WM_APP + 15;
 /// `count_declarations` file list -- see that test's doc comment.
 pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 
+/// Posted to the card's owner window when the user activates "Report a
+/// problem" on an expanded error card (#373). Carries no payload: like
+/// [`WM_APP_CARD_COPY_DETAILS`], the facts come from `App`, not the card.
+/// `App::report_problem` opens the browser at a prefilled new-issue page.
+/// Registered in `app.rs`'s `ALL_WM_APP_IDS` (issue #163).
+pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 23;
+
 use crate::provider::Difficulty;
 pub use crate::ui::pending_status::PendingStage;
 use crate::ui::pending_status::{pending_glyph_should_spin, pending_status_text};
@@ -242,6 +249,7 @@ impl Card {
             open_settings_on_click: false,
             copy_details_available: false,
             copy_details_rect: None,
+            report_rect: None,
             copy_available: false,
             focus_link: None,
             copy_rect: None,
@@ -1161,6 +1169,7 @@ fn scroll_target_for_key(vk: u16, offset: i32, max: i32, line: i32, page: i32) -
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FooterLink {
     CopyDetails,
+    Report,
     ReadAloud,
     Copy,
 }
@@ -1497,6 +1506,10 @@ struct CardInner {
     /// math. `None` whenever there is nothing to show (not an error card,
     /// or not Expanded yet); recomputed by every `layout_expanded` call.
     copy_details_rect: Option<RECT>,
+    /// #373: the "Report a problem" link beside "Copy details", on the same
+    /// cards and in the same coordinates. Shown whenever
+    /// `copy_details_available` is, because both read the same recorded error.
+    report_rect: Option<RECT>,
     /// Issue #77: `true` while the card is an answer card (set only by
     /// [`Card::show_answer`]), i.e. one with a "Read aloud" footer to offer
     /// once Expanded. Mutually exclusive with `copy_details_available`:
@@ -1748,6 +1761,7 @@ impl CardInner {
         // "Copy details" affordance for an error it isn't.
         self.copy_details_available = false;
         self.copy_details_rect = None;
+        self.report_rect = None;
         // Issue #77: likewise, only `Card::show_answer` turns "Read aloud"
         // on, right after this call returns.
         self.read_aloud_available = false;
@@ -2030,6 +2044,29 @@ impl CardInner {
         }
     }
 
+    /// #373: `true` when `(x, y)` lands on the "Report a problem" link.
+    fn point_hits_report(&self, x: i32, y: i32) -> bool {
+        let Some(r) = self.report_rect else {
+            return false;
+        };
+        (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+    }
+
+    /// #373: click, Tab then Enter or Space on "Report a problem". Only
+    /// notifies the owner, which builds the link from what it recorded.
+    fn report_activated(&mut self) {
+        if let Some(owner) = self.owner {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(owner),
+                    WM_APP_CARD_REPORT_PROBLEM,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
     /// Issue #77: `true` when `(x, y)` (client-window coordinates) lands on
     /// the pinned "Read aloud" footer; `false` when there is no such footer.
     fn point_hits_read_aloud(&self, x: i32, y: i32) -> bool {
@@ -2115,6 +2152,7 @@ impl CardInner {
     fn footer_links(&self) -> Vec<FooterLink> {
         [
             (FooterLink::CopyDetails, self.copy_details_rect),
+            (FooterLink::Report, self.report_rect),
             (FooterLink::ReadAloud, self.read_aloud_rect),
             (FooterLink::Copy, self.copy_rect),
         ]
@@ -2139,6 +2177,7 @@ impl CardInner {
         let shown = self.footer_links();
         match self.focus_link.filter(|l| shown.contains(l)) {
             Some(FooterLink::CopyDetails) => self.copy_details_activated(),
+            Some(FooterLink::Report) => self.report_activated(),
             Some(FooterLink::ReadAloud) => self.read_aloud_activated(),
             Some(FooterLink::Copy) => self.copy_activated(),
             None => return false,
@@ -2149,6 +2188,7 @@ impl CardInner {
     /// The pinned footer row's rect, whichever footer the card has.
     fn footer_rect(&self) -> Option<RECT> {
         self.copy_details_rect
+            .or(self.report_rect)
             .or(self.read_aloud_rect)
             .or(self.copy_rect)
     }
@@ -2448,7 +2488,19 @@ impl CardInner {
         };
         // Issue #77: the one pinned footer row is "Copy details" on an error
         // card and "Read aloud" on an answer card, never both.
-        self.copy_details_rect = footer.filter(|_| self.copy_details_available);
+        // #373: an error card splits the row between "Copy details" and
+        // "Report a problem", laid out the way an answer card's links are.
+        self.copy_details_rect = None;
+        self.report_rect = None;
+        if let Some(f) = footer.filter(|_| self.copy_details_available) {
+            let body = self.fonts.caption;
+            let details_w = self.measure_label(body, "Copy details").0;
+            let report_w = self.measure_label(body, "Report a problem").0;
+            let gap = self.scale(FOOTER_LINK_GAP_DP);
+            let (details, report) = footer_links_layout(f, Some(details_w), report_w, gap);
+            self.copy_details_rect = details;
+            self.report_rect = rect_has_area(report).then_some(report);
+        }
         // Issue #531: an answer card splits that row between "Read aloud" and
         // "Copy". Each link is sized for its widest label so the row does not
         // shift when "Read aloud" becomes "Stop reading" or "Copy" "Copied".
@@ -3055,6 +3107,7 @@ impl CardInner {
         // draws within it unless the clip is reset, so reset it first).
         let links = [
             (self.copy_details_rect, "Copy details"),
+            (self.report_rect, "Report a problem"),
             (self.read_aloud_rect, self.read_aloud_label()),
             (self.copy_rect, self.copy_label()),
         ];
@@ -3096,6 +3149,7 @@ impl CardInner {
     fn link_rect(&self, link: FooterLink) -> Option<RECT> {
         match link {
             FooterLink::CopyDetails => self.copy_details_rect,
+            FooterLink::Report => self.report_rect,
             FooterLink::ReadAloud => self.read_aloud_rect,
             FooterLink::Copy => self.copy_rect,
         }
@@ -3262,6 +3316,8 @@ impl CardInner {
                     let (x, y) = crate::dismiss::unpack_point(lparam.0 as u32);
                     if self.point_hits_copy_details(x, y) {
                         self.copy_details_activated();
+                    } else if self.point_hits_report(x, y) {
+                        self.report_activated();
                     } else if self.point_hits_read_aloud(x, y) {
                         self.read_aloud_activated();
                     } else if self.point_hits_copy(x, y) {
@@ -5955,6 +6011,67 @@ mod tests {
         assert!(!card.inner.activate_focused_link());
         card.handle_message(WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(0));
         assert!(!queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
+    }
+
+    // -- Report a problem (#373) ---------------------------------------------
+
+    #[test]
+    fn a_tracked_error_card_shows_report_a_problem_beside_copy_details() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let details = card.inner.copy_details_rect.expect("Copy details");
+        let report = card.inner.report_rect.expect("Report a problem");
+        assert!(report.left >= details.right, "the links must not overlap");
+        assert!(rect_has_area(report));
+        // An untracked error has neither: there is nothing to report from.
+        card.show_error("Hotkeys unavailable", "detail text");
+        card.inner.try_expand();
+        assert!(card.inner.report_rect.is_none());
+        // Nor does an answer card.
+        card.show_answer("2 + 2 = 4", "ok", 0, None);
+        card.inner.try_expand();
+        assert!(card.inner.report_rect.is_none());
+    }
+
+    #[test]
+    fn clicking_report_a_problem_posts_its_message_and_not_copy_details() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        let r = card.inner.report_rect.expect("Report a problem");
+        let lparam = LPARAM(crate::dismiss::pack_point(
+            (r.left + r.right) / 2,
+            (r.top + r.bottom) / 2,
+        ) as isize);
+        card.handle_message(WM_LBUTTONDOWN, WPARAM(0), lparam);
+        assert!(!queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_REPORT_PROBLEM));
+    }
+
+    #[test]
+    fn tab_twice_then_space_runs_report_a_problem() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_TAB.0 as usize), LPARAM(0));
+        assert_eq!(card.inner.focus_link, Some(FooterLink::Report));
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_SPACE.0 as usize), LPARAM(0));
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_REPORT_PROBLEM));
+    }
+
+    #[test]
+    fn enter_on_an_error_card_still_copies_details_not_report() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.set_owner(card.hwnd());
+        card.show_error_with_details("Couldn't add the event", "detail text");
+        card.inner.try_expand();
+        card.handle_message(WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+        assert!(!queue_contains(card.hwnd(), WM_APP_CARD_REPORT_PROBLEM));
+        assert!(queue_contains(card.hwnd(), WM_APP_CARD_COPY_DETAILS));
     }
 
     #[test]
