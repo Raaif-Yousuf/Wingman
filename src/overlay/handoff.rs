@@ -19,6 +19,8 @@ pub struct Ready {
     pub annotations: Vec<Annotation>,
     /// The monitor the capture covered: labels stay inside it.
     pub monitor: ScreenRect,
+    /// Every OCR word box, so a label can keep off text that is not marked.
+    pub obstacles: Vec<ScreenRect>,
 }
 
 static SLOT: Mutex<Option<Ready>> = Mutex::new(None);
@@ -64,6 +66,7 @@ mod tests {
                 right: 10,
                 bottom: 10,
             },
+            obstacles: Vec::new(),
         }
     }
 

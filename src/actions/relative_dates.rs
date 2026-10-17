@@ -40,6 +40,8 @@ pub const NOTHING_HEADLINE: &str = "No relative dates found";
 /// The line under it.
 pub const NOTHING_DETAIL: &str =
     "Looked for phrases like tomorrow, in 3 days, next Tuesday or end of the month.";
+/// Said after a time the text did not give: "EOD" is taken as 17:00.
+pub const ASSUMED_TIME_NOTE: &str = "end of day taken as 17:00";
 /// What the card says when there is no selection and the screen has no text.
 pub const NO_TEXT_HEADLINE: &str = "No text found on screen";
 
@@ -68,8 +70,11 @@ pub fn builtin_action() -> Action {
 /// The card for `text`: each phrase with its date, and the reference day.
 /// The headline is the first phrase (and how many more follow); the detail is
 /// every phrase, then the reference line.
-pub fn answer_for_text(text: &str, today: CivilDate, week: WeekStart) -> Answer {
-    let found = dates::find(text, today, week);
+///
+/// `now_minute` is the local time of day in minutes since midnight. It lets
+/// "in 2 hours" be worked out, and the reference line then names the time.
+pub fn answer_at(text: &str, today: CivilDate, now_minute: Option<u16>, week: WeekStart) -> Answer {
+    let found = dates::find_at(text, today, now_minute, week);
     let Some(first) = found.first() else {
         return Answer {
             headline: NOTHING_HEADLINE.to_string(),
@@ -78,16 +83,14 @@ pub fn answer_for_text(text: &str, today: CivilDate, week: WeekStart) -> Answer 
         };
     };
     let line = |f: &dates::Found| {
-        let note = if f.clamped {
-            format!(" ({})", dates::CLAMPED_NOTE)
-        } else {
-            String::new()
-        };
-        format!(
-            "{}: {}{note}",
-            f.phrase,
-            dates::describe(&f.resolution, today)
-        )
+        let mut note = String::new();
+        if f.clamped {
+            note.push_str(&format!(" ({})", dates::CLAMPED_NOTE));
+        }
+        if f.time.is_some_and(|t| t.assumed) {
+            note.push_str(&format!(" ({})", ASSUMED_TIME_NOTE));
+        }
+        format!("{}: {}{note}", f.phrase, dates::describe_found(f, today))
     };
     let more = found.len() - 1;
     let suffix = match more {
@@ -103,15 +106,29 @@ pub fn answer_for_text(text: &str, today: CivilDate, week: WeekStart) -> Answer 
         lines.push(format!("and {} more", found.len() - MAX_LISTED));
     }
     lines.push(String::new());
+    let reference = match now_minute.filter(|m| *m < 24 * 60) {
+        Some(m) => format!(
+            "{}, {:02}:{:02}",
+            dates::label(today, today),
+            m / 60,
+            m % 60
+        ),
+        None => dates::label(today, today),
+    };
     lines.push(format!(
-        "Worked out from today, {}. Where two dates are shown, the text could mean either.",
-        dates::label(today, today)
+        "Worked out from today, {reference}. Where two dates are shown, the text could mean either."
     ));
     Answer {
         headline,
         detail: lines.join("\n"),
         difficulty: None,
     }
+}
+
+/// [`answer_at`] without a clock, so only the date forms are worked out.
+#[cfg(test)]
+pub fn answer_for_text(text: &str, today: CivilDate, week: WeekStart) -> Answer {
+    answer_at(text, today, None, week)
 }
 
 /// The selection when it holds anything, else the text from `screen_text`.
@@ -121,11 +138,12 @@ pub fn run_with(
     selection: &dyn SelectionSource,
     screen_text: impl FnOnce() -> Result<String>,
     today: CivilDate,
+    now_minute: Option<u16>,
     week: WeekStart,
 ) -> Result<Answer> {
     if let Ok(Some(text)) = selection.selected_text() {
         if !text.trim().is_empty() {
-            return Ok(answer_for_text(&text, today, week));
+            return Ok(answer_at(&text, today, now_minute, week));
         }
     }
     let text = screen_text()?;
@@ -136,13 +154,18 @@ pub fn run_with(
             difficulty: None,
         });
     }
-    Ok(answer_for_text(&text, today, week))
+    Ok(answer_at(&text, today, now_minute, week))
 }
 
 /// The real pipeline over the foreground selection and Windows OCR of `raw`.
 /// Runs on a worker thread: reading the selection can block on another app,
 /// and OCR takes a moment.
-pub fn run(raw: &RawShot, today: CivilDate, week: WeekStart) -> Result<Answer> {
+pub fn run(
+    raw: &RawShot,
+    today: CivilDate,
+    now_minute: Option<u16>,
+    week: WeekStart,
+) -> Result<Answer> {
     run_with(
         &crate::calc::ForegroundSelection,
         || {
@@ -152,6 +175,7 @@ pub fn run(raw: &RawShot, today: CivilDate, week: WeekStart) -> Result<Answer> {
             Ok(crate::ocr::serialize_lines(&ocr.lines))
         },
         today,
+        now_minute,
         week,
     )
 }
@@ -286,6 +310,60 @@ mod tests {
         assert_eq!(sunday_first.headline, "Friday this week: Fri Oct 2");
     }
 
+    const NOW: Option<u16> = Some(14 * 60 + 5);
+
+    #[test]
+    fn a_saturday_week_start_reaches_the_card() {
+        let sat = CivilDate {
+            year: 2026,
+            month: 9,
+            day: 26,
+        };
+        let a = answer_for_text("Friday this week", sat, WeekStart::Saturday);
+        assert_eq!(a.headline, "Friday this week: Fri Oct 2");
+    }
+
+    #[test]
+    fn times_reach_the_card_and_eod_says_it_was_assumed() {
+        let eod = answer_at("Send it tomorrow EOD", WED, NOW, MON);
+        assert_eq!(
+            eod.headline,
+            "tomorrow EOD: Thu Sep 24, 17:00 (end of day taken as 17:00)"
+        );
+        let five = answer_at("Friday at 5pm", WED, NOW, MON);
+        assert_eq!(
+            five.headline,
+            "Friday at 5pm: Fri Sep 18 or Fri Sep 25, 17:00"
+        );
+        let soon = answer_at("Back in 2 hours", WED, NOW, MON);
+        assert_eq!(soon.headline, "in 2 hours: Wed Sep 23, 16:05");
+        assert!(
+            soon.detail
+                .contains("Worked out from today, Wed Sep 23, 14:05."),
+            "{}",
+            soon.detail
+        );
+    }
+
+    #[test]
+    fn without_a_clock_hours_ahead_are_not_listed() {
+        let a = answer_at("Back in 2 hours", WED, None, MON);
+        assert_eq!(a.headline, NOTHING_HEADLINE);
+    }
+
+    #[test]
+    fn the_clock_reaches_the_pipeline() {
+        let a = run_with(
+            &selected("in 90 minutes"),
+            || Ok(String::new()),
+            WED,
+            NOW,
+            MON,
+        )
+        .unwrap();
+        assert_eq!(a.headline, "in 90 minutes: Wed Sep 23, 15:35");
+    }
+
     #[test]
     fn no_phrase_says_what_was_looked_for() {
         let a = answer_for_text("Nothing vague here, just 12 May.", WED, MON);
@@ -325,6 +403,7 @@ mod tests {
                 Ok("next Monday".to_string())
             },
             WED,
+            None,
             MON,
         )
         .unwrap();
@@ -339,14 +418,21 @@ mod tests {
             selected("   \n "),
             Selected(Err("UIA failed")),
         ] {
-            let a = run_with(&sel, || Ok("due next Tuesday".to_string()), WED, MON).unwrap();
+            let a = run_with(&sel, || Ok("due next Tuesday".to_string()), WED, None, MON).unwrap();
             assert_eq!(a.headline, "next Tuesday: Tue Sep 29");
         }
     }
 
     #[test]
     fn a_screen_with_no_text_says_so() {
-        let a = run_with(&Selected(Ok(None)), || Ok("  \n".to_string()), WED, MON).unwrap();
+        let a = run_with(
+            &Selected(Ok(None)),
+            || Ok("  \n".to_string()),
+            WED,
+            None,
+            MON,
+        )
+        .unwrap();
         assert_eq!(a.headline, NO_TEXT_HEADLINE);
     }
 
@@ -356,6 +442,7 @@ mod tests {
             &Selected(Ok(None)),
             || Err(anyhow::anyhow!("OCR engine failed")),
             WED,
+            None,
             MON,
         )
         .unwrap_err();

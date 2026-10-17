@@ -19,12 +19,39 @@
 use crate::connectors::civil_time::{civil_from_days, days_from_civil, CivilDate};
 
 /// The first day of the week, which decides what "this week" and "next week"
-/// mean. Monday is the default here (ISO 8601); Sunday is common in the US.
+/// mean. Monday is the default here (ISO 8601); Sunday is common in the US and
+/// Saturday in parts of the Middle East.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeekStart {
     Monday,
     Sunday,
+    Saturday,
 }
+
+/// A time of day written after a date phrase, or worked out from the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Time {
+    /// Minutes since midnight, 0 to 1439.
+    pub minute_of_day: u16,
+    /// True when the text gave no clock time and one was taken for it ("EOD"
+    /// is 17:00). The card says so. A time written as digits is not assumed.
+    pub assumed: bool,
+}
+
+impl Time {
+    /// "17:00".
+    pub fn label(self) -> String {
+        format!(
+            "{:02}:{:02}",
+            self.minute_of_day / 60,
+            self.minute_of_day % 60
+        )
+    }
+}
+
+/// What "EOD" and "end of day" are taken as: 17:00.
+const END_OF_DAY: u16 = 17 * 60;
+const MINUTES_PER_DAY: i64 = 24 * 60;
 
 /// What a phrase works out to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +71,8 @@ pub struct Found {
     /// True when the day was cut back to the last day of a shorter month
     /// ("in 1 month" from 31 Jan is 28 Feb). The card says so.
     pub clamped: bool,
+    /// The time of day, when the text wrote one or an hour offset gave one.
+    pub time: Option<Time>,
 }
 
 /// Said on the card after a clamped date.
@@ -120,6 +149,7 @@ fn week_pos(weekday: i64, ws: WeekStart) -> i64 {
     match ws {
         WeekStart::Monday => weekday,
         WeekStart::Sunday => (weekday + 1) % 7,
+        WeekStart::Saturday => (weekday + 2) % 7,
     }
 }
 
@@ -156,6 +186,16 @@ pub fn describe(resolution: &Resolution, today: CivilDate) -> String {
     match resolution {
         Resolution::One(d) => label(*d, today),
         Resolution::Either(a, b) => format!("{} or {}", label(*a, today), label(*b, today)),
+    }
+}
+
+/// [`describe`] for a found phrase, with ", 17:00" after the date when it has
+/// a time.
+pub fn describe_found(found: &Found, today: CivilDate) -> String {
+    let date = describe(&found.resolution, today);
+    match found.time {
+        Some(t) => format!("{date}, {}", t.label()),
+        None => date,
     }
 }
 
@@ -203,6 +243,8 @@ struct Parsed {
     /// A month or year step that landed on a shorter month, so the day was
     /// cut back to that month's last day.
     clamped: bool,
+    /// Set by hour and minute offsets, which know the time they land on.
+    time: Option<Time>,
 }
 
 #[derive(Clone, Copy)]
@@ -219,6 +261,15 @@ fn unit_of(t: &str) -> Option<Unit> {
         "week" | "weeks" => Some(Unit::Week),
         "month" | "months" => Some(Unit::Month),
         "year" | "years" => Some(Unit::Year),
+        _ => None,
+    }
+}
+
+/// Minutes in an hour or minute unit word.
+fn clock_unit(t: &str) -> Option<i64> {
+    match t {
+        "hour" | "hours" | "hr" | "hrs" => Some(60),
+        "minute" | "minutes" | "min" | "mins" => Some(1),
         _ => None,
     }
 }
@@ -305,7 +356,9 @@ fn weekday_of_week(kind: &str, target: i64, today: i64, ws: WeekStart) -> Option
 }
 
 /// Parses a phrase at the start of `w` (lowercase words).
-fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
+/// `now` is the minute of the day, for "in 2 hours"; without it an hour or
+/// minute offset is not resolved.
+fn parse(w: &[&str], today: i64, now: Option<u16>, ws: WeekStart) -> Option<Parsed> {
     let td = from_days(today);
     let one = |consumed: usize, date: CivilDate| {
         Some(Parsed {
@@ -313,6 +366,7 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             resolution: Resolution::One(date),
             weekday_phrase: false,
             clamped: false,
+            time: None,
         })
     };
     let weekday_phrase = |consumed: usize, resolution: Resolution| {
@@ -321,6 +375,22 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             resolution,
             weekday_phrase: true,
             clamped: false,
+            time: None,
+        })
+    };
+    // An hour or minute offset from the clock, which can cross midnight.
+    let clocked = |consumed: usize, minutes: i64, sign: i64| {
+        let now = i64::from(now.filter(|m| i64::from(*m) < MINUTES_PER_DAY)?);
+        let total = today * MINUTES_PER_DAY + now + sign * minutes;
+        Some(Parsed {
+            consumed,
+            resolution: Resolution::One(from_days(total.div_euclid(MINUTES_PER_DAY))),
+            weekday_phrase: false,
+            clamped: false,
+            time: Some(Time {
+                minute_of_day: total.rem_euclid(MINUTES_PER_DAY) as u16,
+                assumed: false,
+            }),
         })
     };
     // A counted offset. When a month or year step lands on a shorter month
@@ -332,6 +402,7 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             resolution: Resolution::One(date),
             weekday_phrase: false,
             clamped: matches!(unit, Unit::Month | Unit::Year) && date.day != td.day,
+            time: None,
         })
     };
     let first = *w.first()?;
@@ -351,7 +422,7 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             },
         ),
         "the" if second == "day" => {
-            let mut p = parse(&w[1..], today, ws)?;
+            let mut p = parse(w.get(1..)?, today, now, ws)?;
             p.consumed += 1;
             Some(p)
         }
@@ -364,6 +435,9 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
         }
         "in" => {
             let n = count_of(second)?;
+            if let Some(per) = clock_unit(third) {
+                return clocked(3, n * per, 1);
+            }
             let unit = unit_of(third)?;
             counted(3, n, unit, 1)
         }
@@ -387,11 +461,18 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
                 "week" => {
                     let start = today - week_pos(weekday_of(today), ws) + 7 * on;
                     let friday = from_days(in_this_week(today, 4, ws) + 7 * on);
+                    let last = from_days(start + 6);
+                    // A Saturday-first week ends on its Friday: one day.
                     Some(Parsed {
                         consumed,
-                        resolution: Resolution::Either(friday, from_days(start + 6)),
+                        resolution: if friday == last {
+                            Resolution::One(friday)
+                        } else {
+                            Resolution::Either(friday, last)
+                        },
                         weekday_phrase: false,
                         clamped: false,
+                        time: None,
                     })
                 }
                 _ => None,
@@ -419,6 +500,13 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
             }
             // "3 days ago", "a week from now".
             let n = count_of(first)?;
+            if let Some(per) = clock_unit(second) {
+                return match (third, w.get(3).copied().unwrap_or("")) {
+                    ("ago", _) => clocked(3, n * per, -1),
+                    ("from", "now") => clocked(4, n * per, 1),
+                    _ => None,
+                };
+            }
             let unit = unit_of(second)?;
             match (third, w.get(3).copied().unwrap_or("")) {
                 ("ago", _) => counted(3, n, unit, -1),
@@ -432,14 +520,165 @@ fn parse(w: &[&str], today: i64, ws: WeekStart) -> Option<Parsed> {
 // -- public API --------------------------------------------------------------
 
 /// The week start for a Windows `LOCALE_IFIRSTDAYOFWEEK` value (0 is Monday,
-/// 6 is Sunday). Sunday for 6, Monday for everything else. A locale whose week
-/// starts on Saturday (5) is read as Monday, which is the nearer of the two.
+/// 5 is Saturday, 6 is Sunday). Anything else is Monday.
 pub fn week_start_from_locale(first_day_of_week: u32) -> WeekStart {
-    if first_day_of_week == 6 {
-        WeekStart::Sunday
-    } else {
-        WeekStart::Monday
+    match first_day_of_week {
+        5 => WeekStart::Saturday,
+        6 => WeekStart::Sunday,
+        _ => WeekStart::Monday,
     }
+}
+
+// -- a time of day after the phrase ------------------------------------------
+
+/// Whether only whitespace lies between two tokens.
+fn space_between(text: &str, a: &Tok, b: &Tok) -> bool {
+    text.get(a.end..b.start)
+        .is_some_and(|gap| !gap.is_empty() && gap.chars().all(char::is_whitespace))
+}
+
+/// Whether exactly a colon lies between two tokens.
+fn colon_between(text: &str, a: &Tok, b: &Tok) -> bool {
+    text.get(a.end..b.start) == Some(":")
+}
+
+/// `am` is false, `pm` is true.
+fn meridiem(t: &str) -> Option<bool> {
+    match t {
+        "am" => Some(false),
+        "pm" => Some(true),
+        _ => None,
+    }
+}
+
+/// An ASCII number of one or two digits at the start of `t`, and what follows
+/// it. Anything else (more digits, other scripts) is not a clock number.
+fn split_number(t: &str) -> Option<(u16, &str)> {
+    let cut = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let digits = t.get(..cut)?;
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    Some((digits.parse().ok()?, t.get(cut..)?))
+}
+
+/// A 12-hour clock time: hour 1 to 12 with am or pm.
+fn twelve_hour(hour: u16, pm: bool) -> Option<u16> {
+    (1..=12)
+        .contains(&hour)
+        .then_some(hour % 12 + if pm { 12 } else { 0 })
+}
+
+/// A clock time starting at `toks[j]`: `5pm`, `5 pm`, `5:30pm`, `5:30 pm`, or
+/// 24-hour `17:00` and `09:15`. Returns the last token used and the minute of
+/// the day. A time with no am or pm is only taken when the hour is written with
+/// two digits and a colon, because "5:30" could be either half of the day.
+fn clock_time(text: &str, toks: &[Tok], j: usize) -> Option<(usize, u16)> {
+    let first = toks.get(j)?;
+    let (hour, rest) = split_number(&first.text)?;
+    // `5pm`.
+    if let Some(pm) = meridiem(rest) {
+        return Some((j, twelve_hour(hour, pm)? * 60));
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+    let next = toks.get(j + 1)?;
+    // `5 pm`.
+    if let Some(pm) = meridiem(&next.text) {
+        if !space_between(text, first, next) {
+            return None;
+        }
+        return Some((j + 1, twelve_hour(hour, pm)? * 60));
+    }
+    // `5:30`, `5:30pm`, `5:30 pm`, `17:00`.
+    if !colon_between(text, first, next) {
+        return None;
+    }
+    let (minute, tail) = split_number(&next.text)?;
+    // Minutes are written with two digits, and run 0 to 59.
+    if next.text.len() - tail.len() != 2 || minute > 59 {
+        return None;
+    }
+    let (last, pm) = match (meridiem(tail), tail.is_empty()) {
+        (Some(pm), _) => (j + 1, Some(pm)),
+        (None, true) => match toks.get(j + 2) {
+            Some(after) if space_between(text, next, after) => match meridiem(&after.text) {
+                Some(pm) => (j + 2, Some(pm)),
+                None => (j + 1, None),
+            },
+            _ => (j + 1, None),
+        },
+        (None, false) => return None,
+    };
+    let hour24 = match pm {
+        Some(pm) => twelve_hour(hour, pm)?,
+        None => {
+            if first.text.len() != 2 || hour > 23 {
+                return None;
+            }
+            hour
+        }
+    };
+    Some((last, hour24 * 60 + minute))
+}
+
+/// A time of day written right after the phrase that ends at `toks[from - 1]`:
+/// `EOD`, `COB`, `end of day`, `noon` or a clock time, each with an optional
+/// `at` or `by` before it. Returns the last token used. `None` when the next
+/// words are anything else, so no time is shown rather than a wrong one.
+fn read_time(text: &str, toks: &[Tok], from: usize) -> Option<(usize, Time)> {
+    let prev = toks.get(from.checked_sub(1)?)?;
+    let mut j = from;
+    let first = toks.get(j)?;
+    if !space_between(text, prev, first) {
+        return None;
+    }
+    if matches!(first.text.as_str(), "at" | "by") {
+        let after = toks.get(j + 1)?;
+        if !space_between(text, first, after) {
+            return None;
+        }
+        j += 1;
+    }
+    let t = toks.get(j)?;
+    let assumed = |last: usize| {
+        Some((
+            last,
+            Time {
+                minute_of_day: END_OF_DAY,
+                assumed: true,
+            },
+        ))
+    };
+    match t.text.as_str() {
+        "eod" | "cob" => return assumed(j),
+        "noon" => {
+            return Some((
+                j,
+                Time {
+                    minute_of_day: 12 * 60,
+                    assumed: false,
+                },
+            ))
+        }
+        "end" => {
+            let (of, day) = (toks.get(j + 1)?, toks.get(j + 2)?);
+            let spaced = space_between(text, t, of) && space_between(text, of, day);
+            return (spaced && of.text == "of" && day.text == "day")
+                .then(|| assumed(j + 2))
+                .flatten();
+        }
+        _ => {}
+    }
+    let (last, minute_of_day) = clock_time(text, toks, j)?;
+    Some((
+        last,
+        Time {
+            minute_of_day,
+            assumed: false,
+        },
+    ))
 }
 
 /// What the single phrase `phrase` works out to against `today`, or `None`
@@ -461,7 +700,7 @@ pub fn resolve(phrase: &str, today: CivilDate, week: WeekStart) -> Option<Resolu
         return None;
     }
     let words: Vec<&str> = toks.iter().map(|t| t.text.as_str()).collect();
-    let parsed = parse(&words, to_days(today), week)?;
+    let parsed = parse(&words, to_days(today), None, week)?;
     (parsed.consumed == words.len()).then_some(parsed.resolution)
 }
 
@@ -489,7 +728,20 @@ pub fn resolve(phrase: &str, today: CivilDate, week: WeekStart) -> Option<Resolu
 /// is today). "in 1 month" keeps the day, or the month's last day when it is
 /// shorter (31 Jan is 28 Feb); [`Found::clamped`] says when that happened. "end of the
 /// week" is Friday or the last day of the week.
-pub fn find(text: &str, today: CivilDate, week: WeekStart) -> Vec<Found> {
+///
+/// A date phrase can be followed by a time (#706): `EOD` or `COB` or `end of
+/// day` (taken as 17:00, and marked [`Time::assumed`]), `noon`, or a clock
+/// time such as `5pm`, `9:30 am` or `17:00`, with an optional `at` or `by`.
+/// A time that could be read two ways ("at 5") is left out and the date still
+/// stands. `in N hours|minutes`, `N hours ago` and `N minutes from now` need
+/// `now_minute`, the minutes since local midnight; without it they are not
+/// resolved. An out-of-range `now_minute` counts as without.
+pub fn find_at(
+    text: &str,
+    today: CivilDate,
+    now_minute: Option<u16>,
+    week: WeekStart,
+) -> Vec<Found> {
     if !valid(today) {
         return Vec::new();
     }
@@ -514,19 +766,32 @@ pub fn find(text: &str, today: CivilDate, week: WeekStart) -> Vec<Found> {
             end += 1;
         }
         let words: Vec<&str> = toks[i..end].iter().map(|t| t.text.as_str()).collect();
-        if let Some(p) = parse(&words, today_days, week) {
-            let last = i + p.consumed - 1;
+        if let Some(p) = parse(&words, today_days, now_minute, week) {
+            let mut last = i + p.consumed - 1;
             if !(p.weekday_phrase && near_written_date(&toks, i, last)) {
-                let phrase = toks[i..=last]
-                    .iter()
-                    .map(|t| &text[t.start..t.end])
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                // A time after the phrase, unless the phrase brought its own.
+                let mut time = p.time;
+                if time.is_none() {
+                    if let Some((end, t)) = read_time(text, &toks, last + 1) {
+                        last = end;
+                        time = Some(t);
+                    }
+                }
+                let mut phrase = String::new();
+                for k in i..=last {
+                    if k > i {
+                        // Between words: a space, or the colon in "5:30".
+                        let colon = colon_between(text, &toks[k - 1], &toks[k]);
+                        phrase.push(if colon { ':' } else { ' ' });
+                    }
+                    phrase.push_str(&text[toks[k].start..toks[k].end]);
+                }
                 if seen.insert(phrase.to_lowercase()) {
                     found.push(Found {
                         phrase,
                         resolution: p.resolution,
                         clamped: p.clamped,
+                        time,
                     });
                 }
                 i = last + 1;
@@ -536,6 +801,12 @@ pub fn find(text: &str, today: CivilDate, week: WeekStart) -> Vec<Found> {
         i += 1;
     }
     found
+}
+
+/// [`find_at`] without a clock: the date forms only.
+#[cfg(test)]
+pub fn find(text: &str, today: CivilDate, week: WeekStart) -> Vec<Found> {
+    find_at(text, today, None, week)
 }
 
 // -- a date already written next to a weekday --------------------------------
@@ -875,11 +1146,7 @@ mod tests {
     fn the_windows_first_day_of_week_picks_the_week_start() {
         assert_eq!(week_start_from_locale(0), WeekStart::Monday);
         assert_eq!(week_start_from_locale(6), WeekStart::Sunday);
-        assert_eq!(
-            week_start_from_locale(5),
-            WeekStart::Monday,
-            "Saturday is read as Monday"
-        );
+        assert_eq!(week_start_from_locale(5), WeekStart::Saturday);
         assert_eq!(
             week_start_from_locale(99),
             WeekStart::Monday,
@@ -1068,7 +1335,8 @@ mod tests {
 
     #[test]
     fn a_weekday_with_a_time_or_ordinary_words_is_still_found() {
-        assert_eq!(phrases("Friday 5pm", WED), ["Friday"]);
+        // A clear time is part of the phrase (#706); "at 5" is not clear.
+        assert_eq!(phrases("Friday 5pm", WED), ["Friday 5pm"]);
         assert_eq!(phrases("Friday at 5", WED), ["Friday"]);
         assert_eq!(phrases("Friday may work", WED), ["Friday"]);
         assert_eq!(phrases("on Friday the meeting moves", WED), ["Friday"]);
@@ -1154,5 +1422,215 @@ mod tests {
             describe(&Resolution::One(d(2026, 9, 29)), WED),
             "Tue Sep 29"
         );
+    }
+
+    // -- Saturday-first weeks (#707) ------------------------------------------------------
+
+    /// Saturday 26 September 2026: the first day of a Saturday-first week.
+    const SAT: CivilDate = CivilDate {
+        year: 2026,
+        month: 9,
+        day: 26,
+    };
+
+    fn rs(phrase: &str, today: CivilDate) -> Option<Resolution> {
+        resolve(phrase, today, WeekStart::Saturday)
+    }
+
+    #[test]
+    fn a_saturday_first_week_runs_saturday_to_friday() {
+        assert_eq!(weekday_of(to_days(SAT)), 5, "2026-09-26 is a Saturday");
+        // Monday-first and Sunday-first weeks both end on the 27th or 26th, so
+        // "Friday this week" is the 25th there and the 2nd in a Saturday week.
+        assert_eq!(rs("Friday this week", SAT), one(2026, 10, 2));
+        assert_eq!(
+            resolve("Friday this week", SAT, WeekStart::Monday),
+            one(2026, 9, 25)
+        );
+        assert_eq!(
+            resolve("Friday this week", SAT, WeekStart::Sunday),
+            one(2026, 9, 25)
+        );
+        assert_eq!(rs("Friday next week", SAT), one(2026, 10, 9));
+        assert_eq!(rs("Friday last week", SAT), one(2026, 9, 25));
+        assert_eq!(rs("Saturday this week", SAT), one(2026, 9, 26));
+        assert_eq!(rs("Monday next week", WED), one(2026, 9, 28));
+    }
+
+    #[test]
+    fn this_weekday_follows_the_saturday_week() {
+        let sun = d(2026, 9, 27);
+        assert_eq!(rs("this Monday", sun), one(2026, 9, 28));
+        assert_eq!(
+            resolve("this Monday", sun, WeekStart::Monday),
+            either((2026, 9, 21), (2026, 9, 28)),
+            "a Monday-first week has already had its Monday"
+        );
+        assert_eq!(rs("this Friday", WED), one(2026, 9, 25));
+    }
+
+    #[test]
+    fn end_of_a_saturday_week_is_one_day_the_friday() {
+        assert_eq!(rs("end of the week", SAT), one(2026, 10, 2));
+        assert_eq!(rs("end of next week", SAT), one(2026, 10, 9));
+        // Other starts still show both readings.
+        assert_eq!(
+            resolve("end of the week", WED, WeekStart::Monday),
+            either((2026, 9, 25), (2026, 9, 27))
+        );
+    }
+
+    #[test]
+    fn windows_week_start_five_is_saturday() {
+        assert_eq!(week_start_from_locale(5), WeekStart::Saturday);
+        assert_eq!(week_start_from_locale(6), WeekStart::Sunday);
+        assert_eq!(week_start_from_locale(0), WeekStart::Monday);
+        assert_eq!(week_start_from_locale(1), WeekStart::Monday);
+        assert_eq!(week_start_from_locale(u32::MAX), WeekStart::Monday);
+    }
+
+    // -- times of day (#706) --------------------------------------------------------------
+
+    /// 14:05, in minutes since midnight.
+    const NOW: Option<u16> = Some(14 * 60 + 5);
+
+    fn at(text: &str) -> Vec<Found> {
+        find_at(text, WED, NOW, WeekStart::Monday)
+    }
+
+    fn time_of(text: &str) -> Option<(u16, bool)> {
+        at(text)
+            .first()
+            .and_then(|f| f.time)
+            .map(|t| (t.minute_of_day, t.assumed))
+    }
+
+    #[test]
+    fn eod_is_five_in_the_afternoon_and_says_it_was_assumed() {
+        let f = at("tomorrow EOD");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].phrase, "tomorrow EOD");
+        assert_eq!(f[0].resolution, Resolution::One(d(2026, 9, 24)));
+        assert_eq!(
+            f[0].time.map(|t| (t.minute_of_day, t.assumed)),
+            Some((17 * 60, true))
+        );
+        assert_eq!(time_of("tomorrow COB"), Some((17 * 60, true)));
+        assert_eq!(time_of("tomorrow end of day"), Some((17 * 60, true)));
+        assert_eq!(at("tomorrow by EOD")[0].phrase, "tomorrow by EOD");
+    }
+
+    #[test]
+    fn a_written_clock_time_is_kept_as_written() {
+        let f = at("Friday at 5pm");
+        assert_eq!(f[0].phrase, "Friday at 5pm");
+        assert_eq!(
+            f[0].resolution,
+            Resolution::Either(d(2026, 9, 18), d(2026, 9, 25))
+        );
+        assert_eq!(
+            f[0].time.map(|t| (t.minute_of_day, t.assumed)),
+            Some((17 * 60, false))
+        );
+        assert_eq!(time_of("tomorrow at 9:30am"), Some((9 * 60 + 30, false)));
+        assert_eq!(time_of("tomorrow at 9:30 AM"), Some((9 * 60 + 30, false)));
+        assert_eq!(time_of("tomorrow 5 pm"), Some((17 * 60, false)));
+        assert_eq!(time_of("tomorrow 17:00"), Some((17 * 60, false)));
+        assert_eq!(time_of("tomorrow at 09:15"), Some((9 * 60 + 15, false)));
+        assert_eq!(time_of("tomorrow at noon"), Some((12 * 60, false)));
+        assert_eq!(time_of("tomorrow at 12am"), Some((0, false)));
+        assert_eq!(time_of("tomorrow at 12pm"), Some((12 * 60, false)));
+        assert_eq!(time_of("tomorrow at 12:30pm"), Some((12 * 60 + 30, false)));
+        assert_eq!(at("tomorrow at 5:30pm")[0].phrase, "tomorrow at 5:30pm");
+    }
+
+    #[test]
+    fn a_time_that_could_be_read_two_ways_is_not_guessed() {
+        // No am or pm, and not written as 24-hour: no time, the date stays.
+        for text in [
+            "tomorrow at 5",
+            "tomorrow at 5:30",
+            "tomorrow at 13pm",
+            "tomorrow at 0pm",
+            "tomorrow at 9:75am",
+            "tomorrow at 25:00",
+            "tomorrow at 9:5pm",
+            "tomorrow at 5 people",
+            "tomorrow at",
+            "tomorrow 123pm",
+        ] {
+            let f = at(text);
+            assert_eq!(f.len(), 1, "{text}");
+            assert_eq!(f[0].phrase, "tomorrow", "{text}");
+            assert_eq!(f[0].time, None, "{text}");
+        }
+        assert_eq!(time_of("tomorrow"), None, "no time written, none shown");
+    }
+
+    #[test]
+    fn hostile_digits_never_panic() {
+        let long = format!("tomorrow at {}pm", "9".repeat(5000));
+        assert_eq!(at(&long)[0].time, None);
+        assert_eq!(at("tomorrow at \u{ff15}pm")[0].time, None);
+        assert_eq!(at("tomorrow at 5:\u{ff10}\u{ff10}pm")[0].time, None);
+        assert_eq!(at("tomorrow at 5:30\u{301}pm")[0].time, None);
+        assert_eq!(at("tomorrow at :")[0].time, None);
+    }
+
+    #[test]
+    fn hours_and_minutes_ahead_need_the_clock() {
+        let f = at("in 2 hours");
+        assert_eq!(f[0].phrase, "in 2 hours");
+        assert_eq!(f[0].resolution, Resolution::One(d(2026, 9, 23)));
+        assert_eq!(
+            f[0].time.map(|t| (t.minute_of_day, t.assumed)),
+            Some((16 * 60 + 5, false))
+        );
+        assert_eq!(time_of("in 90 minutes"), Some((15 * 60 + 35, false)));
+        assert_eq!(time_of("in an hour"), Some((15 * 60 + 5, false)));
+        assert_eq!(time_of("2 hours from now"), Some((16 * 60 + 5, false)));
+        assert_eq!(time_of("3 hours ago"), Some((11 * 60 + 5, false)));
+        // Without the clock there is nothing honest to show.
+        assert!(find_at("in 2 hours", WED, None, WeekStart::Monday).is_empty());
+    }
+
+    #[test]
+    fn hours_ahead_cross_midnight_and_a_year_end() {
+        let f = at("in 10 hours");
+        assert_eq!(f[0].resolution, Resolution::One(d(2026, 9, 24)));
+        assert_eq!(f[0].time.map(|t| t.minute_of_day), Some(5));
+        let late = find_at(
+            "in 3 hours",
+            d(2026, 12, 31),
+            Some(23 * 60),
+            WeekStart::Monday,
+        );
+        assert_eq!(late[0].resolution, Resolution::One(d(2027, 1, 1)));
+        assert_eq!(late[0].time.map(|t| t.minute_of_day), Some(2 * 60));
+        let early = find_at("2 hours ago", d(2027, 1, 1), Some(30), WeekStart::Monday);
+        assert_eq!(early[0].resolution, Resolution::One(d(2026, 12, 31)));
+        assert_eq!(early[0].time.map(|t| t.minute_of_day), Some(22 * 60 + 30));
+    }
+
+    #[test]
+    fn a_clock_beyond_the_day_is_not_trusted() {
+        assert!(find_at("in 2 hours", WED, Some(24 * 60), WeekStart::Monday).is_empty());
+        assert!(find_at("in 2 hours", WED, Some(u16::MAX), WeekStart::Monday).is_empty());
+    }
+
+    #[test]
+    fn the_time_label_follows_the_date() {
+        let f = &at("Friday at 5pm")[0];
+        assert_eq!(describe_found(f, WED), "Fri Sep 18 or Fri Sep 25, 17:00");
+        let g = &at("tomorrow at 9:05am")[0];
+        assert_eq!(describe_found(g, WED), "Thu Sep 24, 09:05");
+        let h = &at("tomorrow")[0];
+        assert_eq!(describe_found(h, WED), "Thu Sep 24");
+    }
+
+    #[test]
+    fn find_without_a_clock_is_the_old_behaviour() {
+        assert_eq!(phrases("tomorrow at 5pm", WED), ["tomorrow at 5pm"]);
+        assert!(find("in 2 hours", WED, WeekStart::Monday).is_empty());
     }
 }
