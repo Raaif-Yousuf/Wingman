@@ -428,6 +428,19 @@ fn to_screen(stream: &[Tok], start: usize, n: usize, boxes: &[WordBox], space: &
     }
 }
 
+/// Every usable OCR word box (a line with no word boxes gives its own) in
+/// screen pixels, for a label to keep off.
+pub fn word_rects(lines: &[OcrLine], space: &Space) -> Vec<ScreenRect> {
+    if !space_is_usable(space) {
+        return Vec::new();
+    }
+    let (boxes, _) = flatten(lines);
+    boxes
+        .iter()
+        .filter_map(|b| map_rect(b.rect, space))
+        .collect()
+}
+
 /// `screen = origin + image * scale`, rounded outward and clipped to the
 /// captured monitor. `None` when nothing is left.
 fn map_rect(r: (f32, f32, f32, f32), s: &Space) -> Option<ScreenRect> {
@@ -919,6 +932,22 @@ mod tests {
         let got = found(locate(&lines, &quote("hello", 1), &s));
         // Monitor spans x 500..1500, y 0..1000.
         assert_eq!(got, vec![rect(1490, 995, 1500, 1000)]);
+    }
+
+    #[test]
+    fn word_rects_lists_every_usable_word_in_screen_pixels() {
+        let mut bad = line("nan", 0.0, 50.0);
+        bad.words[0].width = f32::NAN;
+        let lines = [line("hello", 10.0, 20.0), bad, line("off", 2000.0, 0.0)];
+        let got = word_rects(&lines, &space());
+        // The NaN box and the off-monitor box are left out.
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].left, 10);
+        let unusable = Space {
+            scale_x: 0.0,
+            ..space()
+        };
+        assert!(word_rects(&lines, &unusable).is_empty());
     }
 
     #[test]

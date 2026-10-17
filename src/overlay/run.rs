@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use crate::capture::{RawShot, ScreenRect};
 use crate::ocr::OcrOutput;
 
-use super::anchor::Space;
+use super::anchor::{word_rects, Space};
 use super::annotation::Annotation;
 use super::detect;
 
@@ -24,6 +24,8 @@ pub struct Found {
     pub annotations: Vec<Annotation>,
     /// The part of the screen the capture covered.
     pub monitor: ScreenRect,
+    /// Every OCR word box on the capture, in screen pixels.
+    pub obstacles: Vec<ScreenRect>,
 }
 
 /// Runs `detector` over `raw`. `recognize` gets exactly `raw`, so the boxes it
@@ -48,6 +50,7 @@ pub fn detect_on_shot(
     Ok(Found {
         annotations,
         monitor: space.monitor_rect(),
+        obstacles: word_rects(&ocr.lines, &space),
     })
 }
 
