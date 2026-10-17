@@ -86,10 +86,52 @@ fn the_snapshot_follows_tab_focus() {
 }
 
 #[test]
-fn a_collapsed_card_offers_no_links() {
+fn a_collapsed_card_offers_no_links_but_can_be_expanded() {
     let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
     card.show_model_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+    let snap = card.inner.uia_snapshot();
+    assert!(snap.links.is_empty());
+    assert!(snap.expandable, "a collapsed card with detail can expand");
+    // With no detail there is nothing to expand to.
+    card.show_model_answer("2 + 2 = 4", "", 0, None);
     assert_eq!(card.inner.uia_snapshot(), Snapshot::default());
+}
+
+/// #977: Narrator's Invoke on the collapsed card expands it, through the
+/// same message a footer link uses.
+#[test]
+fn an_expand_request_expands_a_collapsed_card() {
+    let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+    card.stay_open_on_focus_loss();
+    card.show_model_answer("2 + 2 = 4", "You carried correctly.", 0, None);
+    assert_eq!(card.state(), CardState::Collapsed);
+    card.inner
+        .uia_link_requested(card_uia::EXPAND_ID, card_uia::LINK_INVOKE);
+    assert_eq!(card.state(), CardState::Expanded);
+    // A second request on the expanded card changes nothing.
+    card.inner
+        .uia_link_requested(card_uia::EXPAND_ID, card_uia::LINK_INVOKE);
+    assert_eq!(card.state(), CardState::Expanded);
+}
+
+/// #977: a new verdict or error is announced, and only when a client listens.
+#[test]
+fn a_new_card_is_announced_only_to_a_listening_client() {
+    let src = include_str!("../card.rs").replace('\r', "");
+    let show = src
+        .find("    fn show_collapsed_with(")
+        .expect("show_collapsed_with");
+    let body = &src[show..];
+    let body = &body[..body.find("\n    fn ").expect("a later fn")];
+    assert!(body.contains("self.announce_to_screen_readers("), "{body}");
+    let announce = src
+        .find("    fn announce_to_screen_readers(")
+        .expect("announce fn");
+    let a = &src[announce..];
+    let a = &a[..a.find("\n    fn ").expect("a later fn")];
+    let listening = a.find("UiaClientsAreListening").expect("no listener gate");
+    let raise = a.find("raise_announcement").expect("no raise");
+    assert!(listening < raise, "the gate must come first: {a}");
 }
 
 #[test]
@@ -349,7 +391,13 @@ fn destroying_the_card_leaves_an_empty_snapshot() {
 
 #[test]
 fn sync_without_a_uia_client_builds_nothing() {
+    // A live client in a parallel test makes `UiaClientsAreListening` true,
+    // and showing a card then builds the tree to announce it (#977).
+    let _uia = uia_lock();
     let mut card = error_card();
+    // Any UIA client on the machine (not only this test's) can have made
+    // showing the card build the tree; start this check from a clean card.
+    card.inner.uia_disconnect();
     assert!(card.inner.uia.is_none());
     card.inner.sync_uia(None);
     assert!(card.inner.uia.is_none());
