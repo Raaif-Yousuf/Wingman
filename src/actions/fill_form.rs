@@ -499,7 +499,7 @@ pub fn build_model_prompt(unmapped: &[UnmappedField], profile: &Profile) -> Stri
 /// a real, fully-local-mappable form.
 pub fn form_fill_request(shot: &Shot, unmapped: &[UnmappedField], profile: &Profile) -> Request {
     Request {
-        system: build_model_prompt(unmapped, profile),
+        system: crate::provider::with_screen_note(&build_model_prompt(unmapped, profile)),
         user: "Fill in what you can; \"skip\" anything you are not sure about.".to_string(),
         images: vec![shot.png.clone()],
         schema: Some(
@@ -1478,6 +1478,10 @@ mod tests {
             height: 10,
         };
         let req = form_fill_request(&shot, &unmapped, &profile);
+        // #799: the screenshot is data, never instructions.
+        assert!(req
+            .system
+            .ends_with(crate::actions::generic_inputs::UNTRUSTED_SCREEN_NOTE));
         assert_eq!(req.images, vec![vec![1u8, 2, 3]]);
         assert_eq!(
             req.schema,
