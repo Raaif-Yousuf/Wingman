@@ -13,6 +13,7 @@ pub mod diff;
 pub mod hash;
 pub mod ingest;
 pub mod mask;
+pub mod notice;
 pub mod parse;
 pub mod retrieve;
 
