@@ -233,6 +233,124 @@ fn tooltip_spend() -> Option<String> {
         .clone()
 }
 
+/// #1203: posted by the one-shot worker that opens `config.toml` or the
+/// knowledge folder, only when that failed. No payload: the worker leaves the
+/// failure in [`SHELL_OPEN_FAILURE`] first, so a message that is dropped or
+/// arrives after the window is gone costs nothing. The file and shell work
+/// runs off the message thread because it can block (a network share, a slow
+/// shell extension, `icacls`), and that thread also hosts the keyboard hook,
+/// which Windows drops if it stalls. `WM_APP + 34`: `+33` is the copy-text
+/// result (#1199).
+pub const WM_APP_SHELL_OPEN_DONE: u32 = WM_APP + 34;
+
+/// What a failed open puts on the card.
+struct ShellOpenFailure {
+    title: String,
+    detail: String,
+    /// A save failure keeps the "Copy details" text; a plain open failure does not.
+    with_details: bool,
+}
+
+static SHELL_OPEN_FAILURE: std::sync::Mutex<Option<ShellOpenFailure>> = std::sync::Mutex::new(None);
+
+fn store_shell_open_failure(failure: ShellOpenFailure) {
+    *SHELL_OPEN_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure);
+}
+
+fn take_shell_open_failure() -> Option<ShellOpenFailure> {
+    SHELL_OPEN_FAILURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// #1203: the file and shell work behind "Edit settings" and "Open knowledge
+/// folder". Runs on a worker.
+enum ShellOpenJob {
+    /// Create `config.toml` from the running config when it is missing, then open it.
+    ConfigFile {
+        config: Box<Config>,
+        path: std::path::PathBuf,
+    },
+    /// Create the folder when it is missing, then open it.
+    Folder { path: std::path::PathBuf },
+}
+
+/// `ShellExecuteW` reports failure as a value of 32 or less.
+fn shell_open_failed(code: isize) -> bool {
+    code <= 32
+}
+
+fn run_shell_open_job(job: ShellOpenJob) -> std::result::Result<(), ShellOpenFailure> {
+    match job {
+        ShellOpenJob::ConfigFile { config, path } => {
+            // Make sure the file exists before asking the shell to open it.
+            let needed_create = !path.exists();
+            let save_result = if needed_create { config.save() } else { Ok(()) };
+            if !App::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
+                // Rule 7: the save the user's click caused must not fail silently.
+                return Err(ShellOpenFailure {
+                    title: "Couldn't save settings".into(),
+                    detail: save_result
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_default(),
+                    with_details: true,
+                });
+            }
+            open_with_shell(&path, "Couldn't open config.toml", "Windows")
+        }
+        ShellOpenJob::Folder { path } => {
+            std::fs::create_dir_all(&path).map_err(|e| ShellOpenFailure {
+                title: "Couldn't open the knowledge folder".into(),
+                detail: format!("{} could not be created: {e}", path.display()),
+                with_details: false,
+            })?;
+            open_with_shell(&path, "Couldn't open the knowledge folder", "Explorer")
+        }
+    }
+}
+
+fn open_with_shell(
+    path: &std::path::Path,
+    title: &str,
+    opener: &str,
+) -> std::result::Result<(), ShellOpenFailure> {
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated path that outlives the call. COM is
+    // initialised for the shell's sake (documented for `ShellExecuteW`) and
+    // balanced here only when this call really initialised it.
+    let code = unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let result = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+        if com {
+            CoUninitialize();
+        }
+        result.0 as isize
+    };
+    if shell_open_failed(code) {
+        return Err(ShellOpenFailure {
+            title: title.into(),
+            detail: format!("{opener} would not open {}.", path.display()),
+            with_details: false,
+        });
+    }
+    Ok(())
+}
 /// Keeps at most one spend worker alive; a request that arrives while one runs
 /// makes it read once more instead of starting a second thread.
 #[derive(Default)]
@@ -6158,6 +6276,7 @@ impl App {
                 DeferredMessage::PauseToggle => self.toggle_pause(),
                 DeferredMessage::NeedScreen(run) => self.on_need_screen(run as usize),
                 DeferredMessage::TooltipSpend => self.on_tooltip_spend(),
+                DeferredMessage::ShellOpenDone => self.on_shell_open_done(),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
                 }
@@ -6341,41 +6460,13 @@ impl App {
             self.set_watch(true);
             return;
         };
-        // Make sure the file exists before asking the shell to open it.
-        let needed_create = !path.exists();
-        let save_result = if needed_create {
-            self.config.save()
-        } else {
-            Ok(())
-        };
-        if !Self::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
-            // Rule 7: the save the user's click just caused must not fail
-            // silently -- before this fix, `let _ = self.config.save();`
-            // dropped the error and still tried to open a file that might
-            // not exist.
-            if let Err(e) = &save_result {
-                let detail = self.track_error("Couldn't save settings", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't save settings", &detail);
-                self.set_watch(true);
-            }
-            return;
-        }
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                PCWSTR(wide.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            );
-        }
+        // #1203: the existence check, the first save (Credential Manager and
+        // an `icacls` process) and the shell open all run on a worker. The
+        // message thread also hosts the keyboard hook.
+        self.spawn_shell_open(ShellOpenJob::ConfigFile {
+            config: Box::new(self.config.clone()),
+            path,
+        });
     }
 
     /// #81: opens the knowledge folder in Explorer, creating it first when it
@@ -6391,40 +6482,55 @@ impl App {
             self.set_watch(true);
             return;
         };
-        if let Err(e) = std::fs::create_dir_all(&path) {
+        // #1203: the folder can be on a network share, and the
+        // shell open can block on a slow shell extension: both run on a
+        // worker.
+        self.spawn_shell_open(ShellOpenJob::Folder { path });
+    }
+
+    /// #1203: runs `job` on a one-shot worker and posts `WM_APP_SHELL_OPEN_DONE`
+    /// when it fails. Success posts nothing: the opened window is the answer.
+    fn spawn_shell_open(&mut self, job: ShellOpenJob) {
+        let target = self.hwnd_isize();
+        let spawned = std::thread::Builder::new()
+            .name("shell-open".into())
+            .spawn(move || {
+                if let Err(failure) = run_shell_open_job(job) {
+                    store_shell_open_failure(failure);
+                    unsafe {
+                        // A failed post (window gone) is harmless: no payload.
+                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            Some(HWND(target as *mut _)),
+                            WM_APP_SHELL_OPEN_DONE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Rule 7: no thread is still a card.
             self.card.show_error(
-                "Couldn't open the knowledge folder",
-                &format!("{} could not be created: {e}", path.display()),
-            );
-            self.set_watch(true);
-            return;
-        }
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `wide` is a NUL-terminated path that outlives the call.
-        let result = unsafe {
-            ShellExecuteW(
-                None,
-                w!("open"),
-                PCWSTR(wide.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            )
-        };
-        // ShellExecuteW reports failure as a value of 32 or less.
-        if result.0 as isize <= 32 {
-            self.card.show_error(
-                "Couldn't open the knowledge folder",
-                &format!("Explorer would not open {}.", path.display()),
+                "Couldn't open it",
+                "Wingman could not start a background task. Try again.",
             );
             self.set_watch(true);
         }
     }
 
+    /// `WM_APP_SHELL_OPEN_DONE` (#1203): the worker's failure becomes a card.
+    fn on_shell_open_done(&mut self) {
+        let Some(failure) = take_shell_open_failure() else {
+            return;
+        };
+        if failure.with_details {
+            let detail = self.track_error(&failure.title, &failure.detail);
+            self.card.show_error_with_details(&failure.title, &detail);
+        } else {
+            self.card.show_error(&failure.title, &failure.detail);
+        }
+        self.set_watch(true);
+    }
     /// Apply a model chosen from a tray submenu. The index addresses the
     /// tray's own list, which is not necessarily the config's — it appends a
     /// hand-edited current model that is missing from `models` — so the name
@@ -9126,6 +9232,9 @@ enum DeferredMessage {
     /// `WM_APP_TOOLTIP_SPEND` (#1181): re-apply the stored spend text once the
     /// menu or dialog is gone, so the tooltip does not lag a request.
     TooltipSpend,
+    /// `WM_APP_SHELL_OPEN_DONE` (#1203): a failed open still ends in a card once
+    /// the menu, dialog or Settings is gone.
+    ShellOpenDone,
 }
 
 /// The card for a key the hook captured for a shortcut change that could not be
@@ -9524,6 +9633,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #1181: no payload; delivered after the modal so the tooltip does not
         // lag a request.
         | WM_APP_TOOLTIP_SPEND
+        // #1203: a failed open is owed a card.
+        | WM_APP_SHELL_OPEN_DONE
         // #1013: the hook swallowed the key, so it ends in a card.
         | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
@@ -9806,6 +9917,7 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
         WM_APP_NEED_SCREEN => DeferredMessage::NeedScreen(wparam.0 as u64),
         WM_APP_TOOLTIP_SPEND => DeferredMessage::TooltipSpend,
+        WM_APP_SHELL_OPEN_DONE => DeferredMessage::ShellOpenDone,
         // #1011: tray menu only; see `tray_menu_policy`.
         WM_APP_ROUTER_RESULT => {
             let (generation, result) = unsafe {
@@ -9942,6 +10054,8 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         // Settings is in front. Settings takes its own Change's chord before
         // it gets here, so this one belongs to the tray; it ends in a card.
         | WM_APP_LEARNED
+        // #1203: a failed open ends in a card.
+        | WM_APP_SHELL_OPEN_DONE
         | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
@@ -10566,6 +10680,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_tooltip_spend();
             LRESULT(0)
         }
+        WM_APP_SHELL_OPEN_DONE => {
+            // #1203: no payload; the failure is in SHELL_OPEN_FAILURE.
+            app.on_shell_open_done();
+            LRESULT(0)
+        }
         WM_APP_CALENDAR_RESULT => {
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
@@ -10868,6 +10987,7 @@ mod tests {
     use super::BeginPlan;
     use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_FIRST_RUN;
+    use super::WM_APP_SHELL_OPEN_DONE;
     use super::WM_APP_TOOLTIP_SPEND;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
@@ -14934,6 +15054,7 @@ mod tests {
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
         ("WM_APP_NEED_SCREEN", WM_APP_NEED_SCREEN),
         ("WM_APP_TOOLTIP_SPEND", WM_APP_TOOLTIP_SPEND),
+        ("WM_APP_SHELL_OPEN_DONE", WM_APP_SHELL_OPEN_DONE),
     ];
 
     // -- #1181: the tooltip's spend part is read off the UI thread -----------
@@ -15052,6 +15173,109 @@ mod tests {
             super::settings_foreground_policy(WM_APP_TOOLTIP_SPEND),
             super::ForegroundPolicy::Pass
         );
+    }
+
+    // -- #1203: file and shell work stays off the message thread -------------
+
+    /// `edit_settings` and `open_knowledge_folder` run on the thread that also
+    /// hosts the keyboard hook. Saving the config (Credential Manager, an
+    /// `icacls` process), creating a folder on a possibly slow share and
+    /// `ShellExecuteW` (slow shell extensions) all belong on a worker.
+    #[test]
+    fn the_open_commands_do_no_file_or_shell_work_on_the_message_thread() {
+        let src = lf(include_str!("app.rs"));
+        let edit = body_between(&src, "    fn edit_settings(&mut self) {", "\n    }\n");
+        let folder = body_between(
+            &src,
+            "    fn open_knowledge_folder(&mut self) {",
+            "\n    }\n",
+        );
+        for (name, body) in [("edit_settings", &edit), ("open_knowledge_folder", &folder)] {
+            assert!(body.len() > 100, "slicing broke for {name}: {body}");
+            for banned in [
+                ".save()",
+                "ShellExecuteW",
+                "create_dir_all",
+                ".exists()",
+                "std::fs::",
+            ] {
+                assert!(!body.contains(banned), "{name} calls {banned}");
+            }
+            assert!(body.contains("spawn_shell_open("), "{name} never spawns");
+        }
+    }
+    #[test]
+    fn a_refused_shell_open_is_a_failure_and_a_started_one_is_not() {
+        assert!(super::shell_open_failed(0));
+        assert!(super::shell_open_failed(5)); // SE_ERR_ACCESSDENIED
+        assert!(super::shell_open_failed(32));
+        assert!(!super::shell_open_failed(33));
+    }
+
+    /// A folder that cannot be created is a failure with a plain sentence,
+    /// not a silent no-op (rule 7). The path sits under a plain file.
+    #[test]
+    fn an_uncreatable_knowledge_folder_is_reported() {
+        let file = std::env::temp_dir().join(format!("wingman-shell-open-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let result = super::run_shell_open_job(super::ShellOpenJob::Folder {
+            path: file.join("sub"),
+        });
+        let _ = std::fs::remove_file(&file);
+        let Err(failure) = result else {
+            panic!("create_dir_all under a file succeeded");
+        };
+        assert_eq!(failure.title, "Couldn't open the knowledge folder");
+        assert!(
+            failure.detail.contains("could not be created"),
+            "{}",
+            failure.detail
+        );
+        assert!(!failure.with_details);
+    }
+
+    #[test]
+    fn the_shell_failure_slot_hands_over_once() {
+        super::store_shell_open_failure(super::ShellOpenFailure {
+            title: "t".into(),
+            detail: "d".into(),
+            with_details: false,
+        });
+        let first = super::take_shell_open_failure();
+        assert_eq!(first.map(|f| f.title), Some("t".to_string()));
+        assert!(super::take_shell_open_failure().is_none());
+    }
+
+    #[test]
+    fn a_shell_open_failure_behind_a_modal_is_kept_and_shown_afterwards() {
+        for policy in [
+            settings_reentrancy_policy(WM_APP_SHELL_OPEN_DONE, FAKE_TASKBAR_CREATED_MSG),
+            super::tray_menu_policy(WM_APP_SHELL_OPEN_DONE, FAKE_TASKBAR_CREATED_MSG),
+            super::file_dialog_policy(WM_APP_SHELL_OPEN_DONE, FAKE_TASKBAR_CREATED_MSG),
+        ] {
+            assert_eq!(policy, SettingsReentrancy::Defer);
+        }
+        assert!(matches!(
+            super::take_deferred(
+                WM_APP_SHELL_OPEN_DONE,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0)
+            ),
+            Some(super::DeferredMessage::ShellOpenDone)
+        ));
+        assert_eq!(
+            super::settings_foreground_policy(WM_APP_SHELL_OPEN_DONE),
+            super::ForegroundPolicy::Hold
+        );
+        let src = lf(include_str!("app.rs"));
+        let arm = body_between(&src, "        WM_APP_SHELL_OPEN_DONE => {", "\n        }\n");
+        assert!(arm.contains("app.on_shell_open_done()"), "{arm}");
+        let worker = body_between(
+            &src,
+            "    fn spawn_shell_open(&mut self, job: ShellOpenJob) {",
+            "\n    }\n",
+        );
+        assert!(worker.contains("WM_APP_SHELL_OPEN_DONE"), "{worker}");
     }
 
     // -- #567: the tray's Ollama model cache --------------------------------
@@ -16237,6 +16461,11 @@ mod tests {
         (
             "WM_APP_TOOLTIP_SPEND",
             WM_APP_TOOLTIP_SPEND,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_SHELL_OPEN_DONE",
+            WM_APP_SHELL_OPEN_DONE,
             SettingsReentrancy::Defer,
         ),
     ];
