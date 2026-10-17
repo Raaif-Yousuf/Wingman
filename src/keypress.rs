@@ -12,6 +12,7 @@
 //! |---|---|---|
 //! | No card (or a card this table does not cover) | Proceed: the primary action | same |
 //! | Looking, inside the window of the press that started it | Absorb (the second tap) | n/a |
+//! | Looking, inside the window, and a last action exists | Repeat it (#42) | n/a |
 //! | Looking | Cancel, no card | Cancel, no card |
 //! | Options card, option 1 key-pickable | Run option 1 | Run option 2 if key-pickable, else nothing |
 //! | Options card, option 1 not key-pickable | Dismiss | Run option 2 if key-pickable, else dismiss |
@@ -67,6 +68,9 @@ pub enum Phase {
         /// Look, so this press is the second tap of a double.
         early: bool,
     },
+    /// The second tap of a double on a fresh Look, and the app has a last
+    /// action to run again (#42). Without one this is `Looking { early: true }`.
+    Repeat,
     /// The options card shows its buttons.
     Options {
         /// How many buttons there are.
@@ -88,6 +92,9 @@ pub enum KeyAction {
     Close,
     /// Run this option (0-based).
     RunOption(usize),
+    /// Run the last action again on a fresh look at the screen (#42). The app
+    /// still checks the action may be run by the key (never a clipboard one).
+    Repeat,
     /// Do nothing: the second tap of a double with nothing to repeat, or a
     /// key that must not act in this mode.
     Absorb,
@@ -101,6 +108,7 @@ pub fn on_key(phase: Phase, mode: KeyMode, press: Press) -> KeyAction {
             KeyMode::Pick => KeyAction::Absorb,
             KeyMode::Dynamic | KeyMode::Close => KeyAction::Close,
         },
+        Phase::Repeat => KeyAction::Repeat,
         Phase::Looking { early: true } => KeyAction::Absorb,
         Phase::Looking { early: false } => KeyAction::Close,
         Phase::Options { count, pickable } => {
@@ -186,6 +194,31 @@ mod tests {
                 on_key(Phase::Looking { early: true }, mode, Single),
                 KeyAction::Absorb
             );
+        }
+    }
+
+    // #42: the second tap of a double on a fresh Look, with a last action to
+    // repeat, repeats it in every mode. Nothing else repeats.
+    #[test]
+    fn the_second_tap_with_a_last_action_repeats_it_in_every_mode() {
+        for mode in [Dynamic, Pick, Close] {
+            for press in [Single, Double] {
+                assert_eq!(on_key(Phase::Repeat, mode, press), KeyAction::Repeat);
+            }
+            assert!(!needs_window(Phase::Repeat, mode), "acts at once");
+        }
+        for phase in [
+            Phase::Other,
+            Phase::Answer,
+            Phase::Looking { early: true },
+            Phase::Looking { early: false },
+            options(2, true, true),
+        ] {
+            for mode in [Dynamic, Pick, Close] {
+                for press in [Single, Double] {
+                    assert_ne!(on_key(phase, mode, press), KeyAction::Repeat, "{phase:?}");
+                }
+            }
         }
     }
 

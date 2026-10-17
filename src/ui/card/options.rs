@@ -86,14 +86,71 @@ const MA_NOACTIVATE: isize = 3;
 /// The hint line under the rows. It names exactly what the hook claims, so a
 /// digit that is not claimed never looks like it should have worked.
 pub(super) fn hint_text(count: usize, claim_keys: bool) -> String {
+    hint_parts(count, claim_keys)
+        .into_iter()
+        .map(|p| match p {
+            HintPart::Text(s) | HintPart::Key(s) => s,
+        })
+        .collect()
+}
+
+/// A piece of the hint line: plain words, or a key drawn as a keycap (#1049).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HintPart {
+    Text(String),
+    Key(String),
+}
+
+/// The hint line as words and keys. Joined, the parts are exactly
+/// [`hint_text`], which stays the one string the window is named with.
+pub(super) fn hint_parts(count: usize, claim_keys: bool) -> Vec<HintPart> {
     let count = count.min(options_keys::MAX_OPTIONS);
+    let text = |s: &str| HintPart::Text(s.to_string());
+    let key = |s: &str| HintPart::Key(s.to_string());
     match (claim_keys, count) {
-        (true, 0) => "Esc to close".to_string(),
-        (true, 1) => "Press 1, or Esc to close".to_string(),
-        (true, n) => format!("Press 1 to {n}, or Esc to close"),
-        (false, 0) => "Click elsewhere to close".to_string(),
-        (false, _) => "Click an option, or click elsewhere to close".to_string(),
+        (true, 0) => vec![key("Esc"), text(" to close")],
+        (true, 1) => vec![
+            text("Press "),
+            key("1"),
+            text(", or "),
+            key("Esc"),
+            text(" to close"),
+        ],
+        (true, n) => vec![
+            text("Press "),
+            key("1"),
+            text(" to "),
+            HintPart::Key(n.to_string()),
+            text(", or "),
+            key("Esc"),
+            text(" to close"),
+        ],
+        (false, 0) => vec![text("Click elsewhere to close")],
+        (false, _) => vec![text("Click an option, or click elsewhere to close")],
     }
+}
+
+/// The left edge of each run of the hint line when the runs (text and keycaps,
+/// `widths` wide) sit one after the other from 0. `None` when they are wider
+/// than `avail` or there are none, so the caller draws the plain line, which
+/// ends in an ellipsis, rather than a clipped row of chips.
+pub(super) fn hint_run_lefts(widths: &[i32], avail: i32) -> Option<Vec<i32>> {
+    if widths.is_empty() {
+        return None;
+    }
+    let mut x = 0;
+    let mut lefts = Vec::with_capacity(widths.len());
+    for w in widths {
+        lefts.push(x);
+        x += (*w).max(0);
+    }
+    (x <= avail).then_some(lefts)
+}
+
+/// A hint keycap's width: its text and a pad each side, but never narrower
+/// than it is tall, so a digit is the same square as on the rows.
+pub(super) fn hint_keycap_width(text_w: i32, height: i32, pad: i32) -> i32 {
+    (text_w + pad * 2).max(height)
 }
 
 /// `text` unchanged when `fits` accepts it, otherwise its longest prefix that
@@ -213,6 +270,47 @@ pub(super) fn options_layout(i: &LayoutInputs) -> OptionsMetrics {
 /// The keycap's side: the row minus a gap above and below.
 pub(super) fn keycap_size(row_h: i32, gap: i32) -> i32 {
     (row_h - gap * 2).max(1)
+}
+
+/// The three colours of a keycap chip.
+#[derive(Clone, Copy)]
+struct KeycapInk {
+    fill: u32,
+    edge: u32,
+    text: u32,
+}
+
+/// Draws one keycap chip, the row digits' and the hint's alike: a filled
+/// rounded square with a hairline and the key's text centred in it, in the font
+/// selected into `hdc`. Every GDI object made here is freed on the way out.
+unsafe fn draw_keycap(hdc: HDC, rect: RECT, text: &str, ink: KeycapInk, ring: i32, radius: i32) {
+    use windows::Win32::Foundation::COLORREF;
+    let fill = CreateSolidBrush(COLORREF(ink.fill));
+    let pen = CreatePen(PS_SOLID, ring.max(1), COLORREF(ink.edge));
+    let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    let corner = (radius * 2 / 3).max(2) * 2;
+    let _ = RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        corner,
+        corner,
+    );
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+    let _ = DeleteObject(HGDIOBJ(fill.0));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(ink.text));
+    draw_text_line(
+        hdc,
+        text,
+        rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -645,12 +743,112 @@ impl CardInner {
 
         SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
         SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
-        draw_text_line(
-            hdc,
-            &hint_text(ui.rows.len(), ui.behavior.claim_keys),
-            metrics.hint,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-        );
+        let parts = hint_parts(ui.rows.len(), ui.behavior.claim_keys);
+        if !self.paint_hint_with_keycaps(hdc, palette, &parts, metrics.hint) {
+            // No keys to draw, or no room for the chips: the plain line, which
+            // ends in an ellipsis where it is too wide.
+            draw_text_line(
+                hdc,
+                &hint_text(ui.rows.len(), ui.behavior.claim_keys),
+                metrics.hint,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+    }
+
+    /// Draws the hint with each key as a keycap, the same chip as the row
+    /// digits (#1049). The body font is selected and the hint colour set. Returns
+    /// false, drawing nothing, when there is no key or the runs do not fit in
+    /// `area`.
+    unsafe fn paint_hint_with_keycaps(
+        &self,
+        hdc: HDC,
+        palette: &Palette,
+        parts: &[HintPart],
+        area: RECT,
+    ) -> bool {
+        use windows::Win32::Foundation::{COLORREF, SIZE};
+        use windows::Win32::Graphics::Gdi::GetTextExtentPoint32W;
+        if !parts.iter().any(|p| matches!(p, HintPart::Key(_))) {
+            return false;
+        }
+        let area_h = area.bottom - area.top;
+        let ring = self.scale(1);
+        let chip_h = (area_h - ring * 2).max(1);
+        let pad = self.scale(GAP_DP) / 2;
+        // Air each side of a chip, so a comma after it does not touch it.
+        let margin = self.scale(2);
+        let widths: Vec<i32> = parts
+            .iter()
+            .map(|part| {
+                let (HintPart::Text(s) | HintPart::Key(s)) = part;
+                let wide: Vec<u16> = s.encode_utf16().collect();
+                let mut size = SIZE::default();
+                if !GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
+                    size.cx = 0;
+                }
+                match part {
+                    HintPart::Text(_) => size.cx,
+                    HintPart::Key(_) => hint_keycap_width(size.cx, chip_h, pad) + margin * 2,
+                }
+            })
+            .collect();
+        let Some(lefts) = hint_run_lefts(&widths, area.right - area.left) else {
+            return false;
+        };
+        let high_contrast = self.theme == Theme::HighContrast;
+        let ink = if high_contrast {
+            self.sys.window_text
+        } else {
+            palette.detail
+        };
+        let edge = if high_contrast {
+            self.sys.window_text
+        } else {
+            palette.border
+        };
+        let fill = crate::ui::theme::keycap_fill(self.theme, palette.bg, palette.headline);
+        let radius = self.scale(CONTROL_RADIUS_DP);
+        for ((part, left), width) in parts.iter().zip(lefts).zip(widths) {
+            let x = area.left + left;
+            match part {
+                HintPart::Text(s) => {
+                    SetTextColor(hdc, COLORREF(palette.hint));
+                    draw_text_line(
+                        hdc,
+                        s,
+                        RECT {
+                            left: x,
+                            right: x + width,
+                            ..area
+                        },
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+                HintPart::Key(s) => {
+                    let top = area.top + (area_h - chip_h) / 2;
+                    let chip = RECT {
+                        left: x + margin,
+                        top,
+                        right: x + width - margin,
+                        bottom: top + chip_h,
+                    };
+                    draw_keycap(
+                        hdc,
+                        chip,
+                        s,
+                        KeycapInk {
+                            fill,
+                            edge,
+                            text: ink,
+                        },
+                        ring,
+                        radius,
+                    );
+                }
+            }
+        }
+        true
     }
 
     /// Paints one row button for `WM_DRAWITEM`: the shared outline button,
@@ -724,37 +922,18 @@ impl CardInner {
                 palette.border
             };
             let cap_fill = crate::ui::theme::keycap_fill(self.theme, look.fill, palette.headline);
-            let fill = CreateSolidBrush(windows::Win32::Foundation::COLORREF(cap_fill));
-            let pen = CreatePen(
-                PS_SOLID,
-                ring.max(1),
-                windows::Win32::Foundation::COLORREF(cap_edge),
-            );
-            let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
-            let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
-            let corner = (radius * 2 / 3).max(2) * 2;
-            let _ = RoundRect(
-                hdc,
-                cap_rect.left,
-                cap_rect.top,
-                cap_rect.right,
-                cap_rect.bottom,
-                corner,
-                corner,
-            );
-            SelectObject(hdc, old_pen);
-            SelectObject(hdc, old_brush);
-            let _ = DeleteObject(HGDIOBJ(pen.0));
-            let _ = DeleteObject(HGDIOBJ(fill.0));
-
             let old_font = SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(cap_ink));
-            draw_text_line(
+            draw_keycap(
                 hdc,
-                &(index + 1).to_string(),
                 cap_rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                &(index + 1).to_string(),
+                KeycapInk {
+                    fill: cap_fill,
+                    edge: cap_edge,
+                    text: cap_ink,
+                },
+                ring,
+                radius,
             );
 
             // The label wraps to at most two lines (the row grew to fit, see
@@ -953,6 +1132,56 @@ mod tests {
                 assert!(!hint_text(count, claim).contains('\u{2014}'));
             }
         }
+    }
+
+    #[test]
+    fn the_hint_parts_read_as_the_hint_text() {
+        // One accessible string: the parts joined are exactly the text the
+        // window is named with, so drawing keycaps changes nothing for a reader.
+        for claim in [true, false] {
+            for count in 0..=5 {
+                let joined: String = hint_parts(count, claim)
+                    .iter()
+                    .map(|p| match p {
+                        HintPart::Text(s) | HintPart::Key(s) => s.as_str(),
+                    })
+                    .collect();
+                assert_eq!(joined, hint_text(count, claim), "{count} {claim}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_keys_in_the_hint_are_the_keys_it_names() {
+        let keys = |count, claim| -> Vec<String> {
+            hint_parts(count, claim)
+                .into_iter()
+                .filter_map(|p| match p {
+                    HintPart::Key(k) => Some(k),
+                    HintPart::Text(_) => None,
+                })
+                .collect()
+        };
+        assert_eq!(keys(0, true), ["Esc"]);
+        assert_eq!(keys(1, true), ["1", "Esc"]);
+        assert_eq!(keys(3, true), ["1", "3", "Esc"]);
+        assert_eq!(keys(9, true), ["1", "4", "Esc"]);
+        // With the claim off no key is promised, so no keycap is drawn.
+        assert!(keys(3, false).is_empty());
+    }
+
+    #[test]
+    fn hint_runs_sit_edge_to_edge_and_none_when_too_wide() {
+        assert_eq!(hint_run_lefts(&[10, 20, 5], 100), Some(vec![0, 10, 30]));
+        assert_eq!(hint_run_lefts(&[10, 20, 5], 35), Some(vec![0, 10, 30]));
+        assert_eq!(hint_run_lefts(&[10, 20, 5], 34), None);
+        assert_eq!(hint_run_lefts(&[], 100), None);
+    }
+
+    #[test]
+    fn a_hint_keycap_is_at_least_square_and_grows_with_its_text() {
+        assert_eq!(hint_keycap_width(6, 18, 4), 18, "a digit is a square");
+        assert_eq!(hint_keycap_width(24, 18, 4), 32, "Esc is wider");
     }
 
     #[test]
