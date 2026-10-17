@@ -212,6 +212,11 @@ const ROUTER_SUMMARY_HEIGHT: i32 = 18;
 /// Space between the selection bar and an action's text, so the bar is not drawn
 /// over the first letter.
 const ROW_TEXT_INSET: i32 = 12;
+/// #883: the scroll thumb is this wide, this far from the window's right edge
+/// and never shorter than this, in logical pixels.
+const SCROLL_THUMB_WIDTH: i32 = 3;
+const SCROLL_THUMB_EDGE: i32 = 2;
+const SCROLL_THUMB_MIN: i32 = 24;
 /// How far the query box's hairline sits outside the edit control.
 const QUERY_BORDER_OUTSET: i32 = 3;
 
@@ -259,6 +264,32 @@ fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Where the scroll thumb is drawn (#883), in client pixels at `dpi`, for a
+/// list of `row_count` rows scrolled to `offset`. `None` when every row fits.
+/// It sits in the padding to the right of the rows, so it never covers a row's
+/// fill or text.
+fn thumb_rect(dpi: u32, offset: usize, row_count: usize) -> Option<RECT> {
+    let list_top = scale(PADDING, dpi)
+        + scale(EDIT_HEIGHT, dpi)
+        + scale(PADDING, dpi)
+        + scale(ROUTER_SUMMARY_HEIGHT, dpi);
+    let track = scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32;
+    let (top, len) = crate::ui::palette_model::scroll_thumb(
+        offset,
+        row_count,
+        crate::ui::palette_model::MAX_VISIBLE_ROWS,
+        track,
+        scale(SCROLL_THUMB_MIN, dpi),
+    )?;
+    let right = scale(WINDOW_WIDTH, dpi) - scale(SCROLL_THUMB_EDGE, dpi);
+    Some(RECT {
+        left: right - scale(SCROLL_THUMB_WIDTH, dpi).max(2),
+        top: list_top + top,
+        right,
+        bottom: list_top + top + len,
+    })
 }
 
 /// Extracts the signed `y` client coordinate from a mouse message's
@@ -549,6 +580,19 @@ impl Palette {
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn set_query_for_test(&mut self, query: &str) {
         self.inner.set_query(query);
+    }
+
+    /// The UI gallery's scroll: moves the viewport by `delta_rows`, clamped,
+    /// like the mouse wheel.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn scroll_for_test(&mut self, delta_rows: i32) {
+        self.inner.state.offset = crate::ui::palette_model::scroll_by(
+            self.inner.state.offset,
+            delta_rows,
+            self.inner.state.rows.len(),
+            crate::ui::palette_model::MAX_VISIBLE_ROWS,
+        );
+        self.inner.invalidate();
     }
 
     #[cfg(test)]
@@ -932,6 +976,8 @@ struct PaletteColors {
     footer: u32,
     /// The router's suggestion line.
     summary: u32,
+    /// The scroll thumb shown when there are more rows than fit (#883).
+    thumb: u32,
     /// The fill of the selected and the hovered row.
     selected_fill: u32,
     selected_text: u32,
@@ -959,6 +1005,7 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
             hint: t.text,
             footer: t.text,
             summary: t.text,
+            thumb: t.text,
             selected_fill: sys.highlight,
             selected_text: sys.highlight_text,
             // The whole row is the highlight, so the bar is the same colour.
@@ -976,6 +1023,7 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
         hint: t.text_faint,
         footer: t.text_faint,
         summary: t.text_dim,
+        thumb: t.text_faint,
         selected_fill: blend(t.surface, bar, 16),
         selected_text: t.text,
         bar,
@@ -1645,6 +1693,27 @@ impl PaletteInner {
             }
         }
 
+        // #883: more rows than fit, so say where the viewport is. Drawn at 96
+        // DPI: the render target scales logical pixels itself.
+        if let Some(t) = thumb_rect(96, self.state.offset, self.state.rows.len()) {
+            if let Ok(brush) = unsafe {
+                target.CreateSolidColorBrush(
+                    &colorref_to_d2d(COLORREF(colors.thumb)) as *const _,
+                    None,
+                )
+            } {
+                let rect = D2D_RECT_F {
+                    left: t.left as f32,
+                    top: t.top as f32,
+                    right: t.right as f32,
+                    bottom: t.bottom as f32,
+                };
+                unsafe {
+                    target.FillRectangle(&rect as *const _, &brush);
+                }
+            }
+        }
+
         let footer_rect = D2D_RECT_F {
             left: pad,
             top: content_h - FOOTER_HEIGHT as f32,
@@ -1862,6 +1931,13 @@ impl PaletteInner {
                         );
                     }
                 }
+            }
+
+            // #883: more rows than fit, so say where the viewport is.
+            if let Some(t) = thumb_rect(self.dpi, self.state.offset, self.state.rows.len()) {
+                let brush = CreateSolidBrush(COLORREF(colors.thumb));
+                FillRect(hdc, &t, brush);
+                let _ = DeleteObject(brush.into());
             }
 
             let footer_rect = RECT {
@@ -2261,6 +2337,14 @@ mod tests {
         }
 
         #[test]
+        fn the_scroll_thumb_has_at_least_3_to_1_on_the_background() {
+            for (name, _, c) in cases() {
+                let r = ratio(c.thumb, c.background);
+                assert!(r >= 3.0, "{name}: the thumb is {r:.2}:1");
+            }
+        }
+
+        #[test]
         fn the_selected_row_is_still_distinct_from_the_background() {
             for (name, _, c) in cases() {
                 assert_ne!(c.selected_fill, c.background, "{name}");
@@ -2484,6 +2568,94 @@ mod tests {
         );
         assert_eq!(empty.0, p.inner.colors.background, "the palette background");
     }
+    /// The colours of the window's pixels at `points`, read from a `WM_PRINT`
+    /// of the palette (the GDI path, like the UI gallery's pictures).
+    fn printed_pixels(p: &Palette, points: &[(i32, i32)]) -> Vec<u32> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let (w, h) = (scale(WINDOW_WIDTH, p.inner.dpi), window_height(p.inner.dpi));
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+            let out = points.iter().map(|&(x, y)| GetPixel(mem, x, y).0).collect();
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            out
+        }
+    }
+
+    /// #883: a list longer than the viewport draws a thumb on the right that
+    /// sits at the top, then at the bottom once scrolled to the end, and a
+    /// list that fits draws none.
+    #[test]
+    fn a_long_list_draws_a_scroll_thumb_that_follows_the_offset() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.force_theme_for_gallery(Theme::Dark);
+        p.show(many_ungrouped_actions(30), true, String::new());
+        let dpi = p.inner.dpi;
+        let rows = p.inner.state.rows.len();
+        let at = |offset: usize| thumb_rect(dpi, offset, rows).expect("30 rows overflow 12");
+        let (top_rect, end_rect) = (at(0), at(rows - crate::ui::palette_model::MAX_VISIBLE_ROWS));
+        let x = (top_rect.left + top_rect.right) / 2;
+        let track_top = top_rect.top;
+        let track_bottom = end_rect.bottom;
+        let probes = [(x, track_top + 2), (x, track_bottom - 2)];
+        let thumb = p.inner.colors.thumb;
+        let bg = p.inner.colors.background;
+
+        assert_eq!(printed_pixels(&p, &probes), [thumb, bg], "at the top");
+        p.inner.state.offset = rows - crate::ui::palette_model::MAX_VISIBLE_ROWS;
+        assert_eq!(
+            printed_pixels(&p, &probes),
+            [bg, thumb],
+            "scrolled to the end"
+        );
+
+        p.show(many_ungrouped_actions(5), true, String::new());
+        assert_eq!(
+            printed_pixels(&p, &probes),
+            [bg, bg],
+            "a short list has no thumb"
+        );
+    }
+
+    #[test]
+    fn the_thumb_rect_sits_in_the_padding_beside_the_rows_at_every_scale() {
+        for dpi in [96u32, 120, 144, 192, 240] {
+            let w = scale(WINDOW_WIDTH, dpi);
+            // Each term is scaled on its own, as the rows are laid out.
+            let list_top = scale(PADDING, dpi)
+                + scale(EDIT_HEIGHT, dpi)
+                + scale(PADDING, dpi)
+                + scale(ROUTER_SUMMARY_HEIGHT, dpi);
+            let track = scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32;
+            assert_eq!(thumb_rect(dpi, 0, 12), None, "12 rows fit");
+            let r = thumb_rect(dpi, 0, 40).unwrap();
+            assert!(
+                r.left >= w - scale(PADDING, dpi),
+                "dpi {dpi}: overlaps the rows"
+            );
+            assert!(r.right < w, "dpi {dpi}: leaves the window");
+            assert!(
+                r.top >= list_top && r.bottom <= list_top + track,
+                "dpi {dpi}"
+            );
+            assert!(r.right - r.left >= 2, "dpi {dpi}: too thin to see");
+        }
+    }
+
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");
