@@ -120,7 +120,8 @@ fn is_corrupt(e: &rusqlite::Error) -> bool {
 
 /// Whether `e` is SQLite's "virtual table is damaged" (`SQLITE_CORRUPT_VTAB`,
 /// extended code 267, primary code 11): what a full-text index that disagrees
-/// with its table raises.
+/// with its table raises. MEASURED 2026-10-17: real damage to the index's own
+/// rows raises 267 (see `real_index_damage_raises_the_virtual_table_code`).
 fn is_fts_corrupt(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -1536,6 +1537,101 @@ mod tests {
             RebuildVerdict::Damaged
         ));
         assert!(matches!(rebuild_verdict(Ok(())), RebuildVerdict::Rebuilt));
+    }
+
+    /// Real damage to the full-text index, one kind at a time.
+    fn store_with_indexed_chunks(name: &str) -> (Store, PathBuf) {
+        let (s, dir) = knowledge_store(name);
+        {
+            let conn = s.lock();
+            for (i, text) in [
+                "ledgerword in the notes",
+                "second page about ledgerword budgets",
+                "third unrelated paragraph",
+                "fourth ledgerword entry",
+            ]
+            .iter()
+            .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+                     VALUES (1, ?1, ?2, ?3, 4)",
+                    rusqlite::params![i as i64, text, format!("h{i}")],
+                )
+                .unwrap();
+            }
+            assert_eq!(fts_hits(&conn, "ledgerword"), 3);
+        }
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        (s, dir)
+    }
+
+    /// The extended code a query raised, or `None` when it ran.
+    fn extended_code(conn: &Connection, sql: &str) -> Option<i32> {
+        match conn.query_row(sql, [], |r| r.get::<_, i64>(0)) {
+            Ok(_) => None,
+            Err(rusqlite::Error::SqliteFailure(f, _)) => Some(f.extended_code),
+            Err(e) => panic!("not a SQLite failure: {e}"),
+        }
+    }
+
+    const MATCH_COUNT: &str = "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'ledgerword'";
+
+    /// MEASURED 2026-10-17 (SQLite bundled with rusqlite): real damage to the
+    /// full-text index raises extended code 267 (`SQLITE_CORRUPT_VTAB`), so
+    /// `is_fts_corrupt` recognises it, for the index's segment rows and for
+    /// its `docsize` rows. Only the `docsize` kind passes `quick_check`, so
+    /// only that one reaches the in-place rebuild. Damage to the segment rows
+    /// is also seen by `quick_check`, so the whole file is moved aside.
+    #[test]
+    fn real_index_damage_raises_the_virtual_table_code() {
+        let _serial = FTS_EVENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let query = "\"ledgerword\"";
+
+        // docsize rows gone: 267 on a ranked read, quick_check passes, index rebuilt.
+        let (s, dir) = store_with_indexed_chunks("fts-real-docsize");
+        {
+            let conn = s.lock();
+            conn.execute_batch("DELETE FROM chunk_fts_docsize;")
+                .unwrap();
+            assert_eq!(
+                extended_code(&conn, MATCH_COUNT),
+                None,
+                "a bare count does not read docsize"
+            );
+            assert!(!file_is_damaged(&conn), "quick_check passes");
+        }
+        let before = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
+        let err = s.search_chunks("C:/Notes", query, 10).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt(_)), "{err:?}");
+        assert_eq!(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst), before + 1);
+        assert!(s.day_total("2026-10-15").unwrap().is_some(), "history kept");
+        assert_eq!(s.fts_hits("ledgerword").unwrap(), 3, "index rebuilt");
+        assert_eq!(s.search_chunks("C:/Notes", query, 10).unwrap().len(), 3);
+        assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Segment rows gone: 267 on read, and quick_check sees it too.
+        let (s, dir) = store_with_indexed_chunks("fts-real-segments");
+        {
+            let conn = s.lock();
+            conn.execute_batch("DELETE FROM chunk_fts_data WHERE id > 10;")
+                .unwrap();
+            assert_eq!(
+                extended_code(&conn, MATCH_COUNT),
+                Some(rusqlite::ffi::SQLITE_CORRUPT_VTAB)
+            );
+            assert!(file_is_damaged(&conn), "quick_check sees this kind");
+        }
+        let before = FTS_CORRUPT_EVENTS.load(Ordering::SeqCst);
+        assert!(s.search_chunks("C:/Notes", query, 10).is_err());
+        assert_eq!(FTS_CORRUPT_EVENTS.load(Ordering::SeqCst), before + 1);
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None, "history lost");
+        assert_eq!(damaged_copies(&dir), 1, "the whole file was moved aside");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A corrupt error that did not come from the full-text index does not
