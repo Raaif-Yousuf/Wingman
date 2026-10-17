@@ -41,14 +41,14 @@ impl Store {
             tx.execute("DELETE FROM chunk WHERE id = ?1", [id])?;
         }
         for (id, ordinal) in &diff.keep {
-            let Some(n) = new.get(*ordinal) else { continue };
+            let n = new_at(new, *ordinal)?;
             tx.execute(
                 "UPDATE chunk SET ordinal = ?1, span = ?2 WHERE id = ?3",
                 params![*ordinal as i64, n.chunk.span_json(), id],
             )?;
         }
         for ordinal in &diff.insert {
-            let Some(n) = new.get(*ordinal) else { continue };
+            let n = new_at(new, *ordinal)?;
             tx.execute(
                 "INSERT INTO chunk (doc_id, ordinal, text, span, text_hash, tokens)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -65,6 +65,13 @@ impl Store {
         tx.commit()?;
         Ok(diff)
     }
+}
+
+/// The new chunk at `ordinal`. The diff is built from `new`, so a miss means
+/// a bug; failing rolls the transaction back instead of dropping a chunk.
+fn new_at(new: &[IndexedChunk], ordinal: usize) -> Result<&IndexedChunk, StoreError> {
+    new.get(ordinal)
+        .ok_or_else(|| StoreError::Other(format!("chunk index {ordinal} is out of range")))
 }
 
 #[cfg(test)]
@@ -163,11 +170,32 @@ mod tests {
     #[test]
     fn a_failed_reindex_leaves_the_old_rows() {
         let s = store_with_doc();
-        s.replace_chunks(1, &indexed("# A\nalpha\n")).unwrap();
+        let old = doc(&[("A", "alpha. "), ("B", "beta. ")]);
+        s.replace_chunks(1, &indexed(&old)).unwrap();
         let before = stored(&s);
-        // A document that does not exist breaks the foreign key on insert.
-        let err = s.replace_chunks(99, &indexed("# B\nbeta\n"));
+        assert_eq!(before.len(), 2);
+        // The new text deletes "A", moves the kept "B", then inserts two
+        // chunks; the second insert fails, after the delete and the update.
+        s.lock()
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON chunk WHEN NEW.ordinal = 2
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )
+            .unwrap();
+        let new = doc(&[("B", "beta. "), ("C", "gamma. "), ("D", "delta. ")]);
+        let err = s.replace_chunks(1, &indexed(&new));
         assert!(err.is_err());
-        assert_eq!(stored(&s), before);
+        assert_eq!(stored(&s), before, "rolled back, spans included");
+    }
+
+    #[test]
+    fn an_impossible_index_is_an_error_not_a_dropped_chunk() {
+        let new = indexed(
+            "# A
+alpha
+",
+        );
+        assert!(new_at(&new, 0).is_ok());
+        assert!(new_at(&new, 1).is_err());
     }
 }
