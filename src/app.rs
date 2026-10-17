@@ -10313,7 +10313,11 @@ mod tests {
     #[test]
     fn check_my_work_from_the_key_or_tray_is_remembered_and_nothing_goes_stale() {
         let src = lf(include_str!("app.rs"));
-        let ask = body_between(&src, "    fn ask(&mut self, trigger: Trigger) {", "\n    }\n");
+        let ask = body_between(
+            &src,
+            "    fn ask(&mut self, trigger: Trigger) {",
+            "\n    }\n",
+        );
         assert!(
             ask.contains("DEFAULT_ACTION_ID") && ask.contains("ask_inner("),
             "{ask}"
