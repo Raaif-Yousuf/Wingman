@@ -5361,11 +5361,19 @@ impl App {
     fn show_empty_chain_failure(&mut self, packed: &str) -> bool {
         if !is_no_providers(packed) {
             let chain = unpack_error(packed).1;
-            let Some((headline, detail)) = setup_failure(chain) else {
+            if let Some((headline, detail)) = setup_failure(chain) {
+                self.record_run_failure(&headline, &headline, chain);
+                self.show_setup_card(&headline, &detail);
+                return true;
+            }
+            // #1183: the network, not the setup: the same plain card the
+            // key's ask shows, not the raw transport text.
+            let Some((headline, detail)) = network_failure(chain) else {
                 return false;
             };
             self.record_run_failure(&headline, &headline, chain);
-            self.show_setup_card(&headline, &detail);
+            self.card.show_error_with_details(&headline, &detail);
+            self.set_watch(true);
             return true;
         }
         let (headline, detail) = self.empty_chain_card_now();
@@ -9018,7 +9026,7 @@ pub(crate) fn network_failure(raw_chain: &str) -> Option<(String, String)> {
     Some((
         headline,
         format!(
-            "Check your internet connection, then press again. Details: {tag} could not be reached."
+            "Check your internet connection, then press again. Details: {name} could not be reached."
         ),
     ))
 }
@@ -13870,6 +13878,48 @@ mod tests {
                 "{name} must call show_empty_chain_failure first"
             );
         }
+    }
+
+    /// #1183: an action run from the palette or the options card meets the
+    /// network card too, not the raw transport text. Every action result
+    /// path goes through `show_empty_chain_failure`, so it must offer the
+    /// failure to `network_failure` and show an error card.
+    #[test]
+    fn every_action_result_path_offers_a_network_failure_its_own_card() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let handlers = [
+            "on_calendar_result",
+            "on_generic_action_result",
+            "on_review_result",
+            "on_form_fill_result",
+            "on_exec_done",
+        ];
+        assert!(!handlers.is_empty());
+        for name in handlers {
+            let def = format!("    fn {name}(");
+            let start = src.find(&def).expect("handler exists");
+            let body = &src[start..];
+            let end = body.find("unpack_error(&packed)").expect("failure arm");
+            assert!(
+                body[..end].contains("show_empty_chain_failure(&packed)"),
+                "{name} must offer the failure to the plain cards first"
+            );
+        }
+        let offer = app_method_body("show_empty_chain_failure");
+        let net = offer
+            .find("network_failure(")
+            .unwrap_or_else(|| panic!("never offered to network_failure: {offer}"));
+        assert!(offer[net..].contains("show_error_with_details("), "{offer}");
+    }
+
+    #[test]
+    fn a_network_card_names_the_service_the_way_a_user_knows_it() {
+        let (_, detail) =
+            super::network_failure("anthropic: transport error: dns failed").expect("unreachable");
+        assert!(
+            detail.contains("Details: Anthropic could not be reached"),
+            "{detail}"
+        );
     }
 
     #[test]
