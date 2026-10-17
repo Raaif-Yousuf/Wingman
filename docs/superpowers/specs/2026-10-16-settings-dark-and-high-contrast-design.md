@@ -22,12 +22,13 @@ written down and agreed before code.
   purpose: a correct light window beats a half-dark one. It handles none of
   `WM_CTLCOLOR*`, `WM_THEMECHANGED`, `WM_SETTINGCHANGE` or `WM_SYSCOLORCHANGE`
   today, so re-theming is new work here, not a copy of the card's.
-- **There is no application manifest.** `assets/app.rc` holds the icon and
-  nothing else, and `build.rs` embeds only that. Nothing requests
-  common-controls v6. `settings.rs` calls `InitCommonControlsEx` with
-  `ICC_BAR_CLASSES` only. So Settings runs classic (v5) controls
-  (MEASURED 2026-10-16, Slice 0). This matters: `NM_CUSTOMDRAW` for buttons is a
-  v6 feature.
+- **The exe carries a common-controls v6 manifest** (`assets/app.manifest`,
+  embedded by `assets/app.rc`, #807), so Settings runs v6 controls. Slice 0
+  measured v5 only because its probe had no manifest; that is not how the exe
+  runs. MEASURED 2026-10-17: a Settings button answers `BCM_GETIDEALSIZE`
+  (a v6-only message) in the test process, which embeds the same resource, and
+  `tests/manifest_embed.rs` checks the built exe. This matters:
+  `NM_CUSTOMDRAW` for buttons is a v6 feature.
 - Control inventory: `EDIT` (all single-line edits are created with
   `WS_EX_BORDER`, a thin frame-colour border, not a sunken one), `COMBOBOX`
   (all `CBS_DROPDOWNLIST | CBS_HASSTRINGS`), `BS_AUTOCHECKBOX`, `BS_GROUPBOX`,
@@ -73,11 +74,13 @@ Settings runs today) and once with an activation context built from a temp
 common-controls 6.0.0.0 manifest. Results replace the theories above. Items 3
 and 6 were not measured, see below. The throwaway code is not kept.
 
-1. **Common-controls version. MEASURED 2026-10-16: v5 today.** With
-   `InitCommonControlsEx(ICC_BAR_CLASSES)` and no manifest, the loaded
+1. **Common-controls version. MEASURED 2026-10-16: v5 without a manifest.**
+   With `InitCommonControlsEx(ICC_BAR_CLASSES)` and no manifest, the loaded
    `comctl32.dll` is the WinSxS 5.82 one and `DllGetVersion` reports 5.82. With
-   the v6 activation context it is WinSxS 6.0 and reports 6.16. So the "very
-   probably v5" in "Where it is today" is now a fact.
+   the v6 activation context it is WinSxS 6.0 and reports 6.16. The probe had
+   no manifest, which is not how the exe runs: the exe has shipped the v6
+   manifest since #807, so Settings runs v6 (MEASURED 2026-10-17, see
+   "Where it is today").
 2. **`NM_CUSTOMDRAW` and `BS_*` buttons. MEASURED 2026-10-16.** Under v5:
    none arrives for a checkbox, radio, group box or push button (a trackbar
    does send it, on both versions). Under v6: it arrives (`CDDS_PREPAINT`) for
@@ -190,8 +193,13 @@ owner-draw style is added to it.
 The role problem applies to checkboxes only (there are no radios), so the
 decision is per control and depends on Slice 0:
 
-- **Manifest route (Decision; Slice 0 confirmed v5 today and that v6 sends
-  the notification):** add the
+- **Slice 2 uses it for push buttons too (Decision).** Push buttons were
+  specified as `BS_OWNERDRAW`. Custom draw reaches them the same way (MEASURED
+  2026-10-16, item 2) and keeps the button's own class, style and UI Automation
+  role, so Settings has one mechanism for buttons and checkboxes
+  (`settings_buttons.rs`) and still reuses the card's button look and paint.
+- **Manifest route (Decision; shipped in #807, and Slice 0 confirmed that v6
+  sends the notification):** add the
   common-controls 6.0.0.0 manifest, keep `BS_AUTOCHECKBOX`, and draw in
   `NM_CUSTOMDRAW` (a v6 button sends it to its parent through `WM_NOTIFY`;
   return `CDRF_SKIPDEFAULT` after painting). The class and style stay a real
@@ -413,8 +421,8 @@ measured size from CI and raises the gate in the same PR if it must.
 Each was an open question with a recommended answer; the recommended answer
 is the decision.
 
-1. **Decision: add the common-controls v6 manifest** (Slice 0 confirmed
-   Settings runs v5). It keeps the checkbox a real checkbox with no
+1. **Decision: add the common-controls v6 manifest** (Slice 0 measured v5
+   with a probe that had no manifest; the exe's own manifest landed in #807). It keeps the checkbox a real checkbox with no
    accessibility wrapper. It is a visible change for light-mode and
    high-contrast users, so it ships alone in slice 0b, checked at 100%, 150%
    and 200% and in Aquatic and Desert. The Memory window in the knowledge spec

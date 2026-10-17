@@ -49,6 +49,30 @@ pub(crate) fn title_bar_dark(theme: Theme) -> Option<bool> {
     }
 }
 
+/// Whether `button` is a common controls v6 button. `BCM_GETIDEALSIZE` exists
+/// only in v6 (a v5 button answers 0), so this asks the control itself, not
+/// the DLL, and is true exactly when `NM_CUSTOMDRAW` will arrive for it (the
+/// custom draw of buttons and checkboxes depends on it, #582). The manifest
+/// that requests v6 is `assets/app.manifest` (#807).
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn button_is_common_controls_v6(button: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::Foundation::{LPARAM, SIZE, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+    const BCM_GETIDEALSIZE: u32 = 0x1601;
+    let mut size = SIZE::default();
+    // SAFETY: the message writes one SIZE through the pointer, which outlives
+    // the synchronous call.
+    unsafe {
+        SendMessageW(
+            button,
+            BCM_GETIDEALSIZE,
+            Some(WPARAM(0)),
+            Some(LPARAM(&mut size as *mut SIZE as isize)),
+        )
+        .0 != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

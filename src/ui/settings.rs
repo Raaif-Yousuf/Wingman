@@ -61,8 +61,9 @@
 //!   contrast-design.md`) and stays off for users, behind
 //!   `settings_theme::SETTINGS_DARK_ENABLED`, until every control follows it:
 //!   a correct light window beats a half-dark one. So far the title bar, the
-//!   window face, the labels, the text boxes, the rail and the footer divider
-//!   follow the theme; buttons, checkboxes, combos, the trackbar and the
+//!   window face, the labels, the text boxes, the rail, the footer divider,
+//!   the push buttons and the checkboxes (`settings_buttons`, drawn from
+//!   `NM_CUSTOMDRAW`) follow the theme; combos, the trackbar and the
 //!   scrollbar are still stock. `edit_style` resolves the theme once per change
 //!   and everything else reads it. The UI gallery forces a theme
 //!   (`--ui-gallery --theme`), which bypasses the gate.
@@ -275,6 +276,16 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     inner_ref.dpi = dpi;
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
     inner_ref.adopt(built);
+    // #582: the dark buttons and checkboxes need common controls v6, which the
+    // exe's manifest asks for (#807). A debug run of the real window says so
+    // when it is missing; a release build just keeps the stock paint.
+    #[cfg(debug_assertions)]
+    if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
+        debug_assert!(
+            crate::ui::settings_theme::button_is_common_controls_v6(box_),
+            "Settings buttons are not common controls v6: is assets/app.manifest embedded?"
+        );
+    }
     sync_card_display_enabled(hwnd);
     if live {
         // #1105: the file's baseline and the Run key are read off the UI thread;
@@ -983,6 +994,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if msg == WM_PAUSE_MENU {
         run_pause_menu(hwnd);
         return LRESULT(0);
+    }
+    // #582: the footer buttons (Undo, Reset) draw from the tokens in dark.
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_NOTIFY {
+        if let Some(answer) = answer_button_draw(hwnd, lparam) {
+            return answer;
+        }
     }
     let inner = &mut *ptr;
 
@@ -4538,6 +4555,31 @@ unsafe fn answer_label_colors(hdc: windows::Win32::Graphics::Gdi::HDC) -> LRESUL
     LRESULT(face_brush_now().0 as isize)
 }
 
+/// `WM_NOTIFY` from a child when Settings paints its own look (#582): a push
+/// button or checkbox asks before painting (`NM_CUSTOMDRAW`, common controls
+/// v6) and is drawn from the tokens. Everything else, and every notification
+/// while the system draws (light, real high contrast), gets `None` and the
+/// default answer, exactly as before. The brush and colours are the cached
+/// style's, so nothing is created per message.
+unsafe fn answer_button_draw(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
+    use crate::ui::settings_buttons::{handle_custom_draw, Palette, NM_CUSTOMDRAW_CODE};
+    let style = edit_style();
+    if !style.paints_face || lparam.0 == 0 {
+        return None;
+    }
+    let header = &*(lparam.0 as *const windows::Win32::UI::Controls::NMHDR);
+    if header.code != NM_CUSTOMDRAW_CODE {
+        return None;
+    }
+    let palette = Palette::new(style.look.theme, &style.look.sys, style.colors.focus_line);
+    Some(LRESULT(handle_custom_draw(
+        lparam,
+        dpi_for(hwnd),
+        &palette,
+        style.face_brush,
+    )))
+}
+
 /// `WM_ERASEBKGND` when Settings paints its own face: fills the client area
 /// with the face colour. The class brush is the system face, which would show
 /// light in dark.
@@ -4823,6 +4865,12 @@ unsafe extern "system" fn body_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // #582: push buttons and checkboxes draw from the tokens in dark.
+    if msg == windows::Win32::UI::WindowsAndMessaging::WM_NOTIFY {
+        if let Some(answer) = answer_button_draw(hwnd, lparam) {
+            return answer;
+        }
+    }
     match msg {
         WM_COMMAND | WM_HSCROLL => {
             let parent = GetParent(hwnd).unwrap_or_default();
@@ -12491,6 +12539,155 @@ mod tests {
                 assert_eq!(label_answer(hwnd), (HC_BLACK.window, HC_BLACK.window_text));
             });
         }
+    }
+
+    /// The Start with Windows checkbox, on the page Settings opens on.
+    fn autostart_checkbox(hwnd: HWND) -> HWND {
+        get_dlg_item(hwnd, ID_AUTOSTART).expect("the Start with Windows checkbox")
+    }
+
+    /// The pixel at (`x`, `y`) of `hwnd`, as `PrintWindow` captures it.
+    fn printed_pixel(hwnd: HWND, x: i32, y: i32) -> u32 {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetPixel, SelectObject,
+        };
+        use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bitmap = CreateCompatibleBitmap(screen, 400, 80);
+            let old = SelectObject(dc, bitmap.into());
+            // PW_RENDERFULLCONTENT
+            assert!(PrintWindow(hwnd, dc, PRINT_WINDOW_FLAGS(2)).as_bool());
+            let pixel = GetPixel(dc, x, y).0;
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+            pixel
+        }
+    }
+
+    /// #582 slice 2, wired-to-nothing check: with nothing wired, a dark
+    /// window's checkbox would be the stock one, a light box with a black
+    /// label. Captured with `PrintWindow`: the unchecked box's left edge is
+    /// the control border token, and a checked box's corner is the accent.
+    /// Light keeps the stock box, whose edge is not the token.
+    #[test]
+    fn a_dark_checkbox_is_drawn_from_the_tokens_and_light_stays_stock() {
+        use crate::ui::theme::DARK;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
+        const BM_SETCHECK: u32 = 0x00F1;
+        let probe = |theme: Theme| {
+            let _forced = Forced::new(theme);
+            let mut seen = (0u32, 0u32, 0u32, 0u32);
+            with_window(Config::default(), |hwnd, _raw| {
+                let check = autostart_checkbox(hwnd);
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNA);
+                    let _ = ShowWindow(check, SW_SHOWNA);
+                    SendMessageW(check, BM_SETCHECK, Some(WPARAM(0)), None);
+                }
+                let mut rc = windows::Win32::Foundation::RECT::default();
+                unsafe {
+                    let _ = GetClientRect(check, &mut rc);
+                }
+                let g = crate::ui::settings_buttons::check_geometry(
+                    rc.right - rc.left,
+                    rc.bottom - rc.top,
+                    96,
+                    0,
+                );
+                let mid = (g.box_rc.top + g.box_rc.bottom) / 2;
+                let edge = printed_pixel(check, g.box_rc.left, mid);
+                unsafe { SendMessageW(check, BM_SETCHECK, Some(WPARAM(1)), None) };
+                let corner = printed_pixel(check, g.box_rc.left + 8, g.box_rc.top + 2);
+                // Inside the 400 px capture, on the top row, clear of the label.
+                let face = printed_pixel(check, rc.right.min(390) - 2, 1);
+                seen = (
+                    edge,
+                    corner,
+                    face,
+                    unsafe { edit_style() }.colors.focus_line,
+                );
+            });
+            seen
+        };
+        let (edge, corner, face, accent) = probe(Theme::Dark);
+        // The edge is anti-aliased, so it is held to the 3:1 bar the token
+        // exists for, not to the token's exact value. The stock box edge
+        // (MEASURED 2026-10-17: 0xF0 on the face in dark, before this slice)
+        // would fail it.
+        let ratio = |a: u32, b: u32| {
+            use crate::ui::theme::{contrast_ratio, relative_luminance};
+            contrast_ratio(relative_luminance(a), relative_luminance(b))
+        };
+        assert!(
+            ratio(edge, DARK.surface) >= 3.0,
+            "the unchecked box edge is {edge:#08x}"
+        );
+        assert_eq!(face, DARK.surface, "the face behind the box");
+        assert_eq!(corner, accent, "a checked box is the accent");
+        let (light_edge, _, _, _) = probe(Theme::Light);
+        assert_ne!(
+            light_edge, edge,
+            "light is the stock box, not the dark paint"
+        );
+    }
+
+    /// #582 slice 2: a focused checkbox draws its 2 px frame in the text token
+    /// only while the keyboard cue is showing, as the stock one does. With the
+    /// cue hidden (the state after a mouse click) the same pixel is the face.
+    #[test]
+    fn a_dark_checkbox_shows_its_focus_frame_only_when_the_cue_is_visible() {
+        use crate::ui::theme::DARK;
+        use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
+        const WM_UPDATEUISTATE: u32 = 0x0128;
+        let _forced = Forced::new(Theme::Dark);
+        with_window(Config::default(), |hwnd, _raw| {
+            let check = autostart_checkbox(hwnd);
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
+                let _ = ShowWindow(check, SW_SHOWNA);
+                let _ = SetFocus(Some(check));
+            }
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            unsafe {
+                let _ = GetClientRect(check, &mut rc);
+            }
+            let mid = (rc.bottom - rc.top) / 2;
+            // UIS_SET (1) / UIS_CLEAR (2) in the low word, UISF_HIDEFOCUS (1)
+            // in the high word.
+            let ui = |action: usize| unsafe {
+                SendMessageW(
+                    check,
+                    WM_UPDATEUISTATE,
+                    Some(WPARAM(action | (1 << 16))),
+                    None,
+                )
+            };
+            ui(1);
+            assert_eq!(printed_pixel(check, 0, mid), DARK.surface, "cue hidden");
+            ui(2);
+            let frame = printed_pixel(check, 0, mid);
+            use crate::ui::theme::{contrast_ratio, relative_luminance};
+            let ratio = contrast_ratio(relative_luminance(frame), relative_luminance(DARK.surface));
+            assert!(ratio >= 3.0, "cue shown: the frame pixel is {frame:#08x}");
+        });
+    }
+
+    /// #582 slice 2: the manifest took effect in the process that runs
+    /// Settings, because custom draw of buttons only exists in common
+    /// controls v6.
+    #[test]
+    fn a_settings_button_is_a_common_controls_v6_button() {
+        with_window(Config::default(), |hwnd, _raw| {
+            assert!(
+                crate::ui::settings_theme::button_is_common_controls_v6(autostart_checkbox(hwnd)),
+                "Settings runs classic controls: NM_CUSTOMDRAW never arrives for buttons"
+            );
+        });
     }
 
     /// #1109: the mouse over a combo hovers it, once: moving inside it again
