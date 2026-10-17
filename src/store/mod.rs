@@ -580,6 +580,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store with one root and one indexed document, for the knowledge
+    /// table tests below. Goes through `open_at`, so the real pragmas
+    /// (foreign keys, trusted_schema off, secure_delete) are in force.
+    fn knowledge_store(name: &str) -> (Store, PathBuf) {
+        let dir = scratch(name);
+        let s = Store::open_at(&dir.join("wingman.db")).unwrap();
+        {
+            let conn = s.lock();
+            conn.execute_batch(
+                "INSERT INTO knowledge_root (id, path, kind, added_unix)
+                     VALUES (1, 'C:/Notes', 'default', 10);
+                 INSERT INTO document (id, root_id, rel_path, status)
+                     VALUES (1, 1, 'notes.md', 'indexed');",
+            )
+            .unwrap();
+        }
+        (s, dir)
+    }
+
+    fn fts_hits(conn: &Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH ?1",
+            [term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_open_has_the_knowledge_tables() {
+        let dir = scratch("kn-tables");
+        let s = Store::open_at(&dir.join("wingman.db")).unwrap();
+        let conn = s.lock();
+        for table in ["knowledge_root", "document", "chunk", "chunk_fts"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table}");
+        }
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunk_text_is_searchable_the_moment_it_is_inserted() {
+        let (s, dir) = knowledge_store("kn-insert");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'My start date at Acme was 3 March', 'h0', 8)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "acme"), 1);
+        assert_eq!(fts_hits(&conn, "zebra"), 0);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edited_chunk_is_searchable_by_its_new_words_only() {
+        let (s, dir) = knowledge_store("kn-update");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'alpha beta', 'h0', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chunk SET text = 'gamma delta' WHERE ordinal = 0",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "alpha"), 0);
+        assert_eq!(fts_hits(&conn, "gamma"), 1);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_document_leaves_no_chunk_and_no_full_text_row() {
+        // The done-when of #83: delete the file, and nothing of it remains.
+        let (s, dir) = knowledge_store("kn-delete");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'findable words', 'h0', 3), (1, 1, 'more findable', 'h1', 3)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "findable"), 2);
+
+        conn.execute("DELETE FROM document WHERE id = 1", [])
+            .unwrap();
+
+        let chunks: i64 = conn
+            .query_row("SELECT count(*) FROM chunk", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 0);
+        assert_eq!(fts_hits(&conn, "findable"), 0);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_a_root_cascades_to_its_documents_and_chunks() {
+        let (s, dir) = knowledge_store("kn-root");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'rooted text', 'h0', 2)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM knowledge_root WHERE id = 1", [])
+            .unwrap();
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM document) + (SELECT count(*) FROM chunk)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(fts_hits(&conn, "rooted"), 0);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_path_is_unique_within_its_root() {
+        let (s, dir) = knowledge_store("kn-unique");
+        let conn = s.lock();
+        let dup = conn.execute(
+            "INSERT INTO document (root_id, rel_path, status) VALUES (1, 'notes.md', 'pending')",
+            [],
+        );
+        assert!(dup.is_err());
+        // The same relative path under another root is a different document.
+        conn.execute(
+            "INSERT INTO knowledge_root (id, path, kind, added_unix) VALUES (2, 'D:/Vault', 'vault', 11)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document (root_id, rel_path, status) VALUES (2, 'notes.md', 'pending')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_status_outside_the_four_known_ones_is_refused() {
+        let (s, dir) = knowledge_store("kn-status");
+        let conn = s.lock();
+        let bad = conn.execute(
+            "INSERT INTO document (root_id, rel_path, status) VALUES (1, 'x.md', 'weird')",
+            [],
+        );
+        assert!(bad.is_err());
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diacritics_do_not_hide_a_word() {
+        let (s, dir) = knowledge_store("kn-diacritics");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'Curriculum vitae of Zoë Müller', 'h0', 5)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "zoe"), 1);
+        assert_eq!(fts_hits(&conn, "muller"), 1);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fts5_is_compiled_in() {
         // The knowledge track (#85) needs FTS5; the bundled build must have it.
