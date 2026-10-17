@@ -66,6 +66,21 @@ pub(super) struct OptionsUi {
     /// How many times the geometry was measured from scratch. Paint must not
     /// move it; a test reads it.
     measure_count: Cell<u32>,
+    /// The painted (shortened) summary and row labels, worked out on the first
+    /// paint and reused (#1068). Cleared with `metrics_cache`.
+    shown_cache: RefCell<ShownCache>,
+    /// How many times a text was shortened with `DrawText`. Paint must not move
+    /// it after the first one.
+    ellipsize_count: Cell<u32>,
+}
+
+/// The shortened texts a paint draws, and the DPI and text scale they fit.
+#[derive(Default)]
+struct ShownCache {
+    key: (u32, u32),
+    summary: Option<String>,
+    /// Per row: the shortened label and the height its text takes.
+    rows: Vec<Option<(String, i32)>>,
 }
 
 /// What was measured, and what it was measured for.
@@ -80,6 +95,52 @@ impl OptionsUi {
     /// Forgets the measured geometry so the next use measures again.
     pub(super) fn invalidate_metrics(&self) {
         self.metrics_cache.borrow_mut().take();
+        *self.shown_cache.borrow_mut() = ShownCache::default();
+    }
+
+    /// The shortened summary for `key`, from `compute` the first time.
+    fn shown_summary(&self, key: (u32, u32), compute: impl FnOnce() -> String) -> String {
+        let mut cache = self.shown_cache.borrow_mut();
+        if cache.key != key {
+            *cache = ShownCache {
+                key,
+                ..ShownCache::default()
+            };
+        }
+        if let Some(text) = &cache.summary {
+            return text.clone();
+        }
+        self.ellipsize_count.set(self.ellipsize_count.get() + 1);
+        let text = compute();
+        cache.summary = Some(text.clone());
+        text
+    }
+
+    /// Row `index`'s shortened label and text height for `key`, from `compute`
+    /// the first time.
+    fn shown_row(
+        &self,
+        key: (u32, u32),
+        index: usize,
+        compute: impl FnOnce() -> (String, i32),
+    ) -> (String, i32) {
+        let mut cache = self.shown_cache.borrow_mut();
+        if cache.key != key {
+            *cache = ShownCache {
+                key,
+                ..ShownCache::default()
+            };
+        }
+        if cache.rows.len() <= index {
+            cache.rows.resize(index + 1, None);
+        }
+        if let Some(found) = &cache.rows[index] {
+            return found.clone();
+        }
+        self.ellipsize_count.set(self.ellipsize_count.get() + 1);
+        let made = compute();
+        cache.rows[index] = Some(made.clone());
+        made
     }
 }
 
@@ -421,6 +482,8 @@ impl CardInner {
             armed_claim: None,
             metrics_cache: RefCell::new(None),
             measure_count: Cell::new(0),
+            shown_cache: RefCell::new(ShownCache::default()),
+            ellipsize_count: Cell::new(0),
         });
         self.state = CardState::Options;
         self.layout_options(true);
@@ -771,24 +834,27 @@ impl CardInner {
         // the painted copy is shortened, with the ellipsis on the last line.
         let max_h = metrics.summary.bottom - metrics.summary.top;
         let width = metrics.summary.right - metrics.summary.left;
-        let shown = ellipsize_to_fit(&ui.summary, |s| {
-            let mut buf: Vec<u16> = s.encode_utf16().collect();
-            if buf.is_empty() {
-                return true;
-            }
-            let mut r = RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: 0,
-            };
-            DrawTextW(
-                hdc,
-                &mut buf,
-                &mut r,
-                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
-            );
-            r.bottom - r.top <= max_h
+        let key = (self.dpi, self.text_scale.to_bits());
+        let shown = ui.shown_summary(key, || {
+            ellipsize_to_fit(&ui.summary, |s| {
+                let mut buf: Vec<u16> = s.encode_utf16().collect();
+                if buf.is_empty() {
+                    return true;
+                }
+                let mut r = RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: 0,
+                };
+                DrawTextW(
+                    hdc,
+                    &mut buf,
+                    &mut r,
+                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                );
+                r.bottom - r.top <= max_h
+            })
         });
         draw_text_line(
             hdc,
@@ -1004,36 +1070,40 @@ impl CardInner {
             };
             let label_w = (label_rect.right - label_rect.left).max(1);
             let max_h = self.line_height(self.fonts.body).max(1) * OPTION_LABEL_MAX_LINES;
-            let shown = ellipsize_to_fit(&row.label, |s| {
-                let mut buf: Vec<u16> = s.encode_utf16().collect();
-                if buf.is_empty() {
-                    return true;
+            let key = (self.dpi, self.text_scale.to_bits());
+            let (shown, text_h) = ui.shown_row(key, index, || {
+                let shown = ellipsize_to_fit(&row.label, |s| {
+                    let mut buf: Vec<u16> = s.encode_utf16().collect();
+                    if buf.is_empty() {
+                        return true;
+                    }
+                    let mut r = RECT {
+                        left: 0,
+                        top: 0,
+                        right: label_w,
+                        bottom: 0,
+                    };
+                    DrawTextW(
+                        hdc,
+                        &mut buf,
+                        &mut r,
+                        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                    );
+                    r.bottom - r.top <= max_h
+                });
+                let mut measure = label_rect;
+                let mut buf: Vec<u16> = shown.encode_utf16().collect();
+                if !buf.is_empty() {
+                    DrawTextW(
+                        hdc,
+                        &mut buf,
+                        &mut measure,
+                        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                    );
                 }
-                let mut r = RECT {
-                    left: 0,
-                    top: 0,
-                    right: label_w,
-                    bottom: 0,
-                };
-                DrawTextW(
-                    hdc,
-                    &mut buf,
-                    &mut r,
-                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
-                );
-                r.bottom - r.top <= max_h
+                let text_h = (measure.bottom - measure.top).max(0);
+                (shown, text_h)
             });
-            let mut measure = label_rect;
-            let mut buf: Vec<u16> = shown.encode_utf16().collect();
-            if !buf.is_empty() {
-                DrawTextW(
-                    hdc,
-                    &mut buf,
-                    &mut measure,
-                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
-                );
-            }
-            let text_h = (measure.bottom - measure.top).max(0);
             let mut text_rect = label_rect;
             text_rect.top += ((label_rect.bottom - label_rect.top) - text_h).max(0) / 2;
             draw_text_line(
@@ -1678,6 +1748,23 @@ mod tests {
             let _ = render_button(&card, *b);
         }
         assert_eq!(measures(&card), after_show, "paint must not re-measure");
+        // Each text is shortened once, on the first paint, never again.
+        let shortened = card.inner.options.as_ref().unwrap().ellipsize_count.get();
+        assert_eq!(
+            shortened, 2,
+            "the summary and the drawn row label, once each"
+        );
+        for _ in 0..3 {
+            paint_once(&card);
+            for b in &buttons {
+                let _ = render_button(&card, *b);
+            }
+        }
+        assert_eq!(
+            card.inner.options.as_ref().unwrap().ellipsize_count.get(),
+            shortened,
+            "later paints shorten nothing"
+        );
         card.hide();
     }
 
