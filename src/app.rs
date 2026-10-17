@@ -607,6 +607,10 @@ struct App {
     /// #901: the finished read of a Reload that was not the last reply. If the
     /// write that superseded it fails, this is the config that gets applied.
     carried_reload: Option<Box<Config>>,
+    /// #901: a Reload put its Working card up and has not taken it down. Only
+    /// then (and not while a model run is busy, whose cards are its own) is a
+    /// Pending card the reload's to hide or replace; see `reload_owns_card`.
+    reload_card: bool,
     /// #870: writes handed to the writer thread whose reply has not come back.
     /// Only the last reply swaps in the loaded config; an earlier one was read
     /// before a later choice was made.
@@ -976,6 +980,7 @@ pub fn run() -> Result<()> {
         config,
         unsaved: Vec::new(),
         carried_reload: None,
+        reload_card: false,
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
         settings_save_starts: VecDeque::new(),
@@ -4714,6 +4719,10 @@ impl App {
     /// run's failure badge ("until the next press").
     fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
+        if busy {
+            // A run's cards replace the reload's Working card.
+            self.reload_card = false;
+        }
         BUSY_STUCK.with(|c| c.set(false));
         let hwnd = self.hwnd();
         unsafe {
@@ -5146,6 +5155,7 @@ impl App {
         RELOAD_STUCK.with(|c| c.set(false));
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
+        self.reload_card = true;
         // The writer answers in well under a second when it is alive; if it
         // never does, the Working card must not stay forever.
         unsafe {
@@ -5168,13 +5178,23 @@ impl App {
         let in_flight = self
             .pending_writes
             .load(std::sync::atomic::Ordering::SeqCst);
-        let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
-        if reload_is_stuck(pending, in_flight) {
+        if reload_is_stuck(self.reload_owns_card(), in_flight) {
+            self.reload_card = false;
             let (headline, detail) = reload_stuck_card();
             self.card.show_error(headline, detail);
             self.set_watch(true);
         }
     }
+
+    /// Whether the Pending card on screen is the Working card a Reload put up.
+    fn reload_owns_card(&self) -> bool {
+        reload_owns_card_rule(
+            self.reload_card,
+            self.busy,
+            matches!(self.card.state(), crate::ui::card::CardState::Pending),
+        )
+    }
+
     /// Opens the Settings window (or brings the open one to the front).
     ///
     /// #871: Settings is modeless. It creates its window and returns; it runs no
@@ -5795,6 +5815,12 @@ impl App {
                 let _ = KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID);
             }
             RELOAD_STUCK.with(|c| c.set(false));
+            // The reload's own Working card goes now; whatever card this reply
+            // has to show replaces nothing of a model run's.
+            if self.reload_owns_card() {
+                self.hide_card();
+            }
+            self.reload_card = false;
             self.carried_reload.take()
         } else {
             None
@@ -5832,14 +5858,10 @@ impl App {
                         // swap the config in. Changes that failed to save before
                         // this read are dropped now; the read itself is kept
                         // for the last reply, which applies it if its own write
-                        // fails. The Working card goes so it cannot outlive the
-                        // answer (a later save keeps a card that is up).
+                        // fails. The Working card stays: the last reply takes
+                        // it down (a newer reload may own it).
                         self.unsaved.clear();
                         self.carried_reload = Some(config);
-                        if matches!(self.card.state(), crate::ui::card::CardState::Pending) {
-                            self.hide_card();
-                            self.set_watch(false);
-                        }
                         return;
                     }
                     if last {
@@ -5861,7 +5883,12 @@ impl App {
                         }
                         self.apply_config();
                         if !unreadable.is_empty() {
-                            let (headline, detail) = unreadable_secrets_card(&unreadable);
+                            let (headline, mut detail) = unreadable_secrets_card(&unreadable);
+                            if let Some(why) = &key_error {
+                                // The key note must not be lost behind this card.
+                                let human = self.track_error(KEY_NOT_STORED_HEADLINE, why);
+                                detail = with_key_failure_note(&detail, &human);
+                            }
                             self.card.show_error(&headline, &detail);
                             self.set_watch(true);
                             return;
@@ -5872,7 +5899,7 @@ impl App {
                     if shown == SavedCard::KeyFailed {
                         // The other changes are saved; only the key is not.
                         let why = key_error.unwrap_or_default();
-                        let headline = "Settings saved, but the key was not stored";
+                        let headline = KEY_NOT_STORED_HEADLINE;
                         let human = self.track_error(headline, &why);
                         self.card.show_error_with_details(
                             headline,
@@ -5917,6 +5944,7 @@ impl App {
             Err(reason) => {
                 // A refused Settings save changed nothing in memory, so there is
                 // nothing for a later reload to put back.
+                let kept = !outcome.from_settings && !changes.is_empty();
                 if !outcome.from_settings {
                     self.unsaved.extend(changes);
                 }
@@ -5926,6 +5954,9 @@ impl App {
                 // rides along on the card.
                 let mut note = format!("{}\n\n{human}", outcome.fail_note);
                 if let Some(carried) = &carried {
+                    // The reloaded values are live now, so the note must not
+                    // say the old settings are still in use.
+                    note = format!("{}\n\n{human}", carried_fail_note(kept));
                     if !carried.unreadable_secrets.is_empty() {
                         let (_, detail) = unreadable_secrets_card(&carried.unreadable_secrets);
                         note = format!("{note}\n\n{detail}");
@@ -8969,6 +9000,32 @@ fn secrets_to_announce<'a>(
     }
 }
 
+const KEY_NOT_STORED_HEADLINE: &str = "Settings saved, but the key was not stored";
+
+/// A Pending card is the reload's own only when the reload put it up, no model
+/// run has taken the card over, and it is still a Pending card (#901).
+fn reload_owns_card_rule(reload_card: bool, run_busy: bool, card_pending: bool) -> bool {
+    reload_card && !run_busy && card_pending
+}
+
+/// The note when a write that followed a reload failed: the reload's values
+/// are live, so "still using the settings it had" would be untrue. `kept` is
+/// whether the failed change itself is kept until quit.
+fn carried_fail_note(kept: bool) -> String {
+    if kept {
+        "Settings were reloaded from the file, but this change was not saved. It stays until you quit.".to_string()
+    } else {
+        "Settings were reloaded from the file, but a later change was not saved.".to_string()
+    }
+}
+
+/// The unreadable-key card with the "key not stored" note kept on it.
+fn with_key_failure_note(detail: &str, human: &str) -> String {
+    format!(
+        "{detail}\n\n{KEY_NOT_STORED_HEADLINE}. Enter the key again in Settings after fixing this.\n\n{human}"
+    )
+}
+
 /// The reload's timer fired: stuck when the Working card is still up and a
 /// write is still unanswered.
 fn reload_is_stuck(working_card_up: bool, writes_in_flight: u32) -> bool {
@@ -10056,7 +10113,8 @@ mod tests {
         let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
         assert!(handler.contains("reload_reply(outcome.from_reload, last)"));
         assert!(handler.contains("KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID)"));
-        assert!(src.contains("app.on_reload_stuck()"));
+        let wnd = body_between(&src, "extern \"system\" fn wnd_proc(", "\n}\n");
+        assert!(wnd.contains("app.on_reload_stuck()"), "not in wnd_proc");
         let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
         assert!(reload.contains("RELOAD_TIMER_ID"));
     }
@@ -10249,6 +10307,67 @@ mod tests {
             "{handler}"
         );
         assert!(handler.contains("secrets_to_announce("), "{handler}");
+    }
+
+    /// #901 review: only the reload's own Working card is hidden or replaced.
+    #[test]
+    fn a_model_pending_card_is_not_the_reloads_to_touch() {
+        use super::{reload_is_stuck, reload_owns_card_rule};
+        assert!(reload_owns_card_rule(true, false, true));
+        assert!(!reload_owns_card_rule(false, false, true), "a model card");
+        assert!(!reload_owns_card_rule(true, true, true), "a run is busy");
+        assert!(!reload_owns_card_rule(true, false, false), "card moved on");
+        // The stuck timer replaces nothing it does not own.
+        assert!(!reload_is_stuck(
+            reload_owns_card_rule(false, false, true),
+            1
+        ));
+        let src = lf(include_str!("app.rs"));
+        let stuck = body_between(&src, "    fn on_reload_stuck(", "\n    }\n");
+        assert!(stuck.contains("self.reload_owns_card()"), "{stuck}");
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        assert!(handler.contains("self.reload_owns_card()"), "{handler}");
+        // A superseded reply hides nothing.
+        let at = handler.find("self.carried_reload = Some(config)").unwrap();
+        let end = handler[at..].find("return;").unwrap();
+        assert!(!handler[at..at + end].contains("hide_card"), "{handler}");
+        let busy = body_between(&src, "    fn set_busy(", "\n    }\n");
+        assert!(busy.contains("self.reload_card = false"), "{busy}");
+        let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(reload.contains("self.reload_card = true"), "{reload}");
+    }
+
+    #[test]
+    fn the_unreadable_key_card_keeps_the_key_not_stored_note() {
+        let text = super::with_key_failure_note("Could not read the saved key.", "disk full");
+        assert!(text.contains("Could not read the saved key."), "{text}");
+        assert!(text.contains("the key was not stored"), "{text}");
+        assert!(text.contains("disk full"), "{text}");
+        assert!(!text.contains('\u{2014}'));
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let at = handler
+            .find("unreadable_secrets_card(&unreadable)")
+            .unwrap();
+        let show = handler[at..].find("return;").unwrap();
+        assert!(
+            handler[at..at + show].contains("with_key_failure_note("),
+            "{handler}"
+        );
+    }
+
+    #[test]
+    fn the_failure_note_after_a_reload_says_the_settings_were_reloaded() {
+        for kept in [true, false] {
+            let note = super::carried_fail_note(kept);
+            assert!(note.contains("reloaded from the file"), "{note}");
+            assert!(!note.contains("still using"), "{note}");
+            assert!(!note.contains('\u{2014}'));
+        }
+        assert!(super::carried_fail_note(true).contains("stays until you quit"));
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        assert!(handler.contains("carried_fail_note(kept)"), "{handler}");
     }
 
     /// The gate is in the one place every model action starts, before the
