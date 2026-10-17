@@ -21,6 +21,7 @@
 
 use super::*;
 use crate::options_keys::{self, Choice, Claim, WM_APP_OPTIONS_CHOICE};
+use std::cell::{Cell, RefCell};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// One button: the action id it runs and the label shown on it.
@@ -59,6 +60,27 @@ pub(super) struct OptionsUi {
     /// The key claim as last armed, so it can be put back if something clears
     /// it while the card stays up ([`Card::rearm_options_claim`]).
     armed_claim: Option<Claim>,
+    /// Row geometry, measured once and reused by every paint (#1068). Cleared
+    /// whenever the rows, the DPI, the text scale or the fonts change.
+    metrics_cache: RefCell<Option<CachedMetrics>>,
+    /// How many times the geometry was measured from scratch. Paint must not
+    /// move it; a test reads it.
+    measure_count: Cell<u32>,
+}
+
+/// What was measured, and what it was measured for.
+struct CachedMetrics {
+    /// The DPI and text scale the numbers belong to.
+    key: (u32, u32),
+    base_row_h: i32,
+    metrics: OptionsMetrics,
+}
+
+impl OptionsUi {
+    /// Forgets the measured geometry so the next use measures again.
+    pub(super) fn invalidate_metrics(&self) {
+        self.metrics_cache.borrow_mut().take();
+    }
 }
 
 /// First child-control id of the row buttons: row `n` (from 0) is
@@ -397,6 +419,8 @@ impl CardInner {
             generation,
             behavior,
             armed_claim: None,
+            metrics_cache: RefCell::new(None),
+            measure_count: Cell::new(0),
         });
         self.state = CardState::Options;
         self.layout_options(true);
@@ -423,6 +447,7 @@ impl CardInner {
                 .take(options_keys::MAX_OPTIONS)
                 .cloned()
                 .collect();
+            ui.invalidate_metrics();
         }
         // Once: the card re-measures for the final row count, not per row.
         self.layout_options(false);
@@ -579,9 +604,40 @@ impl CardInner {
         (content_w - gap - keycap_size(base_row_h, gap) - gap * 4).max(1)
     }
 
+    /// The card's geometry. Measured on the first use after the rows, the DPI,
+    /// the text scale or the fonts change, then reused: a paint never calls
+    /// `DrawText` (#1068).
     fn options_metrics(&self) -> OptionsMetrics {
-        let rows = self.options.as_ref().map_or(0, |o| o.rows.len());
-        options_layout(&self.options_layout_inputs(rows))
+        self.options_geometry().1
+    }
+
+    /// The height of a one-line row, from the same cache as the metrics.
+    fn cached_base_row_h(&self) -> i32 {
+        self.options_geometry().0
+    }
+
+    fn options_geometry(&self) -> (i32, OptionsMetrics) {
+        let key = (self.dpi, self.text_scale.to_bits());
+        let Some(ui) = self.options.as_ref() else {
+            return (
+                self.option_base_row_h(),
+                options_layout(&self.options_layout_inputs(0)),
+            );
+        };
+        if let Some(c) = ui.metrics_cache.borrow().as_ref() {
+            if c.key == key {
+                return (c.base_row_h, c.metrics.clone());
+            }
+        }
+        ui.measure_count.set(ui.measure_count.get() + 1);
+        let base_row_h = self.option_base_row_h();
+        let metrics = options_layout(&self.options_layout_inputs(ui.rows.len()));
+        *ui.metrics_cache.borrow_mut() = Some(CachedMetrics {
+            key,
+            base_row_h,
+            metrics: metrics.clone(),
+        });
+        (base_row_h, metrics)
     }
 
     /// Sizes and places the card. `from_cursor` picks the monitor under the
@@ -897,7 +953,7 @@ impl CardInner {
             let gap = self.scale(GAP_DP);
             // The keycap keeps the one-line size and sits at the first line
             // of a row that grew for a wrapped label.
-            let base_h = self.option_base_row_h();
+            let base_h = self.cached_base_row_h();
             let cap = keycap_size(base_h, gap);
             let cap_top = rc.top + (base_h - cap) / 2;
             let cap_rect = RECT {
@@ -1587,6 +1643,73 @@ mod tests {
         assert!(h(&grown.rows[0]) > h(&plain.rows[0]), "long row grows");
         assert_eq!(h(&grown.rows[1]), h(&plain.rows[1]), "short row stays");
         assert!(grown.height > plain.height);
+        card.hide();
+    }
+
+    fn measures(card: &Card) -> u32 {
+        card.inner
+            .options
+            .as_ref()
+            .map_or(0, |o| o.measure_count.get())
+    }
+
+    /// Paints the summary and the hint into a throwaway memory DC.
+    fn paint_once(card: &Card) {
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let palette = card.inner.palette();
+            card.inner.paint_options(dc, &palette);
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn paint_reuses_the_measured_rows_instead_of_measuring_again() {
+        let _g = lock();
+        let mut card = new_card();
+        card.show_options(1, "Summary", &rows(3), BEHAVIOR);
+        let after_show = measures(&card);
+        assert!(after_show >= 1, "showing measured the rows");
+        for _ in 0..5 {
+            paint_once(&card);
+        }
+        let buttons: Vec<HWND> = card.inner.options.as_ref().unwrap().buttons.clone();
+        for b in &buttons {
+            let _ = render_button(&card, *b);
+        }
+        assert_eq!(measures(&card), after_show, "paint must not re-measure");
+        card.hide();
+    }
+
+    #[test]
+    fn a_dpi_change_measures_again_and_a_text_scale_change_too() {
+        let _g = lock();
+        let mut card = new_card();
+        card.show_options(1, "Summary", &rows(3), BEHAVIOR);
+        let before = measures(&card);
+        let small = card.inner.options_metrics();
+        card.force_dpi_for_gallery(192);
+        let big = card.inner.options_metrics();
+        let after = measures(&card);
+        assert!(after > before, "a DPI change re-measures");
+        assert!(big.height > small.height, "and the cache holds new numbers");
+        paint_once(&card);
+        assert_eq!(measures(&card), after, "then paint reuses them");
+        card.inner.set_text_scale(1.5);
+        assert!(measures(&card) > after, "a text scale change re-measures");
+        card.hide();
+    }
+
+    #[test]
+    fn new_rows_measure_again() {
+        let _g = lock();
+        let mut card = new_card();
+        card.show_options(1, "Looking", &[], BEHAVIOR);
+        let shell = card.inner.options_metrics();
+        let before = measures(&card);
+        assert!(card.set_options(1, "Pick one", &rows(3)));
+        assert!(measures(&card) > before);
+        assert!(card.inner.options_metrics().height > shell.height);
         card.hide();
     }
 

@@ -1733,6 +1733,9 @@ impl CardInner {
         let fresh = build_fonts(self.dpi, self.text_scale);
         let old = std::mem::replace(&mut self.fonts, fresh);
         old.delete();
+        if let Some(ui) = self.options.as_ref() {
+            ui.invalidate_metrics();
+        }
     }
 
     /// Clamps and applies a new text-scale multiplier, then rebuilds fonts
