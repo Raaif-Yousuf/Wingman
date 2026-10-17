@@ -793,6 +793,10 @@ pub fn run() -> Result<()> {
         .name("ics-startup-sweep".into())
         .spawn(|| crate::connectors::IcsConnector::new().sweep_stale());
 
+    // #1010: open the local store here, once, off the UI thread, so the
+    // tray tooltip (UI thread) only ever reads an already-open store.
+    crate::store::open_in_background();
+
     // #831: read before `Config::load`, which creates the file on a first
     // run. If the path cannot be found, say it existed: no welcome is the
     // safe side.
