@@ -142,6 +142,8 @@ pub struct Config {
     pub ui: Ui,
     /// #24: the intent router's settings (`[palette]` in config.toml).
     pub palette: Palette,
+    /// #306: the options card's shortlist settings (`[options]`).
+    pub options: Options,
     /// Provider names (`"openai"`, `"anthropic"`) [`Config::hydrate_secrets`]
     /// could not read a stored credential for (#175). Load-time diagnostic
     /// only -- never persisted (`#[serde(skip)]`), so a caller with access to
@@ -727,7 +729,7 @@ pub struct Forms {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Palette {
-    /// Minimum `RouterResult::confidence` (0.0..=1.0) for the router's
+    /// Minimum `RouterOption::confidence` (0.0..=1.0) for the router's
     /// suggestion to pre-select a row -- see `router::should_apply`, the one
     /// place this value is actually consulted (`app.rs` reads it from
     /// `Config` and passes it through). Kept as a plain `f64` rather than a
@@ -742,6 +744,37 @@ impl Default for Palette {
         Self {
             router_threshold: crate::router::DEFAULT_ROUTER_THRESHOLD,
         }
+    }
+}
+
+/// #306: settings for the router's ranked shortlist, the options card's
+/// source. More fields arrive with the card itself.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Options {
+    /// How many options the shortlist keeps. Clamped to 2..=4 where it is
+    /// used ([`crate::router::RouterLimits::new`]), never rejected.
+    pub max_options: usize,
+    /// The card's inclusion bar for an option's confidence. Separate from
+    /// `palette.router_threshold`: the card exists to show alternatives, so
+    /// it needs a lower bar than the palette's pre-select.
+    pub min_confidence: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            max_options: crate::router::DEFAULT_MAX_OPTIONS,
+            min_confidence: crate::router::DEFAULT_MIN_CONFIDENCE,
+        }
+    }
+}
+
+impl Options {
+    /// The clamped limits the router validates a shortlist with.
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
+    pub fn router_limits(&self) -> crate::router::RouterLimits {
+        crate::router::RouterLimits::new(self.min_confidence, self.max_options)
     }
 }
 
@@ -1177,11 +1210,30 @@ impl Config {
     ///
     /// `env_is_set` is injected (rather than calling `std::env::var`
     /// directly) so tests exercise this without touching real process env.
+    #[cfg(test)]
     fn push_secrets_to_store(
         &mut self,
         store: &dyn SecretStore,
         env_is_set: &dyn Fn(&str) -> bool,
     ) -> Result<()> {
+        self.push_secrets_logged(store, env_is_set, &mut Vec::new())
+    }
+
+    /// [`Config::push_secrets_to_store`] that also records each credential's
+    /// previous value before touching it (#890), so a failed save can put the
+    /// store back. A credential that cannot be read is not recorded: it is
+    /// overwritten as before rather than blocking a retyped key.
+    fn push_secrets_logged(
+        &mut self,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+        undo: &mut Vec<(String, Option<String>)>,
+    ) -> Result<()> {
+        let mut remember = |target: &str| {
+            if let Ok(previous) = store.get(target) {
+                undo.push((target.to_string(), previous));
+            }
+        };
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
@@ -1200,10 +1252,12 @@ impl Config {
                 continue;
             }
             if key.is_empty() {
+                remember(&target);
                 store
                     .delete(&target)
                     .with_context(|| format!("failed to delete {target} from the secret store"))?;
             } else {
+                remember(&target);
                 store
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
@@ -1221,10 +1275,12 @@ impl Config {
                 continue;
             }
             if entry.api_key.is_empty() {
+                remember(&target);
                 store
                     .delete(&target)
                     .with_context(|| format!("failed to delete {target} from the secret store"))?;
             } else {
+                remember(&target);
                 store
                     .set(&target, &entry.api_key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
@@ -1446,12 +1502,39 @@ impl Config {
     /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        self.save_with_store(&path, &CredManagerStore, &|name| {
+            std::env::var(name).is_ok()
+        })
+    }
+
+    /// [`Config::save`] with the path and secret store injected. The store is
+    /// written before the file (the file must not hold a key the store never
+    /// got), so when the file write fails the store is put back: a failed
+    /// save changes neither (#890).
+    fn save_with_store(
+        &self,
+        path: &Path,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
         // #711: checked before the secret store is touched, so a refused save
         // writes nothing anywhere.
-        self.check_save_allowed(&path)?;
+        self.check_save_allowed(path)?;
         let mut on_disk = self.clone();
-        on_disk.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())?;
-        on_disk.save_to(&path)
+        let mut undo = Vec::new();
+        let result = on_disk
+            .push_secrets_logged(store, env_is_set, &mut undo)
+            .and_then(|()| on_disk.save_to(path));
+        if result.is_err() {
+            for (target, previous) in undo.into_iter().rev() {
+                // Best effort: the save error is the one worth reporting.
+                let _ = match previous {
+                    Some(secret) => store.set(&target, &secret),
+                    None => store.delete(&target),
+                };
+            }
+        }
+        result
     }
 
     /// #711: refuses a save that would clobber the user's file.
@@ -1770,6 +1853,7 @@ impl Providers {
     /// Empty for an unrecognized name or a `"compat:<name>"` entry with no
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
+    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
         match Self::known_provider_for(name) {
             Some(KnownProvider::Openai) => self.openai.models.clone(),
@@ -2059,6 +2143,33 @@ mod tests {
         // contract every other Config section already gives).
         let parsed: Config = toml::from_str("").expect("an empty document must still parse");
         assert_eq!(parsed.forms.require_tick_for, RequireTickFor::Sensitive);
+    }
+
+    // -- options.* (issue #306) ----------------------------------------------
+
+    #[test]
+    fn options_defaults_match_the_spec() {
+        let o = Config::default().options;
+        assert_eq!(o.max_options, 4);
+        assert_eq!(o.min_confidence, 0.2);
+        assert_eq!(o.router_limits(), crate::router::RouterLimits::default());
+    }
+
+    #[test]
+    fn options_table_is_optional_and_partial_and_clamped() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.options, Options::default());
+        let cfg: Config = toml::from_str("[options]\nmax_options = 9\n").unwrap();
+        assert_eq!(cfg.options.min_confidence, 0.2);
+        assert_eq!(
+            cfg.options.router_limits(),
+            crate::router::RouterLimits::new(0.2, 4)
+        );
+        let cfg: Config =
+            toml::from_str("[options]\nmax_options = 3\nmin_confidence = 0.5\n").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.options, cfg.options);
     }
 
     // -- palette.router_threshold (issue #24) --------------------------------
@@ -3098,6 +3209,52 @@ structured = "prompt"
         assert!(config
             .unreadable_secrets
             .contains(&"compat:openrouter".to_string()));
+    }
+
+    /// #890: a save that fails after the secret store was written puts the
+    /// store back, so nothing is half-applied.
+    #[test]
+    fn a_save_that_fails_on_the_file_leaves_the_secret_store_as_it_was() {
+        let blocker = std::env::temp_dir().join(format!(
+            "wingman-test-890-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&blocker, "not a directory").unwrap();
+        // A parent that is a file: create_dir_all, so save_to, must fail.
+        let path = blocker.join("config.toml");
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-new".into();
+        config.providers.anthropic.api_key = String::new();
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-old").unwrap();
+        store.set("Wingman/anthropic", "sk-ant-old").unwrap();
+
+        let err = config.save_with_store(&path, &store, &|_| false);
+        let _ = std::fs::remove_file(&blocker);
+        assert!(err.is_err());
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-old")
+        );
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-ant-old"),
+            "a delete must be undone too"
+        );
+        // A key that was new is removed again.
+        let fresh = crate::secrets::InMemoryStore::default();
+        let blocker2 = std::env::temp_dir().join(format!(
+            "wingman-test-890b-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&blocker2, "x").unwrap();
+        let err = config.save_with_store(&blocker2.join("config.toml"), &fresh, &|_| false);
+        let _ = std::fs::remove_file(&blocker2);
+        assert!(err.is_err());
+        assert_eq!(fresh.get("Wingman/openai").unwrap(), None);
     }
 
     #[test]

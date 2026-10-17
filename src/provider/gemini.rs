@@ -163,10 +163,7 @@ impl Gemini {
                     .and_then(|f| f.get("blockReason"))
                     .and_then(Value::as_str)
                 {
-                    return Err(anyhow!(
-                        "gemini: the prompt was blocked ({})",
-                        super::safe_reason(reason)
-                    ));
+                    return Err(super::blocked_error("gemini", reason));
                 }
                 return Err(anyhow!("gemini: response has no candidates[]"));
             }
@@ -862,6 +859,65 @@ mod tests {
         let err = Gemini::parse_completion(&body).unwrap_err();
         assert!(err.to_string().contains("prompt was blocked"), "{err}");
         assert!(err.to_string().contains("SAFETY"), "{err}");
+        assert!(err.downcast_ref::<super::super::Declined>().is_some());
+    }
+
+    /// #767: a blocked prompt stops the chain; the second provider is never
+    /// called.
+    #[test]
+    fn a_blocked_prompt_stops_the_chain_before_the_next_provider() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct Second(std::sync::Arc<AtomicU32>);
+        impl crate::provider::Provider for Second {
+            fn id(&self) -> &'static str {
+                "second"
+            }
+            fn ready(&self) -> bool {
+                true
+            }
+            fn capabilities(&self, _m: &str) -> crate::provider::Caps {
+                crate::provider::Caps::default()
+            }
+            fn complete(
+                &self,
+                _r: &crate::provider::Request,
+            ) -> anyhow::Result<crate::provider::Completion> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!("second was called"))
+            }
+        }
+        struct First;
+        impl crate::provider::Provider for First {
+            fn id(&self) -> &'static str {
+                "gemini"
+            }
+            fn ready(&self) -> bool {
+                true
+            }
+            fn capabilities(&self, _m: &str) -> crate::provider::Caps {
+                crate::provider::Caps::default()
+            }
+            fn complete(
+                &self,
+                _r: &crate::provider::Request,
+            ) -> anyhow::Result<crate::provider::Completion> {
+                Gemini::parse_completion(r#"{"promptFeedback": {"blockReason": "SAFETY"}}"#)
+            }
+        }
+        let calls = std::sync::Arc::new(AtomicU32::new(0));
+        let chain =
+            crate::provider::Chain::new(vec![Box::new(First), Box::new(Second(calls.clone()))]);
+        let req = crate::provider::Request {
+            system: String::new(),
+            user: "u".into(),
+            images: vec![],
+            schema: None,
+            effort: crate::provider::Effort::Unset,
+            max_tokens: 0,
+        };
+        let err = chain.complete_parsed(&req, |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("prompt was blocked"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

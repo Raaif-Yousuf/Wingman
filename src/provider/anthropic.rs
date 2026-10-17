@@ -98,7 +98,7 @@ impl Anthropic {
         let stop_reason = value.get("stop_reason").and_then(Value::as_str);
 
         if stop_reason == Some("refusal") {
-            return Err(anyhow!("anthropic: model refused to answer"));
+            return Err(super::refused_error("anthropic"));
         }
 
         let content = value

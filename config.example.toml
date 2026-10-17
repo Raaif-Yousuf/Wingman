@@ -98,6 +98,10 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
 [palette]
 router_threshold = 0.7
 
+[options]
+max_options = 4
+min_confidence = 0.2
+
 [forms]
 require_tick_for = "sensitive"
 

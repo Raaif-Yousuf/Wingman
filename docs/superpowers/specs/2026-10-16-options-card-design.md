@@ -266,8 +266,9 @@ it writes a label for it.
 - The schema deliberately has no `minItems` or `maxItems`: providers differ
   on which array keywords structured output accepts, and a prompt-only limit
   is not trusted (see #301). The cap is enforced in code.
-- `max_tokens` rises from 200 to 400 (four options at about 35 tokens each,
-  plus the summary).
+- `max_tokens` is 1000 (`ROUTER_MAX_TOKENS`, raised in #764). The cap also
+  covers thinking tokens, and a reply cut off with no text is the "ran out of
+  room" error (#155), so it is not lowered for the shortlist.
 - The prompt asks for up to four options, best first, labels that name the
   thing on screen ("Review this email to Dana"), plain text.
 
@@ -815,15 +816,17 @@ at every step.
 
 1. **Router shortlist (#306).** `RouterResult.options`, schema, validation,
    labels, fallbacks, and the `effect` column on the built-in catalogue. The
-   any remaining palette consumer reads `options[0]`. The palette also stops
-   sending a router request when it opens (see "Related decisions"). Done when
-   the fixture test passes and opening the palette makes no request in the
-   egress log (checked by hand).
+   palette consumer reads `options[0]`. Done when the fixture test passes.
+   The palette keeps its router request in this slice: removing it would leave
+   the shortlist with no caller until the card exists, so "the palette sends
+   no request when it opens" (see "Related decisions") moves to slice 2.
 2. **Options card (#307).** `CardState::Options`, keys 1 to 4 and Esc (the
    bounded claim, with auto-dismiss), click to pick, hide-before-capture.
    Reachable from a new tray item "What can I do here?", behind no setting,
    since the bare key is unchanged (the key keeps running Check my work, even
-   with the card up). Done when Manual checks 5 and 8 pass.
+   with the card up). Also stops the palette sending a router request when it
+   opens (moved here from slice 1), checked by hand in the egress log. Done
+   when Manual checks 5 and 8 pass.
 3. **Bare key opens the options card (#308).** The default flips. This slice
    also carries what the flip needs to be safe: the auto-repeat filter, the
    "Options card" and "Looking" rows of the key table with single-press

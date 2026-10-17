@@ -7,8 +7,11 @@ OpenAI-compatible endpoint (`openai-compat`, issue #16, closed).
 Every provider implements the same `Provider` trait
 (`src/provider/mod.rs`): `id`, `ready`, `capabilities`, `complete`. A
 `Chain` (`src/provider/mod.rs`) tries each ready provider in
-`providers.order` in turn and falls through to the next on any failure,
+`providers.order` in turn and falls through to the next on a failure,
 including a 200 response that fails to parse against the action's schema.
+The exception is a decline (a safety refusal, content filter or blocked
+prompt): the chain stops and the card shows the reason, so the screenshot is
+never sent to a second vendor (#767).
 
 ## Where a key lives
 
@@ -44,10 +47,12 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Effort/thinking:** `reasoning.effort` (`low`/`medium`/`high`), from
   `providers.openai.effort` unless a request carries its own `Effort`
   override. Omitted entirely (not sent as an empty string) when effort is
-  unset/blank, or when the model does not support it. `gpt-4.1` predates
-  `reasoning.effort` on the Responses API and is carved out
-  (`supports_reasoning`); THEORY (unverified): whether sending it anyway
-  400s or is silently ignored has not been checked live (#167).
+  unset/blank, or when the model does not support it. `reasoning.effort` is sent only to known reasoning models: `gpt-5` and
+  later and the o-series (`supports_reasoning`, an allowlist, #766). Any other
+  id (`gpt-4.1`, `gpt-4o`, `-chat` variants, an id it cannot place) is sent
+  without `reasoning` and runs at the model's own default. THEORY
+  (unverified): whether a non-reasoning model 400s or ignores the field has
+  not been checked live (#167).
 - **Structured output:** `text.format` with `type: "json_schema"`,
   `strict: true`, and the schema verbatim from `Request::schema`. Property
   order is preserved end to end (`serde_json`'s `preserve_order`, AGENTS.md
@@ -141,6 +146,13 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Auth:** none. `ready()` only checks that `base_url` is non-empty; a
   local server that isn't actually listening fails as a transport error,
   which `Chain` already falls through on.
+- **A remote `base_url` is allowed, with one warning** (#806). A home server
+  or another PC on the network is still Ollama, so Local mode accepts it.
+  The first press that would send to an address that is not on this PC
+  (`src/remote_ollama.rs`: not 127.0.0.1, `::1` or `localhost`) shows a card
+  saying the screenshot goes there, sends nothing, and remembers the address
+  in `%LOCALAPPDATA%\Wingman\remote-ollama-ack.txt`. The next press goes
+  through. A new address warns again. 127.0.0.1 never shows it.
 - **127.0.0.1, never `localhost`** (AGENTS.md rule 6): IPv6-first resolution
   of `localhost` stalls about 2 seconds per connection on Windows, MEASURED
   in the sibling CLAIR repo. `DEFAULT_BASE_URL` is asserted in tests to
@@ -273,8 +285,11 @@ through `provider/common.rs::post_json` / `post_json_with` (issue #98). Ollama u
 a different helper (`post_json_with_connect_timeout`) with no retry policy,
 since a local server has no rate limit to retry against.
 
-- A transport error (DNS, connect, timeout, dropped connection) or an HTTP
-  5xx is retried up to `RetryPolicy::max_retries` (2) times with full-jitter
+- A request that timed out after the connection was made is **never**
+  retried (#727): the vendor may already have processed and billed it. Only
+  failures that prove nothing was sent (DNS, connect, a DNS or connect
+  timeout) are retried, along with an HTTP 5xx.
+- A transport error that proves nothing was sent, or an HTTP 5xx, is retried up to `RetryPolicy::max_retries` (2) times with full-jitter
   exponential backoff (`base_delay` 200ms), capped at `max_total_backoff`
   (3 seconds) of cumulative sleep across all retries for one call.
 - An HTTP 429 is retried **exactly once**, sleeping the server's own
