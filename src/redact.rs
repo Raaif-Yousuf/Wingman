@@ -672,8 +672,7 @@ pub fn word_byte_ranges(line_text: &str, words: &[OcrWord]) -> Option<Vec<Range<
 /// in any letter case.
 /// The overlay drops a quote that contains one: the model never saw the real
 /// text, so there is nothing on screen to point at. Slice 2 of the overlay
-/// (#809) is its first non-test caller.
-#[cfg_attr(not(test), allow(dead_code))]
+/// (#809) is its first non-test caller; "Ask my documents" uses it too.
 pub fn contains_marker(text: &str) -> bool {
     // ASCII lowercasing keeps every byte offset, so no char is split.
     let text = text.to_ascii_lowercase();

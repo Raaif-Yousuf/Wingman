@@ -68,7 +68,13 @@ change or start.
 The card shows a short answer, then **From your documents** with one line per
 quote: the file (and the heading, if the file has one) and the exact words the
 answer relied on. Wingman checks that every quote really appears in the passage
-it came from, and drops any that does not. It adds the file names itself; the
+it came from, and drops any that does not. It also checks the answer. Every
+number in it must be a number in a quote: digits must match whole digits (or the
+word for them), and number words (English, German, French and Spanish, such as
+"three" or "vingt et un") must match a number the quote states, read one
+sentence at a time. A German compound such as "einundzwanzig" is accepted only
+when a quote has that same word. An answer or quote that holds a redaction
+marker such as [email 1] is never shown. Wingman adds the file names itself; the
 model never supplies one.
 
 If no quote holds up, the card says **Your documents had no supported answer**
