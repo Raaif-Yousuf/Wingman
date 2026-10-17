@@ -751,15 +751,19 @@ struct SettingsInner {
 /// keeps the window open.
 type SaveSink = Box<dyn Fn(&Config, &Config) -> Result<(), String>>;
 
-/// Counts the `SettingsInner` values dropped, so a test can tell a double free
-/// from a single one.
+// Counts the `SettingsInner` values dropped on this thread, so a test can tell
+// a double free from a single one. Per thread on purpose: many other tests
+// build and drop a `SettingsInner` in parallel without taking the open-guard
+// lock, and a process-wide count would include their drops.
 #[cfg(test)]
-static INNERS_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static INNERS_DROPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 impl Drop for SettingsInner {
     fn drop(&mut self) {
-        INNERS_DROPPED.fetch_add(1, Ordering::SeqCst);
+        INNERS_DROPPED.with(|c| c.set(c.get() + 1));
     }
 }
 
@@ -13313,7 +13317,7 @@ mod tests {
             };
             assert!(unsafe { RegisterClassExW(&wc) } != 0);
         });
-        let before = INNERS_DROPPED.load(Ordering::SeqCst);
+        let before = INNERS_DROPPED.with(|c| c.get());
         let opened = open_impl(
             instance,
             HWND(std::ptr::null_mut()),
@@ -13323,7 +13327,7 @@ mod tests {
         );
         assert!(!opened, "the window cannot be created");
         assert_eq!(
-            INNERS_DROPPED.load(Ordering::SeqCst) - before,
+            INNERS_DROPPED.with(|c| c.get()) - before,
             1,
             "the window state must be freed once, not twice"
         );
@@ -13339,7 +13343,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
-        let before = INNERS_DROPPED.load(Ordering::SeqCst);
+        let before = INNERS_DROPPED.with(|c| c.get());
         let opened = open_impl(
             HINSTANCE(h.0),
             HWND(std::ptr::null_mut()),
@@ -13348,7 +13352,7 @@ mod tests {
             false,
         );
         assert!(!opened);
-        assert_eq!(INNERS_DROPPED.load(Ordering::SeqCst) - before, 1);
+        assert_eq!(INNERS_DROPPED.with(|c| c.get()) - before, 1);
     }
 
     /// #871: Esc in the open window is taken by `pre_dispatch` and becomes a

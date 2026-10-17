@@ -1574,10 +1574,10 @@ mod tests {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, LoadCursorW,
-            PeekMessageW, RegisterClassExW, SetForegroundWindow, SetWindowPos, ShowWindow,
-            TranslateMessage, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, ES_PASSWORD, HWND_BOTTOM,
-            IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE,
-            WNDCLASSEXW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+            PeekMessageW, RegisterClassExW, SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW,
+            CS_VREDRAW, ES_AUTOHSCROLL, ES_PASSWORD, HWND_BOTTOM, IDC_ARROW, MSG, PM_REMOVE,
+            SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE, WNDCLASSEXW, WS_CHILD,
+            WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
         };
 
         /// Drains the calling thread's message queue without blocking.
@@ -1734,13 +1734,9 @@ mod tests {
             stack_in_creation_order(&[name_label, name_edit, password_label, password_edit]);
             pump_pending_messages();
 
-            // Best-effort; the test asserts via `snapshot_hwnd` (by handle),
-            // not `snapshot_foreground`, precisely so the result does not
-            // depend on this succeeding under an unattended agent with no
-            // interactive desktop session.
-            unsafe {
-                let _ = SetForegroundWindow(frame);
-            }
+            // No `SetForegroundWindow`: the test asserts via `snapshot_hwnd`
+            // (by handle), so it needs no focus, and stealing the real
+            // desktop's focus would interrupt whoever is typing (#981).
 
             let start = std::time::Instant::now();
             let snapshot = crate::inputs::uia::snapshot_hwnd(
