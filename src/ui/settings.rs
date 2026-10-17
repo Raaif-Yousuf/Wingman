@@ -89,8 +89,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW,
     PM_REMOVE, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT,
-    WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
     WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -739,6 +739,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HSCROLL => {
             update_text_scale_label(hwnd);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            paint_footer_divider(hwnd);
             LRESULT(0)
         }
         WM_OLLAMA_STATUS => {
@@ -1924,6 +1928,51 @@ fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
     } else {
         crate::ui::theme::LIGHT.text_dim
     }
+}
+
+/// #935: the divider above the footer, as `(left, top, right, bottom)` in
+/// client px. One physical pixel on the footer's first row, directly under the
+/// body, so a row the scrolling body cuts off reads as an edge.
+fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i32, i32, i32) {
+    let top = client_h_px - to_px(FOOTER_H_DP, dpi);
+    (0, top, client_w_px, top + 1)
+}
+
+/// #935: the divider's colour. The theme's hairline token; the system's own
+/// text colour in high contrast, where a pale hairline would not show.
+fn footer_divider_color(high_contrast: bool, btn_text: u32) -> u32 {
+    if high_contrast {
+        btn_text
+    } else {
+        crate::ui::theme::LIGHT.border
+    }
+}
+
+/// Paints the footer divider (#935). The class background has already filled
+/// the client area; only the line is drawn here.
+unsafe fn paint_footer_divider(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, EndPaint, FillRect, GetSysColor, COLOR_BTNTEXT, PAINTSTRUCT,
+    };
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+        let ink = footer_divider_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+        let (l, t, r, b) =
+            footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
+        let line = windows::Win32::Foundation::RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        };
+        FillRect(hdc, &line, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 /// The body forwards what its controls tell their parent (button clicks, the
@@ -6654,6 +6703,34 @@ mod tests {
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
         assert_eq!(hotkey_hint_color(true, hc), hc);
+    }
+
+    /// #935: a 1 px line sits on the first row of the footer, directly under
+    /// the scrolling body, at every scale and for every client size, so a row
+    /// the body cuts off reads as an edge under a divider.
+    #[test]
+    fn footer_divider_sits_on_the_body_edge() {
+        for dpi in [96u32, 144, 192, 240] {
+            let (client_w, client_h) = (to_px(WIN_W_DP, dpi) + 17, to_px(700, dpi));
+            let (l, t, r, b) = footer_divider_rect(client_w, client_h, dpi);
+            let body_bottom = client_h - to_px(FOOTER_H_DP, dpi);
+            assert_eq!(
+                t, body_bottom,
+                "the line starts where the body ends ({dpi} dpi)"
+            );
+            assert_eq!(b - t, 1, "a hairline at every scale ({dpi} dpi)");
+            assert_eq!((l, r), (0, client_w), "the line spans the client width");
+        }
+    }
+
+    /// #935: the divider uses the theme's hairline token, and the system's
+    /// own text colour in high contrast (a light grey would vanish there).
+    #[test]
+    fn footer_divider_colour_comes_from_the_tokens() {
+        use crate::ui::theme::{rgb, LIGHT};
+        assert_eq!(footer_divider_color(false, rgb(1, 2, 3)), LIGHT.border);
+        let hc = rgb(255, 255, 255);
+        assert_eq!(footer_divider_color(true, hc), hc);
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
