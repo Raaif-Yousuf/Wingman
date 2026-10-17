@@ -429,6 +429,12 @@ impl Tray {
         Self::with_icon(hwnd, instance, HICON::default())
     }
 
+    /// Whether the shell accepted the icon. False for a tray made by
+    /// [`Tray::without_icon`] until [`Tray::readd`] succeeds (#1037).
+    pub fn has_icon(&self) -> bool {
+        !self.base_icon.is_invalid()
+    }
+
     fn with_icon(hwnd: HWND, instance: HINSTANCE, base_icon: HICON) -> Self {
         Self {
             hwnd,
@@ -1733,6 +1739,13 @@ fn derive_icon_with_edit(
 
 #[cfg(test)]
 mod tests {
+    // #1037: a tray the shell refused reports no icon, so the app retries it.
+    #[test]
+    fn a_tray_without_an_icon_reports_it() {
+        let tray = Tray::without_icon(HWND::default(), HINSTANCE::default());
+        assert!(!tray.has_icon());
+    }
+
     use super::*;
 
     // -- Version label (#317) ------------------------------------------------
