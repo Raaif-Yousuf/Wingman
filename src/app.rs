@@ -366,6 +366,13 @@ fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) 
     }
 }
 
+/// #42: moves the pending action to the last-run slot. Pure.
+fn remember_started(pending: &mut Option<String>, last: &mut Option<String>) {
+    if let Some(id) = pending.take() {
+        *last = Some(id);
+    }
+}
+
 /// #42: the action a double press repeats: the last one the user ran, if the
 /// catalogue still knows it and its effect lets a bare key run it (never one
 /// that writes the clipboard, #859). Pure.
@@ -634,10 +641,13 @@ struct App {
     key_quiet_until: Option<Instant>,
     /// #393: when the press that started the current Look was made.
     look_pressed_at: Option<Instant>,
-    /// #42: the id of the last action run through the palette dispatch, kept
-    /// for this run only (a double press repeats it). Not saved: an id from an
-    /// earlier session could name an action that has since changed.
+    /// #42: the id of the last action whose run started, kept for this run
+    /// only (a double press repeats it). Not saved: an id from an earlier
+    /// session could name an action that has since changed.
     last_action: Option<String>,
+    /// #42: the action being dispatched right now. It becomes `last_action`
+    /// only when its run starts ([`App::note_run_started`]), not on a refusal.
+    pending_action: Option<String>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -958,6 +968,7 @@ pub fn run() -> Result<()> {
         key_quiet_until: None,
         look_pressed_at: None,
         last_action: None,
+        pending_action: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1988,6 +1999,7 @@ impl App {
         let foreground_hwnd_isize =
             unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize;
 
+        self.note_run_started();
         self.set_busy(true);
         // Disarmed for the whole in-flight window: a click while the spinner
         // is up must not touch the card.
@@ -2026,6 +2038,24 @@ impl App {
     /// ready, grab the screen, then hand the bytes to a worker so the
     /// message loop stays responsive during the call.
     fn ask(&mut self, trigger: Trigger) {
+        // #42: Check my work from the key or the tray has no dispatch id.
+        let own = self.pending_action.is_none();
+        if own {
+            self.pending_action = Some(actions::DEFAULT_ACTION_ID.to_string());
+        }
+        self.ask_inner(trigger);
+        if own {
+            self.pending_action = None;
+        }
+    }
+
+    /// #42: called where a run actually starts, after every gate and just
+    /// before the app goes busy: the pending action becomes the last one.
+    fn note_run_started(&mut self) {
+        remember_started(&mut self.pending_action, &mut self.last_action);
+    }
+
+    fn ask_inner(&mut self, trigger: Trigger) {
         let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
@@ -2581,7 +2611,12 @@ impl App {
                 }
             }
             keypress::KeyAction::Absorb => {}
-            keypress::KeyAction::Repeat => self.repeat_last_action(),
+            keypress::KeyAction::Repeat => {
+                self.repeat_last_action();
+                // Like every immediate action: a third tap during the settle
+                // must not reach the busy card.
+                self.key_quiet_until = window.map(|w| Instant::now() + w);
+            }
             keypress::KeyAction::Proceed => {
                 self.look_pressed_at = Some(now);
                 self.run_primary_action(trigger);
@@ -2697,8 +2732,9 @@ impl App {
         // sees whatever Windows re-activated. Honour what was in front when
         // it opened as well, for the length of this one dispatch.
         self.password_manager_hint = self.palette_password_manager;
-        self.last_action = Some(action_id.to_string());
+        self.pending_action = Some(action_id.to_string());
         self.dispatch_palette_target(action_id);
+        self.pending_action = None;
         self.password_manager_hint = false;
     }
 
@@ -2809,6 +2845,7 @@ impl App {
             }
         };
 
+        self.note_run_started();
         self.set_busy(true);
         self.set_watch(false);
         // No model in this flow (see the doc comment above): `Working` is
@@ -4815,6 +4852,7 @@ impl App {
             return;
         }
 
+        self.note_run_started();
         self.set_busy(true);
         self.set_watch(false);
         // Issue #354 follow-up review, finding 3: this reads the current
@@ -10184,15 +10222,99 @@ mod tests {
         assert_eq!(super::repeat_target(None, &cat), None);
     }
 
-    /// #42: the one dispatch every palette and options run goes through
-    /// remembers the action, and a Repeat reaches `repeat_last_action`.
+    /// #42: an action is remembered only once its run starts, never on a
+    /// refusal. The pure part.
     #[test]
-    fn running_an_action_remembers_it_and_the_repeat_key_action_is_handled() {
+    fn an_action_is_remembered_only_when_its_run_starts() {
+        let mut pending = Some("a".to_string());
+        let mut last = Some("old".to_string());
+        // A refusal never reaches `remember_started`: the old one stays.
+        assert_eq!(last.as_deref(), Some("old"));
+        super::remember_started(&mut pending, &mut last);
+        assert_eq!(last.as_deref(), Some("a"));
+        assert_eq!(pending, None, "consumed, so a later run cannot reuse it");
+        // Nothing pending: what was remembered is kept.
+        super::remember_started(&mut pending, &mut last);
+        assert_eq!(last.as_deref(), Some("a"));
+    }
+
+    /// #42: `note_run_started` sits after every gate and just before the run
+    /// goes busy, in each path that starts a run. Fails if it moves above a
+    /// gate (a refusal would then be remembered) or the paths change.
+    #[test]
+    fn the_run_is_noted_after_the_gates_and_just_before_it_goes_busy() {
         let src = lf(include_str!("app.rs"));
+        let paths: [(&str, &[&str]); 3] = [
+            (
+                "    fn begin_action<",
+                &[
+                    "refuse_for_settings()",
+                    "model_action_gate(",
+                    "refuse_if_password_manager()",
+                    "grab_raw_for(",
+                ],
+            ),
+            (
+                "    fn run_model_free_screen_action(",
+                &[
+                    "busy_now()",
+                    "gate(pause::is_paused_now())",
+                    "refuse_if_password_manager()",
+                    "capture_screen()",
+                ],
+            ),
+            (
+                "    fn calculate_selection(",
+                &[
+                    "busy_now()",
+                    "is_paused_now()",
+                    "refuse_if_password_manager()",
+                ],
+            ),
+        ];
+        let mut checked = 0;
+        for (sig, gates) in paths {
+            let body = body_between(&src, sig, "\n    }\n");
+            let note = body.find("self.note_run_started();").expect(sig);
+            for g in gates {
+                let at = body.find(g).unwrap_or_else(|| panic!("{sig} lost `{g}`"));
+                assert!(at < note, "{sig}: `{g}` must come before the note");
+            }
+            let busy = body.find("self.set_busy(true);").expect(sig);
+            assert!(note < busy, "{sig}");
+            assert!(body[note..busy].lines().count() <= 3, "{sig}");
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
+    }
+
+    /// #42: Check my work from the key or the tray is remembered too, and the
+    /// dispatch's pending id is cleared when the dispatch returns.
+    #[test]
+    fn check_my_work_from_the_key_or_tray_is_remembered_and_nothing_goes_stale() {
+        let src = lf(include_str!("app.rs"));
+        let ask = body_between(&src, "    fn ask(&mut self, trigger: Trigger) {", "\n    }\n");
+        assert!(
+            ask.contains("DEFAULT_ACTION_ID") && ask.contains("ask_inner("),
+            "{ask}"
+        );
         let dispatch = body_between(&src, "    fn dispatch_palette_action(", "\n    }\n");
-        assert!(dispatch.contains("self.last_action = Some("), "{dispatch}");
+        let set = dispatch.find("self.pending_action = Some(").expect("set");
+        let run = dispatch.find("self.dispatch_palette_target(").expect("run");
+        let clear = dispatch.find("self.pending_action = None").expect("clear");
+        assert!(set < run && run < clear, "{dispatch}");
+    }
+
+    /// #42: a Repeat reaches `repeat_last_action`, and the key goes quiet
+    /// after it so a third tap during the settle does not hit the busy card.
+    #[test]
+    fn the_repeat_key_action_is_handled_and_quiets_the_key() {
+        let src = lf(include_str!("app.rs"));
         let apply = body_between(&src, "    fn apply_key_action(", "\n    }\n");
-        assert!(apply.contains("KeyAction::Repeat => self.repeat_last_action()"));
+        let arm = apply.find("KeyAction::Repeat =>").expect("arm");
+        let tail = &apply[arm..];
+        assert!(tail.contains("self.repeat_last_action()"), "{apply}");
+        assert!(tail.contains("self.key_quiet_until"), "{apply}");
         let rep = body_between(&src, "    fn repeat_last_action(", "\n    }\n");
         assert!(rep.contains("run_option("), "{rep}");
     }
