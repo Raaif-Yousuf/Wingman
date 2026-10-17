@@ -4725,10 +4725,11 @@ impl App {
     /// [`executors::Outcome::Opened`] the executor attaches (#1215), not
     /// the summary text, which starts with a title taken from the screen.
     fn calendar_headline(outcome: &executors::Outcome) -> &'static str {
-        if *outcome == executors::Outcome::Opened(false) {
-            "Event added, not opened"
-        } else {
-            "Event opened in your calendar app"
+        match *outcome {
+            executors::Outcome::Opened(true) => "Event opened in your calendar app",
+            executors::Outcome::Opened(false) => "Event added, not opened",
+            // No typed result: claim nothing about opening it.
+            _ => "Event added",
         }
     }
 
@@ -5099,7 +5100,9 @@ impl App {
             executors::Outcome::Filled { filled, total } if filled < total => {
                 "Form partially filled"
             }
-            _ => "Form filled",
+            executors::Outcome::Filled { .. } => "Form filled",
+            // No typed counts: claim nothing about how many were filled.
+            _ => "Form fill finished",
         }
     }
 
@@ -15026,10 +15029,14 @@ mod tests {
     }
 
     #[test]
-    fn form_fill_headline_falls_back_to_form_filled_without_an_outcome() {
+    fn headlines_claim_nothing_without_a_typed_outcome() {
         assert_eq!(
             App::form_fill_headline(&executors::Outcome::Unspecified),
-            "Form filled"
+            "Form fill finished"
+        );
+        assert_eq!(
+            App::calendar_headline(&executors::Outcome::Unspecified),
+            "Event added"
         );
     }
 
@@ -15076,6 +15083,11 @@ mod tests {
         let live = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
         let cal = body_between(live, "fn calendar_headline(", "\n    }\n");
         assert!(!cal.contains(".contains("), "{cal}");
+        let form = body_between(live, "fn form_fill_headline(", "\n    }\n");
+        assert!(
+            !form.contains(".contains(") && !form.contains("summary"),
+            "{form}"
+        );
         assert!(!live.contains("fn parse_filled_of_total"));
     }
 
