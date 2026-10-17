@@ -99,7 +99,7 @@ use std::sync::{Once, OnceLock};
 
 use crate::ui::theme::{
     detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
-    Theme, Tokens,
+    Theme, Tokens, SPACE_SM_DP,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -125,10 +125,10 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
+    GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TEXTMETRICW,
     TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -145,8 +145,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
-    WM_THEMECHANGED, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
@@ -203,6 +203,17 @@ const PADDING: i32 = 8;
 const ROW_TEXT_INSET: i32 = 12;
 /// How far the query box's hairline sits outside the edit control.
 const QUERY_BORDER_OUTSET: i32 = 3;
+/// Space between the query box's left and right edges and its text (#881), on
+/// top of the padding the box sits in.
+const QUERY_TEXT_INSET: i32 = SPACE_SM_DP;
+/// The placeholder in an empty query box (#881). No em dash (rule 11).
+const QUERY_CUE: &str = "Type to filter";
+/// Private message the query edit's subclass sends its parent to have the
+/// placeholder drawn into the DC it just painted (`wParam` is the HDC, `lParam`
+/// the edit). `WM_USER` range: private to this window class.
+const WM_PALETTE_DRAW_CUE: u32 = WM_USER + 1;
+/// `EM_GETMARGINS`: the low word of the result is the left margin.
+const EM_GETMARGINS: u32 = 0x00D4;
 /// #217: rows beyond `crate::ui::palette_model::MAX_VISIBLE_ROWS` are
 /// reachable by scrolling (keyboard: Up/Down/PageUp/PageDown drag the
 /// viewport via `PaletteState::offset`; mouse: `WM_MOUSEWHEEL` below) rather
@@ -211,6 +222,47 @@ const QUERY_BORDER_OUTSET: i32 = 3;
 /// `palette_model.rs`.
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
+}
+
+/// Where the query `EDIT` goes, in client pixels (#881). A single-line EDIT
+/// draws its text from the top of its client area and cannot be told to centre
+/// it, so the control is exactly one text line high (`text_h`, from the font
+/// it uses) and sits in the middle of the box, inset from the box's left and
+/// right edges.
+fn query_edit_rect(window_w: i32, dpi: u32, text_h: i32) -> RECT {
+    let pad = scale(PADDING, dpi);
+    let inset = scale(QUERY_TEXT_INSET, dpi);
+    let box_h = scale(EDIT_HEIGHT, dpi);
+    let h = text_h.clamp(1, box_h.max(1));
+    let top = pad + (box_h - h) / 2;
+    RECT {
+        left: pad + inset,
+        top,
+        right: window_w - pad - inset,
+        bottom: top + h,
+    }
+}
+
+/// The height in pixels of one line of text in `font`, or the body line
+/// height at `dpi` when it cannot be measured.
+fn font_text_height(font: HFONT, dpi: u32) -> i32 {
+    let fallback = scale(crate::ui::theme::TYPE_BODY_LINE_PX, dpi);
+    if font.0.is_null() {
+        return fallback;
+    }
+    unsafe {
+        let dc = GetDC(None);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let mut tm = TEXTMETRICW::default();
+        let ok = GetTextMetricsW(dc, &mut tm).as_bool();
+        SelectObject(dc, old);
+        ReleaseDC(None, dc);
+        if ok && tm.tmHeight > 0 {
+            tm.tmHeight
+        } else {
+            fallback
+        }
+    }
 }
 
 fn window_height(dpi: u32) -> i32 {
@@ -293,7 +345,8 @@ impl Palette {
             edit_hwnd: HWND(std::ptr::null_mut()),
             owner: None,
             dpi: 96,
-            font: unsafe { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) },
+            // Made once the window (and so its DPI) exists.
+            font: HFONT(std::ptr::null_mut()),
             d2d: None,
             catalogue: Vec::new(),
             model_configured: true,
@@ -346,6 +399,7 @@ impl Palette {
         let inner_ref = unsafe { &mut *raw };
         inner_ref.hwnd = hwnd;
         inner_ref.dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        inner_ref.font = gdi_font(inner_ref.dpi, FW_NORMAL.0 as i32);
 
         // Best-effort rounded corners (Windows 11), as the card does (#361).
         // A square window on an older system is an acceptable degrade.
@@ -599,13 +653,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn create_query_edit(parent: HWND, instance: HINSTANCE, font: HFONT, dpi: u32) -> HWND {
     let class_w = wide_z(WC_EDIT);
     let text_w = wide_z("");
-    let pad = scale(PADDING, dpi);
-    let rect = RECT {
-        left: pad,
-        top: pad,
-        right: scale(WINDOW_WIDTH, dpi) - pad,
-        bottom: pad + scale(EDIT_HEIGHT, dpi),
-    };
+    let rect = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, font_text_height(font, dpi));
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -674,6 +722,25 @@ unsafe extern "system" fn palette_edit_subclass(
             // default proc.
             return LRESULT(0);
         }
+    }
+    // The placeholder (#881): the control paints itself, then the palette
+    // draws its cue over the empty box.
+    if msg == WM_PAINT || msg == WM_PRINTCLIENT {
+        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+        if GetWindowTextLengthW(hwnd) == 0 {
+            let own_dc = (msg == WM_PAINT).then(|| GetDC(Some(hwnd)));
+            let hdc = own_dc.unwrap_or(HDC(wparam.0 as *mut c_void));
+            SendMessageW(
+                parent,
+                WM_PALETTE_DRAW_CUE,
+                Some(WPARAM(hdc.0 as usize)),
+                Some(LPARAM(hwnd.0 as isize)),
+            );
+            if own_dc.is_some() {
+                ReleaseDC(Some(hwnd), hdc);
+            }
+        }
+        return result;
     }
     if msg == WM_KILLFOCUS {
         let _ = PostMessageW(
@@ -874,6 +941,9 @@ struct PaletteColors {
     /// The "no matching actions" hint.
     hint: u32,
     footer: u32,
+    /// The placeholder in an empty query box. High contrast uses GrayText,
+    /// which Windows keeps readable on Window.
+    cue: u32,
     /// The fill of the selected and the hovered row.
     selected_fill: u32,
     selected_text: u32,
@@ -900,6 +970,7 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
             header: t.text,
             hint: t.text,
             footer: t.text,
+            cue: sys.gray_text,
             selected_fill: sys.highlight,
             selected_text: sys.highlight_text,
             // The whole row is the highlight, so the bar is the same colour.
@@ -916,6 +987,7 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
         header: t.text_dim,
         hint: t.text_faint,
         footer: t.text_faint,
+        cue: t.text_faint,
         selected_fill: blend(t.surface, bar, 16),
         selected_text: t.text,
         bar,
@@ -1040,6 +1112,11 @@ struct PaletteInner {
 impl Drop for PaletteInner {
     fn drop(&mut self) {
         self.drop_edit_brush();
+        if !self.font.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
     }
 }
 
@@ -1145,17 +1222,57 @@ impl PaletteInner {
     /// handler can re-run the same layout after a DPI change without
     /// re-centering the window on the active monitor too.
     fn layout_edit_control(&self, w: i32) {
-        let pad = scale(PADDING, self.dpi);
+        let r = query_edit_rect(w, self.dpi, font_text_height(self.font, self.dpi));
         unsafe {
             let _ = SetWindowPos(
                 self.edit_hwnd,
                 None,
-                pad,
-                pad,
-                w - pad * 2,
-                scale(EDIT_HEIGHT, self.dpi),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
+        }
+    }
+
+    /// Draws the placeholder into `hdc`, which the query `edit` has just
+    /// painted (#881). Left-aligned with the text the user would type.
+    fn draw_query_cue(&self, hdc: HDC, edit: HWND) {
+        let mut rc = RECT::default();
+        unsafe {
+            if GetClientRect(edit, &mut rc).is_err() {
+                return;
+            }
+            let margins = SendMessageW(edit, EM_GETMARGINS, None, None).0 as u32 & 0xFFFF;
+            rc.left += margins as i32;
+            let old_font = SelectObject(hdc, HGDIOBJ(self.font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(self.colors.cue));
+            draw_text_line(
+                hdc,
+                QUERY_CUE,
+                rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old_font);
+        }
+    }
+
+    /// A new font for a new DPI, given to the query box (#881).
+    fn rebuild_font(&mut self) {
+        let old = self.font;
+        self.font = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+        unsafe {
+            SendMessageW(
+                self.edit_hwnd,
+                WM_SETFONT,
+                Some(WPARAM(self.font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+            if !old.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(old.0));
+            }
         }
     }
 
@@ -1665,6 +1782,10 @@ impl PaletteInner {
             WM_ERASEBKGND => Some(LRESULT(1)), // we paint the whole client area ourselves
             // #579: without this the query box keeps the stock white
             // background and black text whatever the theme.
+            WM_PALETTE_DRAW_CUE => {
+                self.draw_query_cue(HDC(wparam.0 as *mut c_void), HWND(lparam.0 as *mut c_void));
+                Some(LRESULT(0))
+            }
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
                 unsafe {
@@ -1847,6 +1968,7 @@ impl PaletteInner {
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
+                self.rebuild_font();
                 self.layout_edit_control(w);
                 if let Some(renderer) = &mut self.d2d {
                     renderer.set_dpi(self.dpi);
@@ -1985,6 +2107,7 @@ mod tests {
                     ("header", c.header),
                     ("hint", c.hint),
                     ("footer", c.footer),
+                    ("cue", c.cue),
                 ] {
                     let r = ratio(fg, c.background);
                     assert!(r >= 4.5, "{name}: {what} is {r:.2}:1 on the background");
@@ -2165,6 +2288,132 @@ mod tests {
             assert_eq!(text.0, colors.text);
         }
     }
+    // #881: the query box centres its text and shows a placeholder.
+    mod query_box_tests {
+        use super::super::{
+            query_edit_rect, scale, EDIT_HEIGHT, PADDING, QUERY_TEXT_INSET, WINDOW_WIDTH,
+        };
+
+        #[test]
+        fn the_text_line_is_centred_in_the_box_at_every_scale() {
+            for dpi in [96u32, 120, 144, 192, 240] {
+                let text_h = scale(20, dpi);
+                let r = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, text_h);
+                let box_top = scale(PADDING, dpi);
+                let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+                assert_eq!(r.bottom - r.top, text_h, "dpi {dpi}");
+                let (above, below) = (r.top - box_top, box_bottom - r.bottom);
+                assert!(above > 0 && (above - below).abs() <= 1, "dpi {dpi}");
+                // The text clears the box edge by the inset on both sides.
+                assert_eq!(r.left, scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi));
+                assert_eq!(
+                    scale(WINDOW_WIDTH, dpi) - r.right,
+                    scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi)
+                );
+            }
+        }
+
+        #[test]
+        fn a_font_taller_than_the_box_is_clamped_to_the_box() {
+            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 500);
+            assert_eq!(r.bottom - r.top, scale(EDIT_HEIGHT, 96));
+            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 0);
+            assert!(
+                r.bottom > r.top,
+                "a zero-height font still leaves a control"
+            );
+        }
+    }
+
+    // The placeholder is painted into the EDIT by the palette (a plain EDIT
+    // has no cue banner in the palette's colours), so these print the real
+    // control and look at its pixels.
+    mod query_cue_tests {
+        use super::*;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        /// How many pixels of the printed edit, at or right of `from_x`, are not
+        /// the background colour.
+        fn ink_right_of(p: &Palette, from_x: i32) -> usize {
+            let edit = p.edit_hwnd();
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetClientRect(edit, &mut rc);
+                let screen = GetDC(None);
+                let dc = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, rc.right, rc.bottom);
+                let old = SelectObject(dc, HGDIOBJ(bmp.0));
+                let bg = CreateSolidBrush(COLORREF(p.inner.colors.background));
+                FillRect(dc, &rc, bg);
+                let _ = DeleteObject(bg.into());
+                // PRF_CLIENT
+                SendMessageW(
+                    edit,
+                    WM_PRINTCLIENT,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(0x4)),
+                );
+                let mut n = 0;
+                for y in 0..rc.bottom {
+                    for x in from_x..rc.right {
+                        if GetPixel(dc, x, y).0 != p.inner.colors.background {
+                            n += 1;
+                        }
+                    }
+                }
+                SelectObject(dc, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+                ReleaseDC(None, screen);
+                n
+            }
+        }
+
+        fn shown() -> Palette {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            p.show(free_actions(), true, String::new());
+            p
+        }
+
+        #[test]
+        fn an_empty_query_box_shows_the_placeholder() {
+            let p = shown();
+            assert!(ink_right_of(&p, 0) > 0, "nothing is drawn in an empty box");
+        }
+
+        #[test]
+        fn typing_removes_the_placeholder() {
+            let mut p = shown();
+            let from = scale(60, p.inner.dpi);
+            assert!(
+                ink_right_of(&p, from) > 0,
+                "the placeholder is wider than 60 DIP"
+            );
+            p.set_query_for_test("a");
+            assert_eq!(ink_right_of(&p, from), 0, "the placeholder is still drawn");
+        }
+
+        #[test]
+        fn the_edit_is_one_text_line_high_and_centred_in_the_box() {
+            let p = shown();
+            let (mut er, mut pr) = (RECT::default(), RECT::default());
+            unsafe {
+                let _ = GetWindowRect(p.edit_hwnd(), &mut er);
+                let _ = GetWindowRect(p.hwnd(), &mut pr);
+            }
+            let dpi = p.inner.dpi;
+            let box_top = scale(PADDING, dpi);
+            let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+            let (top, bottom) = (er.top - pr.top, er.bottom - pr.top);
+            assert!(bottom - top < scale(EDIT_HEIGHT, dpi), "{top}..{bottom}");
+            assert!(((top - box_top) - (box_bottom - bottom)).abs() <= 1);
+        }
+    }
+
     mod row_at_tests {
         use super::super::row_at;
 
