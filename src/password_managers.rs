@@ -763,11 +763,11 @@ mod tests {
             .find("self.palette.show(")
             .expect("no palette.show call");
         assert!(ask < show, "the palette steals the foreground when shown");
+        // #805: opening the palette starts no router request, so the answer
+        // is kept for the action the user picks.
         assert!(
-            body.contains(
-                "self.maybe_start_router(candidates, password_manager_in_front, underlying)"
-            ),
-            "toggle_palette must hand its answer to the router"
+            body.contains("self.palette_password_manager = self.password_manager_now();"),
+            "toggle_palette must keep its answer for the action the palette runs"
         );
     }
 

@@ -322,7 +322,7 @@ pub fn classify_host(url: &str) -> HostClass {
 /// port, no path/query/fragment, IPv6 brackets stripped, lowercased.
 /// Returns `None` only when there is no discoverable host at all (an empty
 /// string, or an authority that is empty after userinfo is removed).
-fn extract_host(url: &str) -> Option<String> {
+pub(crate) fn extract_host(url: &str) -> Option<String> {
     let after_scheme = match url.find("://") {
         Some(i) => &url[i + 3..],
         None => url,
