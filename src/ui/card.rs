@@ -73,11 +73,11 @@ use crate::ui::card_placement::{
 };
 use crate::ui::text::draw_text_line;
 use crate::ui::theme::{
-    contrast_ratio, detect_theme, relative_luminance, rgb, setting_change_affects_theme,
-    setting_change_name, type_height_px, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK,
-    BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE,
-    GAP_DP, GLYPH_ERROR, ICON_BOX_DP, ICON_FONT_DP, MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE,
-    SPACE_SM_DP, TYPE_BODY_PX, TYPE_CAPTION_PX,
+    contrast_ratio, detect_theme, progress_ring_ink, relative_luminance, rgb,
+    setting_change_affects_theme, setting_change_name, type_height_px, SysColors, Theme, Tokens,
+    BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT, BADGE_LOW, BADGE_MID, BADGE_ULTRA,
+    CONTROL_RADIUS_DP, FALLBACK_FONT_FACE, GAP_DP, GLYPH_ERROR, ICON_BOX_DP, ICON_FONT_DP,
+    MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE, SPACE_SM_DP, TYPE_BODY_PX, TYPE_CAPTION_PX,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -3229,13 +3229,21 @@ impl CardInner {
         }
         let _ = DeleteObject(HGDIOBJ(ring_pen.0));
 
+        // #973: progress is the one place the accent shows on the card; high
+        // contrast uses the system highlight.
+        let ink = progress_ring_ink(
+            self.theme,
+            &self.sys,
+            crate::ui::card_buttons::system_accent(self.theme, palette.bg),
+        );
+
         if pending_glyph_should_spin(self.animations_enabled) {
             // Bright sweeping arc on top. Prefer a geometric pen with round
             // end caps for a clean look; fall back to a plain cosmetic pen
             // if that ever fails (e.g. exotic display driver).
             let brush = LOGBRUSH {
                 lbStyle: BS_SOLID,
-                lbColor: windows::Win32::Foundation::COLORREF(palette.headline),
+                lbColor: windows::Win32::Foundation::COLORREF(ink),
                 lbHatch: 0,
             };
             let mut arc_pen = ExtCreatePen(
@@ -3245,11 +3253,7 @@ impl CardInner {
                 None,
             );
             if arc_pen.0.is_null() {
-                arc_pen = CreatePen(
-                    PS_SOLID,
-                    stroke,
-                    windows::Win32::Foundation::COLORREF(palette.headline),
-                );
+                arc_pen = CreatePen(PS_SOLID, stroke, windows::Win32::Foundation::COLORREF(ink));
             }
             if !arc_pen.0.is_null() {
                 let start_deg = (self.anim_frame as f32 * SPINNER_DEGREES_PER_FRAME) % 360.0;
@@ -3267,11 +3271,7 @@ impl CardInner {
             // of the dim outer one, so the state still reads as "in
             // progress" without any per-frame motion.
             let inner_radius = (radius * 3 / 5).max(1);
-            let inner_pen = CreatePen(
-                PS_SOLID,
-                stroke,
-                windows::Win32::Foundation::COLORREF(palette.headline),
-            );
+            let inner_pen = CreatePen(PS_SOLID, stroke, windows::Win32::Foundation::COLORREF(ink));
             if !inner_pen.0.is_null() {
                 let old_pen = SelectObject(hdc, HGDIOBJ(inner_pen.0));
                 let _ = Ellipse(
