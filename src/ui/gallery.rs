@@ -263,6 +263,9 @@ pub enum GalleryState {
     /// Issue #307: four options with long labels and a long summary, and
     /// option 1 drawn as the default (the key runs it).
     CardOptionsDefaultLong,
+    /// #828: the confirm button with a label far wider than the button, for
+    /// the end ellipsis.
+    CardPreviewLongButton,
     /// Issue #307: no model is set up, so the static list of actions that
     /// need none.
     CardOptionsNoModel,
@@ -354,6 +357,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardOptionsLooking,
         CardOptionsReady,
         CardOptionsDefaultLong,
+        CardPreviewLongButton,
         CardOptionsNoModel,
         CardSetupNoModel,
         CardSetupOllamaDown,
@@ -418,6 +422,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardOptionsLooking => "card-options-looking",
         CardOptionsReady => "card-options-ready",
         CardOptionsDefaultLong => "card-options-default-long",
+        CardPreviewLongButton => "card-preview-long-button",
         CardOptionsNoModel => "card-options-no-model",
         CardSetupNoModel => "card-setup-no-model",
         CardSetupOllamaDown => "card-setup-ollama-down",
@@ -1177,6 +1182,19 @@ mod driver {
                         ("extract-text", "Copy text from screen"),
                     ]),
                     options_behavior(true),
+                );
+            }
+            CardPreviewLongButton => {
+                // A confirm label far wider than its button, to see the end
+                // ellipsis (DT_END_ELLIPSIS) at every scale.
+                card.hide();
+                palette.hide();
+                let (schema, value) = calendar_fixture();
+                let _ = card.show_preview_long_button_for_gallery(
+                    "Add to calendar",
+                    &schema,
+                    &value,
+                    "Add this event to my work calendar",
                 );
             }
             CardOptionsNoModel => {
@@ -2028,8 +2046,9 @@ mod tests {
         // button states (#818) = 46, + the status line saved, not valid and not
         // saved (#875) = 49, + the in-place overlay (#809) = 50, + the key being
         // checked and refused (#876) = 52, + the Settings combo under the mouse
-        // (#1109) = 53, + the same combo with its list open (#1125) = 54.
-        assert_eq!(states.len(), 54);
+        // (#1109) = 53, + the same combo with its list open (#1125) = 54, + the long
+        // button label (#828) = 55.
+        assert_eq!(states.len(), 55);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -2037,6 +2056,13 @@ mod tests {
             states.len(),
             "every gallery state must have a unique name"
         );
+    }
+
+    #[test]
+    fn the_long_button_state_is_listed_and_follows_themes_and_scales() {
+        let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
+        assert!(names.contains(&"card-preview-long-button"));
+        assert!(follows_variants(GalleryState::CardPreviewLongButton));
     }
 
     #[test]

@@ -676,6 +676,21 @@ impl Card {
         }
     }
 
+    /// The UI gallery's preview with a confirm label far wider than the
+    /// button, to look at the end ellipsis (#828).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn show_preview_long_button_for_gallery(
+        &mut self,
+        title: &str,
+        schema: &serde_json::Value,
+        proposal_value: &serde_json::Value,
+        label: &'static str,
+    ) -> u32 {
+        self.inner
+            .show_preview_labeled(title, schema, proposal_value, false, label, None);
+        self.inner.preview_generation
+    }
+
     /// The card's own window proc dispatches internally; this is the seam
     /// tests use to feed synthetic messages.
     #[allow(dead_code)]
