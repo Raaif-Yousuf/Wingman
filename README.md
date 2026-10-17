@@ -263,7 +263,7 @@ One press of the primary key shows the options card: a few choices for what
 is on your screen. Press the key once while the card is up to run the first
 choice, or twice quickly to run the second (never one that writes to the
 clipboard; the key closes the card instead). A press while an answer card is
-showing closes it. Under `[hotkeys]` in `config.toml`, `key_mode` is`
+showing closes it. Under `[hotkeys]` in `config.toml`, `key_mode` is
 `"dynamic"` (the default), `"pick"` (the key never closes an answer card) or
 `"close"` (the key only ever closes a card), and `double_press_ms` (default
 300, from 150 to 600) is how fast the second press must come; `0` turns

@@ -1563,7 +1563,7 @@ impl App {
         ) else {
             let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
             if should_hide_after_first_run(pending, self.busy) {
-                self.card.hide();
+                self.hide_card();
             }
             return;
         };
@@ -1706,7 +1706,7 @@ impl App {
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
@@ -2045,7 +2045,7 @@ impl App {
         };
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             self.set_watch(false);
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
@@ -2292,31 +2292,38 @@ impl App {
         if self.key_quiet_until.is_some_and(|t| now < t) {
             return;
         }
+        if KEY_WINDOW_STALE.with(|c| c.replace(false)) {
+            self.disarm_key_window();
+        }
         let window = self.key_window();
         let mode = self.config.hotkeys.key_mode_value();
         let phase = self.current_key_phase(now, window);
-        if let Some((generation, at)) = self.key_pending.take() {
-            self.kill_key_window();
-            let inside = window.is_some_and(|w| now.duration_since(at) < w);
-            if inside && self.card.options_generation() == Some(generation) {
+        let step = key_press_step(
+            self.key_pending.take(),
+            self.card.options_generation(),
+            window,
+            keypress::needs_window(phase, mode),
+            now,
+        );
+        // A stale wait (its card is gone) leaves nothing armed.
+        self.disarm_key_window();
+        match step {
+            KeyStep::Double => {
                 let action = keypress::on_key(phase, mode, keypress::Press::Double);
                 self.apply_key_action(action, trigger, window, now);
-                return;
             }
-            // A stale wait (its card is gone): this is a fresh press.
-        }
-        if let (Some(w), true) = (window, keypress::needs_window(phase, mode)) {
-            if let Some(generation) = self.card.options_generation() {
+            KeyStep::Wait(generation, w) => {
                 self.key_pending = Some((generation, now));
                 let hwnd = self.hwnd();
                 unsafe {
                     let _ = SetTimer(Some(hwnd), KEY_WINDOW_TIMER_ID, w.as_millis() as u32, None);
                 }
-                return;
+            }
+            KeyStep::Single => {
+                let action = keypress::on_key(phase, mode, keypress::Press::Single);
+                self.apply_key_action(action, trigger, window, now);
             }
         }
-        let action = keypress::on_key(phase, mode, keypress::Press::Single);
-        self.apply_key_action(action, trigger, window, now);
     }
 
     /// The double-press window from the config, or `None` when it is off.
@@ -2330,11 +2337,9 @@ impl App {
     /// #393: the double-press window ran out with no second press: the first
     /// press was a single. Dropped when its card is gone.
     fn on_key_window_expired(&mut self) {
-        self.kill_key_window();
-        let Some((generation, _)) = self.key_pending.take() else {
-            return;
-        };
-        if self.card.options_generation() != Some(generation) {
+        let pending = self.key_pending.take();
+        self.disarm_key_window();
+        if !key_wait_is_live(pending, self.card.options_generation()) {
             return;
         }
         let now = Instant::now();
@@ -2345,7 +2350,10 @@ impl App {
         self.apply_key_action(action, Trigger::Hotkey, window, now);
     }
 
-    fn kill_key_window(&mut self) {
+    /// The one place the double-press wait is cancelled: forgets the pending
+    /// first press and kills the one-shot timer.
+    fn disarm_key_window(&mut self) {
+        self.key_pending = None;
         let hwnd = self.hwnd();
         unsafe {
             let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
@@ -2425,11 +2433,16 @@ impl App {
     /// Hides the options card and forgets it. The card's own `hide` stops the
     /// key claim and the auto-dismiss.
     fn close_options_card(&mut self) {
-        self.key_pending = None;
-        self.kill_key_window();
         self.options = None;
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
+    }
+
+    /// Every path that hides the card goes through here, so the double-press
+    /// wait never outlives the card it was waiting on (#393).
+    fn hide_card(&mut self) {
+        self.disarm_key_window();
+        self.card.hide();
     }
 
     /// `"<name>:<model>"` for the first entry `self.config.mode` would
@@ -2569,7 +2582,7 @@ impl App {
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
@@ -2642,7 +2655,7 @@ impl App {
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
@@ -3421,7 +3434,7 @@ impl App {
         if !take_send_slot(&mut self.pending_preview) {
             return false;
         }
-        self.card.hide();
+        self.hide_card();
         true
     }
 
@@ -3432,7 +3445,7 @@ impl App {
         if !is_send_cancelled(packed) {
             return false;
         }
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         true
     }
@@ -4783,7 +4796,7 @@ impl App {
     fn open_settings_inner(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
 
         SETTINGS_OPEN.with(|c| c.set(true));
@@ -5401,7 +5414,7 @@ impl App {
         }
 
         self.tray.set_paused(true);
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         self.update_tooltip();
     }
@@ -5531,7 +5544,7 @@ impl App {
         if self.point_in_card(x, y) {
             return;
         }
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
     }
 
@@ -5566,7 +5579,7 @@ impl App {
     fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
         // Like `open_settings`: no card timers or click watcher while the
         // nested loop runs.
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
         let out = dialog();
@@ -7297,6 +7310,11 @@ thread_local! {
     /// #723: the in-flight run outlasted its bound; the next press abandons
     /// it. Thread-local for the same reason as `SETTINGS_OPEN`.
     static BUSY_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// #393: the double-press timer fired while Settings was open. `App`
+    /// cannot be touched there (see `SETTINGS_OPEN`), so the wait is
+    /// forgotten by the next press, through `disarm_key_window`.
+    static KEY_WINDOW_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -7820,6 +7838,47 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     LRESULT(0)
 }
 
+/// What a press of the Wingman key does with the double-press wait (#393).
+#[derive(Debug, PartialEq, Eq)]
+enum KeyStep {
+    /// A second press inside the window, for the card that is still up.
+    Double,
+    /// Start waiting for a second press (card generation, window).
+    Wait(u32, Duration),
+    /// Act now as a single press.
+    Single,
+}
+
+/// Whether a timer expiry still belongs to the card up now: the generation
+/// it waited on must be the one showing. Anything else is stale and runs
+/// nothing.
+fn key_wait_is_live(pending: Option<(u32, Instant)>, generation: Option<u32>) -> bool {
+    pending.is_some_and(|(g, _)| generation == Some(g))
+}
+
+/// The pure state machine behind `App::on_primary_key`: `pending` is the
+/// first press still waiting (its card generation and time), `generation`
+/// the card up now. A wait whose card is gone (a different generation, or
+/// none) is stale and the press is a fresh one.
+fn key_press_step(
+    pending: Option<(u32, Instant)>,
+    generation: Option<u32>,
+    window: Option<Duration>,
+    needs_window: bool,
+    now: Instant,
+) -> KeyStep {
+    if let Some((g, at)) = pending {
+        let inside = window.is_some_and(|w| now.duration_since(at) < w);
+        if inside && generation == Some(g) {
+            return KeyStep::Double;
+        }
+    }
+    match (window, needs_window, generation) {
+        (Some(w), true, Some(g)) => KeyStep::Wait(g, w),
+        _ => KeyStep::Single,
+    }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
@@ -7855,12 +7914,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == KEY_WINDOW_TIMER_ID {
-            // A one-shot: killed at once so it cannot repeat behind the modal.
-            // Its wait is stale by the time Settings closes; the next press
-            // checks the clock and starts fresh.
+            // A one-shot: killed at once so it cannot repeat behind the modal,
+            // and the wait is forgotten so the next press is a fresh press.
             unsafe {
                 let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
             }
+            KEY_WINDOW_STALE.with(|c| c.set(true));
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
@@ -8991,23 +9050,115 @@ mod tests {
             .nth(1)
             .expect("no on_primary_key");
         let key = &key[..key.find("\n    }\n").unwrap()];
-        assert!(key.contains("SetTimer("), "{key}");
-        assert!(key.contains("KEY_WINDOW_TIMER_ID"), "{key}");
+        let squashed = |t: &str| t.split_whitespace().collect::<String>();
+        let key_sq = squashed(key);
+        assert!(key_sq.contains("SetTimer("), "{key}");
+        assert!(key_sq.contains("KEY_WINDOW_TIMER_ID"), "{key}");
         assert!(key.contains("needs_window("), "{key}");
         let proc_src = wnd_proc_body(&src);
         assert!(
             proc_src.contains("app.on_key_window_expired()"),
             "WM_TIMER must reach the window-expiry handler"
         );
-        let kills = proc_src
-            .matches("KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID)")
+        let kills = squashed(proc_src)
+            .matches("KillTimer(Some(hwnd),KEY_WINDOW_TIMER_ID)")
             .count();
         assert!(kills >= 1, "the Settings branch must kill the one-shot");
         // Armed in exactly one place, after a press, never at startup.
         let live = src.split("\n#[cfg(test)]").next().unwrap();
         assert_eq!(
-            live.matches("KEY_WINDOW_TIMER_ID, w.as_millis()").count(),
+            squashed(live)
+                .matches("SetTimer(Some(hwnd),KEY_WINDOW_TIMER_ID,")
+                .count(),
             1
+        );
+    }
+
+    /// #393: every hide path ends the double-press wait through
+    /// `disarm_key_window`, so none can leave a timer armed.
+    #[test]
+    fn every_card_hide_goes_through_the_helper_that_disarms_the_key_window() {
+        let src = lf(include_str!("app.rs"));
+        let live = src
+            .split(
+                "
+#[cfg(test)]",
+            )
+            .next()
+            .unwrap();
+        let helper = live
+            .split("fn hide_card(&mut self)")
+            .nth(1)
+            .expect("no hide_card");
+        let helper = &helper[..helper
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+        assert!(helper.contains("self.disarm_key_window()"), "{helper}");
+        let disarm = live
+            .split("fn disarm_key_window(&mut self)")
+            .nth(1)
+            .expect("no disarm_key_window");
+        let disarm = &disarm[..disarm
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+        assert!(disarm.contains("self.key_pending = None"), "{disarm}");
+        assert!(disarm.contains("KillTimer("), "{disarm}");
+        let direct = live.matches("self.card.hide()").count();
+        assert_eq!(direct, 1, "only hide_card may call card.hide() directly");
+        let routed = live.matches("self.hide_card()").count();
+        assert!(
+            routed >= 10,
+            "expected the hide sites to be routed: {routed}"
+        );
+    }
+
+    /// #393: the press state machine. A second press inside the window for
+    /// the same card is a double; a stale or late one is a fresh press.
+    #[test]
+    fn key_press_step_pending_stale_and_quiet_cases() {
+        use super::{key_press_step as step, key_wait_is_live, KeyStep};
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let w = Some(ms(300));
+        let later = |m| t0 + ms(m);
+        // The expiry guard: a stale timer never runs an option.
+        assert!(key_wait_is_live(Some((4, t0)), Some(4)));
+        assert!(!key_wait_is_live(Some((4, t0)), Some(5)));
+        assert!(!key_wait_is_live(Some((4, t0)), None));
+        assert!(!key_wait_is_live(None, Some(4)));
+        // No wait pending, the options card needs the window: wait.
+        assert_eq!(step(None, Some(4), w, true, t0), KeyStep::Wait(4, ms(300)));
+        // The window is off: act at once.
+        assert_eq!(step(None, Some(4), None, true, t0), KeyStep::Single);
+        // Nothing to wait for (no options card): single.
+        assert_eq!(step(None, None, w, false, t0), KeyStep::Single);
+        // Second press inside the window, same card: double.
+        assert_eq!(
+            step(Some((4, t0)), Some(4), w, true, later(100)),
+            KeyStep::Double
+        );
+        // Second press after the window: a fresh wait, not a double.
+        assert_eq!(
+            step(Some((4, t0)), Some(4), w, true, later(400)),
+            KeyStep::Wait(4, ms(300))
+        );
+        // A stale expiry never runs an option: another card is up.
+        assert_eq!(
+            step(Some((4, t0)), Some(5), w, true, later(100)),
+            KeyStep::Wait(5, ms(300))
+        );
+        // The card is gone: single.
+        assert_eq!(
+            step(Some((4, t0)), None, w, false, later(100)),
+            KeyStep::Single
         );
     }
 
