@@ -70,6 +70,8 @@ const OPTION_SUBCLASS_ID: usize = 2;
 const OPTIONS_WIDTH_DP: i32 = 320;
 /// The least a row is tall: Windows 11's list items are 32 dp.
 const OPTION_ROW_MIN_H_DP: i32 = 32;
+/// Label lines a row shows before the ellipsis.
+const OPTION_LABEL_MAX_LINES: i32 = 2;
 /// Summary lines kept before the ellipsis.
 const OPTIONS_SUMMARY_MAX_LINES: i32 = 2;
 
@@ -97,7 +99,9 @@ pub(super) fn hint_text(count: usize, claim_keys: bool) -> String {
 /// still fits once an ellipsis is added (#969). GDI's `DT_END_ELLIPSIS` does not
 /// mark the cut when a wrapped paragraph is clipped by the rectangle, so the
 /// cut is made here, on `char` boundaries (never a byte slice) and after
-/// trimming the whitespace it would leave in front of the ellipsis.
+/// trimming the whitespace it would leave in front of the ellipsis. The cut
+/// also backs off over a joiner, variation selector, skin tone or combining
+/// mark, so it never leaves a stray joiner or parts a mark from its base.
 pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> String {
     if fits(text) {
         return text.to_string();
@@ -105,7 +109,15 @@ pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> Strin
     // Byte offsets of the first `n` chars, for n in 0..=chars: always on a boundary.
     let mut ends: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
     ends.push(text.len());
-    let candidate = |n: usize| format!("{}\u{2026}", text[..ends[n]].trim_end());
+    let chars: Vec<char> = text.chars().collect();
+    let candidate = |mut n: usize| {
+        // A cut before a continuation, or right after a joiner, splits a cluster.
+        while n > 0 && (n < chars.len() && is_cluster_continuation(chars[n]) || chars[n - 1] == ZWJ)
+        {
+            n -= 1;
+        }
+        format!("{}\u{2026}", text[..ends[n]].trim_end())
+    };
     // Largest `n` whose prefix fits; `fits` only gets harder as `n` grows.
     let (mut lo, mut hi) = (0usize, ends.len() - 1);
     while lo < hi {
@@ -117,6 +129,24 @@ pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> Strin
         }
     }
     candidate(lo)
+}
+
+const ZWJ: char = '\u{200D}';
+
+/// A char that belongs to the one before it: a joiner, a variation selector,
+/// an emoji skin tone or a combining mark.
+fn is_cluster_continuation(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200D}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{1F3FB}'..='\u{1F3FF}'
+            | '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
 }
 
 /// The name a row button carries for assistive tech: the whole label, with
@@ -139,6 +169,8 @@ pub(super) struct LayoutInputs {
     pub gap: i32,
     pub summary_h: i32,
     pub row_h: i32,
+    /// Height a row grows by beyond `row_h` when its label wraps (#999).
+    pub row_extra: [i32; options_keys::MAX_OPTIONS],
     pub hint_h: i32,
     pub rows: usize,
 }
@@ -174,13 +206,14 @@ pub(super) fn options_layout(i: &LayoutInputs) -> OptionsMetrics {
             if n > 0 {
                 y += i.gap;
             }
+            let h = i.row_h + i.row_extra.get(n).copied().unwrap_or(0).max(0);
             rows.push(RECT {
                 left,
                 top: y,
                 right,
-                bottom: y + i.row_h,
+                bottom: y + h,
             });
-            y += i.row_h;
+            y += h;
         }
         y += i.gap * 2;
     } else {
@@ -433,15 +466,44 @@ impl CardInner {
             .measure_wrapped(self.fonts.headline, summary_text, content_w)
             .clamp(summary_line, summary_line * OPTIONS_SUMMARY_MAX_LINES);
         let body_line = self.line_height(self.fonts.body).max(1);
+        let row_h = self.option_base_row_h();
+        // #999: a label that does not fit one line wraps (up to two lines)
+        // and its row grows, instead of being cut.
+        let label_w = self.option_label_width(row_h);
+        let mut row_extra = [0; options_keys::MAX_OPTIONS];
+        if let Some(ui) = self.options.as_ref() {
+            for (extra, row) in row_extra.iter_mut().zip(ui.rows.iter()) {
+                let text_h = self
+                    .measure_wrapped(self.fonts.body, &row.label, label_w)
+                    .clamp(body_line, body_line * OPTION_LABEL_MAX_LINES);
+                *extra = (text_h + gap * 2 - row_h).max(0);
+            }
+        }
         LayoutInputs {
             width,
             padding,
             gap,
             summary_h,
-            row_h: (body_line + gap * 2).max(self.scale(OPTION_ROW_MIN_H_DP)),
+            row_h,
+            row_extra,
             hint_h: body_line,
             rows,
         }
+    }
+
+    /// The height of a one-line row.
+    fn option_base_row_h(&self) -> i32 {
+        let gap = self.scale(GAP_DP);
+        let body_line = self.line_height(self.fonts.body).max(1);
+        (body_line + gap * 2).max(self.scale(OPTION_ROW_MIN_H_DP))
+    }
+
+    /// Width the label text gets in a row: the row minus the keycap and the
+    /// gaps around it. Layout and paint both use it.
+    fn option_label_width(&self, base_row_h: i32) -> i32 {
+        let gap = self.scale(GAP_DP);
+        let content_w = self.scale(OPTIONS_WIDTH_DP) - self.scale(PADDING_DP) * 2;
+        (content_w - gap - keycap_size(base_row_h, gap) - gap * 4).max(1)
     }
 
     fn options_metrics(&self) -> OptionsMetrics {
@@ -660,13 +722,16 @@ impl CardInner {
             let hdc = dis.hDC;
             let rc = dis.rcItem;
             let gap = self.scale(GAP_DP);
-            let row_h = rc.bottom - rc.top;
-            let cap = keycap_size(row_h, gap);
+            // The keycap keeps the one-line size and sits at the first line
+            // of a row that grew for a wrapped label.
+            let base_h = self.option_base_row_h();
+            let cap = keycap_size(base_h, gap);
+            let cap_top = rc.top + (base_h - cap) / 2;
             let cap_rect = RECT {
                 left: rc.left + gap,
-                top: rc.top + (row_h - cap) / 2,
+                top: cap_top,
                 right: rc.left + gap + cap,
-                bottom: rc.top + (row_h - cap) / 2 + cap,
+                bottom: cap_top + cap,
             };
 
             // The keycap: a small outlined square with the digit, in the
@@ -709,8 +774,9 @@ impl CardInner {
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
 
-            // The label, one line, ending in an ellipsis. The button's window
-            // name carries the whole label for assistive tech.
+            // The label wraps to at most two lines (the row grew to fit, see
+            // `options_layout_inputs`), vertically centred, with an ellipsis
+            // only past that. The button's window name carries the whole label.
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(look.text));
             let label_rect = RECT {
                 left: cap_rect.right + gap * 2,
@@ -718,11 +784,45 @@ impl CardInner {
                 right: (rc.right - gap * 2).max(cap_rect.right + gap * 2),
                 bottom: rc.bottom,
             };
+            let label_w = (label_rect.right - label_rect.left).max(1);
+            let max_h = self.line_height(self.fonts.body).max(1) * OPTION_LABEL_MAX_LINES;
+            let shown = ellipsize_to_fit(&row.label, |s| {
+                let mut buf: Vec<u16> = s.encode_utf16().collect();
+                if buf.is_empty() {
+                    return true;
+                }
+                let mut r = RECT {
+                    left: 0,
+                    top: 0,
+                    right: label_w,
+                    bottom: 0,
+                };
+                DrawTextW(
+                    hdc,
+                    &mut buf,
+                    &mut r,
+                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                );
+                r.bottom - r.top <= max_h
+            });
+            let mut measure = label_rect;
+            let mut buf: Vec<u16> = shown.encode_utf16().collect();
+            if !buf.is_empty() {
+                DrawTextW(
+                    hdc,
+                    &mut buf,
+                    &mut measure,
+                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+                );
+            }
+            let text_h = (measure.bottom - measure.top).max(0);
+            let mut text_rect = label_rect;
+            text_rect.top += ((label_rect.bottom - label_rect.top) - text_h).max(0) / 2;
             draw_text_line(
                 hdc,
-                &row.label,
-                label_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                &shown,
+                text_rect,
+                DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
             );
             SelectObject(hdc, old_font);
 
@@ -836,6 +936,7 @@ mod tests {
             gap: 6,
             summary_h: 20,
             row_h: 32,
+            row_extra: [0; options_keys::MAX_OPTIONS],
             hint_h: 16,
             rows,
         }
@@ -932,6 +1033,7 @@ mod tests {
                 gap: px(6),
                 summary_h: px(20),
                 row_h: px(32),
+                row_extra: [0; options_keys::MAX_OPTIONS],
                 hint_h: px(16),
                 rows: 3,
             })
@@ -968,6 +1070,55 @@ mod tests {
             assert!(out.chars().count() <= 4, "{out}");
             assert!(text.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
         }
+    }
+
+    #[test]
+    fn ellipsize_never_leaves_half_a_cluster_before_the_mark() {
+        // Family emoji (joined by U+200D), a heart with a variation selector,
+        // a thumb with a skin tone, and e + combining acute.
+        let texts = [
+            "ab\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}cd",
+            "ab\u{2764}\u{FE0F}cd",
+            "ab\u{1F44D}\u{1F3FD}cd",
+            "ab\u{0065}\u{0301}cd",
+        ];
+        for text in texts {
+            for limit in 1..text.chars().count() {
+                let out = ellipsize_to_fit(text, |s| s.chars().count() <= limit);
+                let kept: Vec<char> = out.trim_end_matches('\u{2026}').chars().collect();
+                let last = kept.last().copied();
+                assert!(
+                    last != Some('\u{200D}'),
+                    "stray joiner in {out:?} (limit {limit})"
+                );
+                // The text after the cut never starts with a continuation, so
+                // no mark was separated from its base.
+                let rest: Vec<char> = text.chars().skip(kept.len()).collect();
+                assert!(
+                    !matches!(
+                        rest.first(),
+                        Some('\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{0301}' | '\u{1F3FD}')
+                    ),
+                    "cut inside a cluster in {out:?} (limit {limit})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wrapped_row_adds_its_extra_height_and_pushes_the_rest_down() {
+        let plain = options_layout(&inputs(3));
+        let mut tall = inputs(3);
+        tall.row_extra[0] = 15;
+        let tall = options_layout(&tall);
+        assert_eq!(tall.height - plain.height, 15);
+        assert_eq!(tall.rows[0].bottom - tall.rows[0].top, 32 + 15);
+        assert_eq!(tall.rows[1].top - plain.rows[1].top, 15);
+        assert_eq!(tall.rows[2].top - plain.rows[2].top, 15);
+        // Extra for a row that is not there changes nothing.
+        let mut ghost = inputs(1);
+        ghost.row_extra[3] = 99;
+        assert_eq!(options_layout(&ghost), options_layout(&inputs(1)));
     }
 
     #[test]
@@ -1149,6 +1300,29 @@ mod tests {
         assert_eq!(names[2], "Translate to Spanish, 3 of 3");
         let claim = options_keys::current().unwrap();
         assert_eq!(claim.count, 3, "digits 1 to 3 are claimed");
+        card.hide();
+    }
+
+    #[test]
+    fn a_long_label_grows_its_row_instead_of_being_cut() {
+        let _g = lock();
+        let mut card = new_card();
+        let long = OptionRow {
+            id: "long".into(),
+            label: "Review this email to Dana about the quarterly budget".into(),
+        };
+        let short = OptionRow {
+            id: "short".into(),
+            label: "Translate".into(),
+        };
+        card.show_options(1, "Summary", &[short.clone(), short.clone()], BEHAVIOR);
+        let plain = card.inner.options_metrics();
+        card.show_options(2, "Summary", &[long, short], BEHAVIOR);
+        let grown = card.inner.options_metrics();
+        let h = |r: &RECT| r.bottom - r.top;
+        assert!(h(&grown.rows[0]) > h(&plain.rows[0]), "long row grows");
+        assert_eq!(h(&grown.rows[1]), h(&plain.rows[1]), "short row stays");
+        assert!(grown.height > plain.height);
         card.hide();
     }
 
