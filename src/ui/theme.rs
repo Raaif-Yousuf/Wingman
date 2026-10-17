@@ -183,6 +183,10 @@ pub(crate) struct Tokens {
     /// `ControlFillColorDefault`). High contrast has no tints: the window
     /// colour, with the border carrying the shape.
     pub(crate) control_fill: u32,
+    /// The edge of a control (text box, combo, checkbox, button): a graphic, so
+    /// it reaches 3:1 against the surface and the fill (#582). `border` is
+    /// decorative and does not. Settings draws it in dark only for now; light keeps `border` there until its own slice.
+    pub(crate) control_border: u32,
 }
 
 /// Neither pure black nor pure white, per the card spec.
@@ -196,6 +200,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     mark_note: rgb(0, 95, 184),
     danger: rgb(0xC4, 0x2B, 0x1C),
     control_fill: rgb(255, 255, 255),
+    control_border: rgb(138, 138, 138),
 };
 
 pub(crate) const DARK: Tokens = Tokens {
@@ -208,6 +213,7 @@ pub(crate) const DARK: Tokens = Tokens {
     mark_note: rgb(96, 170, 255),
     danger: rgb(0xFF, 0x99, 0xA4),
     control_fill: rgb(45, 45, 45),
+    control_border: rgb(135, 135, 135),
 };
 
 /// The Windows system colours that matter in high contrast, read again on
@@ -261,6 +267,7 @@ impl Tokens {
                 danger: sys.window_text,
                 mark_note: sys.highlight,
                 control_fill: sys.window,
+                control_border: sys.window_text,
             },
         }
     }
@@ -809,6 +816,28 @@ mod tests {
         assert_ne!(DARK.control_fill, DARK.surface);
         let hc = Tokens::for_theme(Theme::HighContrast, &HC_WHITE);
         assert_eq!(hc.control_fill, HC_WHITE.window);
+    }
+
+    /// #582: a control's edge is a graphic that has to be seen, so it reaches
+    /// 3:1 against the surface and the text box fill it joins (WCAG 1.4.11).
+    /// The decorative `border` does not.
+    #[test]
+    fn the_control_border_reaches_three_to_one_where_it_is_drawn() {
+        for sys in [HC_BLACK, HC_WHITE] {
+            let hc = Tokens::for_theme(Theme::HighContrast, &sys);
+            assert_eq!(hc.control_border, sys.window_text);
+            assert!(contrast_between(hc.control_border, hc.surface) >= AA_LARGE);
+        }
+        for (name, t) in [("dark", DARK), ("light", LIGHT)] {
+            let on_surface = contrast_between(t.control_border, t.surface);
+            let on_fill = contrast_between(t.control_border, t.control_fill);
+            assert!(
+                on_surface >= AA_LARGE,
+                "{name} on surface {on_surface:.2}:1"
+            );
+            assert!(on_fill >= AA_LARGE, "{name} on fill {on_fill:.2}:1");
+        }
+        assert!(contrast_between(DARK.border, DARK.surface) < AA_LARGE);
     }
 
     #[test]

@@ -304,8 +304,8 @@ Replace `SettingsTop`, `SettingsBottom`, `SettingsAdvancedTop` and
 `SettingsPrivacy`, `SettingsActions`, `SettingsAdvanced`,
 `SettingsAdvancedPromptOpen` and `SettingsRowStates` (one row each of Checking,
 Saved with Undo, invalid number, rejected key, failed write). They follow
-`--dpi` and, once the dark spec ships, `--theme`; until then `follows_dpi_only`
-lists them. A test asserts every `Page` has a state. A slice is not done until
+`--dpi` and `--theme`, and the matrix draws every one of them in every theme
+and scale. A test asserts every `Page` has a state. A slice is not done until
 its pictures at 100 % and 150 % have been looked at.
 
 ## Migration from the single window
