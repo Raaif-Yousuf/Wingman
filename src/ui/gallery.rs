@@ -76,6 +76,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | PaletteNoModel
             | PaletteLong
             | PaletteLongScrolled
+            | PaletteLongName
             | PaletteHover
             | SettingsTop
             | SettingsBottom
@@ -99,6 +100,7 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
             | PaletteHover
             | PaletteLong
             | PaletteLongScrolled
+            | PaletteLongName
     )
 }
 
@@ -117,6 +119,7 @@ pub fn follows_theme_only(state: GalleryState) -> bool {
             | PaletteHover
             | PaletteLong
             | PaletteLongScrolled
+            | PaletteLongName
     )
 }
 
@@ -248,6 +251,9 @@ pub enum GalleryState {
     PaletteLong,
     /// #883: the same list scrolled to the end: the thumb at the bottom.
     PaletteLongScrolled,
+    /// #1000: an action name and a footer line far wider than the row: both
+    /// end in an ellipsis, clear of the scroll thumb.
+    PaletteLongName,
     /// #882: the mouse over a row other than the selected one.
     PaletteHover,
     /// Issue #560: the Settings window from a default config, Advanced
@@ -299,6 +305,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteNoModel,
         PaletteLong,
         PaletteLongScrolled,
+        PaletteLongName,
         PaletteHover,
         SettingsTop,
         SettingsBottom,
@@ -344,6 +351,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteNoModel => "palette-no-model",
         PaletteLong => "palette-long",
         PaletteLongScrolled => "palette-long-scrolled",
+        PaletteLongName => "palette-long-name",
         PaletteHover => "palette-hover",
         SettingsTop => "settings-top",
         SettingsBottom => "settings-bottom",
@@ -737,6 +745,25 @@ mod driver {
         .collect()
     }
 
+    /// One action whose name is about 90 characters, among short ones (#1000).
+    fn long_name_palette_catalogue() -> Vec<PaletteAction> {
+        [
+            "Check my work",
+            "Copy every table on this page into a spreadsheet and keep the column headings as they are",
+            "Summarize this",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| PaletteAction {
+            id: format!("long-name-{i}"),
+            name: (*name).to_string(),
+            group: None,
+            requires_model: false,
+            effect: crate::ui::palette_model::Effect::None,
+        })
+        .collect()
+    }
+
     /// The options card's rows from `(id, label)` pairs.
     fn option_rows(rows: &[(&str, &str)]) -> Vec<crate::ui::card::OptionRow> {
         rows.iter()
@@ -1050,6 +1077,18 @@ mod driver {
                     palette.scroll_for_test(i32::MAX);
                 }
             }
+            PaletteLongName => {
+                card.hide();
+                palette.hide();
+                palette.show(
+                    long_name_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line(
+                        "Auto",
+                        Some("openai:a-model-with-a-name-far-too-long-for-the-footer-line-to-hold-and-then-some-more-and-a-good-deal-more-after-that"),
+                    ),
+                );
+            }
             PaletteHover => {
                 card.hide();
                 palette.hide();
@@ -1092,7 +1131,7 @@ mod driver {
         }
         Ok(match state {
             PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover | PaletteLong
-            | PaletteLongScrolled => palette.hwnd(),
+            | PaletteLongScrolled | PaletteLongName => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
                 .map(|o| o.hwnd())
@@ -1586,7 +1625,7 @@ mod tests {
                 palette_states += 1;
             }
         }
-        assert_eq!(palette_states, 6, "the test must see every palette state");
+        assert_eq!(palette_states, 7, "the test must see every palette state");
     }
 
     #[test]
@@ -1601,7 +1640,7 @@ mod tests {
             );
             palette_states += usize::from(n.starts_with("palette-"));
         }
-        assert_eq!(palette_states, 6, "the test must see every palette state");
+        assert_eq!(palette_states, 7, "the test must see every palette state");
     }
 
     #[test]
@@ -1682,8 +1721,8 @@ mod tests {
         // states + 4 settings states (#560) + the region overlay (#580) + the
         // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
         // two long palettes (#883) = 33, + the tray menu with and without an
-        // open submenu (#825) = 35.
-        assert_eq!(states.len(), 35);
+        // open submenu (#825) = 35, + the long action name (#1000) = 36.
+        assert_eq!(states.len(), 36);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
