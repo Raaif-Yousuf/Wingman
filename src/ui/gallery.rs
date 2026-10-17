@@ -68,7 +68,6 @@ pub fn follows_variants(state: GalleryState) -> bool {
     !matches!(
         state,
         PaletteDefault
-            | PaletteRouterSuggestion
             | PaletteNoMatches
             | PaletteNoModel
             | SettingsTop
@@ -85,10 +84,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
 #[cfg(any(test, debug_assertions))]
 pub fn prints_with_wm_print(state: GalleryState) -> bool {
     use GalleryState::*;
-    matches!(
-        state,
-        PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel
-    )
+    matches!(state, PaletteDefault | PaletteNoMatches | PaletteNoModel)
 }
 
 /// Whether a state follows `--theme` but not `--dpi`: the palette can be drawn
@@ -98,10 +94,7 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
 #[cfg(any(test, debug_assertions))]
 pub fn follows_theme_only(state: GalleryState) -> bool {
     use GalleryState::*;
-    matches!(
-        state,
-        PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel
-    )
+    matches!(state, PaletteDefault | PaletteNoMatches | PaletteNoModel)
 }
 
 /// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
@@ -205,11 +198,21 @@ pub enum GalleryState {
     /// The preview's title line replaced by an error message, drawn in the
     /// error colour (a number field holding text).
     CardPreviewError,
+    /// Issue #307: the options card while the router works: the summary
+    /// placeholder, no buttons yet.
+    CardOptionsLooking,
+    /// Issue #307: three options, the router's answer.
+    CardOptionsReady,
+    /// Issue #307: four options with long labels and a long summary, and
+    /// option 1 drawn as the default (the key runs it).
+    CardOptionsDefaultLong,
+    /// Issue #307: no model is set up, so the static list of actions that
+    /// need none.
+    CardOptionsNoModel,
     /// #885: the setup cards a new user sees, which show their detail line.
     CardSetupNoModel,
     CardSetupOllamaDown,
     PaletteDefault,
-    PaletteRouterSuggestion,
     PaletteNoMatches,
     PaletteNoModel,
     /// Issue #560: the Settings window from a default config, Advanced
@@ -246,10 +249,13 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardPreviewCalendar,
         CardPreviewFormLongLabels,
         CardPreviewError,
+        CardOptionsLooking,
+        CardOptionsReady,
+        CardOptionsDefaultLong,
+        CardOptionsNoModel,
         CardSetupNoModel,
         CardSetupOllamaDown,
         PaletteDefault,
-        PaletteRouterSuggestion,
         PaletteNoMatches,
         PaletteNoModel,
         SettingsTop,
@@ -283,10 +289,13 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardPreviewCalendar => "card-preview-calendar",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
         CardPreviewError => "card-preview-error",
+        CardOptionsLooking => "card-options-looking",
+        CardOptionsReady => "card-options-ready",
+        CardOptionsDefaultLong => "card-options-default-long",
+        CardOptionsNoModel => "card-options-no-model",
         CardSetupNoModel => "card-setup-no-model",
         CardSetupOllamaDown => "card-setup-ollama-down",
         PaletteDefault => "palette-default",
-        PaletteRouterSuggestion => "palette-router-suggestion",
         PaletteNoMatches => "palette-no-matches",
         PaletteNoModel => "palette-no-model",
         SettingsTop => "settings-top",
@@ -624,6 +633,28 @@ mod driver {
         crate::actions::fill_form::build_preview_schema_and_value(&proposal)
     }
 
+    /// The options card's rows from `(id, label)` pairs.
+    fn option_rows(rows: &[(&str, &str)]) -> Vec<crate::ui::card::OptionRow> {
+        rows.iter()
+            .map(|(id, label)| crate::ui::card::OptionRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect()
+    }
+
+    /// The options card as the app shows it: the longest dismiss time (so the
+    /// interactive gallery does not lose it) and the key claim on, so the
+    /// hint line reads as it does in use.
+    fn options_behavior(key_runs_first: bool) -> crate::ui::card::OptionsBehavior {
+        crate::ui::card::OptionsBehavior {
+            dismiss_secs: 120,
+            claim_keys: true,
+            key_runs_first,
+            foreground: 0,
+        }
+    }
+
     fn free_palette_catalogue() -> Vec<PaletteAction> {
         vec![
             PaletteAction {
@@ -821,20 +852,61 @@ mod driver {
                 palette.hide();
                 palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
             }
-            PaletteRouterSuggestion => {
+            CardOptionsLooking => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
-                let generation = palette.router_generation();
-                let result = crate::router::RouterResult {
-                    summary: "Check my work".to_string(),
-                    options: vec![crate::router::RouterOption {
-                        intent: "check-work".to_string(),
-                        label: "Check my work".to_string(),
-                        confidence: 0.92,
-                    }],
-                };
-                palette.apply_router_suggestion(generation, &result, 0.5);
+                card.show_options(
+                    1,
+                    crate::router::LOOKING_SUMMARY,
+                    &[],
+                    options_behavior(false),
+                );
+            }
+            CardOptionsReady => {
+                card.hide();
+                palette.hide();
+                card.show_options(
+                    1,
+                    "Compose window to Dana, \"Q3 numbers\"",
+                    &option_rows(&[
+                        ("review-this-email", "Review this email to Dana"),
+                        ("rewrite-tone", "Make it sound friendlier"),
+                        ("translate", "Translate to Spanish"),
+                    ]),
+                    options_behavior(false),
+                );
+            }
+            CardOptionsDefaultLong => {
+                card.hide();
+                palette.hide();
+                card.show_options(
+                    1,
+                    "A long thread about the quarterly numbers, with a table of figures and two attachments",
+                    &option_rows(&[
+                        (
+                            "review-this-email",
+                            "Review this email to Dana about the quarterly numbers",
+                        ),
+                        ("explain-screen", "Explain what is on screen"),
+                        ("chart-table", "Turn the table into a chart"),
+                        ("extract-text", "Copy text from screen"),
+                    ]),
+                    options_behavior(true),
+                );
+            }
+            CardOptionsNoModel => {
+                card.hide();
+                palette.hide();
+                card.show_options(
+                    1,
+                    crate::router::NO_MODEL_SUMMARY,
+                    &option_rows(&[
+                        ("extract-text", "Copy text from screen"),
+                        ("read-qr", "Read QR code from screen"),
+                        ("calculate-selection", "Calculate selection"),
+                    ]),
+                    options_behavior(false),
+                );
             }
             PaletteNoMatches => {
                 card.hide();
@@ -870,9 +942,7 @@ mod driver {
             }
         }
         Ok(match state {
-            PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel => {
-                palette.hwnd()
-            }
+            PaletteDefault | PaletteNoMatches | PaletteNoModel => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
                 .map(|o| o.hwnd())
@@ -1084,7 +1154,7 @@ mod tests {
                 palette_states += 1;
             }
         }
-        assert_eq!(palette_states, 4, "the test must see every palette state");
+        assert_eq!(palette_states, 3, "the test must see every palette state");
     }
 
     #[test]
@@ -1099,7 +1169,7 @@ mod tests {
             );
             palette_states += usize::from(n.starts_with("palette-"));
         }
-        assert_eq!(palette_states, 4, "the test must see every palette state");
+        assert_eq!(palette_states, 3, "the test must see every palette state");
     }
 
     #[test]
@@ -1176,16 +1246,35 @@ mod tests {
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
-        // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) + the region overlay (#580) + the welcome card (#831) = 25,
-        // + the two setup cards (#885) = 27.
-        assert_eq!(states.len(), 27);
+        // focus = 15 card states, + 4 options card states (#307) + 3 palette
+        // states + 4 settings states (#560) + the region overlay (#580) + the
+        // welcome card (#831) = 28, + the two setup cards (#885) = 30.
+        assert_eq!(states.len(), 30);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
             names.len(),
             states.len(),
             "every gallery state must have a unique name"
+        );
+    }
+
+    #[test]
+    fn the_options_card_states_are_listed_and_follow_themes_and_scales() {
+        let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
+        for want in [
+            "card-options-looking",
+            "card-options-ready",
+            "card-options-default-long",
+            "card-options-no-model",
+        ] {
+            assert!(names.contains(&want), "missing {want}");
+        }
+        assert!(follows_variants(GalleryState::CardOptionsReady));
+        assert!(follows_variants(GalleryState::CardOptionsDefaultLong));
+        assert!(
+            !names.iter().any(|n| n.contains("router-suggestion")),
+            "the palette no longer shows a router suggestion (#805)"
         );
     }
 

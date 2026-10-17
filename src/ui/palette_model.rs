@@ -393,30 +393,6 @@ impl PaletteState {
     }
 }
 
-/// #24: pre-selects the row whose action id is `action_id`, for the intent
-/// router's suggestion. `false` (a no-op, never a panic -- rule 7) when
-/// `action_id` isn't among today's ROWS at all -- e.g. the row only shows up
-/// once a provider is configured, and the grouped view currently has none,
-/// or the query has since filtered it out. Whether this should even be
-/// attempted (confidence vs. threshold, whether the user already
-/// typed/moved) is [`crate::router::should_apply`]'s job, not this
-/// function's -- this only performs the mechanical "does this id exist as a
-/// row right now, and if so select it" step, which is why it lives here
-/// (state mutation) rather than in `router.rs` (decision).
-pub fn preselect_action(state: &mut PaletteState, action_id: &str) -> bool {
-    match state
-        .rows
-        .iter()
-        .position(|r| matches!(r, Row::Action { id, .. } if id == action_id))
-    {
-        Some(idx) => {
-            state.selected = idx;
-            true
-        }
-        None => false,
-    }
-}
-
 /// What handling a key should cause the caller (the Win32 layer) to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteOutcome {
@@ -1105,24 +1081,6 @@ mod tests {
         }
         assert_eq!(state.selected, 19);
         assert_eq!(state.offset, 20 - MAX_VISIBLE_ROWS);
-    }
-
-    // -- preselect_action (#24: the intent router's palette-side half) -----
-
-    #[test]
-    fn preselect_action_selects_the_matching_row() {
-        let mut state = PaletteState::new(three_action_rows());
-        assert_eq!(state.selected_action_id(), Some("a"));
-        assert!(preselect_action(&mut state, "c"));
-        assert_eq!(state.selected_action_id(), Some("c"));
-    }
-
-    #[test]
-    fn preselect_action_false_when_the_id_is_not_a_row_right_now() {
-        let mut state = PaletteState::new(three_action_rows());
-        assert!(!preselect_action(&mut state, "not-a-row"));
-        // Selection is untouched by a failed attempt.
-        assert_eq!(state.selected_action_id(), Some("a"));
     }
 
     // -- dispatch table: every built-in, tested (rule 8) ------------------

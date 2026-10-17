@@ -771,9 +771,8 @@ impl Chain {
 
     /// #105: this chain never shows the send preview. With the toggle on, a
     /// request that leaves the machine is then refused by the send guard
-    /// instead of asking. Used by the Quick Ask router, which runs on its
-    /// own when the palette opens and so must not pop a card.
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
+    /// instead of asking. Used by the options card's router, which runs on its
+    /// own and so must not pop a card.
     pub fn without_prompt(mut self) -> Self {
         self.no_prompt = true;
         self
@@ -783,7 +782,6 @@ impl Chain {
     /// interrupted (blocking HTTP), but once the deadline has passed the chain
     /// starts no further provider and sends no repair request, so a hint
     /// nobody is waiting for is never billed twice.
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.deadline = Some(deadline);
         self
@@ -942,7 +940,6 @@ impl Chain {
     /// *first* such failure is what a full-chain failure surfaces, worded to
     /// name both the provider and the reason (rule 7: a full-chain failure
     /// must still end in a card naming why).
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn complete_parsed_with_fallback<T>(
         &self,
         req: &Request,
