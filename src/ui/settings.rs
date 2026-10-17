@@ -8124,6 +8124,7 @@ fn build_ui_recorded(
         );
         SendMessageW(track, TBM_SETLINESIZE, None, Some(LPARAM(5)));
         SendMessageW(track, TBM_SETPAGESIZE, None, Some(LPARAM(10)));
+        crate::ui::settings_trackbar::track_hover(track, || edit_style().paints_face);
         let pos = (clamp_text_scale(config.ui.text_scale) * 100.0).round() as i32;
         SendMessageW(
             track,
@@ -13938,6 +13939,117 @@ mod tests {
                 assert_ne!(pixel, token, "light {name} must stay stock");
             }
         }
+    }
+
+    /// #1240: the real trackbar sends the hot and pressed item states for its
+    /// thumb, so the dot swells under the mouse and shrinks while it is held.
+    /// Measured from a `WM_PRINTCLIENT` of the trackbar: the width of the
+    /// accent run across the thumb's middle row.
+    #[test]
+    fn the_dark_trackbar_dot_swells_when_hot_and_shrinks_when_pressed() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetPixel, ReleaseDC, SelectObject,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            ShowWindow, SW_SHOWNA, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        };
+        const TBM_GETTHUMBRECT: u32 = 0x0419;
+        const WM_MOUSELEAVE: u32 = 0x02A3;
+        let _forced = Forced::new(Theme::Dark);
+        with_window(Config::default(), |hwnd, _raw| {
+            let track = get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK).expect("the trackbar");
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
+                let _ = ShowWindow(track, SW_SHOWNA);
+            }
+            let mut thumb = windows::Win32::Foundation::RECT::default();
+            unsafe {
+                SendMessageW(
+                    track,
+                    TBM_GETTHUMBRECT,
+                    None,
+                    Some(LPARAM(&mut thumb as *mut _ as isize)),
+                );
+            }
+            let (cx, cy) = (
+                (thumb.left + thumb.right) / 2,
+                (thumb.top + thumb.bottom) / 2,
+            );
+            let at = LPARAM(((cy as isize) << 16) | (cx as isize & 0xFFFF));
+            let dot_width = || unsafe {
+                let mut rc = windows::Win32::Foundation::RECT::default();
+                let _ = GetClientRect(track, &mut rc);
+                let screen = GetDC(None);
+                let dc = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, rc.right.max(400), rc.bottom.max(80));
+                let old = SelectObject(dc, HGDIOBJ(bmp.0));
+                SendMessageW(
+                    track,
+                    windows::Win32::UI::WindowsAndMessaging::WM_PRINTCLIENT,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(0x4)),
+                );
+                let n = (thumb.left..thumb.right)
+                    .filter(|&x| GetPixel(dc, x, cy).0 != crate::ui::theme::DARK.text)
+                    .count() as i32;
+                SelectObject(dc, old);
+                let _ = DeleteObject(HGDIOBJ(bmp.0));
+                let _ = DeleteDC(dc);
+                ReleaseDC(None, screen);
+                n
+            };
+            let rest = dot_width();
+            unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at)) };
+            let hot = dot_width();
+            unsafe {
+                SendMessageW(track, WM_LBUTTONDOWN, Some(WPARAM(1)), Some(at));
+            }
+            let held = dot_width();
+            unsafe {
+                SendMessageW(track, WM_LBUTTONUP, Some(WPARAM(0)), Some(at));
+                SendMessageW(track, WM_MOUSELEAVE, None, None);
+            }
+            assert!(hot > rest, "hot dot {hot} swells past rest {rest}");
+            assert!(held < rest, "held dot {held} shrinks below rest {rest}");
+            assert_eq!(dot_width(), rest, "released, mouse gone");
+            // Moving off the thumb ends the hover too, without a leave message.
+            unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at)) };
+            assert!(dot_width() > rest, "hot again");
+            unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            assert_eq!(dot_width(), rest, "mouse moved off the thumb");
+            // Hiding or disabling it ends the hover, with no leave message.
+            for (msg, off) in [(WM_SHOWWINDOW, 0usize), (WM_ENABLE, 0)] {
+                unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at)) };
+                assert!(dot_width() > rest, "hot before {msg:#x}");
+                unsafe { SendMessageW(track, msg, Some(WPARAM(off)), Some(LPARAM(0))) };
+                assert!(
+                    !crate::ui::settings_trackbar::is_hot(track),
+                    "{msg:#x} ends it"
+                );
+            }
+            unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at)) };
+            unsafe { SendMessageW(track, WM_CAPTURECHANGED, None, None) };
+            assert!(!crate::ui::settings_trackbar::is_hot(track), "capture lost");
+        });
+    }
+
+    /// #1240 review: light never tracks the thumb.
+    #[test]
+    fn light_does_not_track_the_trackbar_thumb() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _forced = Forced::new(Theme::Light);
+        with_window(Config::default(), |hwnd, _raw| {
+            let track = get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK).expect("the trackbar");
+            unsafe {
+                SendMessageW(
+                    track,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(0x0008_0040)),
+                )
+            };
+            assert!(!crate::ui::settings_trackbar::is_hot(track));
+        });
     }
 
     /// #582 slice 2: the manifest took effect in the process that runs

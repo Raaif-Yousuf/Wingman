@@ -198,7 +198,13 @@ pub(crate) unsafe fn handle_custom_draw(
         return Some(CDRF_DODEFAULT);
     }
     let hwnd = nm.hdr.hwndFrom;
-    let state = state_from_cdis(nm.uItemState.0, IsWindowEnabled(hwnd).as_bool());
+    // The stock trackbar never reports `CDIS_HOT` for its thumb (MEASURED
+    // 2026-10-17: a real cursor over it, painted, `uItemState` stayed 0), so the
+    // hover is tracked by `track_hover`.
+    let mut state = state_from_cdis(nm.uItemState.0, IsWindowEnabled(hwnd).as_bool());
+    if state == ThumbState::Normal && is_hot(hwnd) {
+        state = ThumbState::Hot;
+    }
     let colors = look(state, palette);
     let smooth = palette.high_contrast.is_none();
     match nm.dwItemSpec {
@@ -231,6 +237,113 @@ pub(crate) unsafe fn handle_custom_draw(
     }
 }
 
+thread_local! {
+    /// The trackbar whose thumb the mouse is over (0: none). One mouse, one hover.
+    static THUMB_HOT: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the mouse is over the thumb of `track`.
+pub(crate) fn is_hot(track: windows::Win32::Foundation::HWND) -> bool {
+    THUMB_HOT.get() == track.0 as isize
+}
+
+const SUBCLASS_ID: usize = 0x1240;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// Whether a client point is over the thumb rectangle.
+pub(crate) fn over_thumb(thumb: &RECT, x: i32, y: i32) -> bool {
+    x >= thumb.left && x < thumb.right && y >= thumb.top && y < thumb.bottom
+}
+
+/// Makes `track` report the mouse over its thumb (#1240). Event driven: a
+/// `WM_MOUSEMOVE` that changes the answer repaints the thumb only, and Windows
+/// sends one `WM_MOUSELEAVE` when the mouse goes. Nothing runs while still.
+/// `paints_face` says whether Settings draws the trackbar itself right now; when
+/// it does not (light, the system's high contrast) nothing is tracked.
+pub(crate) fn track_hover(track: windows::Win32::Foundation::HWND, paints_face: fn() -> bool) {
+    unsafe {
+        let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+            track,
+            Some(hover_subclass),
+            SUBCLASS_ID,
+            paints_face as usize,
+        );
+    }
+}
+
+unsafe fn set_hot(hwnd: windows::Win32::Foundation::HWND, hot: bool) {
+    use windows::Win32::Graphics::Gdi::InvalidateRect;
+    let me = hwnd.0 as isize;
+    if (THUMB_HOT.get() == me) == hot {
+        return;
+    }
+    THUMB_HOT.set(if hot { me } else { 0 });
+    let mut thumb = RECT::default();
+    SendMessageW(
+        hwnd,
+        TBM_GETTHUMBRECT,
+        None,
+        Some(LPARAM(&mut thumb as *mut RECT as isize)),
+    );
+    let _ = InvalidateRect(Some(hwnd), Some(&thumb), false);
+}
+
+unsafe extern "system" fn hover_subclass(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    };
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CAPTURECHANGED, WM_ENABLE, WM_MOUSEMOVE, WM_NCDESTROY, WM_SHOWWINDOW,
+    };
+    // SAFETY: `data` is the `fn() -> bool` `track_hover` stored.
+    let paints_face: fn() -> bool = std::mem::transmute::<usize, fn() -> bool>(data);
+    match msg {
+        WM_MOUSEMOVE if !paints_face() => {}
+        WM_MOUSEMOVE => {
+            let mut thumb = RECT::default();
+            SendMessageW(
+                hwnd,
+                TBM_GETTHUMBRECT,
+                None,
+                Some(LPARAM(&mut thumb as *mut RECT as isize)),
+            );
+            let (x, y) = (
+                (lparam.0 & 0xFFFF) as i16 as i32,
+                ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+            );
+            let over = over_thumb(&thumb, x, y);
+            if over && THUMB_HOT.get() != hwnd.0 as isize {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut track);
+            }
+            set_hot(hwnd, over);
+        }
+        // A disabled or hidden trackbar, or one that lost the capture, may not get
+        // `WM_MOUSELEAVE`, so those end the hover themselves.
+        WM_MOUSELEAVE | WM_CAPTURECHANGED => set_hot(hwnd, false),
+        WM_ENABLE | WM_SHOWWINDOW if wparam.0 == 0 => set_hot(hwnd, false),
+        WM_NCDESTROY => {
+            set_hot(hwnd, false);
+            let _ = RemoveWindowSubclass(hwnd, Some(hover_subclass), SUBCLASS_ID);
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
 /// A filled bar whose ends are half circles (a disc when it is square).
 unsafe fn fill_pill(hdc: HDC, rc: RECT, color: u32, smooth: bool) {
     let radius = (rc.right - rc.left).min(rc.bottom - rc.top) / 2;
@@ -248,6 +361,19 @@ mod tests {
 
     fn contrast(a: u32, b: u32) -> f64 {
         contrast_ratio(relative_luminance(a), relative_luminance(b))
+    }
+
+    #[test]
+    fn the_thumb_hit_test_is_half_open() {
+        let thumb = RECT {
+            left: 60,
+            top: 2,
+            right: 68,
+            bottom: 17,
+        };
+        assert!(over_thumb(&thumb, 60, 2) && over_thumb(&thumb, 67, 16));
+        assert!(!over_thumb(&thumb, 68, 5) && !over_thumb(&thumb, 64, 17));
+        assert!(!over_thumb(&thumb, 59, 5) && !over_thumb(&thumb, 64, 1));
     }
 
     #[test]
