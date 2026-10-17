@@ -3439,10 +3439,10 @@ struct Look {
 /// detected one, with dark gated off for real users (see
 /// `settings_theme::SETTINGS_DARK_ENABLED`).
 fn current_look() -> Look {
-    use crate::ui::theme::{detect_theme, SysColors, Theme};
+    use crate::ui::theme::{detect_theme, SysColors};
     #[cfg(any(test, debug_assertions))]
     if let Some(theme) = FORCED_THEME.with(std::cell::Cell::get) {
-        let sys = if theme == Theme::HighContrast {
+        let sys = if theme == crate::ui::theme::Theme::HighContrast {
             crate::ui::theme::HC_BLACK
         } else {
             SysColors::read()
@@ -9876,10 +9876,10 @@ impl GalleryWindow {
     }
 
     /// Opens the window and shows it without taking focus, under a forced theme
-    /// (#582): `None` follows the
-    /// system. The forced theme lasts until the window is dropped. High contrast
-    /// is drawn with Windows' black colours, since the gallery cannot switch the
-    /// system theme; dark is drawn although real windows keep it off.
+    /// (#582); `None` follows the system. `dpi` is as for the plain open. The
+    /// forced theme lasts until the window is dropped. High contrast is drawn
+    /// with Windows' black colours, since the gallery cannot switch the system
+    /// theme; dark is drawn although real windows keep it off.
     pub fn open_themed(
         instance: HINSTANCE,
         dpi: Option<u32>,
