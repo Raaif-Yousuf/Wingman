@@ -404,6 +404,8 @@ wired to nothing (AGENTS.md rule 8).
 | 5 | v5 = `document`, `chunk`, `chunk_fts`, the `VectorIndex` trait and chosen implementation (with #83 and #85) | the ingest pipeline and retrieval | A phrase from a dropped resume comes back as the first hit; deleting the file leaves no chunk rows |
 | 6 | delete-after-release: remove the `.migrated` files; context table with #61 | the same startup path | the files are gone |
 
+Order note: the knowledge track ([spec](2026-10-16-knowledge-and-memory-design.md)) lands its tables before the memory table, so the roles of rows 4 and 5 may swap. Version numbers are assigned in merge order. As built, v4 is the knowledge migration (`knowledge_root`, `document`, `chunk`, `chunk_fts` with its triggers); the memory table takes the next free number when it lands.
+
 Slice 2 as built: v2 adds `trigger_label` and `redactions` to the `egress`
 table (fields added to `EgressEntry` after this spec, #236 and #508). When the
 store cannot save a row, the failure is reported once per run and the row is

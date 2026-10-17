@@ -22,6 +22,10 @@ mod executors;
 mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
+mod keypress;
+// Called by the ingest worker in a later slice; until then only tests use it.
+#[cfg_attr(not(test), expect(dead_code))]
+mod knowledge;
 mod known_folder;
 mod machine;
 mod mode;

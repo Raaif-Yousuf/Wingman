@@ -1,5 +1,8 @@
 mode = "auto"
 
+[hotkeys]
+primary_action = "options"
+
 [hotkeys.primary]
 vk = 134
 ctrl = false
@@ -96,8 +99,8 @@ Respond with exactly two fields, and write them in this order:
 Use plain text only in both fields: no markdown (no asterisks, backticks, headers or bullet characters) and no LaTeX. This renders in a plain GDI text window that can display neither. Write powers as m/s^2 and fractions inline. Never use an em dash; write a full stop, a colon, or the word "and" or "but" instead."""
 
 [palette]
-# Not used yet: nothing reads this until the key picks an option
-# (#308). Changing it has no effect today.
+# Not used yet: the key never runs a clipboard option on the model's
+# confidence alone (#859). Changing it has no effect today.
 router_threshold = 0.7
 
 [options]
