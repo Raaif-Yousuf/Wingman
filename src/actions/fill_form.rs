@@ -759,17 +759,50 @@ pub fn unfilled_labels(proposal: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The preview row key for the "part of the form was not read" note (#653).
+/// Like [`UNFILLED_PREVIEW_KEY`], it cannot collide with the `f<i>` keys.
+pub const PARTIAL_READ_PREVIEW_KEY: &str = "partial_read";
+
+/// The note shown when the UIA walk hit its cap or time budget, or skipped an
+/// element it could not fetch. A skipped label (Text) element would leave the
+/// next field with the wrong label, so the user is told to check each row.
+const PARTIAL_READ_NOTE: &str = "Part of the form could not be read, so a field's label may be wrong. Check each row before you confirm.";
+
+/// Records that the form was only partly read (`Snapshot::truncated`), so the
+/// preview can say so. A no-op when the whole form was read.
+pub fn with_partial_read_note(mut proposal: Value, truncated: bool) -> Value {
+    if truncated {
+        if let Some(obj) = proposal.as_object_mut() {
+            obj.insert(PARTIAL_READ_PREVIEW_KEY.to_string(), Value::Bool(true));
+        }
+    }
+    proposal
+}
+
+/// Whether [`with_partial_read_note`] recorded a partial read.
+pub fn partial_read(proposal: &Value) -> bool {
+    proposal
+        .get(PARTIAL_READ_PREVIEW_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Detail text for the card shown when a proposal has no fillable field.
 pub fn nothing_to_fill_detail(proposal: &Value) -> String {
     let left = unfilled_labels(proposal);
-    if left.is_empty() {
+    let mut detail = if left.is_empty() {
         "No fillable fields were found on the foreground window.".to_string()
     } else {
         format!(
             "Nothing in your profile matches these fields: {}. Add a model in Settings to fill the rest.",
             left.join(", ")
         )
+    };
+    if partial_read(proposal) {
+        detail.push(' ');
+        detail.push_str(PARTIAL_READ_NOTE);
     }
+    detail
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +898,20 @@ pub fn build_preview_schema_and_value(proposal: &Value) -> (Value, Value) {
         value_obj.insert(
             UNFILLED_PREVIEW_KEY.to_string(),
             Value::String(left.join(", ")),
+        );
+    }
+
+    if partial_read(proposal) {
+        properties.insert(
+            PARTIAL_READ_PREVIEW_KEY.to_string(),
+            json!({
+                "type": "string",
+                "label": "Check the labels",
+            }),
+        );
+        value_obj.insert(
+            PARTIAL_READ_PREVIEW_KEY.to_string(),
+            Value::String(PARTIAL_READ_NOTE.to_string()),
         );
     }
 
@@ -2602,6 +2649,44 @@ mod tests {
         assert!(unfilled_labels(&proposal).is_empty());
         let (schema, _) = build_preview_schema_and_value(&proposal);
         assert!(schema["properties"].get(UNFILLED_PREVIEW_KEY).is_none());
+    }
+
+    #[test]
+    fn a_partial_read_adds_a_check_the_labels_row_and_a_full_read_adds_nothing() {
+        let candidates = vec![field(
+            ControlKind::Edit,
+            "Full name",
+            FieldValue::Empty,
+            true,
+        )];
+        let (mapped, _) = map_candidates_locally(&candidates, &sample_profile());
+        let base = build_proposal(&candidates, &mapped, RequireTickFor::Sensitive);
+
+        let full = with_partial_read_note(base.clone(), false);
+        assert!(!partial_read(&full));
+        let (schema, _) = build_preview_schema_and_value(&full);
+        assert!(schema["properties"].get(PARTIAL_READ_PREVIEW_KEY).is_none());
+
+        let cut = with_partial_read_note(base, true);
+        assert!(partial_read(&cut));
+        let (schema, value) = build_preview_schema_and_value(&cut);
+        assert!(schema["properties"].get(PARTIAL_READ_PREVIEW_KEY).is_some());
+        let text = value[PARTIAL_READ_PREVIEW_KEY].as_str().unwrap();
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(!text.contains('\u{2014}'), "no em dash: {text}");
+        // The executor-facing shape is unchanged by the note.
+        let rebuilt = rebuild_after_confirm(&cut, &value);
+        assert!(rebuilt.get("partial_read").is_none());
+        assert_eq!(rebuilt["fields"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn nothing_to_fill_detail_mentions_a_partial_read() {
+        let cut = with_partial_read_note(json!({ "fields": [] }), true);
+        let detail = nothing_to_fill_detail(&cut);
+        assert!(detail.contains("could not be read"), "{detail}");
+        let plain = nothing_to_fill_detail(&json!({ "fields": [] }));
+        assert!(!plain.contains("could not be read"), "{plain}");
     }
 
     #[test]
