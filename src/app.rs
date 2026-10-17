@@ -5533,6 +5533,7 @@ impl App {
         // The old start-up scan too: dropping it stops it within one file.
         self.knowledge_watch = None;
         self.knowledge_scan = None;
+        crate::knowledge::ingest::reset_indexed_files();
         self.knowledge_folder = folder.clone();
         let (watch, scan, problem) = start_knowledge(&folder);
         self.knowledge_watch = watch;
@@ -5601,6 +5602,53 @@ impl App {
                 None,
                 SW_SHOWNORMAL,
             );
+        }
+    }
+
+    /// #81: opens the knowledge folder in Explorer, creating it first when it
+    /// does not exist yet (the spec's "created on first use"). Rule 7: a
+    /// failure is a card, never a silent no-op.
+    fn open_knowledge_folder(&mut self) {
+        let Some(path) = crate::knowledge::ingest::folder_to_open(&self.config.knowledge.folder)
+        else {
+            self.card.show_error(
+                "No knowledge folder set",
+                "Set [knowledge] folder in config.toml, then choose Reload settings.",
+            );
+            self.set_watch(true);
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            self.card.show_error(
+                "Couldn't open the knowledge folder",
+                &format!("{} could not be created: {e}", path.display()),
+            );
+            self.set_watch(true);
+            return;
+        }
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a NUL-terminated path that outlives the call.
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        // ShellExecuteW reports failure as a value of 32 or less.
+        if result.0 as isize <= 32 {
+            self.card.show_error(
+                "Couldn't open the knowledge folder",
+                &format!("Explorer would not open {}.", path.display()),
+            );
+            self.set_watch(true);
         }
     }
 
@@ -8809,6 +8857,10 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     if Tray::opens_menu(lparam) {
         app.sync_ollama_menu();
         app.sync_export_menu();
+        // #81: the cached count, never a store query on this thread.
+        app.tray.set_knowledge(crate::knowledge::ingest::menu_files(
+            &app.config.knowledge.folder,
+        ));
     }
     let mut was_menu = false;
     let id = match app.tray.on_tray_message(lparam) {
@@ -8877,6 +8929,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
         MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
         MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
+        MenuChoice::Command(cmd::OPEN_KNOWLEDGE) => app.open_knowledge_folder(),
         MenuChoice::Command(cmd::RELOAD) => app.reload(),
         MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
         MenuChoice::Command(cmd::COPY_EGRESS_LOG) => app.copy_egress_log(),
