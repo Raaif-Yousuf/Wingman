@@ -10,6 +10,15 @@
 //! never blocks while the voice talks, and nothing here polls. When the
 //! voice finishes it posts a window message (`SetNotifyWindowMessage`), so
 //! the card can flip its label back without a timer (AGENTS.md rule 5).
+//!
+//! The first `Speaker::new` of a run runs on the UI thread, on the first Read
+//! aloud click. MEASURED 2026-10-17 (debug test binary, fresh process each
+//! run, five runs, `speaker_new_cold_time`): `CoInitializeEx` plus
+//! `CoCreateInstance(SpVoice)` took 8.6 to 14.5 ms cold and about 0.4 ms
+//! warm. That is well under the keyboard hook's budget, so the voice stays on
+//! the UI thread (SAPI objects are apartment-bound, and moving it would mean
+//! a second thread owning every call). THEORY (unverified): a machine with
+//! a cold disk cache or a third-party voice could take longer.
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -204,5 +213,18 @@ mod tests {
     #[test]
     fn angle_brackets_survive_for_is_not_xml() {
         assert_eq!(spoken_text("x < 5.", "and y > 2"), "x < 5. and y > 2");
+    }
+
+    /// Manual measurement for issue #1202. Run with
+    /// `cargo test speaker_new_cold_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn speaker_new_cold_time() {
+        let t = std::time::Instant::now();
+        let s = Speaker::new(HWND::default(), 0x8001);
+        eprintln!("Speaker::new cold: {:?} res={:?}", t.elapsed(), s.as_ref().err());
+        let t = std::time::Instant::now();
+        let s2 = Speaker::new(HWND::default(), 0x8001);
+        eprintln!("Speaker::new warm: {:?} ok={}", t.elapsed(), s2.is_ok());
     }
 }
