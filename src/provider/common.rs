@@ -77,8 +77,10 @@ pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce
 // The router chain stops starting calls at its wall clock, but a call
 // already in flight used to run to its own 90 s or 180 s HTTP timeout, and
 // could be billed after the palette gave up. `Chain` now scopes a deadline
-// around each provider attempt; every HTTP entry point below caps its timeout
-// to what is left of it. A thread-local (like `SEND_AUTHORIZED`) keeps
+// around each provider attempt; the completion entry points (`post_json_with`
+// and `post_json_with_connect_timeout`) cap their timeout to what is left of
+// it. The model download, model list and GET helpers are not part of a chain
+// attempt and are deliberately uncapped. A thread-local (like `SEND_AUTHORIZED`) keeps
 // `Request` and every provider unchanged: the attempt runs on one thread,
 // blocking, and nothing here starts a timer or a thread.
 // ---------------------------------------------------------------------
