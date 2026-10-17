@@ -8971,6 +8971,10 @@ mod tests {
             // The Ollama group is on the Models page; its button only shows
             // while that page does.
             unsafe { show_page(inner, Page::Models) };
+            // The card is under the Ollama block, hidden on a default config
+            // (#874); the probe still reports into it, and this checks the
+            // button once it is on show.
+            unsafe { reveal_providers(inner) };
             inner.ollama_status.clone()
         };
         let alive = unsafe { &*raw }.alive.clone();
