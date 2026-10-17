@@ -17333,7 +17333,7 @@ mod tests {
             "on_taskbar_created",
             "copy_region",
             "commit_import",
-            "export_action",
+            "export_action_by_id",
         ];
         for name in names {
             let body = body_of(name);
