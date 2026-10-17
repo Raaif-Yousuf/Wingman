@@ -7,14 +7,117 @@ tagged release.
 
 ## [Unreleased]
 
-### Changed
+## [0.2.0] - 2026-10-16
 
-- A `config.toml` that does not parse no longer gets replaced by defaults. Wingman starts in Offline mode, shows a card naming the problem, and does not save over the file until it parses again (use Reload settings after fixing it). Before a save changes the file, one copy is kept as `config.toml.bak` with the API keys blanked (issue #711).
-- Settings refuses Save when `config.toml` changed on disk while the window was open, so a hand edit is never overwritten.
-- Quit is refused while Ollama is being restarted by the fix card.
-- Settings has an "Open config file" button and plainer labels. The card uses a clearer type ramp, and buttons follow the Windows accent colour.
-- Table to CSV now copies tab-separated text, so it pastes into spreadsheet columns.
-- Settings now uses the modern Windows 11 controls (rounded combo boxes and buttons, themed checkboxes and slider) instead of the classic look. The app now carries a manifest that asks for them (issues #807, #820).
+Changes since 0.1.0, grouped by what you notice. The release page has the download and its checksums.
+
+### New actions
+
+Wingman now ships more than two dozen built-in actions, all in the Quick Ask
+palette and the tray's Actions menu. New since 0.1.0: Read QR code from screen
+(no model, works offline), Copy text from screen, Add event from screen,
+Review this email, Fill this form (works with no model too), Action items to a
+checklist, Summarize this page, Summarize a link, Explain this error, Define
+this word, Translate selection, Describe image (alt text), Explain what's on
+screen, Table to CSV, Chart to data table, Receipt to expense row, Convert
+times to my time zone, Relative dates to real dates, Is this a scam?, Jargon to
+plain English, Explain, fix and write tests for code, and three Rewrite for
+tone actions.
+
+You can write your own in `actions.toml`: they appear in the palette and run
+like built-in ones, and an entry with the same id as a built-in changes only
+the fields you write. Share an action as a file from the tray (Help and
+diagnostics) and import one after a preview.
+
+### Look and feel (Windows 11)
+
+- Settings uses the modern Windows 11 controls, one aligned column of fields,
+  visible edit outlines and plain-word labels, plus an "Open config file"
+  button.
+- The card follows the Windows 11 type sizes, the main button uses your accent
+  colour, preview fields look editable, long labels and values show whole, and
+  the difficulty badge has an accessible name.
+- The Quick Ask palette follows light, dark and high contrast, has rounded
+  corners and a clearer selected row, and sends nothing when it opens: a
+  request starts only after you pick or type.
+- The region overlay keeps your selection bright with a clear outline and a
+  size label.
+
+### First run
+
+- A one-time card on the very first start says Wingman is running, which key
+  to press and where the tray icon is.
+- Setup cards ("No AI model set up yet", "Ollama is not running") show what to
+  do without expanding, close when you click away, and are read in full by
+  Narrator. A config.toml that does not parse is named on the card, with the
+  line and column.
+
+### Privacy and safety
+
+- Card numbers, IBANs, key-like tokens, emails and password fields are
+  painted over in the screenshot before a cloud request, and hidden in any text
+  sent too, then restored in the answer. One checkbox in Settings.
+- Wingman does not read password managers: it shows a card and sends nothing.
+- Optional preview of exactly what will be sent before any cloud request.
+- A daily cost budget with a warning and a stop, and the cost shown on each
+  cloud answer. Local models stay free and are never blocked.
+- A screenshot is treated as content, never as instructions to the model.
+- A write is refused if the field changed after you confirmed it.
+- Calendar files are deleted sooner, and the log and profile files are limited
+  to your account.
+
+### Local models and modes
+
+- First run: with nothing set up, a press looks for a local Ollama with a
+  vision model and uses it.
+- Settings can pull an Ollama model with live progress, pick it from the tray,
+  and fix a CPU-only Ollama on an Intel GPU PC. Tray: "Check this PC for local
+  models".
+- Local mode no longer fetches cloud model lists or starts connector sign-in.
+- Settings has live model lists for ChatGPT, Claude and Gemini, and Gemini
+  key, model and thinking fields.
+
+### The card and Settings
+
+- The card follows light, dark and high contrast live, shows what Wingman is
+  doing while it works, scrolls from the keyboard, and has Tab between its
+  footer links. Copy the answer or the card as an image (Ctrl+Shift+C), read an
+  answer aloud, and choose which corner and display it appears on.
+- Settings is laid out in plain words, scrolls with Save always in view, and
+  Save with no edits changes nothing. The tray menu is regrouped, and its
+  first line shows the running version.
+- The tray icon shows when a run is working or the last one failed.
+
+### Reliability
+
+- A crash leaves a note that is shown on the next start. Copy diagnostics
+  hides your account name and the last error's private details.
+- A config.toml that fails to parse is never saved over.
+- Cards show human errors instead of raw messages, with a next step.
+- Fixes for QR codes that crashed the reader, held keys auto-repeating, and
+  the card opening at 0x0.
+- Confirmed actions no longer run on the keyboard thread.
+- Quit and sign-out work while Settings is open, and Quit waits for a form
+  fill or the Ollama fix to finish.
+- A request that timed out is not sent again, so one press is billed once.
+- When a vendor declines a request, Wingman stops and says why instead of
+  sending the screenshot to the next vendor.
+- In Local mode, an Ollama on another computer gets a one-time warning that
+  the screenshot is sent there.
+- Spend that could not be saved still counts toward the daily budget, and a
+  refused Settings save leaves everything as it was.
+
+### Install and release
+
+- Portable mode: a `wingman.portable` file next to the exe keeps every file
+  Wingman writes in that folder.
+- CI now checks the exe size, startup time, idle memory and a start, hand-off
+  and clean-exit smoke test. Release builds are reproducible and ship a
+  CycloneDX SBOM and SHA256SUMS.
+- The release is not code-signed. Windows SmartScreen will warn on first run;
+  see the README.
+
+## [0.1.0] - 2026-09-20
 
 ### Added
 
@@ -105,11 +208,10 @@ tagged release.
   malformed answer from provider 1 correctly falls through to provider 2
   (issue #176).
 
-## [0.1.0] - unreleased
+## Before the first tag
 
-The version currently in `Cargo.toml`. Not yet tagged; listed here because
-this is what exists in the codebase today, per the working name
-`copilot-ask`.
+The state of the code under its working name, `copilot-ask`, before 0.1.0 was
+tagged.
 
 ### Added
 
