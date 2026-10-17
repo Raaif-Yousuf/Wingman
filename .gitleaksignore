@@ -18,3 +18,7 @@ b52fbb2a735670004173bea910c499ed205670b0:src/redact.rs:generic-api-key:657
 f4383e4bb951aa953aba9a44594f49df5f94c29c:src/egress.rs:stripe-access-token:527
 f4383e4bb951aa953aba9a44594f49df5f94c29c:src/egress.rs:stripe-access-token:1108
 f4383e4bb951aa953aba9a44594f49df5f94c29c:src/egress.rs:stripe-access-token:1110
+
+# src/ui/settings.rs: "sk-bad-whole-key-1" in an earlier commit of the #1130 PR is a
+# fake test string (later shortened); the fingerprint is pinned to that commit.
+24073ebc8f3f347609ad02457a1aef786be48fd7:src/ui/settings.rs:generic-api-key:18617
