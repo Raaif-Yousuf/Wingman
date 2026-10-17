@@ -651,6 +651,9 @@ unsafe fn register_class_named(instance: HINSTANCE, name: &str) -> bool {
 struct SettingsInner {
     hwnd: HWND,
     font: HFONT,
+    /// The smaller font of the helper lines (#1015); null until the first
+    /// layout, when they use `font`.
+    hint_font: HFONT,
     /// The window's current DPI; updated by `WM_DPICHANGED` (#233).
     dpi: u32,
     /// Every child with its design rect, for re-layout on a DPI change.
@@ -765,6 +768,7 @@ impl SettingsInner {
         SettingsInner {
             hwnd: HWND(std::ptr::null_mut()),
             font: HFONT(std::ptr::null_mut()),
+            hint_font: HFONT(std::ptr::null_mut()),
             dpi: 96,
             children: Vec::new(),
             content_top_dp: 0,
@@ -986,6 +990,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if inner.learning.take().is_some() {
                 let _ = KillTimer(Some(hwnd), LEARN_TIMER_ID);
                 disarm_learning();
+            }
+            if !inner.hint_font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
+                inner.hint_font = HFONT(std::ptr::null_mut());
             }
             if !inner.font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
@@ -2102,6 +2110,13 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
     } else {
         inner.font
     };
+    // #1015: the helper-line font follows the body font: kept when the body
+    // font is kept, rebuilt when it is.
+    let new_hint_font = if new_font == inner.font && !inner.hint_font.0.is_null() {
+        inner.hint_font
+    } else {
+        build_hint_font(new_font, dpi)
+    };
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
@@ -2132,10 +2147,16 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
             set_combo_heights(c.hwnd, dpi);
         }
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        // #1015: helper lines are set smaller than the labels.
+        let font = if !new_hint_font.0.is_null() && is_hint_id(GetDlgCtrlID(c.hwnd)) {
+            new_hint_font
+        } else {
+            new_font
+        };
         SendMessageW(
             c.hwnd,
             WM_SETFONT,
-            Some(WPARAM(new_font.0 as usize)),
+            Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
         );
     }
@@ -2147,6 +2168,10 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
         let _ = DeleteObject(HGDIOBJ(inner.font.0));
     }
     inner.font = new_font;
+    if new_hint_font != inner.hint_font && !inner.hint_font.0.is_null() {
+        let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
+    }
+    inner.hint_font = new_hint_font;
     // `win_h_dp` stays the baseline the recorded design rects were built
     // for, so every later change diffs against the same reference.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
@@ -3383,6 +3408,9 @@ fn build_font(dpi: u32) -> HFONT {
             lf
         };
         lf.lfWeight = FW_NORMAL.0 as i32;
+        // The face comes from the system; the size from the type ramp, so labels
+        // are the 14 px body and helper lines the 12 px caption (#1015).
+        lf.lfHeight = body_font_height(dpi);
 
         let f = CreateFontIndirectW(&lf);
         if f.0.is_null() {
@@ -3396,6 +3424,35 @@ fn build_font(dpi: u32) -> HFONT {
             f
         }
     }
+}
+
+/// The labels' `lfHeight` at `dpi`: the type ramp's 14 px body (#1015).
+fn body_font_height(dpi: u32) -> i32 {
+    crate::ui::theme::type_height_px(crate::ui::theme::TYPE_BODY_PX, dpi, 1.0)
+}
+
+/// #1015: a helper line's `lfHeight` at `dpi`: the ramp's 12 px caption, the
+/// smallest size Windows 11 uses for text, so never below 12 px at 96 DPI.
+fn hint_font_height(dpi: u32) -> i32 {
+    crate::ui::theme::type_height_px(crate::ui::theme::TYPE_CAPTION_PX, dpi, 1.0)
+}
+
+/// The helper-line font: the body font `body` with the smaller height of
+/// [`hint_font_height`]. Null when the body font cannot be read, so the caller
+/// keeps the body font. The caller deletes it.
+unsafe fn build_hint_font(body: HFONT, dpi: u32) -> HFONT {
+    use windows::Win32::Graphics::Gdi::GetObjectW;
+    let mut lf = LOGFONTW::default();
+    let got = GetObjectW(
+        HGDIOBJ(body.0),
+        std::mem::size_of::<LOGFONTW>() as i32,
+        Some(&mut lf as *mut LOGFONTW as *mut c_void),
+    );
+    if got <= 0 {
+        return HFONT(std::ptr::null_mut());
+    }
+    lf.lfHeight = hint_font_height(dpi);
+    CreateFontIndirectW(&lf)
 }
 
 // ---------------------------------------------------------------------------
@@ -9978,6 +10035,44 @@ mod tests {
         });
     }
 
+    /// #1015: a helper line is under the body height at every scale, never
+    /// below a legible floor, and never taller than the body.
+    #[test]
+    fn the_hint_font_is_smaller_than_the_body_font_but_legible() {
+        for dpi in [96u32, 120, 144, 192, 240] {
+            let body = body_font_height(dpi);
+            let hint = hint_font_height(dpi);
+            assert!(hint.abs() < body.abs(), "dpi {dpi}: {hint} vs {body}");
+            // Windows 11's floor is 12 px at 100 %, scaled.
+            assert!(
+                hint.abs() as f32 >= (12.0 * dpi as f32 / 96.0).round() - 0.5,
+                "dpi {dpi}: {hint} is below the 12 px floor"
+            );
+        }
+        // The ramp at 100 %: 14 px labels, 12 px helper lines.
+        assert_eq!(body_font_height(96), -14);
+        assert_eq!(hint_font_height(96), -12);
+    }
+
+    /// #1015: in the real window every helper line is set in a smaller font
+    /// than a label, and freed fonts do not leak into a re-layout.
+    #[test]
+    fn helper_lines_are_set_smaller_than_the_labels() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { apply_dpi(inner) };
+            let label = font_height_of(get_dlg_item(hwnd, ID_REDACT).expect("label"));
+            for id in [ID_MODEL_LIST_HINT, ID_CAPTURE_DETAIL_HINT, ID_REDACT_HINT] {
+                let hint = font_height_of(get_dlg_item(hwnd, id).expect("hint"));
+                assert!(hint < label, "hint {id}: {hint} px vs label {label} px");
+            }
+            // Laid out again: still smaller, and the old hint font is gone.
+            unsafe { apply_dpi(inner) };
+            let hint = font_height_of(get_dlg_item(hwnd, ID_REDACT_HINT).expect("hint"));
+            assert!(hint < label);
+        });
+    }
+
     /// #1014: a page that fits needs no bar; a taller one does. An unlaid-out
     /// box (no page) keeps the bar.
     #[test]
@@ -10004,6 +10099,9 @@ mod tests {
             // assertion that can only pass if the sync ran.
             unsafe {
                 let _ = ShowWindow(prompt, SW_SHOW);
+                // A real box is at least three rows tall; the unlaid-out test
+                // window leaves it one, which the 14 px labels no longer fit.
+                let _ = SetWindowPos(prompt, None, 0, 0, 300, 120, SWP_NOMOVE | SWP_NOZORDER);
                 let _ = SetWindowTextW(prompt, windows::core::w!("short"));
             }
             assert!(!has_bar(), "one line needs none");

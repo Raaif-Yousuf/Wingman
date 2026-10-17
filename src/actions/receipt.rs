@@ -2,7 +2,7 @@
 //! expense row on the clipboard.
 //!
 //! Nothing here needs new plumbing. The model fills the same `table` proposal
-//! as "Table to CSV" (#69) with a fixed header and a single row; the preview
+//! as "Table to spreadsheet rows" (#69) with a fixed header and a single row; the preview
 //! card shows that row, and "Do it" runs the `clipboard` executor, which writes
 //! it through [`super::table`]'s tab-separated quoting and spreadsheet-formula guard. A
 //! merchant name read off a hostile receipt cannot run as a formula.
