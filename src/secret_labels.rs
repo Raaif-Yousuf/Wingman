@@ -188,10 +188,37 @@ fn looks_like_secret_word(word: &[(usize, char)]) -> bool {
         .any(|&(_, c)| c.is_ascii_digit() || !c.is_alphanumeric())
 }
 
+/// True when the whole line is one secret label, with optional emphasis,
+/// quotes and a colon (`Password`, `**Password**`, `Password：`): a login
+/// form's label above its field. A bare `pin` needs its colon, since a lone
+/// "pin" is as likely a circuit label.
+fn is_label_alone(text: &str) -> bool {
+    let junk = |c: char| c.is_whitespace() || is_emphasis(c) || is_quote(c);
+    let t = text.trim_matches(junk);
+    let has_colon = t.ends_with([':', '：']);
+    let t = t.trim_end_matches([':', '：']).trim_matches(junk);
+    let chars: Vec<(usize, char)> = t.char_indices().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    let whole = |label: &str| {
+        let Some(e) = match_label(&chars, 0, label) else {
+            return false;
+        };
+        e == chars.len() || (e + 1 == chars.len() && lower(chars[e].1) == 's')
+    };
+    SECRET_LABELS
+        .iter()
+        .any(|l| whole(l) && (has_colon || *l != "pin"))
+}
+
 /// True when `text` ends in a secret label that is waiting for its value on
 /// the next line (`Password:`, `PIN =`, `**Password:**`), so a caller that
 /// holds one line at a time (OCR) knows to hide the line that follows.
 pub fn ends_with_open_label(text: &str) -> bool {
+    if is_label_alone(text) {
+        return true;
+    }
     let trimmed = text.trim_end();
     if !trimmed.ends_with([':', '=', '：', '＝', '*']) {
         return false;
@@ -314,7 +341,7 @@ pub fn secret_spans(text: &str, space_join: bool) -> Vec<Range<usize>> {
                 while last > m && at(last - 1).is_some_and(is_blank) {
                     last -= 1;
                 }
-                if short && last > m && at(last - 1) != Some(':') {
+                if short && last > m && !at(last - 1).is_some_and(|c| matches!(c, ':' | '：')) {
                     j = m;
                 }
             }
@@ -371,7 +398,7 @@ pub fn secret_spans(text: &str, space_join: bool) -> Vec<Range<usize>> {
         let holds_value = value.iter().any(|&(_, c)| c.is_alphanumeric())
             && match join {
                 Join::Space => value.iter().any(|&(_, c)| c.is_ascii_digit()),
-                Join::Is => looks_like_secret_word(value),
+                Join::Is => at(value_begin).is_some_and(is_quote) || looks_like_secret_word(value),
                 _ => true,
             };
         if !holds_value || span_begin >= stop {
@@ -480,6 +507,55 @@ mod tests {
         assert!(!ends_with_open_label("password: hunter2"));
         assert!(!ends_with_open_label("the password"));
         assert!(!ends_with_open_label(""));
+    }
+
+    #[test]
+    fn a_label_alone_on_a_line_opens_the_next_line() {
+        for yes in [
+            "Password",
+            "  PASSWORD  ",
+            "Password：",
+            "**Password**",
+            "Passwords:",
+            "Security code",
+            "pin:",
+        ] {
+            assert!(ends_with_open_label(yes), "{yes}");
+        }
+        for no in [
+            "Answer",
+            "Problem 3:",
+            "pin 3",
+            "pin",
+            "Pin",
+            "Enter your password",
+            "Password reset",
+            "password policy:",
+        ] {
+            assert!(!ends_with_open_label(no), "{no}");
+        }
+        assert_eq!(mask("Password：\nhunter2", false), "Password：\n#");
+        assert_eq!(
+            mask("Password:\nUsername：", false),
+            "Password:\nUsername："
+        );
+    }
+
+    #[test]
+    fn a_quoted_value_after_is_counts() {
+        for (text, want) in [
+            ("password is \"hunter\"", "password is #"),
+            ("password is 'sunshine'", "password is #"),
+            ("my password is `abc`", "my password is #"),
+        ] {
+            assert_eq!(mask(text, false), want, "input: {text}");
+        }
+        // A plain word after "is" is still prose.
+        assert_eq!(
+            mask("my password is sunshine", false),
+            "my password is sunshine"
+        );
+        assert_eq!(mask("pin is \"3\"", false), "pin is \"3\"");
     }
 
     #[test]

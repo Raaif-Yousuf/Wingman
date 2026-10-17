@@ -797,7 +797,7 @@ fn regions_with_kinds(
         let mut spans = sensitive_spans_labeled(&line.text);
         let bare_label = crate::secret_labels::ends_with_open_label(&line.text);
         if value_below
-            && !line.text.trim_end().ends_with(':')
+            && !line.text.trim_end().ends_with([':', '：'])
             && line.text.chars().any(char::is_alphanumeric)
         {
             spans.push((0..line.text.len(), SECRET));
@@ -1844,6 +1844,23 @@ mod tests {
         let rects = regions_for_lines(&lines, 1000, 200);
         assert_eq!(rects.len(), 1, "{rects:?}");
         assert_eq!((rects[0].y0, rects[0].y1), (37, 55));
+        // A login form: the label alone, no colon.
+        let lines = [
+            laid_out("Password", 100.0, 10.0),
+            laid_out("hunter2", 100.0, 40.0),
+        ];
+        assert_eq!(regions_for_lines(&lines, 1000, 200).len(), 1);
+        let lines = [
+            laid_out("Password：", 100.0, 10.0),
+            laid_out("hunter2", 100.0, 40.0),
+            laid_out("Username：", 100.0, 70.0),
+        ];
+        assert_eq!(regions_for_lines(&lines, 1000, 200).len(), 1);
+        let lines = [
+            laid_out("pin", 100.0, 10.0),
+            laid_out("3 connects to 4", 100.0, 40.0),
+        ];
+        assert!(regions_for_lines(&lines, 1000, 200).is_empty());
         // A worksheet label above the next problem paints nothing.
         let lines = [
             laid_out("Answer:", 100.0, 10.0),
