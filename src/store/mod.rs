@@ -185,6 +185,9 @@ struct HealState {
     not_before: Option<Instant>,
     /// Whether the user was already told the store is stuck.
     told: bool,
+    /// Whether the user was already told the search index is stuck. Separate
+    /// from `told`, so the milder index notice never hides the file notice.
+    index_told: bool,
     /// Set once the damaged file was moved here but no fresh database is open
     /// yet: the next try only has to open one.
     kept: Option<PathBuf>,
@@ -352,16 +355,14 @@ impl Store {
             Heal::Stuck(why) => {
                 // `seen` stays behind, so a later lock tries again.
                 state.not_before = Some(now + self.retry_gap);
-                if !state.told {
-                    state.told = true;
-                    note_recovery(runtime_recovery_notice(Err(&why)));
+                if let Some(text) = stuck_notice_once(&mut state, false, &why) {
+                    note_recovery(text);
                 }
             }
             Heal::IndexStuck(why) => {
                 state.not_before = Some(now + self.retry_gap);
-                if !state.told {
-                    state.told = true;
-                    note_recovery(index_stuck_notice(&why));
+                if let Some(text) = stuck_notice_once(&mut state, true, &why) {
+                    note_recovery(text);
                 }
             }
         }
@@ -569,6 +570,26 @@ fn index_stuck_notice(why: &str) -> String {
     format!(
         "Wingman's search index could not be rebuilt ({why}), so searching saved data may miss results for now. Your history is still being saved. Wingman will try again."
     )
+}
+
+/// The notice for a stuck heal, once per kind: the index one and the file one
+/// each have their own flag, so the milder index notice never hides the file
+/// one (#1182).
+fn stuck_notice_once(state: &mut HealState, index_only: bool, why: &str) -> Option<String> {
+    let told = if index_only {
+        &mut state.index_told
+    } else {
+        &mut state.told
+    };
+    if *told {
+        return None;
+    }
+    *told = true;
+    Some(if index_only {
+        index_stuck_notice(why)
+    } else {
+        runtime_recovery_notice(Err(why))
+    })
 }
 
 /// Pragmas set on every connection; the reasons are in the design spec.
@@ -1974,6 +1995,17 @@ mod tests {
         assert!(t.contains("search"), "{t}");
         assert!(!t.contains("not being saved"), "{t}");
         assert!(!t.contains('\u{2014}'), "{t}");
+    }
+
+    #[test]
+    fn the_index_notice_never_hides_the_file_notice() {
+        let mut state = HealState::default();
+        let index = stuck_notice_once(&mut state, true, "busy").unwrap();
+        assert!(index.contains("search"), "{index}");
+        assert!(stuck_notice_once(&mut state, true, "busy").is_none());
+        let file = stuck_notice_once(&mut state, false, "in use").unwrap();
+        assert!(file.contains("not being saved"), "{file}");
+        assert!(stuck_notice_once(&mut state, false, "in use").is_none());
     }
 
     #[test]
