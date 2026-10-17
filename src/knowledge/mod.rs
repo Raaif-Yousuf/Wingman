@@ -1,17 +1,18 @@
 //! Knowledge folder: the pure foundation (spec
 //! `docs/superpowers/specs/2026-10-16-knowledge-and-memory-design.md`, K1).
 //!
-//! This module holds only pure code: parsing text-like files, chunking, and
-//! deciding which stored chunks survive an edit. There is no watcher, no
-//! thread, no timer and no network here, so nothing runs while idle (AGENTS.md
-//! rule 5). Later slices call it from the ingest worker.
-//!
-//! Every function takes bytes or text and returns a value or a plain-words
-//! error; none panics on file contents.
+//! Parsing text-like files, chunking, masking and deciding which stored chunks
+//! survive an edit are pure: bytes or text in, a value or a plain-words error
+//! out, never a panic on file contents. [`ingest`] is the one place that
+//! touches the disk and the store: a start-up scan on a short-lived background
+//! thread that ends when the scan does. There is no watcher, no timer and no
+//! network, so nothing runs while idle (AGENTS.md rule 5).
 
 pub mod chunk;
 pub mod diff;
 pub mod hash;
+pub mod ingest;
+pub mod mask;
 pub mod parse;
 
 #[cfg(test)]
