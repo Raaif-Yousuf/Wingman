@@ -20,9 +20,10 @@
 //!   the thread ends. Reload settings starts a new one.
 //! - Buffer overflow (a zero-byte completion or `ERROR_NOTIFY_ENUM_DIR`): one
 //!   full reconciliation, the same walk the start-up scan does.
-//! - Quit or a changed folder: dropping the [`Watcher`] sets the stop event; the
-//!   thread cancels its read, waits for the cancel and ends. Nothing joins it,
-//!   so Quit never waits on a busy disk.
+//! - Quit or a changed folder: dropping the [`Watcher`] sets the stop event and
+//!   waits at most 150 ms for the thread to end. The thread checks the event
+//!   before every store write, cancels its read, waits for the cancel and ends.
+//!   It is never joined without a bound, so Quit never waits on a busy disk.
 //! - A file the editor still holds open: retried three times, 500 ms apart
 //!   growing, inside the same pending mechanism, then left `pending` for the
 //!   next event.
@@ -39,10 +40,10 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_NOTIFY_ENUM_DIR, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
-    FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, GetLongPathNameW, ReadDirectoryChangesW, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Threading::{
     CreateEventW, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
@@ -275,6 +276,60 @@ impl Pending {
     }
 }
 
+/// The wait timeout in whole milliseconds, rounded up: a window with less than
+/// a millisecond left must not wait 0 (a busy loop until it closes). `None` is
+/// forever. Capped at a minute; the loop just comes round again.
+pub fn wait_millis(wait: Option<Duration>) -> u32 {
+    wait.map_or(INFINITE, |d| {
+        u32::try_from(d.as_nanos().div_ceil(1_000_000))
+            .unwrap_or(u32::MAX)
+            .min(60_000)
+    })
+}
+
+/// `rel` with every folder and the file spelled as the disk stores them. Windows
+/// can report a change under an 8.3 short name (`NOTES~1.MD`); keyed as is it
+/// would become a second document next to `notes.md`. A file that is already
+/// gone cannot be looked up, so its folder is and its own name is kept.
+pub fn long_rel(root: &Path, rel: &str) -> String {
+    let full = root.join(rel.replace('/', "\\"));
+    let long = long_path(&full).or_else(|| {
+        let name = full.file_name()?;
+        Some(long_path(full.parent()?)?.join(name))
+    });
+    long.and_then(|p| p.strip_prefix(root).ok().map(ingest::rel_key))
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| rel.to_string())
+}
+
+fn long_path(path: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 32_768];
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `buf` is the
+    // buffer length given.
+    let n = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+    (n > 0 && n < buf.len())
+        .then(|| std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])))
+}
+
+fn long_changes(root: &Path, changes: Vec<Change>) -> Vec<Change> {
+    changes
+        .into_iter()
+        .map(|c| match c {
+            Change::Added(p) => Change::Added(long_rel(root, &p)),
+            Change::Removed(p) => Change::Removed(long_rel(root, &p)),
+            Change::Modified(p) => Change::Modified(long_rel(root, &p)),
+            Change::RenamedOld(p) => Change::RenamedOld(long_rel(root, &p)),
+            Change::RenamedNew(p) => Change::RenamedNew(long_rel(root, &p)),
+        })
+        .collect()
+}
+
 /// What a finished `ReadDirectoryChangesW` means.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Completion {
@@ -311,17 +366,23 @@ pub fn docs_under(rows: &[DocumentRow], rel: &str) -> Vec<i64> {
 
 /// Brings the store in line with `actions`. Returns the paths that could not
 /// be opened (in use) so the caller can try them again shortly. A store error
-/// stops it.
+/// stops it. `stopped` is asked before every write: once it says yes nothing
+/// more is written (a watcher that was replaced must not touch rows the new
+/// scan now owns).
 pub fn apply(
     store: &Store,
     root_id: i64,
     root: &Path,
     actions: &[Action],
     now: i64,
+    stopped: &dyn Fn() -> bool,
 ) -> Result<Vec<String>, StoreError> {
     let mut busy = Vec::new();
     let mut rescan = false;
     for action in actions {
+        if stopped() {
+            return Ok(busy);
+        }
         match action {
             Action::Rescan => rescan = true,
             Action::Index(rel) | Action::Discover(rel) | Action::Remove(rel) => {
@@ -358,7 +419,7 @@ pub fn apply(
             },
         }
     }
-    if rescan {
+    if rescan && !stopped() {
         let summary = ingest::scan_folder(store, root, now)?;
         if let Some(text) = ingest::summary_notice(&summary) {
             notice::report(&text);
@@ -427,11 +488,23 @@ impl Watcher {
     }
 }
 
+/// The longest dropping a [`Watcher`] waits for its thread to notice the stop.
+const STOP_WAIT: Duration = Duration::from_millis(150);
+
 impl Drop for Watcher {
     fn drop(&mut self) {
         // SAFETY: `stop` holds a live event handle.
         unsafe {
             let _ = SetEvent(self.stop.0);
+        }
+        // Reload settings drops the old watcher and starts a scan for the new
+        // folder. The thread checks the stop event before every write, so a
+        // short wait here lets it be out before that scan retires the old root.
+        // Bounded on purpose: the UI thread never waits on a busy disk, and a
+        // thread still inside one file write is covered by the per-write check.
+        let end = Instant::now() + STOP_WAIT;
+        while !self.thread.is_finished() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -636,7 +709,6 @@ fn stop_requested(stop: &StopEvent) -> bool {
 /// `ready` is sent once the first read is armed; dropping it unsent (any early
 /// return) tells `start` there is nothing to wait for.
 fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>) {
-    ingest::lower_thread_priority();
     // A folder that is not there is the scan's notice to give, not ours.
     let Ok(root) = ingest::canonical_root(folder) else {
         return;
@@ -656,8 +728,12 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
         return;
     }
     let _ = ready.send(());
-    // A store that cannot open has already reported itself.
-    let Ok(store) = store::global() else { return };
+    // #1053: open the store (if the start-up open has not) at normal priority,
+    // as the scan does, and only then drop to background. A store that cannot
+    // open has already reported itself.
+    let opened = store::global();
+    ingest::lower_thread_priority();
+    let Ok(store) = opened else { return };
     let root_key = root.to_string_lossy().into_owned();
     let root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
         Ok(id) => id,
@@ -669,15 +745,15 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
     let mut pending = Pending::default();
     let mut tries: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     loop {
-        let timeout = pending
-            .wait(Instant::now())
-            .map_or(INFINITE, |d| d.as_millis().min(60_000) as u32);
+        let timeout = wait_millis(pending.wait(Instant::now()));
         let handles = [dir.event, stop.0];
         // SAFETY: both handles are live events owned by `dir` and `stop`.
         let woke = unsafe { WaitForMultipleObjects(&handles, false, timeout) };
         if woke == WAIT_OBJECT_0 {
             match dir.complete() {
-                Ok(Read::Changes(changes)) => pending.record(changes, Instant::now()),
+                Ok(Read::Changes(changes)) => {
+                    pending.record(long_changes(&root, changes), Instant::now());
+                }
                 Ok(Read::Overflow) => pending.mark_overflow(Instant::now()),
                 Err(code) => {
                     report_ended(&root, Some(code));
@@ -706,7 +782,15 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
             return;
         }
         let actions = pending.take();
-        match apply(&store, root_id, &root, &actions, ingest::now_unix()) {
+        let stopped = || stop_requested(stop);
+        match apply(
+            &store,
+            root_id,
+            &root,
+            &actions,
+            ingest::now_unix(),
+            &stopped,
+        ) {
             Ok(busy) => {
                 tries.retain(|rel, _| busy.contains(rel));
                 let now = Instant::now();
@@ -981,12 +1065,28 @@ mod tests {
         let store = Store::in_memory();
         let root = store.ensure_root("C:\\apply-basic", 0).unwrap();
         fs::write(dir.join("notes.md"), "# Notes\nfrobnicate the widget\n").unwrap();
-        let busy = apply(&store, root, &dir, &[Action::Discover(s("notes.md"))], FUT).unwrap();
+        let busy = apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("notes.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert!(busy.is_empty());
         assert_eq!(store.fts_hits("frobnicate").unwrap(), 1);
 
         fs::remove_file(dir.join("notes.md")).unwrap();
-        apply(&store, root, &dir, &[Action::Remove(s("notes.md"))], FUT).unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Remove(s("notes.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert!(store.chunks_of(root, "notes.md").unwrap().is_empty());
         assert_eq!(store.document_state(root, "notes.md").unwrap(), None);
         assert_eq!(store.fts_hits("frobnicate").unwrap(), 0);
@@ -999,9 +1099,25 @@ mod tests {
         let store = Store::in_memory();
         let root = store.ensure_root("C:\\apply-still", 0).unwrap();
         fs::write(dir.join("a.md"), "# A\nkeepword\n").unwrap();
-        apply(&store, root, &dir, &[Action::Discover(s("a.md"))], FUT).unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("a.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         // The event said removed, but it was saved again before we looked.
-        apply(&store, root, &dir, &[Action::Remove(s("a.md"))], FUT).unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Remove(s("a.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(store.fts_hits("keepword").unwrap(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1012,7 +1128,15 @@ mod tests {
         let store = Store::in_memory();
         let root = store.ensure_root("C:\\apply-rename", 0).unwrap();
         fs::write(dir.join("old.md"), "# Old\nrenamedword here\n").unwrap();
-        apply(&store, root, &dir, &[Action::Discover(s("old.md"))], FUT).unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("old.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         let before = store.chunks_of(root, "old.md").unwrap();
         let id_before = store.document_row(root, "old.md").unwrap().unwrap().id;
 
@@ -1022,7 +1146,7 @@ mod tests {
             from: s("old.md"),
             to: s("sub/new.md"),
         };
-        apply(&store, root, &dir, &[rename], FUT).unwrap();
+        apply(&store, root, &dir, &[rename], FUT, &|| false).unwrap();
 
         assert_eq!(store.document_state(root, "old.md").unwrap(), None);
         assert_eq!(store.chunks_of(root, "sub/new.md").unwrap(), before);
@@ -1042,15 +1166,34 @@ mod tests {
         fs::write(dir.join("sub").join("a.md"), "# A\nsubfolderword\n").unwrap();
         fs::write(dir.join("top.md"), "# T\ntopword\n").unwrap();
         // Adding the folder is a Discover: its files were never seen.
-        apply(&store, root, &dir, &[Action::Discover(s("sub"))], FUT).unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("sub"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(store.fts_hits("subfolderword").unwrap(), 1);
         assert_eq!(store.fts_hits("topword").unwrap(), 1, "the walk covers all");
         // A change inside a folder (its own Modified event) is not a walk.
-        let none = apply(&store, root, &dir, &[Action::Index(s("sub"))], FUT).unwrap();
+        let none = apply(&store, root, &dir, &[Action::Index(s("sub"))], FUT, &|| {
+            false
+        })
+        .unwrap();
         assert!(none.is_empty());
 
         fs::remove_dir_all(dir.join("sub")).unwrap();
-        apply(&store, root, &dir, &[Action::Remove(s("sub"))], FUT).unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Remove(s("sub"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(store.fts_hits("subfolderword").unwrap(), 0);
         assert_eq!(store.fts_hits("topword").unwrap(), 1);
         let _ = fs::remove_dir_all(&dir);
@@ -1066,7 +1209,7 @@ mod tests {
         let root_real = store.ensure_root(&key, 0).unwrap();
         let _ = root;
         fs::write(dir.join("lost.md"), "# L\nlostevent\n").unwrap();
-        apply(&store, root_real, &dir, &[Action::Rescan], FUT).unwrap();
+        apply(&store, root_real, &dir, &[Action::Rescan], FUT, &|| false).unwrap();
         assert_eq!(store.fts_hits("lostevent").unwrap(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1087,14 +1230,105 @@ mod tests {
                 .open(&path)
                 .unwrap()
         };
-        let busy = apply(&store, root, &dir, &[Action::Discover(s("held.md"))], FUT).unwrap();
+        let busy = apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("held.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(busy, vec![s("held.md")]);
         let (status, _) = store.document_state(root, "held.md").unwrap().unwrap();
         assert_eq!(status, "pending");
         drop(held);
-        let busy = apply(&store, root, &dir, &[Action::Discover(s("held.md"))], FUT).unwrap();
+        let busy = apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("held.md"))],
+            FUT,
+            &|| false,
+        )
+        .unwrap();
         assert!(busy.is_empty());
         assert_eq!(store.fts_hits("heldword").unwrap(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wait_is_rounded_up_to_whole_milliseconds_and_never_zero_while_pending() {
+        assert_eq!(wait_millis(None), INFINITE);
+        assert_eq!(wait_millis(Some(Duration::from_micros(1))), 1);
+        assert_eq!(wait_millis(Some(Duration::from_micros(1_001))), 2);
+        assert_eq!(wait_millis(Some(Duration::from_millis(750))), 750);
+        assert_eq!(wait_millis(Some(Duration::from_secs(3_600))), 60_000);
+        assert_eq!(wait_millis(Some(Duration::ZERO)), 0, "already due");
+    }
+
+    #[test]
+    fn a_stopped_apply_writes_nothing() {
+        let dir = scratch("apply-stopped");
+        let store = Store::in_memory();
+        let root = store.ensure_root("C:\\apply-stopped", 0).unwrap();
+        fs::write(dir.join("a.md"), "# A\nstoppedword\n").unwrap();
+        apply(
+            &store,
+            root,
+            &dir,
+            &[Action::Discover(s("a.md"))],
+            FUT,
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(store.fts_hits("stoppedword").unwrap(), 0);
+        assert!(store.documents_in_root(root).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_short_name_from_windows_is_keyed_as_the_long_name() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let dir = scratch("short-names");
+        let root = ingest::canonical_root(&dir).unwrap();
+        fs::create_dir_all(root.join("a long folder")).unwrap();
+        let file = root.join("a long folder").join("long notes file.md");
+        fs::write(&file, "# N\nshortword\n").unwrap();
+        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: NUL-terminated input, buffer length passed.
+        let n = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+        if n == 0 {
+            let _ = fs::remove_dir_all(&dir);
+            return; // 8.3 names are switched off on this volume
+        }
+        let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+        let short_rel = short
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if short_rel == "a long folder/long notes file.md" {
+            // THEORY (unverified): 8.3 name creation is off for this volume.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(
+            long_rel(&root, &short_rel),
+            "a long folder/long notes file.md"
+        );
+        // An ordinary name, and one that is gone, come back as they were.
+        assert_eq!(
+            long_rel(&root, "a long folder/long notes file.md"),
+            "a long folder/long notes file.md"
+        );
+        assert_eq!(
+            long_rel(&root, "a long folder/missing.md"),
+            "a long folder/missing.md"
+        );
+        assert_eq!(long_rel(&root, "nowhere/x.md"), "nowhere/x.md");
         let _ = fs::remove_dir_all(&dir);
     }
 

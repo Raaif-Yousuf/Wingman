@@ -135,9 +135,11 @@ pub(super) fn guarded(work: impl FnOnce()) {
 /// free next time, or it never will be.
 #[derive(Debug, PartialEq, Eq)]
 enum OpenFailure {
-    /// In use right now (a sharing or lock violation), or gone since it was
-    /// listed: try again at the next scan.
+    /// In use right now (a sharing or lock violation): try again at the next
+    /// scan.
     Busy,
+    /// Not there any more: deleted since it was listed. Nothing to retry.
+    Gone,
     /// Refused by permissions: retrying at every start only repeats the same
     /// notice, so it is recorded as failed and left alone until the file changes.
     Denied,
@@ -147,6 +149,8 @@ fn open_failure(e: &std::io::Error) -> OpenFailure {
     // ERROR_ACCESS_DENIED
     if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) {
         OpenFailure::Denied
+    } else if e.kind() == std::io::ErrorKind::NotFound {
+        OpenFailure::Gone
     } else {
         OpenFailure::Busy
     }
@@ -277,6 +281,8 @@ pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, 
             Outcome::Skipped => summary.skipped += 1,
             Outcome::Failed => summary.failed += 1,
             Outcome::Pending => summary.pending += 1,
+            // Deleted while the scan ran: nothing to count, nothing left over.
+            Outcome::Gone => {}
         }
     }
 
@@ -401,10 +407,49 @@ pub(super) fn is_ignored_rel(rel: &str) -> bool {
     true
 }
 
-/// Looks at `rel` under `root` without following links.
+/// What the folders between the root and a file are.
+enum Ancestors {
+    Plain,
+    /// One is a symbolic link, junction or other reparse point.
+    Link,
+    Missing,
+    /// One could not be looked at: treated as unreadable, never as plain.
+    Unknown,
+}
+
+const ATTR_REPARSE_POINT: u32 = 0x400;
+
+fn ancestors_state(root: &Path, rel: &str) -> Ancestors {
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    let mut path = root.to_path_buf();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || attributes(&meta) & ATTR_REPARSE_POINT != 0 {
+                    return Ancestors::Link;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ancestors::Missing,
+            Err(_) => return Ancestors::Unknown,
+        }
+    }
+    Ancestors::Plain
+}
+
+/// Looks at `rel` under `root` without following links, the final component's
+/// or any folder's on the way.
 pub(super) fn probe(root: &Path, rel: &str) -> Probe {
     if is_ignored_rel(rel) {
         return Probe::Ignored;
+    }
+    // A folder inside the root that became a link would resolve outside it,
+    // and the final-component check below cannot see that.
+    match ancestors_state(root, rel) {
+        Ancestors::Plain => {}
+        Ancestors::Link => return Probe::Ignored,
+        Ancestors::Missing => return Probe::Gone,
+        Ancestors::Unknown => return Probe::Unreadable,
     }
     let path = root.join(rel);
     let meta = match std::fs::symlink_metadata(&path) {
@@ -444,7 +489,7 @@ fn is_ignored_file(name: &str) -> bool {
 }
 
 /// A path relative to its root, with `/` separators, as the document key.
-fn rel_key(rel: &Path) -> String {
+pub(super) fn rel_key(rel: &Path) -> String {
     rel.components()
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
@@ -457,6 +502,9 @@ fn attributes(meta: &std::fs::Metadata) -> u32 {
 }
 
 pub(super) enum Outcome {
+    /// The file was deleted between listing and reading: its row, if any, is
+    /// dropped and no `pending` row is left behind.
+    Gone,
     Indexed,
     Unchanged,
     Skipped,
@@ -524,6 +572,12 @@ pub(super) fn index_file(
                 &stamp,
                 "the file could not be opened or read (permission refused or damaged)",
             );
+        }
+        Err(OpenFailure::Gone) => {
+            if let Some(doc) = existing {
+                store.delete_documents(&[doc.id])?;
+            }
+            return Ok(Outcome::Gone);
         }
         Err(OpenFailure::Busy) => {
             store.mark_document(
@@ -645,7 +699,7 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, OpenFailure> {
 fn read_failure(e: &std::io::Error) -> OpenFailure {
     match e.raw_os_error() {
         Some(32 | 33) => OpenFailure::Busy,
-        _ if e.kind() == std::io::ErrorKind::NotFound => OpenFailure::Busy,
+        _ if e.kind() == std::io::ErrorKind::NotFound => OpenFailure::Gone,
         _ => OpenFailure::Denied,
     }
 }
@@ -1010,7 +1064,7 @@ mod tests {
         );
         assert_eq!(
             open_failure(&Error::from(ErrorKind::NotFound)),
-            OpenFailure::Busy
+            OpenFailure::Gone
         );
         assert_eq!(
             open_failure(&Error::from(ErrorKind::PermissionDenied)),
@@ -1025,13 +1079,13 @@ mod tests {
     #[test]
     fn a_read_error_is_retried_only_when_the_file_is_in_use_or_gone() {
         use std::io::{Error, ErrorKind};
-        for busy in [
-            Error::from_raw_os_error(32),
-            Error::from_raw_os_error(33),
-            Error::from(ErrorKind::NotFound),
-        ] {
+        for busy in [Error::from_raw_os_error(32), Error::from_raw_os_error(33)] {
             assert_eq!(read_failure(&busy), OpenFailure::Busy, "{busy:?}");
         }
+        assert_eq!(
+            read_failure(&Error::from(ErrorKind::NotFound)),
+            OpenFailure::Gone
+        );
         for permanent in [
             Error::from_raw_os_error(23),
             Error::from(ErrorKind::InvalidData),
@@ -1043,6 +1097,76 @@ mod tests {
                 "{permanent:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_file_deleted_before_it_was_read_is_gone_not_pending() {
+        let dir = scratch("gone-before-read");
+        let file = FoundFile {
+            rel: "vanished.md".into(),
+            path: dir.join("vanished.md"),
+            size: 10,
+            mtime: Some(100),
+            attributes: 0,
+            parser: parser_for("vanished.md").unwrap(),
+        };
+        let store = Store::in_memory();
+        let root = store.ensure_root("C:\\gone-root", 0).unwrap();
+        let outcome = index_file(&store, root, &file, None, FUT).unwrap();
+        assert!(matches!(outcome, Outcome::Gone));
+        assert_eq!(store.document_state(root, "vanished.md").unwrap(), None);
+
+        // A row that was there is dropped with it.
+        fs::write(dir.join("vanished.md"), "# V\nvanishword\n").unwrap();
+        let found = match probe(&dir, "vanished.md") {
+            Probe::File(f) => f,
+            _ => panic!("the file is there"),
+        };
+        index_file(&store, root, &found, None, FUT).unwrap();
+        let known = store.documents_in_root(root).unwrap();
+        assert_eq!(known.len(), 1);
+        fs::remove_file(dir.join("vanished.md")).unwrap();
+        let mut stale = known[0].clone();
+        stale.status = "pending".into();
+        let again = index_file(&store, root, &found, Some(&stale), 0).unwrap();
+        assert!(matches!(again, Outcome::Gone));
+        assert_eq!(store.document_state(root, "vanished.md").unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory junction `link` pointing at `target` (no elevation needed).
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn a_path_through_a_junction_inside_the_root_is_not_followed() {
+        let dir = scratch("junction-ancestor");
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.md"), "# S\nsecretword\n").unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::write(root.join("real").join("ok.md"), "# O\nokword\n").unwrap();
+        assert!(junction(&root.join("jump"), &outside), "mklink /J failed");
+
+        // The control: a real subfolder is looked at.
+        assert!(matches!(probe(&root, "real/ok.md"), Probe::File(_)));
+        // The same shape through the junction resolves outside the root.
+        assert!(
+            matches!(probe(&root, "jump/secret.md"), Probe::Ignored),
+            "an ancestor that is a link must not be followed"
+        );
+        assert!(matches!(probe(&root, "jump"), Probe::Ignored));
+        // Remove the junction itself first so nothing is deleted through it.
+        let _ = fs::remove_dir(root.join("jump"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
