@@ -175,12 +175,13 @@ pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 24;
 /// #871: posted by the Settings window to the owner window when it loses the
 /// foreground and when it closes. Settings is not modal any more, so nothing
 /// else tells `App` that a card which had to wait (a finished request, a press
-/// of the Wingman key) can now be shown. No payload. `WM_APP + 26`: `+25` is
-/// `WM_APP_CARD_REPORT_PROBLEM`.
+/// of the Wingman key) can now be shown. No payload, except that on close
+/// `wparam` is how many settings were still not saved (#875), which get one card.
+/// `WM_APP + 26`: `+25` is `WM_APP_CARD_REPORT_PROBLEM`.
 pub const WM_APP_SETTINGS_LEFT: u32 = WM_APP + 26;
 
-/// #871: posted by the Settings window to the owner window when Save is pressed.
-/// `lparam` is `Box::into_raw(Box::new(SettingsSave))`; the handler takes
+/// #871, #875: posted by the Settings window to the owner window when a setting
+/// is changed. `lparam` is `Box::into_raw(Box::new(SettingsSave))`; the handler takes
 /// ownership and hands the changes to the writer thread through the same path
 /// every tray change takes (`App::persist_changes_with`), so the count of writes
 /// in flight, the reload and the cards are all kept in one place. `WM_APP + 27`.
@@ -5602,7 +5603,7 @@ impl App {
     /// refused with a card at the time (`settings_hold_card`), not kept: running
     /// it now would bill a request for a screen the user has since left.
     /// Does nothing while Settings is still in front.
-    fn on_settings_left(&mut self) {
+    fn on_settings_left(&mut self, unsaved: usize) {
         if settings::is_foreground() {
             return;
         }
@@ -5617,6 +5618,13 @@ impl App {
             )
         });
         self.deliver_deferred(pending);
+        // #875: the window closed with settings it could not save. Inline was
+        // all it could show while it was open; this is the card (rule 7), shown
+        // last so an answer that waited does not cover it.
+        if unsaved > 0 {
+            let (headline, detail) = settings::unsaved_card(unsaved);
+            self.card.show_error(&headline, &detail);
+        }
         // Click-away dismissal needs the global mouse hook, which is armed only
         // while a card is showing (nothing runs while idle).
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
@@ -5624,11 +5632,13 @@ impl App {
         }
     }
 
-    /// The Settings window's Save (#871): only the fields the user changed, the
-    /// file patched on the writer thread, then a key (if one was typed) stored in
-    /// Credential Manager after the file write succeeded. Nothing here waits.
+    /// One change from the Settings window (#871, #875): the keys of that one
+    /// field, the file patched on the writer thread, then a key (if that is what
+    /// changed) stored in Credential Manager after the file write succeeded.
+    /// Nothing here waits.
     fn on_settings_save(&mut self, save: SettingsSave) {
         let SettingsSave {
+            label,
             changes,
             original,
             edited,
@@ -5638,7 +5648,7 @@ impl App {
         self.settings_saves
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.persist_changes_with(
-            crate::config_writer::Outcome::settings_save(),
+            crate::config_writer::Outcome::settings_field(&label),
             changes,
             Some((original, edited)),
         );
@@ -5732,7 +5742,7 @@ impl App {
                 }
                 DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
                 DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
-                DeferredMessage::SettingsLeft => self.on_settings_left(),
+                DeferredMessage::SettingsLeft(unsaved) => self.on_settings_left(unsaved),
                 DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
                 DeferredMessage::SettingsCommand(command) => self.on_settings_command(command),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
@@ -6292,6 +6302,20 @@ impl App {
         let rewritten =
             |c: &crate::config_writer::FieldChange| changes.iter().any(|n| n.path() == c.path());
         self.unsaved.retain(|c| !rewritten(c));
+        // #875: an open Settings window shows the answer on its status line, so
+        // no card goes over the window being typed in. A key that could not be
+        // stored counts as a failure of its row. With no window to say it (it
+        // closed first), the cards below do.
+        let inline = outcome.from_settings && {
+            let told = match (&reply.result, &key_error) {
+                (Err(reason), _) => Err(reason.clone()),
+                (Ok(()), Some(_)) => {
+                    Err("The key could not be stored in Windows Credential Manager.".to_string())
+                }
+                (Ok(()), None) => Ok(()),
+            };
+            settings::note_write_result(&outcome.ok_headline, &told)
+        };
         match reply.result {
             Ok(()) => match loaded {
                 Some(crate::config_writer::Loaded {
@@ -6348,12 +6372,14 @@ impl App {
                         let why = key_error.unwrap_or_default();
                         let headline = KEY_NOT_STORED_HEADLINE;
                         let human = self.track_error(headline, &why);
-                        self.card.show_error_with_details(
-                            headline,
-                            &format!(
-                                "Enter the key again in Settings after fixing this.\n\n{human}"
-                            ),
-                        );
+                        if !inline {
+                            self.card.show_error_with_details(
+                                headline,
+                                &format!(
+                                    "Enter the key again in Settings after fixing this.\n\n{human}"
+                                ),
+                            );
+                        }
                     } else if shown == SavedCard::Keep {
                         // An answer that waited for Settings is on screen now;
                         // "Settings saved" must not replace it (#213).
@@ -6414,8 +6440,10 @@ impl App {
                     self.config = config;
                     self.apply_config();
                 }
-                self.card
-                    .show_error_with_details(&outcome.fail_headline, &note);
+                if !inline {
+                    self.card
+                        .show_error_with_details(&outcome.fail_headline, &note);
+                }
             }
         }
         self.set_watch(true);
@@ -8487,8 +8515,9 @@ enum DeferredMessage {
     ConfigWritten(crate::config_writer::Written),
     /// `WM_APP_SETTINGS_LEFT` (#871), when it arrives during a tray menu or a
     /// file dialog, or Settings is in front: the flush it asks for happens
-    /// once that is over.
-    SettingsLeft,
+    /// once that is over. The number is how many settings were not saved when
+    /// the window closed (#875).
+    SettingsLeft(usize),
     /// `WM_APP_SETTINGS_SAVE` (#871), when it arrives during a tray menu or a
     /// file dialog: the save is handed to the writer once that loop has ended.
     SettingsSave(Box<SettingsSave>),
@@ -8957,15 +8986,17 @@ fn missing_key_card(provider: ActiveProvider) -> (String, String) {
     )
 }
 
-/// What the Settings window sends the owner window on Save (#871): the fields
-/// it changed (`config_writer::diff` of the two configs, whole values made
-/// conditional by `guard_whole_values`) and the two configs, from which the keys
-/// that changed are worked out and stored once the file write has succeeded.
+/// What the Settings window sends the owner window for one change (#871, #875):
+/// what the field is called, its keys (whole values made conditional by
+/// `guard_whole_values`) and the config before and with it, from which a key that
+/// changed is worked out and stored once the file write has succeeded.
 pub(crate) struct SettingsSave {
+    /// The field's name ("Card corner"): the writer's answer is matched by it.
+    pub label: String,
     pub changes: Vec<crate::config_writer::FieldChange>,
-    /// What the window opened with.
+    /// What the window had applied before this change.
     pub original: Config,
-    /// What it saved.
+    /// With the change.
     pub edited: Config,
 }
 
@@ -9095,7 +9126,7 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
             *Box::from_raw(lparam.0 as *mut crate::config_writer::Written)
         }),
-        WM_APP_SETTINGS_LEFT => DeferredMessage::SettingsLeft,
+        WM_APP_SETTINGS_LEFT => DeferredMessage::SettingsLeft(wparam.0),
         WM_APP_SETTINGS_SAVE => {
             DeferredMessage::SettingsSave(unsafe { Box::from_raw(lparam.0 as *mut SettingsSave) })
         }
@@ -9893,7 +9924,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             LRESULT(0)
         }
         WM_APP_SETTINGS_LEFT => {
-            app.on_settings_left();
+            app.on_settings_left(wparam.0);
             LRESULT(0)
         }
         WM_APP_SETTINGS_SAVE => {
@@ -10472,7 +10503,12 @@ mod tests {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         assert!(matches!(
             take_deferred(WM_APP_SETTINGS_LEFT, WPARAM(0), LPARAM(0)),
-            Some(DeferredMessage::SettingsLeft)
+            Some(DeferredMessage::SettingsLeft(0))
+        ));
+        // The window closing with rows unsaved carries their number.
+        assert!(matches!(
+            take_deferred(WM_APP_SETTINGS_LEFT, WPARAM(3), LPARAM(0)),
+            Some(DeferredMessage::SettingsLeft(3))
         ));
         assert!(matches!(
             take_deferred(WM_APP_PAUSE_TOGGLE, WPARAM(0), LPARAM(0)),
@@ -10487,7 +10523,7 @@ mod tests {
                 result: Err("disk full".into()),
             },
             changes: Vec::new(),
-            outcome: crate::config_writer::Outcome::settings_save(),
+            outcome: crate::config_writer::Outcome::settings_field("Card corner"),
             loaded: None,
             key_error: None,
         };
@@ -10501,6 +10537,7 @@ mod tests {
         }
 
         let save = SettingsSave {
+            label: "Mode".into(),
             changes: vec![crate::config_writer::FieldChange::mode(Mode::Offline)],
             original: crate::config::Config::default(),
             edited: crate::config::Config::default(),
@@ -10951,7 +10988,11 @@ mod tests {
             !code.contains("ASK_WAITING_FOR_SETTINGS"),
             "a press must not be kept while Settings is open"
         );
-        let left = body_between(&src, "    fn on_settings_left(&mut self) {", "\n    }\n");
+        let left = body_between(
+            &src,
+            "    fn on_settings_left(&mut self, unsaved: usize) {",
+            "\n    }\n",
+        );
         assert!(
             !left.contains(".ask("),
             "leaving Settings must not run an ask:\n{left}"
@@ -11057,7 +11098,11 @@ mod tests {
     #[test]
     fn leaving_settings_arms_the_click_watch_only_for_a_visible_card() {
         let src = lf(include_str!("app.rs"));
-        let left = body_between(&src, "    fn on_settings_left(&mut self) {", "\n    }\n");
+        let left = body_between(
+            &src,
+            "    fn on_settings_left(&mut self, unsaved: usize) {",
+            "\n    }\n",
+        );
         let deliver = left
             .find("self.deliver_deferred(pending)")
             .expect("deliver moved");
@@ -11125,7 +11170,7 @@ mod tests {
         let src = lf(include_str!("app.rs"));
         let save = body_between(&src, "    fn on_settings_save(", "\n    }\n");
         assert!(save.contains("self.persist_changes_with("), "{save}");
-        assert!(save.contains("Outcome::settings_save()"), "{save}");
+        assert!(save.contains("Outcome::settings_field("), "{save}");
         assert!(save.contains("self.settings_saves"), "{save}");
         // The keys are stored on the writer thread, after the file write and
         // before the reload that reads them back.
@@ -11138,6 +11183,39 @@ mod tests {
         assert!(wrote < push && push < load, "{persist}");
         // A reply that cannot be posted must not leave asks refused for good.
         assert!(persist.contains("finish(saves)"), "{persist}");
+    }
+
+    /// #875: the writer's answer for a Settings change goes to the open window
+    /// first, and a card is shown only when the window did not take it (it closed
+    /// first). A close with rows still failed gets one card, shown after what
+    /// waited for Settings.
+    #[test]
+    fn a_settings_answer_goes_to_the_window_and_a_card_only_when_it_did_not_take_it() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let told = handler
+            .find("settings::note_write_result(")
+            .expect("the window is never told");
+        let matched = handler.find("match reply.result {").expect("match moved");
+        assert!(
+            told < matched,
+            "the window hears before any card: {handler}"
+        );
+        // Both failure cards wait on what the window said.
+        assert_eq!(handler.matches("if !inline {").count(), 2, "{handler}");
+        let left = body_between(
+            &src,
+            "    fn on_settings_left(&mut self, unsaved: usize) {",
+            "\n    }\n",
+        );
+        let deliver = left.find("self.deliver_deferred(pending)").expect("moved");
+        let card = left
+            .find("settings::unsaved_card(unsaved)")
+            .expect("no card for rows left unsaved");
+        assert!(deliver < card, "{left}");
+        // Every arm that reads WM_APP_SETTINGS_LEFT passes the count on.
+        assert!(src.contains("DeferredMessage::SettingsLeft(wparam.0)"));
+        assert!(src.contains("app.on_settings_left(wparam.0)"));
     }
 
     /// Quit: a Save that is still queued is handed to the writer and flushed, the
@@ -11170,6 +11248,7 @@ mod tests {
     fn a_failed_settings_post_frees_its_payload_and_a_dropped_one_is_freed() {
         // The owner is gone: the box is freed here and the window is told.
         let save = SettingsSave {
+            label: String::new(),
             changes: Vec::new(),
             original: crate::config::Config::default(),
             edited: crate::config::Config::default(),
@@ -11178,6 +11257,7 @@ mod tests {
         assert!(super::post_settings_save(nobody, save).is_err());
         // Dropped unhandled (quit): free_boxed_payload knows the id.
         let raw = Box::into_raw(Box::new(SettingsSave {
+            label: String::new(),
             changes: Vec::new(),
             original: crate::config::Config::default(),
             edited: crate::config::Config::default(),
