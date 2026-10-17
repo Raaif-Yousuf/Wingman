@@ -138,7 +138,7 @@ impl OpenAi {
                     // message carried partial text.
                     if let Some(refusal) = part.get("refusal").and_then(Value::as_str) {
                         if !refusal.is_empty() {
-                            return Err(anyhow!("openai: model refused to answer"));
+                            return Err(super::refused_error("openai"));
                         }
                     }
                     if let Some(t) = part.get("text").and_then(Value::as_str) {
