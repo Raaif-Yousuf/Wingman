@@ -161,6 +161,16 @@ pub const WM_APP_FIRST_RUN: u32 = WM_APP + 20;
 /// thread. `WM_APP + 22`: `+21` is `WM_APP_MACHINE_CHECK_RESULT`.
 pub const WM_APP_EXECUTOR_DONE: u32 = WM_APP + 22;
 
+/// #870: posted by the `settings-writer` thread (`config_writer`) when a change
+/// to `config.toml` has been written or refused. `lparam` is
+/// `Box::into_raw(Box::new(config_writer::Written))`; the handler takes
+/// ownership and swaps in the config the writer thread re-read from the file (so
+/// a hand edit made meanwhile is picked up) and shows the result. The file,
+/// Credential Manager and `icacls` work all runs off the message thread, which
+/// also hosts the keyboard hook. `WM_APP + 23`: `+22` is
+/// `WM_APP_EXECUTOR_DONE`.
+pub const WM_APP_CONFIG_WRITTEN: u32 = WM_APP + 24;
+
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
 /// `Box::into_raw(Box::new(machine::MachineFacts))`; the receiver takes
@@ -415,6 +425,16 @@ struct App {
     /// doc comment.
     taskbar_created_msg: u32,
     config: Config,
+    /// #870: changes made in memory whose write to `config.toml` failed. They
+    /// are live until quit; a reload after a later successful write puts them
+    /// back on the loaded config instead of silently reverting them.
+    unsaved: Vec<crate::config_writer::FieldChange>,
+    /// #870: writes handed to the writer thread whose reply has not come back.
+    /// Only the last reply swaps in the loaded config; an earlier one was read
+    /// before a later choice was made.
+    pending_writes: Arc<std::sync::atomic::AtomicU32>,
+    /// #870: the newest good load an earlier (not last) reply left unadopted.
+    skipped_mtime: Option<Option<std::time::SystemTime>>,
     /// #339: whether a password manager was in front before Wingman's own UI
     /// (the tray menu, the palette) took the foreground. Set only around a
     /// dispatch from that UI and cleared right after, so it never leaks into
@@ -699,6 +719,9 @@ pub fn run() -> Result<()> {
         instance,
         taskbar_created_msg,
         config,
+        unsaved: Vec::new(),
+        pending_writes: Arc::default(),
+        skipped_mtime: None,
         chain,
         card,
         palette,
@@ -1406,24 +1429,18 @@ impl App {
             .providers
             .first_run_local_eligible(self.config.mode);
         if let (FirstRun::Found { model, kind }, true) = (&found, eligible) {
+            let before = self.config.clone();
             let base_url = ollama_admin::first_run_base_url(&self.config.providers.ollama.base_url)
                 .unwrap_or_else(|| self.config.providers.ollama.base_url.clone());
             self.config.providers.adopt_local_model(model, &base_url);
             self.chain = Arc::new(self.config.build_chain());
-            let saved = self.config.save();
             self.refresh_tray_labels();
             let (title, text) = first_run_adopted_card(model, *kind);
-            match saved {
-                Ok(()) => self.card.show_answer(&title, &text, 8, None),
-                Err(e) => {
-                    let headline = format!("{title}: not saved");
-                    let human = self.track_error(&headline, &format!("{e:#}"));
-                    self.card.show_error_with_details(
-                        &headline,
-                        &format!("It will revert when you quit.\n\n{human}"),
-                    );
-                }
-            }
+            let mut outcome = crate::config_writer::Outcome::simple(&title);
+            outcome.ok_detail = text;
+            outcome.ok_secs = 8;
+            outcome.fail_headline = format!("{title}: not saved");
+            self.persist_diff(&before, outcome);
             self.set_watch(true);
             return;
         }
@@ -4344,6 +4361,7 @@ impl App {
             }
             LearnedVerdict::Apply => self.pending_conflict = None,
         }
+        let before = self.config.clone();
         apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
             if which == HK_PAUSE {
@@ -4352,23 +4370,14 @@ impl App {
                 hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
             }
         }
-        let saved = self.config.save();
         self.refresh_tray_labels();
 
         let name = chord_to_string(&chord);
-        match saved {
-            Ok(()) => self
-                .card
-                .show_answer(&format!("Bound to {name}"), "", 4, None),
-            Err(e) => {
-                let headline = format!("Bound to {name}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will work until you quit.\n\n{human}"),
-                );
-            }
-        }
+        let mut outcome = crate::config_writer::Outcome::simple(&format!("Bound to {name}"));
+        outcome.ok_secs = 4;
+        outcome.fail_headline = format!("Bound to {name}: not saved");
+        outcome.fail_note = "It will work until you quit.".to_string();
+        self.persist_diff(&before, outcome);
     }
 
     fn reload(&mut self) {
@@ -4385,6 +4394,9 @@ impl App {
                 // freshly loaded config is the one whose hydrate ran.
                 let unreadable = config.unreadable_secrets.clone();
                 self.config = config;
+                // The file is the truth again; an old failed write must not be
+                // re-applied over it later.
+                self.unsaved.clear();
                 self.apply_config();
                 if unreadable.is_empty() {
                     self.card.show_answer("Settings reloaded", "", 3, None);
@@ -4508,6 +4520,8 @@ impl App {
             self.show_tray_restore_error(tray_restore_error);
             return;
         }
+        // The saved config replaces everything, failed tray writes included.
+        self.unsaved.clear();
         self.apply_config();
 
         if pending.is_empty() {
@@ -4569,6 +4583,7 @@ impl App {
                     self.on_generic_action_result(action, schema, result)
                 }
                 DeferredMessage::ExecutorDone(result) => self.on_exec_done(result),
+                DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
             }
         }
     }
@@ -4716,6 +4731,7 @@ impl App {
 
         let Some(model) = picked else { return };
 
+        let before = self.config.clone();
         let slot = if openai {
             &mut self.config.providers.openai.model
         } else {
@@ -4725,7 +4741,7 @@ impl App {
             return;
         }
         *slot = model.clone();
-        self.commit_model_pick(&model);
+        self.commit_model_pick(&before, &model);
     }
 
     /// #567: apply a model chosen from the tray's Ollama submenu. Same shape
@@ -4738,71 +4754,52 @@ impl App {
         if self.config.providers.ollama.model == model {
             return;
         }
+        let before = self.config.clone();
         self.config.providers.ollama.model = model.clone();
-        self.commit_model_pick(&model);
+        self.commit_model_pick(&before, &model);
     }
 
     /// The part of a tray model pick that comes after the config field is
     /// set: rebuild the chain so the pick is live, save, refresh the tray and
     /// say what happened on a card.
-    fn commit_model_pick(&mut self, model: &str) {
+    fn commit_model_pick(&mut self, before: &Config, model: &str) {
         self.chain = Arc::new(self.config.build_chain());
-        let saved = self.config.save();
         self.refresh_tray_labels();
-
-        match saved {
-            Ok(()) => self.card.show_answer(model, "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {model}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
-            }
-        }
-        self.set_watch(true);
+        self.persist_diff(before, crate::config_writer::Outcome::simple(model));
     }
 
     /// Move a provider to the front of `providers.order`, making it the one
     /// that answers. The other stays in the list as the fallback rather than
     /// being dropped, so switching never costs you the second provider.
     fn set_provider(&mut self, provider: ActiveProvider) {
+        let before = self.config.clone();
         if !provider.move_to_front(&mut self.config.providers.order) {
             return;
         }
 
         self.chain = Arc::new(self.config.build_chain());
-        let saved = self.config.save();
         self.refresh_tray_labels();
 
-        let name = provider.label();
-        match saved {
-            // Issue #569: a provider with no key would fail on the next
-            // press, so say so now and point at Settings.
-            Ok(()) if provider_needs_key(provider, &self.config.providers, self.config.mode) => {
-                let (headline, detail) = missing_key_card(provider);
-                self.show_setup_card(&headline, &detail);
-            }
-            Ok(()) => self.card.show_answer(name, "", 3, None),
-            Err(e) => {
-                let headline = format!("Using {name}: not saved");
-                let human = self.track_error(&headline, &format!("{e:#}"));
-                self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
-                );
-            }
+        let mut outcome = crate::config_writer::Outcome::simple(provider.label());
+        // Issue #569: a provider with no key would fail on the next press, so
+        // say so now and point at Settings.
+        if provider_needs_key(provider, &self.config.providers, self.config.mode) {
+            let (headline, detail) = missing_key_card(provider);
+            outcome.ok_headline = headline;
+            outcome.ok_detail = detail;
+            outcome.ok_setup = true;
         }
-        self.set_watch(true);
+        self.persist_diff(&before, outcome);
     }
 
     /// Issue #19: switch `Mode`, publish it to the process-wide atomic the
     /// Offline guard reads (`mode::set_current`), radio-check it in the
     /// tray and update the icon (`Tray::set_mode`), and persist it --
-    /// mirrors `set_provider`'s shape exactly. Unlike Pause, Mode IS
-    /// persisted (`Config.mode`), so unlike `pause_for`/`resume` this
-    /// writes to disk, same as every other tray setting change.
+    /// mirrors `set_provider`'s shape. Unlike Pause, Mode IS persisted
+    /// (`Config.mode`). The write changes only the `mode` key, on the
+    /// `settings-writer` thread (#870): comments, unknown keys and hand edits in
+    /// `config.toml` stay, and no file work runs on this thread. The outcome
+    /// comes back as `WM_APP_CONFIG_WRITTEN` (`on_config_written`).
     fn set_mode(&mut self, mode: Mode) {
         if self.config.mode == mode {
             return;
@@ -4820,16 +4817,163 @@ impl App {
         mode::set_current(mode);
         self.tray.set_mode(mode);
         self.update_tooltip();
+        self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
+        self.set_watch(true);
+    }
 
-        let saved = self.config.save();
-        match saved {
-            Ok(()) => self.card.show_answer(mode.label(), "", 3, None),
+    /// Hands one field change to the writer thread. `label` names it in the
+    /// card that reports the outcome. Never blocks and never touches the disk
+    /// here; if the writer cannot even be reached the failure is posted back
+    /// like any other, so it still ends in a card (rule 7).
+    fn persist_field(&mut self, label: &str, change: crate::config_writer::FieldChange) {
+        self.persist_changes(crate::config_writer::Outcome::simple(label), vec![change]);
+    }
+
+    /// Writes whatever differs between `before` (the config before this tray
+    /// change) and the config now, through the writer thread. Replaces a
+    /// whole-file `config.save()`: the file keeps its comments and hand edits,
+    /// no disk work runs on this thread, and a failure is remembered in
+    /// `unsaved` instead of being undone by the next reload.
+    fn persist_diff(&mut self, before: &Config, outcome: crate::config_writer::Outcome) {
+        match crate::config_writer::diff(before, &self.config) {
+            Ok(changes) => self.persist_changes(outcome, changes),
             Err(e) => {
-                let headline = format!("Using {}: not saved", mode.label());
-                let human = self.track_error(&headline, &format!("{e:#}"));
+                let human = self.track_error(&outcome.fail_headline, &format!("{e:#}"));
                 self.card.show_error_with_details(
-                    &headline,
-                    &format!("It will revert when you quit.\n\n{human}"),
+                    &outcome.fail_headline,
+                    &format!("{}\n\n{human}", outcome.fail_note),
+                );
+            }
+        }
+    }
+
+    fn persist_changes(
+        &mut self,
+        outcome: crate::config_writer::Outcome,
+        changes: Vec<crate::config_writer::FieldChange>,
+    ) {
+        use crate::config_writer::{WriteReply, Written};
+        self.pending_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pending = Arc::clone(&self.pending_writes);
+        let target = self.hwnd_isize();
+        let label = outcome.ok_headline.clone();
+        let sent = changes.clone();
+        let sent_outcome = outcome;
+        let done = move |reply: WriteReply| {
+            // On the writer thread (or here, if the writer could not start). The
+            // reload is the slow part, so it happens here and not in the handler.
+            let loaded = (reply.result.is_ok() && !crate::config_writer::shutting_down())
+                .then(crate::config_writer::load_after_write);
+            let payload = Box::into_raw(Box::new(Written {
+                reply,
+                changes: sent,
+                outcome: sent_outcome,
+                loaded,
+            }));
+            unsafe {
+                if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(HWND(target as *mut _)),
+                    WM_APP_CONFIG_WRITTEN,
+                    WPARAM(0),
+                    LPARAM(payload as isize),
+                )
+                .is_err()
+                {
+                    // Window gone: nobody will take the box, so free it here, and
+                    // settle the count its reply would have settled.
+                    free_boxed_payload(WM_APP_CONFIG_WRITTEN, LPARAM(payload as isize));
+                    crate::config_writer::finish(&pending);
+                }
+            }
+        };
+        match crate::config_writer::global() {
+            Ok(writer) => writer.submit(&label, changes, done),
+            Err(reason) => done(WriteReply {
+                label,
+                result: Err(reason),
+            }),
+        }
+    }
+
+    /// The writer thread's answer, with the file already read again (a hand edit
+    /// made meanwhile is applied too, and nothing afterwards saves a stale copy
+    /// over it). On failure the change is live until quit but not on disk, and
+    /// the card says so; it is remembered so a later reload does not quietly undo
+    /// it. While other writes are still in flight this reply's read is stale (a
+    /// later choice may already be live), so only the last reply swaps.
+    fn on_config_written(&mut self, written: crate::config_writer::Written) {
+        let crate::config_writer::Written {
+            reply,
+            changes,
+            outcome,
+            loaded,
+        } = written;
+        let last = crate::config_writer::finish(&self.pending_writes);
+        let this_ok = match (&reply.result, &loaded) {
+            (
+                Ok(()),
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config),
+                    mtime,
+                }),
+            ) if config.load_problem.is_none() => Some(*mtime),
+            _ => None,
+        };
+        let (adopt, skipped) =
+            crate::config_writer::track_mtime(last, this_ok, self.skipped_mtime.take());
+        self.skipped_mtime = skipped;
+        if let Some(mtime) = adopt {
+            crate::config_writer::adopt_mtime(mtime);
+        }
+        let rewritten =
+            |c: &crate::config_writer::FieldChange| changes.iter().any(|n| n.path() == c.path());
+        self.unsaved.retain(|c| !rewritten(c));
+        match reply.result {
+            Ok(()) => match loaded {
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config), ..
+                }) if config.load_problem.is_none() => {
+                    if last {
+                        self.config = crate::config_writer::reapply(&config, &self.unsaved)
+                            .unwrap_or(*config);
+                        self.apply_config();
+                    }
+                    if outcome.ok_setup {
+                        self.show_setup_card(&outcome.ok_headline, &outcome.ok_detail);
+                    } else {
+                        self.card.show_answer(
+                            &outcome.ok_headline,
+                            &outcome.ok_detail,
+                            outcome.ok_secs,
+                            None,
+                        );
+                    }
+                }
+                // The file was edited into something unreadable after our
+                // write: keep the settings already running, as Reload does, and
+                // say so.
+                Some(crate::config_writer::Loaded {
+                    config: Ok(config), ..
+                }) => {
+                    let (headline, detail) =
+                        config_problem_card(config.load_problem.as_deref().unwrap_or_default());
+                    self.card.show_error(&headline, &detail);
+                }
+                Some(crate::config_writer::Loaded { config: Err(e), .. }) => {
+                    let detail = self.track_error("Couldn't reload settings", &e);
+                    self.card
+                        .show_error_with_details("Couldn't reload settings", &detail);
+                }
+                // The app is quitting.
+                None => {}
+            },
+            Err(reason) => {
+                self.unsaved.extend(changes);
+                let human = self.track_error(&outcome.fail_headline, &reason);
+                self.card.show_error_with_details(
+                    &outcome.fail_headline,
+                    &format!("{}\n\n{human}", outcome.fail_note),
                 );
             }
         }
@@ -6882,6 +7026,9 @@ enum DeferredMessage {
     GenericActionResult(actions::Action, Value, GenericResult),
     /// `WM_APP_EXECUTOR_DONE` (#712).
     ExecutorDone(std::result::Result<ExecDone, String>),
+    /// `WM_APP_CONFIG_WRITTEN` (#870): a failed write must still end in a card
+    /// when Settings was open at the time.
+    ConfigWritten(crate::config_writer::Written),
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -7089,7 +7236,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_PREVIEW_DECIDED
         | WM_APP_FORM_FILL_RESULT
         | WM_APP_GENERIC_ACTION_RESULT
-        | WM_APP_EXECUTOR_DONE => SettingsReentrancy::Defer,
+        | WM_APP_EXECUTOR_DONE
+        | WM_APP_CONFIG_WRITTEN => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -7211,6 +7359,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_EXECUTOR_DONE => drop(Box::from_raw(
                 p as *mut std::result::Result<ExecDone, String>,
             )),
+            WM_APP_CONFIG_WRITTEN => drop(Box::from_raw(p as *mut crate::config_writer::Written)),
             _ => return false,
         }
     }
@@ -7479,6 +7628,9 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     WM_APP_EXECUTOR_DONE => DeferredMessage::ExecutorDone(unsafe {
                         *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>)
                     }),
+                    WM_APP_CONFIG_WRITTEN => DeferredMessage::ConfigWritten(unsafe {
+                        *Box::from_raw(lparam.0 as *mut crate::config_writer::Written)
+                    }),
                     _ => {
                         unreachable!("the reentrancy policies only return Defer for the ids above")
                     }
@@ -7597,6 +7749,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<ExecDone, String>) };
             app.on_exec_done(result);
+            LRESULT(0)
+        }
+        WM_APP_CONFIG_WRITTEN => {
+            let written = unsafe { *Box::from_raw(lparam.0 as *mut crate::config_writer::Written) };
+            app.on_config_written(written);
             LRESULT(0)
         }
         WM_APP_MACHINE_CHECK_RESULT => {
@@ -7742,6 +7899,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
         }
         WM_DESTROY => {
+            // #870: a settings write still queued must reach the file before the
+            // process exits. Bounded, so a stuck disk cannot hang Quit.
+            // The keyboard hook goes first: while it is installed, every key in
+            // the system waits on this thread.
+            app.hook = None;
+            crate::config_writer::flush_global(std::time::Duration::from_secs(2));
             // Drop the App (and with it the hook, tray icon and card) before
             // the loop exits, so the tray icon actually disappears.
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
@@ -7800,6 +7963,7 @@ mod tests {
     use super::unreadable_secrets_card;
     use super::App;
     use super::BeginPlan;
+    use super::WM_APP_CONFIG_WRITTEN;
     use super::WM_APP_FIRST_RUN;
     use super::{
         exec_work_calendar, exec_work_form_fill, exec_work_restore, ExecDone, WM_APP_EXECUTOR_DONE,
@@ -9519,6 +9683,7 @@ mod tests {
         ("WM_APP_MACHINE_CHECK_RESULT", WM_APP_MACHINE_CHECK_RESULT),
         ("WM_APP_FIRST_RUN", WM_APP_FIRST_RUN),
         ("WM_APP_EXECUTOR_DONE", WM_APP_EXECUTOR_DONE),
+        ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
     ];
 
@@ -10319,6 +10484,11 @@ mod tests {
         (
             "WM_APP_EXECUTOR_DONE",
             WM_APP_EXECUTOR_DONE,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_CONFIG_WRITTEN",
+            WM_APP_CONFIG_WRITTEN,
             SettingsReentrancy::Defer,
         ),
         (

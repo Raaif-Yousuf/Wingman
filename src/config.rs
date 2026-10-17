@@ -808,7 +808,7 @@ impl Options {
 // and cannot leak into a concurrently-running test.
 #[cfg(test)]
 thread_local! {
-    static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// #711: the modified time of each config file as this process last read or
@@ -818,7 +818,7 @@ thread_local! {
 static SEEN_MTIMES: std::sync::Mutex<Vec<(PathBuf, std::time::SystemTime)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+pub(crate) fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
@@ -827,7 +827,31 @@ fn seen_mtime(path: &Path) -> Option<std::time::SystemTime> {
     seen.iter().find(|(p, _)| p == path).map(|(_, t)| *t)
 }
 
-fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
+/// Runs `load` (a `Config::load` that notes the file as read) without leaving
+/// that note behind, and returns the mtime it noted. The field writer's thread
+/// loads the file for the UI thread; until the UI thread swaps the result in,
+/// its in-memory config is still the stale one, so a whole-file save must stay
+/// refused. The UI thread calls [`note_mtime`] with the returned value when it
+/// adopts the load.
+pub(crate) fn load_deferring_mtime<T>(
+    path: &Path,
+    load: impl FnOnce() -> T,
+) -> (T, Option<std::time::SystemTime>) {
+    let before = seen_mtime(path);
+    let out = load();
+    let noted = seen_mtime(path);
+    let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    match before {
+        Some(t) => match seen.iter_mut().find(|(p, _)| p == path) {
+            Some(entry) => entry.1 = t,
+            None => seen.push((path.to_path_buf(), t)),
+        },
+        None => seen.retain(|(p, _)| p != path),
+    }
+    (out, noted)
+}
+
+pub(crate) fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
     let Some(mtime) = mtime else { return };
     let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
     match seen.iter_mut().find(|(p, _)| p == path) {
@@ -841,6 +865,8 @@ fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
 /// copy rather than an intermediate one.
 static BACKED_UP: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 /// A backup that could not be made, for the next card. See [`take_backup_warning`].
+/// Held for the whole of [`write_file_atomically`].
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static BACKUP_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -933,6 +959,100 @@ fn backup_without_keys(path: &Path) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     made
+}
+
+/// "config.toml has an error at line L, column C", from a parse error's byte
+/// span. Never includes any file text: a value could be an API key. Shared with
+/// the field-level writer (`config_writer`), whose `toml_edit` errors would
+/// otherwise print the offending line.
+pub(crate) fn describe_error_span(contents: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(span) = span else {
+        return "config.toml could not be parsed".to_string();
+    };
+    let before = &contents.as_bytes()[..span.start.min(contents.len())];
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let line_start = before
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    let column = String::from_utf8_lossy(&before[line_start..])
+        .chars()
+        .count()
+        + 1;
+    format!("config.toml has an error at line {line}, column {column}")
+}
+
+/// The one atomic write of `config.toml`, shared by [`Config::save_to`] and the
+/// field-level writer (`config_writer`, #870): temp file, owner-only ACL on the
+/// temp file, one-generation backup, rename, then note the new mtime.
+///
+/// `note_new_mtime` says whether the new file counts as "read by this process".
+/// [`Config::save_to`] writes what the process holds, so yes. The field-level
+/// writer patches the file as it is on disk, which the in-memory config has not
+/// read, so no: the mtime stays unseen until `Config::load` reads the file, and
+/// a whole-file save in between is refused instead of overwriting a hand edit
+/// that the patch carried along.
+pub(crate) fn write_file_atomically(path: &Path, text: &str, note_new_mtime: bool) -> Result<()> {
+    let _one_writer = lock_writes();
+    write_file_atomically_held(path, text, note_new_mtime)
+}
+
+/// The UI thread's whole-file save and the writer thread share one temp file
+/// name; two writes at once would trip over it. The field writer holds this
+/// across its "did the file change" check and its write.
+pub(crate) fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+    lock_ignoring_poison(&WRITE_LOCK)
+}
+
+/// [`write_file_atomically`] for a caller that already holds [`lock_writes`].
+pub(crate) fn write_file_atomically_held(
+    path: &Path,
+    text: &str,
+    note_new_mtime: bool,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create config directory")?;
+    }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    fs::write(&tmp_path, text).context("failed to write config temp file")?;
+
+    // #257: restrict the ACL on the TEMP file, before it is ever visible
+    // under the real name, and never rename an unrestricted file into
+    // place. The old order (rename, then restrict) left a window where
+    // the finally-named file existed, held a live key, and had whatever
+    // ACL the rename happened to produce; it also swallowed a failure
+    // there and let the write stand regardless. Now a failure aborts
+    // the write entirely instead.
+    #[cfg(windows)]
+    if let Err(e) = Config::restrict_acl(&tmp_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).context(
+            "failed to restrict the config file's permissions to the current \
+             user; the write was aborted rather than leave an API key in an \
+             unprotected file",
+        );
+    }
+
+    // #711: one generation of backup, taken on the first save after each
+    // load (so the hand-edited original survives the load's own repair or
+    // key-import rewrites). It never holds an API key. A backup that cannot
+    // be made only warns: the atomic write below still goes ahead.
+    if path.exists() && mark_backed_up(path) {
+        if let Err(e) = backup_without_keys(path) {
+            *lock_ignoring_poison(&BACKUP_WARNING) = Some(format!(
+                "Wingman could not keep a backup copy of config.toml ({e:#}). Your settings were saved."
+            ));
+        }
+    }
+
+    fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
+    if note_new_mtime {
+        note_mtime(path, file_mtime(path));
+    }
+
+    Ok(())
 }
 
 impl Config {
@@ -1355,20 +1475,7 @@ impl Config {
     /// "config.toml has an error at line L, column C", from the parse error's
     /// byte span. Never includes any file text: a value could be an API key.
     fn describe_parse_error(contents: &str, err: &toml::de::Error) -> String {
-        let Some(span) = err.span() else {
-            return "config.toml could not be parsed".to_string();
-        };
-        let before = &contents.as_bytes()[..span.start.min(contents.len())];
-        let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
-        let line_start = before
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let column = String::from_utf8_lossy(&before[line_start..])
-            .chars()
-            .count()
-            + 1;
-        format!("config.toml has an error at line {line}, column {column}")
+        describe_error_span(contents, err.span())
     }
 
     /// Defaults, marked "not loaded" so nothing saves them over the file.
@@ -1603,49 +1710,8 @@ impl Config {
     /// so a reader never observes a half-written file.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         self.check_save_allowed(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("failed to create config directory")?;
-        }
         let toml_str = toml::to_string_pretty(self).context("failed to serialize config")?;
-
-        let mut tmp_name = path.as_os_str().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_name);
-        fs::write(&tmp_path, &toml_str).context("failed to write config temp file")?;
-
-        // #257: restrict the ACL on the TEMP file, before it is ever visible
-        // under the real name, and never rename an unrestricted file into
-        // place. The old order (rename, then restrict) left a window where
-        // the finally-named file existed, held a live key, and had whatever
-        // ACL the rename happened to produce; it also swallowed a failure
-        // there and let the write stand regardless. Now a failure aborts
-        // the write entirely instead.
-        #[cfg(windows)]
-        if let Err(e) = Self::restrict_acl(&tmp_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e).context(
-                "failed to restrict the config file's permissions to the current \
-                 user; the write was aborted rather than leave an API key in an \
-                 unprotected file",
-            );
-        }
-
-        // #711: one generation of backup, taken on the first save after each
-        // load (so the hand-edited original survives the load's own repair or
-        // key-import rewrites). It never holds an API key. A backup that cannot
-        // be made only warns: the atomic write below still goes ahead.
-        if path.exists() && mark_backed_up(path) {
-            if let Err(e) = backup_without_keys(path) {
-                *lock_ignoring_poison(&BACKUP_WARNING) = Some(format!(
-                    "Wingman could not keep a backup copy of config.toml ({e:#}). Your settings were saved."
-                ));
-            }
-        }
-
-        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
-        note_mtime(path, file_mtime(path));
-
-        Ok(())
+        write_file_atomically(path, &toml_str, true)
     }
 
     /// Restricts a file's ACL to the current user only, via `icacls`.
