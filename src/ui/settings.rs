@@ -8772,21 +8772,27 @@ struct RawForm {
     redact: bool,
 }
 
+/// The Active provider combo's selection as `RawForm::provider_choice`. A
+/// control that was never created, or one with nothing selected, is
+/// `usize::MAX` (no choice), which keeps the stored order. A null window would
+/// read 0, which is "ChatGPT first" (#782).
+fn provider_choice_from(cursel: Option<isize>) -> usize {
+    match cursel {
+        Some(i) if i >= 0 => i as usize,
+        _ => usize::MAX,
+    }
+}
+
 /// Reads every control into a [`RawForm`], without yet folding it into a
 /// [`Config`]. Split out from [`read_form`] so Save can validate the raw
 /// values (#344) before committing to `build_config`'s fallback behavior.
 fn read_raw_form(inner: &SettingsInner) -> RawForm {
     let hwnd = inner.hwnd;
     RawForm {
-        provider_choice: unsafe {
-            SendMessageW(
-                get_dlg_item(hwnd, ID_ACTIVE_PROVIDER).unwrap_or(HWND(std::ptr::null_mut())),
-                CB_GETCURSEL,
-                None,
-                None,
-            )
-            .0 as usize
-        },
+        provider_choice: provider_choice_from(
+            get_dlg_item(hwnd, ID_ACTIVE_PROVIDER)
+                .map(|h| unsafe { SendMessageW(h, CB_GETCURSEL, None, None).0 }),
+        ),
         ollama_model: combo_selected_text(hwnd, ID_OLLAMA_MODEL),
         openai_key: get_dlg_item(hwnd, ID_OPENAI_KEY)
             .map(get_text)
@@ -13963,6 +13969,14 @@ mod tests {
             build_config(&original, &max).providers.order,
             original.providers.order
         );
+    }
+
+    #[test]
+    fn a_missing_provider_combo_reads_as_no_selection() {
+        assert_eq!(provider_choice_from(None), usize::MAX);
+        assert_eq!(provider_choice_from(Some(-1)), usize::MAX);
+        assert_eq!(provider_choice_from(Some(0)), 0);
+        assert_eq!(provider_choice_from(Some(2)), 2);
     }
 
     #[test]
