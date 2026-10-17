@@ -2357,7 +2357,20 @@ mod tests {
         use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.ignore_mouse_for_test();
+        p.keep_open_for_gallery();
         p.show(free_actions(), true, "mode: Auto".to_string());
+        // #991: another test's window taking the foreground makes the query
+        // box lose focus, which hides a normal palette and leaves WM_PRINT
+        // (PRF_CHECKVISIBLE) nothing to paint. Do that here on purpose, so the
+        // check no longer depends on what else is running.
+        unsafe {
+            SendMessageW(
+                p.hwnd(),
+                WM_COMMAND,
+                Some(WPARAM(ID_PALETTE_LOST_FOCUS as usize)),
+                Some(LPARAM(0)),
+            );
+        }
         pump_pending(p.hwnd());
         let dpi = unsafe { GetDpiForWindow(p.hwnd()) };
         let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
@@ -2430,6 +2443,7 @@ mod tests {
     fn a_long_list_draws_a_scroll_thumb_that_follows_the_offset() {
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.force_theme_for_gallery(Theme::Dark);
+        p.keep_open_for_gallery();
         p.show(many_ungrouped_actions(30), true, String::new());
         let dpi = p.inner.dpi;
         let rows = p.inner.state.rows.len();
@@ -2471,6 +2485,7 @@ mod tests {
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.force_theme_for_gallery(Theme::Dark);
         p.ignore_mouse_for_test();
+        p.keep_open_for_gallery();
         p.show(free_actions(), true, "mode: Auto".to_string());
         // Rows: header, action (selected), header, action.
         p.inner.hover = Some(3);
