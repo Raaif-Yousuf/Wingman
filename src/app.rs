@@ -326,6 +326,8 @@ struct ShellOpenFailure {
     detail: String,
     /// A save failure keeps the "Copy details" text; a plain open failure does not.
     with_details: bool,
+    /// The raw error chain for "Copy diagnostics" (empty when with_details is false).
+    raw: String,
 }
 
 /// A queue, not a slot: two failures close together must both be reported.
@@ -361,6 +363,12 @@ fn merge_shell_open_failures(mut failures: Vec<ShellOpenFailure>) -> Option<Shel
                 .collect::<Vec<_>>()
                 .join("\n"),
             with_details: failures.iter().any(|f| f.with_details),
+            raw: failures
+                .iter()
+                .map(|f| f.raw.as_str())
+                .filter(|r| !r.is_empty())
+                .collect::<Vec<_>>()
+                .join("; "),
         }),
     }
 }
@@ -376,12 +384,14 @@ fn ensure_config_file(
     if App::should_open_config_after_ensuring_it_exists(needed_create, &save_result) {
         return Ok(());
     }
+    let (detail, raw) = save_result
+        .err()
+        .map(|e| (human_error_detail(&format!("{e:#}")), format!("{e:#}")))
+        .unwrap_or_default();
     Err(ShellOpenFailure {
         title: "Couldn't save settings".into(),
-        detail: save_result
-            .err()
-            .map(|e| format!("{e:#}"))
-            .unwrap_or_default(),
+        detail,
+        raw,
         with_details: true,
     })
 }
@@ -415,6 +425,7 @@ fn run_shell_open_job(job: ShellOpenJob) -> std::result::Result<(), ShellOpenFai
                 title: "Couldn't open the knowledge folder".into(),
                 detail: format!("{} could not be created: {e}", path.display()),
                 with_details: false,
+                raw: String::new(),
             })?;
             open_with_shell(&path, "Couldn't open the knowledge folder", "Explorer")
         }
@@ -457,6 +468,7 @@ fn open_with_shell(
             title: title.into(),
             detail: format!("{opener} would not open {}.", path.display()),
             with_details: false,
+            raw: String::new(),
         });
     }
     Ok(())
@@ -6685,8 +6697,11 @@ impl App {
             return;
         };
         if failure.with_details {
-            let detail = self.track_error(&failure.title, &failure.detail);
-            self.card.show_error_with_details(&failure.title, &detail);
+            // `detail` was made plain on the worker; the raw chain still
+            // goes to "Copy diagnostics".
+            self.record_last_error(&failure.title, &failure.raw);
+            self.card
+                .show_error_with_details(&failure.title, &failure.detail);
         } else {
             self.card.show_error(&failure.title, &failure.detail);
         }
@@ -15530,6 +15545,7 @@ mod tests {
             title: t.into(),
             detail: d.into(),
             with_details: false,
+            raw: String::new(),
         };
         // Nothing queued by another test: this one owns the queue while it runs.
         let _ = super::take_shell_open_failures();
@@ -15568,7 +15584,8 @@ mod tests {
             panic!("a failed save was treated as success");
         };
         assert_eq!(failure.title, "Couldn't save settings");
-        assert!(failure.detail.contains("disk full"), "{}", failure.detail);
+        assert!(failure.raw.contains("disk full"), "{}", failure.raw);
+        assert!(!failure.detail.is_empty());
         assert!(failure.with_details);
     }
 
@@ -18131,7 +18148,9 @@ mod tests {
         // Every early return in edit_settings that follows a card arms it.
         let edit = body_of("edit_settings");
         let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
-        assert!(returns.len() >= 2, "edit_settings candidates not found");
+        // #1203: the save and the open moved to a worker, so the one return
+        // left is the unreadable-%APPDATA% card.
+        assert!(!returns.is_empty(), "edit_settings candidates not found");
         for at in returns {
             let before = &edit[at.saturating_sub(120)..at];
             if before.contains(".show_error") {
