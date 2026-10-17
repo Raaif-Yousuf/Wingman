@@ -1926,6 +1926,198 @@ fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
     }
 }
 
+/// #934: the colours of a text box. Tokens in a normal theme, system colours in
+/// high contrast. Settings is drawn on the system face and does not follow
+/// dark mode yet, so a normal theme here is always the light one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditColors {
+    fill: u32,
+    border: u32,
+    text: u32,
+    /// The line along the bottom of a box that has the keyboard focus.
+    focus_line: u32,
+    /// What lies behind the box, seen in the four rounded corners.
+    face: u32,
+}
+
+fn edit_colors(
+    high_contrast: bool,
+    sys: &crate::ui::theme::SysColors,
+    accent: u32,
+    face: u32,
+) -> EditColors {
+    use crate::ui::theme::{Theme, Tokens};
+    let t = Tokens::for_theme(Theme::resolve(true, high_contrast), sys);
+    EditColors {
+        fill: t.control_fill,
+        border: t.border,
+        text: t.text,
+        focus_line: if high_contrast { sys.highlight } else { accent },
+        face,
+    }
+}
+
+/// The colours for a text box right now.
+unsafe fn current_edit_colors() -> EditColors {
+    use crate::ui::theme::{SysColors, Theme, LIGHT};
+    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
+    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+    edit_colors(
+        high_contrast,
+        &SysColors::read(),
+        crate::ui::card_buttons::system_accent(Theme::Light, LIGHT.surface),
+        GetSysColor(COLOR_3DFACE),
+    )
+}
+
+/// The focus line of a text box `w` by `h` px: along the bottom, between the
+/// rounded corners, as thick as Windows 11's 2 dp accent underline. The
+/// bottom border row is part of it, so the line reads as the border turning
+/// to the accent. `(left, top, right, bottom)` in window px.
+fn edit_focus_line_rect(w: i32, h: i32, dpi: u32) -> (i32, i32, i32, i32) {
+    let radius = to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+    (radius, h - to_px(2, dpi).max(2), w - radius, h)
+}
+
+const EDIT_SUBCLASS_ID: usize = 0x934;
+
+thread_local! {
+    /// The one brush `WM_CTLCOLOREDIT` returns: `(colour, HBRUSH)`, replaced
+    /// when the colour changes (a high contrast switch).
+    static EDIT_BRUSH: std::cell::Cell<(u32, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// A solid brush of `fill` for `WM_CTLCOLOREDIT`, kept for the next message.
+unsafe fn edit_fill_brush(fill: u32) -> windows::Win32::Graphics::Gdi::HBRUSH {
+    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
+    let (colour, brush) = EDIT_BRUSH.get();
+    if brush != 0 && colour == fill {
+        return HBRUSH(brush as *mut c_void);
+    }
+    if brush != 0 {
+        let _ = DeleteObject(HGDIOBJ(brush as *mut c_void));
+    }
+    let made = CreateSolidBrush(windows::Win32::Foundation::COLORREF(fill));
+    EDIT_BRUSH.set((fill, made.0 as usize));
+    made
+}
+
+/// Draws a text box's frame onto `hdc` (#934): the Windows 11 look of a
+/// control, a 1 px border with 4 dp corners on the token fill, and the accent
+/// line along the bottom while it has the focus. `w` by `h` is the whole box
+/// in px. Only the ring the system reserves for the edge is drawn, so the
+/// client area, any scrollbar and the text are the edit's own.
+unsafe fn draw_edit_frame(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    w: i32,
+    h: i32,
+    dpi: u32,
+    colors: &EditColors,
+    focused: bool,
+) {
+    use windows::Win32::Graphics::Gdi::{
+        CreatePen, CreateSolidBrush, ExcludeClipRect, FillRect, RoundRect, SelectObject,
+        PS_INSIDEFRAME,
+    };
+    let rgb = |c: u32| windows::Win32::Foundation::COLORREF(c);
+    let rect = |l, t, r, b| windows::Win32::Foundation::RECT {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    };
+    let edge =
+        GetSystemMetricsForDpi(windows::Win32::UI::WindowsAndMessaging::SM_CXEDGE, dpi).max(1);
+    ExcludeClipRect(hdc, edge, edge, w - edge, h - edge);
+    let face = CreateSolidBrush(rgb(colors.face));
+    FillRect(hdc, &rect(0, 0, w, h), face);
+    let fill = CreateSolidBrush(rgb(colors.fill));
+    let pen = CreatePen(PS_INSIDEFRAME, 1, rgb(colors.border));
+    let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    let round = 2 * to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+    let _ = RoundRect(hdc, 0, 0, w, h, round, round);
+    if focused {
+        let (l, t, r, b) = edit_focus_line_rect(w, h, dpi);
+        let line = CreateSolidBrush(rgb(colors.focus_line));
+        FillRect(hdc, &rect(l, t, r, b), line);
+        let _ = DeleteObject(HGDIOBJ(line.0));
+    }
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+    let _ = DeleteObject(HGDIOBJ(fill.0));
+    let _ = DeleteObject(HGDIOBJ(face.0));
+}
+
+/// Paints `hwnd`'s frame on its own window DC (see [`draw_edit_frame`]).
+unsafe fn paint_edit_frame(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    let mut wr = windows::Win32::Foundation::RECT::default();
+    if GetWindowRect(hwnd, &mut wr).is_err() {
+        return;
+    }
+    let hdc = GetWindowDC(Some(hwnd));
+    if hdc.is_invalid() {
+        return;
+    }
+    draw_edit_frame(
+        hdc,
+        wr.right - wr.left,
+        wr.bottom - wr.top,
+        dpi_for(hwnd),
+        &current_edit_colors(),
+        GetFocus() == hwnd,
+    );
+    ReleaseDC(Some(hwnd), hdc);
+}
+
+/// Gives every Settings text box the frame of [`paint_edit_frame`] (#934).
+unsafe extern "system" fn edit_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWL_STYLE, WM_KILLFOCUS, WM_NCPAINT, WM_SETFOCUS, WS_HSCROLL,
+    };
+    match msg {
+        WM_NCPAINT => {
+            // A box with a scrollbar (the prompt) lets the system draw that
+            // first; the frame goes on top of the ring either way.
+            let scrolls = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & (WS_VSCROLL.0 | WS_HSCROLL.0);
+            let result = if scrolls != 0 {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            } else {
+                LRESULT(0)
+            };
+            paint_edit_frame(hwnd);
+            result
+        }
+        // The focus line comes and goes with the focus.
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                windows::Win32::Graphics::Gdi::RDW_FRAME | RDW_INVALIDATE,
+            );
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(edit_subclass), EDIT_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
 /// The body forwards what its controls tell their parent (button clicks, the
 /// trackbar) up to the settings window, and runs its own scrollbar.
 unsafe extern "system" fn body_wndproc(
@@ -1954,6 +2146,20 @@ unsafe extern "system" fn body_wndproc(
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
             SetBkMode(hdc, TRANSPARENT);
             LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
+        }
+        // #934: a text box is the token fill with the token text on it.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT => {
+            let colors = current_edit_colors();
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
+            windows::Win32::Graphics::Gdi::SetTextColor(
+                hdc,
+                windows::Win32::Foundation::COLORREF(colors.text),
+            );
+            windows::Win32::Graphics::Gdi::SetBkColor(
+                hdc,
+                windows::Win32::Foundation::COLORREF(colors.fill),
+            );
+            LRESULT(edit_fill_brush(colors.fill).0 as isize)
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -2425,6 +2631,17 @@ impl Ctx {
                     Some(WPARAM(self.font.0 as usize)),
                     Some(LPARAM(1)),
                 );
+            }
+            if class == WC_EDIT {
+                // #934: the frame of a Windows 11 text box.
+                unsafe {
+                    let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+                        hwnd,
+                        Some(edit_subclass),
+                        EDIT_SUBCLASS_ID,
+                        0,
+                    );
+                }
             }
             self.children.borrow_mut().push(ChildLayout {
                 hwnd,
@@ -6654,6 +6871,149 @@ mod tests {
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
         assert_eq!(hotkey_hint_color(true, hc), hc);
+    }
+
+    /// #934: a text box takes its fill, border and text from the theme tokens
+    /// (the system colours in high contrast), and the focus line is the accent
+    /// in a normal theme and the system highlight in high contrast.
+    #[test]
+    fn edit_colours_come_from_the_tokens() {
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE, LIGHT};
+        let accent = rgb(0, 103, 192);
+        let face = rgb(240, 240, 240);
+        let c = edit_colors(false, &HC_BLACK, accent, face);
+        assert_eq!(c.fill, LIGHT.control_fill);
+        assert_eq!(c.border, LIGHT.border);
+        assert_eq!(c.text, LIGHT.text);
+        assert_eq!(c.focus_line, accent);
+        assert_eq!(c.face, face);
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, accent, face);
+            assert_eq!(c.fill, sys.window);
+            assert_eq!(c.border, sys.window_text);
+            assert_eq!(c.text, sys.window_text);
+            assert_eq!(c.focus_line, sys.highlight);
+        }
+    }
+
+    /// #934: the focus line is a bar along the bottom of the box, inside the
+    /// border and clear of the rounded corners, at every scale.
+    #[test]
+    fn the_edit_focus_line_sits_inside_the_bottom_border() {
+        for dpi in [96u32, 144, 192, 240] {
+            let (w, h) = (to_px(200, dpi), to_px(ROW_H, dpi));
+            let (l, t, r, b) = edit_focus_line_rect(w, h, dpi);
+            let radius = to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+            assert_eq!(b, h, "covers the bottom border row ({dpi} dpi)");
+            assert_eq!(b - t, to_px(2, dpi).max(2), "2 dp thick ({dpi} dpi)");
+            assert_eq!(l, radius, "starts after the left corner ({dpi} dpi)");
+            assert_eq!(r, w - radius, "ends before the right corner ({dpi} dpi)");
+        }
+    }
+
+    /// #934: every text box in Settings is restyled: it carries the subclass
+    /// that paints the border, and the window above it answers
+    /// `WM_CTLCOLOREDIT` with the token fill. A box missing either would still
+    /// be the flat white one.
+    #[test]
+    fn every_settings_text_box_is_styled() {
+        use windows::Win32::Graphics::Gdi::{GetBkColor, GetDC, ReleaseDC};
+        use windows::Win32::UI::Shell::GetWindowSubclass;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, WM_CTLCOLOREDIT};
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let mut edits = 0;
+            for c in &inner.children {
+                let mut name = [0u16; 16];
+                let n = unsafe { GetClassNameW(c.hwnd, &mut name) } as usize;
+                if String::from_utf16_lossy(&name[..n]) != "Edit" {
+                    continue;
+                }
+                edits += 1;
+                let mut data = 0usize;
+                assert!(
+                    unsafe {
+                        GetWindowSubclass(
+                            c.hwnd,
+                            Some(edit_subclass),
+                            EDIT_SUBCLASS_ID,
+                            Some(&mut data),
+                        )
+                    }
+                    .as_bool(),
+                    "a text box is not subclassed"
+                );
+                let parent = unsafe { GetParent(c.hwnd) }.expect("parent");
+                let hdc = unsafe { GetDC(Some(c.hwnd)) };
+                let brush = unsafe {
+                    SendMessageW(
+                        parent,
+                        WM_CTLCOLOREDIT,
+                        Some(WPARAM(hdc.0 as usize)),
+                        Some(LPARAM(c.hwnd.0 as isize)),
+                    )
+                };
+                let bk = unsafe { GetBkColor(hdc) };
+                unsafe { ReleaseDC(Some(c.hwnd), hdc) };
+                assert_ne!(brush.0, 0, "the parent returns a brush");
+                let hc = crate::ui::card_buttons::system_high_contrast().is_some();
+                if !hc {
+                    assert_eq!(bk.0, crate::ui::theme::LIGHT.control_fill);
+                }
+            }
+            assert!(
+                edits >= 5,
+                "found {edits} text boxes, expected the whole set"
+            );
+            let _ = hwnd;
+        });
+    }
+
+    /// #934: the frame draw puts the border colour on the box's edge and
+    /// leaves the inside alone, and the accent goes on the bottom edge only
+    /// while the box has the focus. Drawn on a memory bitmap and read back.
+    #[test]
+    fn the_frame_draw_paints_border_and_focus_line() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject,
+        };
+        let colors = EditColors {
+            fill: 0x00FF_FFFF,
+            border: 0x0000_00FF,
+            text: 0,
+            focus_line: 0x00FF_0000,
+            face: 0x0000_FF00,
+        };
+        for dpi in [96u32, 240] {
+            let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
+            for focused in [false, true] {
+                let (screen, dc, bmp) = unsafe {
+                    let screen = GetDC(None);
+                    let dc = CreateCompatibleDC(Some(screen));
+                    let bmp = CreateCompatibleBitmap(screen, w, h);
+                    SelectObject(dc, HGDIOBJ(bmp.0));
+                    (screen, dc, bmp)
+                };
+                unsafe { draw_edit_frame(dc, w, h, dpi, &colors, focused) };
+                let px = |x: i32, y: i32| unsafe { GetPixel(dc, x, y).0 };
+                let (mx, my) = (w / 2, h / 2);
+                assert_eq!(px(mx, 0), colors.border, "top border ({dpi} dpi)");
+                assert_eq!(px(0, my), colors.border, "left border ({dpi} dpi)");
+                assert_eq!(px(0, 0), colors.face, "corner shows what is behind");
+                if focused {
+                    assert_eq!(px(mx, h - 1), colors.focus_line, "focus line ({dpi} dpi)");
+                    assert_eq!(px(mx, 0), colors.border, "top stays the border");
+                } else {
+                    assert_eq!(px(mx, h - 1), colors.border, "bottom border at rest");
+                }
+                unsafe {
+                    let _ = DeleteDC(dc);
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    ReleaseDC(None, screen);
+                }
+            }
+        }
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
