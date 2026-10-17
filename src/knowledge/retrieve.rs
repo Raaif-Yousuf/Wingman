@@ -88,21 +88,29 @@ pub struct Snippet {
     pub page: Option<u32>,
     pub heading: Option<String>,
     pub text: String,
+    /// Ordinal of the first chunk merged into this snippet.
+    pub chunk: i64,
+    /// First 8 hex characters of that chunk's text hash.
+    pub hash8: String,
     /// `1 / (60 + rank)` of the best chunk merged into this snippet. Not a
     /// sum: neighbours of a mediocre match would otherwise outrank a single
     /// top chunk.
     pub score: f64,
 }
 
-/// The top snippets for `question`, best first, at most [`MAX_SNIPPETS`].
+/// The top snippets for `question` from the folder indexed under `root_path`
+/// (never another root), best first, at most [`MAX_SNIPPETS`].
 /// Empty when the question has no usable word or nothing matches. Blocking
 /// (one SQLite query): call it from a worker, never the UI thread.
-#[cfg_attr(not(test), expect(dead_code))]
-pub fn search(store: &Store, question: &str) -> Result<Vec<Snippet>, StoreError> {
+pub fn search_in(
+    store: &Store,
+    root_path: &str,
+    question: &str,
+) -> Result<Vec<Snippet>, StoreError> {
     let Some(query) = fts_query(&query_terms(question)) else {
         return Ok(Vec::new());
     };
-    let hits = store.search_chunks(&query, FTS_TOP)?;
+    let hits = store.search_chunks(root_path, &query, FTS_TOP)?;
     Ok(snippets_from(hits))
 }
 
@@ -169,6 +177,8 @@ fn snippets_from(hits: Vec<ChunkHit>) -> Vec<Snippet> {
                 label: clean_label(&r.hit.rel_path),
                 page: r.page,
                 heading: r.heading,
+                chunk: r.hit.ordinal,
+                hash8: r.hit.text_hash.chars().take(8).collect(),
                 text: r.hit.text,
                 score: r.score,
             },
@@ -199,6 +209,15 @@ fn join_piece(next: &str, prev_end: Option<usize>, next_start: Option<usize>) ->
         }
     }
     format!("\n{next}")
+}
+
+impl Snippet {
+    /// The label the egress log and the send preview show for this excerpt:
+    /// `resume.pdf#chunk 12:ab12cd34` (file, chunk number, 8 hex characters of
+    /// the chunk hash). Never the text. The file name is already masked.
+    pub fn egress_label(&self) -> String {
+        format!("{}#chunk {}:{}", self.label, self.chunk, self.hash8)
+    }
 }
 
 /// A label on one line, masked.
@@ -232,7 +251,6 @@ const END_MARK: &str = "[end of documents]";
 /// never exceeds it. A snippet that does not fit whole is cut at a character
 /// boundary if enough of it fits, and nothing follows it. Label and text are
 /// masked again here, the last step before the text can leave the store.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn format_context(snippets: &[Snippet], budget_tokens: usize) -> Context {
     let mut remaining = budget_tokens
         .saturating_mul(4)
@@ -328,6 +346,32 @@ mod tests {
         store
     }
 
+    /// The tests' folder is `C:\Notes`.
+    fn search(store: &Store, question: &str) -> Result<Vec<Snippet>, StoreError> {
+        search_in(store, "C:\\Notes", question)
+    }
+
+    #[test]
+    fn only_the_given_root_is_searched() {
+        let store = store_with(&[("new.txt", "the warranty lasts two years")]);
+        let old = store.ensure_root("D:\\Old", 0).unwrap();
+        index(&store, old, "stale.txt", "the warranty lasts ten years");
+        // Both roots are enabled, and both match.
+        assert_eq!(
+            labels(&search_in(&store, "C:\\Notes", "warranty").unwrap()),
+            ["new.txt"]
+        );
+        assert_eq!(
+            labels(&search_in(&store, "D:\\Old", "warranty").unwrap()),
+            ["stale.txt"]
+        );
+        // A root that cannot be resolved finds nothing, never every root.
+        assert!(search_in(&store, "", "warranty").unwrap().is_empty());
+        assert!(search_in(&store, "E:\\Gone", "warranty")
+            .unwrap()
+            .is_empty());
+    }
+
     fn labels(snips: &[Snippet]) -> Vec<&str> {
         snips.iter().map(|s| s.label.as_str()).collect()
     }
@@ -339,6 +383,8 @@ mod tests {
             page: None,
             heading: None,
             text: text.to_string(),
+            chunk: 0,
+            hash8: "ab12cd34".to_string(),
             score: 1.0,
         }
     }
@@ -604,6 +650,7 @@ mod tests {
             text: text.to_string(),
             span: None,
             rel_path: format!("d{doc_id}.txt"),
+            text_hash: format!("{doc_id:04x}{ordinal:04x}ffff"),
         }
     }
 
