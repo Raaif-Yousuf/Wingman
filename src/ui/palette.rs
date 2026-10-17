@@ -98,8 +98,8 @@ use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
 use crate::ui::palette_paint::{
-    build_ops, palette_colors, query_edit_rect, row_at, window_height, Face, Op, PaintInput,
-    PaletteColors, WINDOW_WIDTH,
+    build_ops, ellipsizes, palette_colors, query_edit_rect, row_at, snap_rect, snap_stroke,
+    window_height, Face, Op, PaintInput, PaletteColors, SnappedRect, WINDOW_WIDTH,
 };
 use crate::ui::theme::{
     detect_theme, icon_font_face, setting_change_affects_theme, setting_change_name, SysColors,
@@ -122,7 +122,8 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -132,9 +133,9 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
     GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TEXTMETRICW,
-    TRANSPARENT,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
+    PAINTSTRUCT, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -815,16 +816,19 @@ impl PaletteRenderer {
                 D2D_FONT_FAMILY,
                 D2D_FONT_SIZE_DIP,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
+                ellipsizes(Face::Body),
             );
             self.caption_format = self.build_text_format(
                 D2D_FONT_FAMILY,
                 TYPE_CAPTION_PX as f32,
                 DWRITE_TEXT_ALIGNMENT_LEADING,
+                ellipsizes(Face::Caption),
             );
             self.icon_format = self.build_text_format(
                 icon_face(),
                 ICON_FONT_DP as f32,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
+                ellipsizes(Face::Icon),
             );
         }
         self.target.is_some() && self.text_format.is_some()
@@ -835,6 +839,7 @@ impl PaletteRenderer {
         face: &str,
         size_dip: f32,
         align: DWRITE_TEXT_ALIGNMENT,
+        ellipsis: bool,
     ) -> Option<IDWriteTextFormat> {
         let family = wide_z(face);
         let locale = wide_z(D2D_LOCALE);
@@ -858,7 +863,27 @@ impl PaletteRenderer {
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
+        if ellipsis {
+            self.set_ellipsis_trimming(&format);
+        }
         Some(format)
+    }
+
+    /// Makes `format` end a line that is wider than its box in an ellipsis
+    /// (#1000), the Direct2D side of GDI's `DT_END_ELLIPSIS`. The trimming sign
+    /// is created here, once for the format, never per frame. Any failure leaves
+    /// the format as it was: the text is then drawn without trimming (clipped
+    /// at the box) rather than not at all.
+    fn set_ellipsis_trimming(&self, format: &IDWriteTextFormat) {
+        let Ok(sign) = (unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(format) }) else {
+            return;
+        };
+        let trimming = DWRITE_TRIMMING {
+            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            delimiter: 0,
+            delimiterCount: 0,
+        };
+        let _ = unsafe { format.SetTrimming(&trimming as *const _, &sign) };
     }
 
     /// Resizes the render target's pixel buffer to match a real window-size
@@ -1022,10 +1047,25 @@ fn rect_f(r: &RECT) -> D2D_RECT_F {
     }
 }
 
+/// A snapped rectangle as Direct2D wants it.
+fn snapped_rect_f(r: SnappedRect) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left: r.left,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+    }
+}
+
 /// Draws a paint list with Direct2D. `formats` are the body, caption and icon
 /// text formats. A brush that cannot be made leaves that one shape out, so a
 /// single failure never blanks the window.
-fn paint_ops_d2d(target: &ID2D1HwndRenderTarget, formats: [&IDWriteTextFormat; 3], ops: &[Op]) {
+fn paint_ops_d2d(
+    target: &ID2D1HwndRenderTarget,
+    formats: [&IDWriteTextFormat; 3],
+    dpi: u32,
+    ops: &[Op],
+) {
     for op in ops {
         let color = match op {
             Op::Clear { color }
@@ -1062,7 +1102,7 @@ fn paint_ops_d2d(target: &ID2D1HwndRenderTarget, formats: [&IDWriteTextFormat; 3
             Op::Clear { .. } | Op::Text { .. } => {}
             Op::FillRound { rect, radius, .. } => {
                 let shape = D2D1_ROUNDED_RECT {
-                    rect: rect_f(rect),
+                    rect: snapped_rect_f(snap_rect(*rect, dpi)),
                     radiusX: *radius as f32,
                     radiusY: *radius as f32,
                 };
@@ -1074,23 +1114,16 @@ fn paint_ops_d2d(target: &ID2D1HwndRenderTarget, formats: [&IDWriteTextFormat; 3
                 width,
                 ..
             } => {
-                // A stroke is centred on its path: half a stroke in from the
-                // edge keeps the whole line inside `rect`, on whole pixels.
-                let half = *width as f32 / 2.0;
-                let r = rect_f(rect);
+                // A stroke is centred on its path: snap_stroke puts the path half
+                // a stroke in from edges that are whole device pixels, so a 1 dp
+                // border is one crisp pixel line at 150 and 250 percent (#1001).
+                let s = snap_stroke(*rect, *radius, *width, dpi);
                 let shape = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: r.left + half,
-                        top: r.top + half,
-                        right: r.right - half,
-                        bottom: r.bottom - half,
-                    },
-                    radiusX: (*radius as f32 - half).max(0.0),
-                    radiusY: (*radius as f32 - half).max(0.0),
+                    rect: snapped_rect_f(s.rect),
+                    radiusX: s.radius,
+                    radiusY: s.radius,
                 };
-                unsafe {
-                    target.DrawRoundedRectangle(&shape as *const _, &brush, *width as f32, None)
-                };
+                unsafe { target.DrawRoundedRectangle(&shape as *const _, &brush, s.width, None) };
             }
         }
     }
@@ -1177,11 +1210,17 @@ fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
                     };
                     SelectObject(hdc, HGDIOBJ(font.0));
                     SetTextColor(hdc, COLORREF(*color));
+                    // #1000: one line, and an ellipsis where it is too wide.
+                    let trim = if ellipsizes(*face) {
+                        DT_END_ELLIPSIS
+                    } else {
+                        DRAW_TEXT_FORMAT(0)
+                    };
                     draw_text_line(
                         hdc,
                         text,
                         *rect,
-                        align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                        align | trim | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
                     );
                 }
             }
@@ -1607,7 +1646,7 @@ impl PaletteInner {
         unsafe {
             target.BeginDraw();
         }
-        paint_ops_d2d(&target, [&body, &caption, &icon], &ops);
+        paint_ops_d2d(&target, [&body, &caption, &icon], self.dpi, &ops);
 
         if let Err(e) = unsafe { target.EndDraw(None, None) } {
             if e.code() == D2DERR_RECREATE_TARGET {
@@ -2318,7 +2357,20 @@ mod tests {
         use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.ignore_mouse_for_test();
+        p.keep_open_for_gallery();
         p.show(free_actions(), true, "mode: Auto".to_string());
+        // #991: another test's window taking the foreground makes the query
+        // box lose focus, which hides a normal palette and leaves WM_PRINT
+        // (PRF_CHECKVISIBLE) nothing to paint. Do that here on purpose, so the
+        // check no longer depends on what else is running.
+        unsafe {
+            SendMessageW(
+                p.hwnd(),
+                WM_COMMAND,
+                Some(WPARAM(ID_PALETTE_LOST_FOCUS as usize)),
+                Some(LPARAM(0)),
+            );
+        }
         pump_pending(p.hwnd());
         let dpi = unsafe { GetDpiForWindow(p.hwnd()) };
         let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
@@ -2391,6 +2443,7 @@ mod tests {
     fn a_long_list_draws_a_scroll_thumb_that_follows_the_offset() {
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.force_theme_for_gallery(Theme::Dark);
+        p.keep_open_for_gallery();
         p.show(many_ungrouped_actions(30), true, String::new());
         let dpi = p.inner.dpi;
         let rows = p.inner.state.rows.len();
@@ -2432,6 +2485,7 @@ mod tests {
         let mut p = Palette::new_for_test(instance()).unwrap();
         p.force_theme_for_gallery(Theme::Dark);
         p.ignore_mouse_for_test();
+        p.keep_open_for_gallery();
         p.show(free_actions(), true, "mode: Auto".to_string());
         // Rows: header, action (selected), header, action.
         p.inner.hover = Some(3);
@@ -2993,6 +3047,37 @@ mod tests {
         assert_eq!(pref, DWMWCP_ROUND);
     }
 
+    /// #1000: the Direct2D text formats for rows and the footer trim to an
+    /// ellipsis by character; the icon format does not. Observable if the
+    /// trimming were wired to nothing: the granularity would read back as none.
+    #[test]
+    fn d2d_text_formats_trim_with_an_ellipsis_except_the_icon() {
+        use windows::Win32::Graphics::DirectWrite::{
+            DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_NONE,
+        };
+        let Some(r) = PaletteRenderer::new() else {
+            return; // no Direct2D here: the GDI path is the only one
+        };
+        for (face, want) in [
+            (Face::Body, DWRITE_TRIMMING_GRANULARITY_CHARACTER),
+            (Face::Caption, DWRITE_TRIMMING_GRANULARITY_CHARACTER),
+            (Face::Icon, DWRITE_TRIMMING_GRANULARITY_NONE),
+        ] {
+            let format = r
+                .build_text_format(
+                    D2D_FONT_FAMILY,
+                    D2D_FONT_SIZE_DIP,
+                    DWRITE_TEXT_ALIGNMENT_LEADING,
+                    ellipsizes(face),
+                )
+                .expect("a text format");
+            let mut trimming = DWRITE_TRIMMING::default();
+            let mut sign = None;
+            unsafe { format.GetTrimming(&mut trimming, &mut sign) }.expect("GetTrimming");
+            assert_eq!(trimming.granularity, want, "{face:?}");
+            assert_eq!(sign.is_some(), ellipsizes(face), "{face:?}: the sign");
+        }
+    }
     // -- show latency (#25's Done-when: under 100 ms) -----------------------
 
     #[test]
