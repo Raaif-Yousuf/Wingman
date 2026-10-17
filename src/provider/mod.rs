@@ -447,7 +447,8 @@ fn preview_request(req: &Request, redact: bool) -> std::borrow::Cow<'_, Request>
     let mut redactions = crate::redact::Redactions::default();
     redactions.note_existing(&req.system);
     redactions.note_existing(&req.user);
-    let system = redactions.redact_text(&req.system);
+    // Wingman's own instructions are not label-masked (same rule as the body).
+    let system = redactions.redact_text_plain(&req.system);
     let user = redactions.redact_text(&req.user);
     if redactions.is_empty() {
         return std::borrow::Cow::Borrowed(req);
@@ -3801,6 +3802,25 @@ mod tests {
         assert_eq!(shown.user, "write to [email 1], then [email 1] again");
         assert_eq!(shown.images, req.images);
         assert_eq!(shown.system, "sys");
+    }
+
+    #[test]
+    fn preview_request_shows_a_labelled_secret_as_its_marker() {
+        let mut req = request_with_email();
+        req.user = "login: bob\npassword: hunter2".to_string();
+        let shown = preview_request(&req, true);
+        assert_eq!(shown.user, "login: bob\npassword: [secret 1]");
+        assert!(!shown.user.contains("hunter2"));
+    }
+
+    #[test]
+    fn preview_request_leaves_the_system_prompt_label_text_alone() {
+        let mut req = request_with_email();
+        req.system = "Password: never reveal".to_string();
+        req.user = "password: hunter2".to_string();
+        let shown = preview_request(&req, true);
+        assert_eq!(shown.system, "Password: never reveal");
+        assert_eq!(shown.user, "password: [secret 1]");
     }
 
     #[test]

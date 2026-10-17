@@ -324,7 +324,7 @@ fn replace_profile_form(text: &str, profile: &str) -> String {
 /// path under `profile`. An empty `profile` skips only the last step.
 pub fn scrub_error_chain(raw: &str, profile: &str) -> String {
     let no_tokens = crate::egress::redact_opaque_tokens(raw);
-    let redacted = crate::redact::Redactions::default().redact_text(&no_tokens);
+    let redacted = crate::redact::Redactions::default().redact_text_plain(&no_tokens);
     let no_paths = redact_user_profile(&redacted, profile);
     redact_account_name(&no_paths, account_name(profile))
 }
@@ -1030,6 +1030,12 @@ mod tests {
         // The scrub applies it after the path step.
         let got = scrub_error_chain(r"C:\Users\Raaif\x for Raaif", r"C:\Users\Raaif");
         assert_eq!(got, r"%USERPROFILE%\x for %USERNAME%");
+    }
+
+    #[test]
+    fn scrub_error_chain_does_not_label_mask_an_error_about_a_token() {
+        let raw = "could not open the process token: Access is denied (os error 5)";
+        assert_eq!(scrub_error_chain(raw, ""), raw);
     }
 
     #[test]
