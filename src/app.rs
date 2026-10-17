@@ -1071,7 +1071,7 @@ pub(crate) fn welcome_card(secondary: &str) -> (String, String) {
         "Wingman is running".to_string(),
         format!(
             "Press the Copilot key or {secondary}. If you do not see the icon, look under Show hidden icons in the tray and \
-             drag it out to keep it in view. Click here to open Settings."
+             drag it out to keep it in view."
         ),
     )
 }
@@ -1330,11 +1330,11 @@ fn first_run_card_detail(
 fn first_run_detail(found: &FirstRun) -> Option<String> {
     match found {
         FirstRun::NoVisionModel => Some(
-            "Ollama is running, but none of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+            "Ollama is running, but none of its models can read the screen. Download gemma3:4b in Settings, or paste an API key."
                 .to_string(),
         ),
         FirstRun::VisionUnknown => Some(
-            "Ollama is running, but Wingman could not tell which of its models can read the screen. Click here to open Settings and download gemma3:4b, or paste an API key."
+            "Ollama is running, but Wingman could not tell which of its models can read the screen. Download gemma3:4b in Settings, or paste an API key."
                 .to_string(),
         ),
         FirstRun::NotRunning | FirstRun::Found { .. } => None,
@@ -1489,11 +1489,11 @@ impl App {
             ),
             Mode::Cloud => (
                 "No AI model set up yet".to_string(),
-                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+                "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
             Mode::Auto => (
                 "No AI model set up yet".to_string(),
-                "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+                "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
             ),
         })
     }
@@ -7414,13 +7414,13 @@ pub(crate) fn empty_chain_card(
     {
         return (
             "Ollama is not running".to_string(),
-            "Start Ollama, or click here to open Settings and paste an API key.".to_string(),
+            "Start Ollama, or paste an API key in Settings.".to_string(),
         );
     }
     App::readiness_gate(mode, providers, config_path).unwrap_or_else(|| {
         (
             "No AI model set up yet".to_string(),
-            "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.".to_string(),
+            "Paste an API key, or install Ollama to run models on this PC for free.".to_string(),
         )
     })
 }
@@ -7647,7 +7647,7 @@ fn missing_key_card(provider: ActiveProvider) -> (String, String) {
     (
         format!("{} needs an API key", provider.label()),
         format!(
-            "Click here to open Settings and paste a {} key. Wingman will use it as soon as it is saved.",
+            "Paste a {} key in Settings. Wingman will use it as soon as it is saved.",
             provider.label()
         ),
     )
@@ -9861,7 +9861,7 @@ mod tests {
         assert!(detail.contains("Copilot key"), "{detail}");
         assert!(detail.contains("Ctrl+Shift+/"), "{detail}");
         assert!(detail.contains("tray"), "{detail}");
-        assert!(detail.contains("Click here"), "{detail}");
+        assert!(!detail.contains("Click here"), "{detail}");
         // #936: the overflow button by its Windows name, not a typed caret.
         assert!(detail.contains("Show hidden icons"), "{detail}");
         assert!(!detail.contains('^'), "{detail}");

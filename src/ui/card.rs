@@ -1128,6 +1128,9 @@ pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
 /// #885: the most lines of detail a setup card shows; the rest ends in an
 /// ellipsis, so a long config path cannot make the card taller than the screen.
 const SETUP_DETAIL_MAX_LINES: i32 = 6;
+/// #971: the link line a setup card ends with. A click anywhere on the card
+/// opens Settings; this line, in the link colour, says so.
+const SETUP_LINK_LABEL: &str = "Open Settings";
 /// Characters that fit on one collapsed headline line once the chevron's
 /// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
@@ -2647,6 +2650,7 @@ impl CardInner {
         if self.shows_setup_detail() {
             let gap = self.scale(GAP_DP);
             height += gap + self.setup_detail_height(content_width);
+            height += gap + self.line_height(self.fonts.caption).max(1);
         }
 
         self.place_bottom_right(work, width, height);
@@ -3220,6 +3224,20 @@ impl CardInner {
                 &self.detail,
                 detail_rect,
                 DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            let link_top = detail_rect.bottom + self.scale(GAP_DP);
+            let link_rect = RECT {
+                left: detail_rect.left,
+                top: link_top,
+                right: detail_rect.right,
+                bottom: link_top + self.line_height(self.fonts.caption).max(1),
+            };
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
+            draw_text_line(
+                hdc,
+                SETUP_LINK_LABEL,
+                link_rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
             );
         }
 
@@ -5411,7 +5429,7 @@ mod tests {
             }
             r.bottom - r.top
         };
-        let detail = "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.";
+        let detail = "Paste an API key, or install Ollama to run models on this PC for free.";
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.show_settings_needed("No AI model set up yet", "");
         let headline_only = height(&card);
@@ -5425,7 +5443,7 @@ mod tests {
             "a click opens Settings, so no expand chevron"
         );
         // Narrator reads the detail too (the window text is the accessible name).
-        assert!(window_text(card.hwnd()).contains("paste an API key"));
+        assert!(window_text(card.hwnd()).contains("Paste an API key"));
         // A very long detail is capped, not taller than a few lines.
         let normal = height(&card);
         card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
@@ -5454,7 +5472,10 @@ mod tests {
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_settings_needed("No AI model set up yet", "Click here to open Settings.");
+        card.show_settings_needed(
+            "No AI model set up yet",
+            "Paste an API key, or install Ollama.",
+        );
         assert_eq!(card.state(), CardState::Collapsed);
 
         let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
