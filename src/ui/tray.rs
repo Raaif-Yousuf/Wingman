@@ -3038,9 +3038,20 @@ mod tests {
             );
         });
         let sub = find_sub(find_sub(&tree, "Models"), "Gemini model");
-        let mut ids = Vec::new();
-        ids_under(sub, &mut ids);
-        assert_eq!(ids, [cmd::GEMINI_MODEL_BASE, cmd::GEMINI_MODEL_BASE + 1]);
+        let got: Vec<(u32, &str, bool)> = sub
+            .iter()
+            .filter_map(|n| match n {
+                Node::Item(id, t, _, c) => Some((*id, t.as_str(), *c)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (cmd::GEMINI_MODEL_BASE, "g-1", false),
+                (cmd::GEMINI_MODEL_BASE + 1, "g-2", true),
+            ]
+        );
     }
 
     #[test]

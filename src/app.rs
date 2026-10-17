@@ -6198,8 +6198,11 @@ impl App {
     fn pick_model(&mut self, provider: ActiveProvider, index: usize) {
         let picked = match provider {
             ActiveProvider::OpenAi => self.tray.openai_model_at(index),
+            ActiveProvider::Anthropic => self.tray.anthropic_model_at(index),
             ActiveProvider::Gemini => self.tray.gemini_model_at(index),
-            _ => self.tray.anthropic_model_at(index),
+            // Ollama has its own pick (`pick_ollama_model`); never write
+            // another provider's slot for it.
+            ActiveProvider::Ollama => return,
         }
         .map(str::to_owned);
 
@@ -6208,8 +6211,9 @@ impl App {
         let before = self.config.clone();
         let slot = match provider {
             ActiveProvider::OpenAi => &mut self.config.providers.openai.model,
+            ActiveProvider::Anthropic => &mut self.config.providers.anthropic.model,
             ActiveProvider::Gemini => &mut self.config.providers.gemini.model,
-            _ => &mut self.config.providers.anthropic.model,
+            ActiveProvider::Ollama => return,
         };
         if *slot == model {
             return;
@@ -8797,7 +8801,7 @@ enum DeferredMessage {
     /// rate limit when it is delivered, and only then may it show the card.
     ActivateDuringMenu,
     /// `WM_APP_LEARNED` (#1013) while a menu, a file dialog or Settings had
-    /// the loop. The hook swallowed that key for a tray "Set ... key", so it
+    /// the loop. The hook swallowed that key for a Settings Change, so it
     /// ends in a card (`learn_lost_card`).
     LearnLost,
     /// `WM_APP_NEED_SCREEN` (#709): the run it was posted for. Checked again
@@ -8808,12 +8812,12 @@ enum DeferredMessage {
 /// The card for a key the hook captured for a shortcut change that could not be
 /// applied because a menu, a dialog or Settings was up (#1013). The learn state
 /// is cleared by the hook the moment it captures, so `wnd_proc` cannot tell a
-/// tray "Set ... key" from a Settings Change that just ended (a timer race);
-/// the wording therefore fits both and names both ways to retry.
+/// Settings Change from one that just ended (a timer race);
+/// the wording therefore names the one way to retry.
 fn learn_lost_card() -> (&'static str, &'static str) {
     (
         "Shortcut unchanged",
-        "A key was pressed while a window was open, so it was not applied. Use Set key or Change to try again.",
+        "A key was pressed while a window was open, so it was not applied. Use Change in Settings to try again.",
     )
 }
 
@@ -9523,7 +9527,7 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         // #709: the capture must not land on the window being typed in; it
         // waits, and `on_need_screen` checks the run again when it is let go.
         | WM_APP_NEED_SCREEN
-        // #1013: a chord the hook swallowed for a tray "Set ... key" while
+        // #1013: a chord the hook swallowed for a shortcut change while
         // Settings is in front. Settings takes its own Change's chord before
         // it gets here, so this one belongs to the tray; it ends in a card.
         | WM_APP_LEARNED
@@ -10628,7 +10632,7 @@ mod tests {
             // #709: the screenshot a selection-first action asked for waits
             // until Settings is left, then is checked again.
             WM_APP_NEED_SCREEN,
-            // #1013: a chord the hook swallowed for a tray "Set ... key" must
+            // #1013: a chord the hook swallowed for a shortcut change must
             // end in a card, not vanish.
             WM_APP_LEARNED,
             // #845: an on-demand verdict is still owed a card.
@@ -10662,7 +10666,7 @@ mod tests {
         }
     }
 
-    /// #1013 item 2: a chord the hook swallowed for a tray "Set ... key" ends
+    /// #1013 item 2: a chord the hook swallowed for a shortcut change ends
     /// in a card whenever it arrives while a menu, a file dialog or Settings is
     /// up, and the card says the shortcut is unchanged.
     #[test]
@@ -10689,11 +10693,7 @@ mod tests {
         let (headline, detail) = learn_lost_card();
         assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         assert!(headline.contains("unchanged"), "{headline}");
-        // Fits a tray "Set key" and a Settings "Change" alike.
-        assert!(
-            detail.contains("Set key") && detail.contains("Change"),
-            "{detail}"
-        );
+        assert!(detail.contains("Change in Settings"), "{detail}");
     }
 
     /// #1013: a lost-key card queued after a finished result must not replace
