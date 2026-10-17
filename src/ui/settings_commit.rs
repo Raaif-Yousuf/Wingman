@@ -447,8 +447,32 @@ pub(crate) const CHECKING_LINE: &str = "Checking key...";
 pub(crate) const UNCHECKED_NOTE: &str = "Saved. Could not check it right now.";
 const OFFLINE_NOTE: &str = "Saved. Not checked in Offline mode.";
 const LOCAL_NOTE: &str = "Saved. Not checked in Local mode.";
-/// Why a key still being checked when the window closed was not saved.
-pub(crate) const KEY_UNFINISHED: &str = "The key was not checked before the window closed.";
+
+/// #1130: a key still being checked when the window closes is saved unchecked,
+/// like one whose check could not finish. If its vendor then refuses it
+/// (401 or 403), nothing is left to show that inline, so it is a card.
+/// `window_told` is whether the window took the verdict itself.
+pub(crate) fn late_refusal(verdict: KeyVerdict, window_told: bool) -> bool {
+    verdict == KeyVerdict::Rejected && !window_told
+}
+
+/// The card for a key that was saved on close and then refused by its vendor.
+/// The key stays saved: undoing it would need the writer, and a refused key
+/// only fails requests, which then end in their own card. `vendor`: 0 OpenAI,
+/// 1 Anthropic, 2 Gemini.
+pub(crate) fn late_refusal_card(vendor: usize) -> (String, String) {
+    let name = match vendor {
+        0 => "OpenAI",
+        1 => "Anthropic",
+        _ => "Gemini",
+    };
+    (
+        format!("{name} did not accept the key"),
+        format!(
+            "The key you typed was saved when Settings closed, but {name} refused it. Open Settings and enter a working key."
+        ),
+    )
+}
 
 /// Offline and Local keep every request on this computer, so a key is
 /// shape-checked and saved without asking its vendor.
@@ -554,15 +578,16 @@ impl KeyChecks {
         same
     }
 
-    /// The vendors still being checked, now forgotten (the window is closing).
-    pub(crate) fn take_pending(&mut self) -> Vec<usize> {
-        let mut vendors = Vec::new();
+    /// The vendors still being checked with the key each was asked about, now
+    /// forgotten (the window is closing and saves them unchecked, #1130).
+    pub(crate) fn take_pending(&mut self) -> Vec<(usize, String)> {
+        let mut left = Vec::new();
         for (vendor, slot) in self.pending.iter_mut().enumerate() {
-            if slot.take().is_some() {
-                vendors.push(vendor);
+            if let Some(pending) = slot.take() {
+                left.push((vendor, pending.key));
             }
         }
-        vendors
+        left
     }
 }
 
@@ -1065,12 +1090,26 @@ card_seconds = {}
         assert!(rejected_reason(0).starts_with("OpenAI did not accept"));
         assert!(rejected_reason(1).starts_with("Anthropic did not accept"));
         assert!(rejected_reason(2).starts_with("Gemini did not accept"));
-        for text in [
-            CHECKING_LINE,
-            KEY_UNFINISHED,
-            "Saved. Could not check it right now.",
-        ] {
+        for text in [CHECKING_LINE, "Saved. Could not check it right now."] {
             assert!(!text.contains('\u{2014}'), "{text}");
+        }
+    }
+
+    /// #1130: a key saved unchecked on close, then refused, is told in a card.
+    #[test]
+    fn a_late_refusal_is_a_card_for_a_closed_window_only() {
+        assert!(late_refusal(KeyVerdict::Rejected, false));
+        assert!(
+            !late_refusal(KeyVerdict::Rejected, true),
+            "the window tells it"
+        );
+        assert!(!late_refusal(KeyVerdict::Accepted, false));
+        assert!(!late_refusal(KeyVerdict::Unchecked, false));
+        for (vendor, name) in [(0, "OpenAI"), (1, "Anthropic"), (2, "Gemini")] {
+            let (headline, detail) = late_refusal_card(vendor);
+            assert!(headline.contains(name), "{headline}");
+            assert!(detail.contains("Settings"), "{detail}");
+            assert!(!format!("{headline}{detail}").contains('\u{2014}'));
         }
     }
 
@@ -1123,11 +1162,14 @@ card_seconds = {}
     }
 
     #[test]
-    fn closing_with_a_check_running_names_the_keys_left_unsaved() {
+    fn closing_with_a_check_running_hands_back_the_keys_to_save() {
         let mut checks = KeyChecks::default();
         checks.begin(0, "sk-a").unwrap();
-        checks.begin(2, "AIzaB").unwrap();
-        assert_eq!(checks.take_pending(), vec![0, 2]);
+        checks.begin(2, "  AIzaB ").unwrap();
+        assert_eq!(
+            checks.take_pending(),
+            vec![(0, "sk-a".to_string()), (2, "AIzaB".to_string())]
+        );
         assert!(!checks.is_pending(0) && !checks.is_pending(2));
         assert!(checks.take_pending().is_empty());
     }

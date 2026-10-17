@@ -341,6 +341,31 @@ fn store_shell_open_failure(failure: ShellOpenFailure) {
         .push(failure);
 }
 
+/// #1130: a key Settings saved unchecked on close was then refused by its
+/// vendor. Settings is gone, so the worker leaves the card text in the same
+/// queue as a failed open and posts the same message. A null owner (the tests'
+/// windows) says nothing.
+pub(crate) fn post_late_key_refusal(owner: isize, headline: String, detail: String) -> bool {
+    if owner == 0 {
+        return false;
+    }
+    store_shell_open_failure(ShellOpenFailure {
+        title: headline,
+        detail,
+        with_details: false,
+        raw: String::new(),
+    });
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(owner as *mut _)),
+            WM_APP_SHELL_OPEN_DONE,
+            WPARAM(0),
+            LPARAM(0),
+        )
+        .is_ok()
+    }
+}
+
 fn take_shell_open_failures() -> Vec<ShellOpenFailure> {
     std::mem::take(
         &mut *SHELL_OPEN_FAILURES

@@ -1018,6 +1018,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(field) = inner.deferred_key.take() {
                 commit_field(inner, field);
             }
+            save_checking_keys_unchecked(inner);
             inner.closing = true;
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -1268,13 +1269,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // queued for the main window, which would take it as a rebind.
                 // Free it unused.
                 drain_learned_messages();
-                // #876: a key still being checked is not written (it was not
-                // checked), and that is told like any other row left unsaved.
-                for vendor in inner.key_checks.take_pending() {
-                    if let Some(field) = key_field_of(vendor) {
-                        inner.tracker.fail(field, commit::KEY_UNFINISHED);
-                    }
-                }
                 // A row still failed is told once, as a card (rule 7): inline
                 // is all a window being typed in can show.
                 tell_owner_left(inner.owner, inner.tracker.failed_count());
@@ -1744,6 +1738,7 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
     let sync = inner.cloud_sync.clone();
     let alive = inner.alive.clone();
     let hwnd_raw = inner.hwnd.0 as isize;
+    let owner_raw = inner.owner.0 as isize;
     let job = move || {
         use crate::provider::model_list::KeyCheck;
         let mut full_list_owed = false;
@@ -1775,7 +1770,7 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
                 commit::KeyVerdict::Unchecked
             }
         };
-        post_while_open(&alive, || unsafe {
+        let window_told = post_while_open(&alive, || unsafe {
             let _ = PostMessageW(
                 Some(HWND(hwnd_raw as *mut c_void)),
                 WM_KEY_CHECKED,
@@ -1783,6 +1778,12 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
                 LPARAM(commit::encode_verdict(generation, verdict)),
             );
         });
+        // #1130: the window closed and saved the key unchecked; a refusal
+        // that arrives now is told in a card by the app.
+        if commit::late_refusal(verdict, window_told) {
+            let (headline, detail) = commit::late_refusal_card(index);
+            let _ = crate::app::post_late_key_refusal(owner_raw, headline, detail);
+        }
         // The verdict is out; now the rest of a list that goes on, which the
         // check did not wait for (#1140).
         if full_list_owed {
@@ -1852,6 +1853,36 @@ fn on_key_checked(
         return;
     }
     apply_field(inner, field, &raw, commit::verdict_note(verdict));
+}
+
+/// #1130: closing while a typed key is still out for checking saves that key
+/// unchecked, as a check that could not finish does (only a refusal blocks a
+/// key), so it is not lost. `alive` goes down here, before the window is
+/// destroyed, so the worker sees the window is gone and a refusal that comes
+/// later is a card (`late_refusal`) instead of a message to nobody.
+fn save_checking_keys_unchecked(inner: &mut SettingsInner) {
+    let pending = inner.key_checks.take_pending();
+    if pending.is_empty() {
+        return;
+    }
+    inner.alive.store(false, Ordering::SeqCst);
+    for (index, key) in pending {
+        let Some(field) = key_field_of(index) else {
+            continue;
+        };
+        let mut raw = read_raw_form(inner);
+        match index {
+            0 => raw.openai_key = key,
+            1 => raw.anthropic_key = key,
+            _ => raw.gemini_key = key,
+        }
+        apply_field(
+            inner,
+            field,
+            &raw,
+            commit::verdict_note(commit::KeyVerdict::Unchecked),
+        );
+    }
 }
 
 /// Whether the status line shows exactly `text`.
@@ -17913,9 +17944,9 @@ mod tests {
         });
     }
 
-    /// A key typed, then the window deactivated, then closed: counted as not
-    /// saved, whether it does not fit its vendor or has not been checked yet.
-    /// Never silently dropped.
+    /// A key typed, then the window deactivated, then closed: one that does not
+    /// fit its vendor is counted as not saved, one still being checked is saved
+    /// unchecked (#1130). Never silently dropped.
     #[test]
     fn closing_while_inactive_does_not_drop_a_typed_key() {
         use windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE;
@@ -17938,12 +17969,12 @@ mod tests {
             away(hwnd, "sk-a-whole-key");
             drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
-            // #876: the key was still being checked, so it was not stored, and
-            // closing counts it as not saved instead of dropping it silently.
-            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_none());
+            // #1130: the key was still being checked, so closing saves it
+            // unchecked (only a refusal blocks a key) instead of losing it.
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some());
             let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
-            assert_eq!(left.wParam.0, 1, "an unchecked key is counted");
+            assert_eq!(left.wParam.0, 0, "a saved key is not counted as lost");
         });
     }
 
