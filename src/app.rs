@@ -4762,6 +4762,15 @@ impl App {
     /// same as the modal window did, #673); a Save already pressed is written
     /// before the process exits (`WM_DESTROY`).
     fn open_settings(&mut self) {
+        // An earlier save is still being applied: opening now would show the
+        // pre-save config. Say so instead (the same card a key press gets).
+        let saves = self
+            .settings_saves
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((headline, detail)) = settings_hold_card(false, saves) {
+            self.card.show_answer(headline, detail, 3, None);
+            return;
+        }
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
         self.hide_card();
@@ -8862,6 +8871,21 @@ mod tests {
         let watch = left.find("self.set_watch(true)").expect("no re-arm at all");
         let hidden = left.find("CardState::Hidden").expect("arms with no card");
         assert!(deliver < hidden && hidden < watch, "{left}");
+    }
+
+    /// A save still being applied: the window would open on the pre-save config
+    /// and a baseline read from the old file, and the next save of the same
+    /// list would be falsely refused. Refuse with the same card as a key press.
+    #[test]
+    fn settings_does_not_reopen_while_a_save_is_in_flight() {
+        let src = lf(include_str!("app.rs"));
+        let open = body_between(&src, "    fn open_settings(&mut self) {", "\n    }\n");
+        let gate = open
+            .find("settings_hold_card(false, ")
+            .expect("open_settings ignores a save in flight");
+        let hide = open.find("self.hide_card()").expect("hide moved");
+        let create = open.find("settings::open(").expect("open moved");
+        assert!(gate < hide && gate < create, "{open}");
     }
 
     /// A router answer that arrives while Settings is in front is dropped, so
