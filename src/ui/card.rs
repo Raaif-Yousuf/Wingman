@@ -7344,8 +7344,8 @@ mod tests {
         );
         // The preview error colour was rgb(224, 82, 82) in both themes
         // until #578 moved each one to 4.5:1 on its own surface.
-        assert_eq!(d.danger, 0x0064_64F0);
-        assert_eq!(l.danger, 0x0032_32C8);
+        assert_eq!(d.danger, 0x00A4_99FF);
+        assert_eq!(l.danger, 0x001C_2BC4);
     }
 
     #[test]
