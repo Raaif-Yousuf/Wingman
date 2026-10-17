@@ -46,7 +46,7 @@ pub enum Effect {
 pub fn effect_for_executor(executor: &str) -> Effect {
     match executor {
         "none" => Effect::None,
-        "calendar_add" | "replace_text" | "fill_form" => Effect::Preview,
+        "calendar_add" | "replace_text" | "fill_form" | "contact_add" => Effect::Preview,
         _ => Effect::Clipboard,
     }
 }
@@ -1162,6 +1162,7 @@ mod tests {
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
             crate::actions::jargon::ACTION_ID,
+            crate::actions::contact::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
@@ -1342,6 +1343,7 @@ mod tests {
         assert_eq!(effect_for_executor("image_clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("replace_text"), Effect::Preview);
         assert_eq!(effect_for_executor("calendar_add"), Effect::Preview);
+        assert_eq!(effect_for_executor("contact_add"), Effect::Preview);
         assert_eq!(effect_for_executor("fill_form"), Effect::Preview);
         assert_eq!(effect_for_executor("typo"), Effect::Clipboard);
         assert_eq!(effect_for_executor(""), Effect::Clipboard);

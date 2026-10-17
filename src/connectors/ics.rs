@@ -256,7 +256,7 @@ impl IcsConnector<ShellOpener> {
 
 /// `%TEMP%\Wingman`, or `Wingman\tmp` under the portable root (#130) so
 /// portable mode leaves nothing on the host PC.
-fn temp_dir_for(portable_root: Option<&Path>, system_temp: PathBuf) -> PathBuf {
+pub(crate) fn temp_dir_for(portable_root: Option<&Path>, system_temp: PathBuf) -> PathBuf {
     match portable_root {
         Some(root) => root.join("Wingman").join("tmp"),
         None => system_temp.join("Wingman"),
@@ -366,7 +366,7 @@ impl<O: Opener> Connector for IcsConnector<O> {
 /// only needs to be unique within the producing identifier's namespace,
 /// here `wingman.local`), which wall-clock milliseconds plus a monotonic
 /// counter already gives -- no `uuid` dependency needed.
-fn generate_uid() -> String {
+pub(crate) fn generate_uid() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -380,7 +380,7 @@ fn generate_uid() -> String {
 /// one `.`, `local`) except for `@`, which some tools mis-handle in a
 /// filename; replaced with `_` for the on-disk name only. The UID inside
 /// the file content is untouched.
-fn sanitize_filename(uid: &str) -> String {
+pub(crate) fn sanitize_filename(uid: &str) -> String {
     uid.replace('@', "_")
 }
 
@@ -424,14 +424,19 @@ fn is_stale(modified: SystemTime, now: SystemTime, max_age: Duration) -> bool {
 /// ignored and the sweep moves on to the next entry: this is cleanup, not
 /// the action itself, so it must never turn a successful "Add to
 /// calendar" into a failure (rule 7).
-fn cleanup_stale_ics_files(dir: &Path) {
+pub(crate) fn cleanup_stale_ics_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "ics") {
+        // `.vcf` too: the contact action (#71) writes its card into the same
+        // folder, and it holds a person's name, number and address.
+        if !path
+            .extension()
+            .is_some_and(|ext| ext == "ics" || ext == "vcf")
+        {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -565,7 +570,7 @@ fn default_end(start: &EventTime) -> EventTime {
 /// caller of this connector goes through) uses LF line breaks, not
 /// old-Mac-style bare CR, so this is a deliberate scope limitation, not an
 /// unmeasured guess.
-fn escape_text(s: &str) -> String {
+pub(crate) fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -586,7 +591,7 @@ fn escape_text(s: &str) -> String {
 /// plus up to 74 more octets of content, joined by CRLF. Never splits a
 /// multi-byte UTF-8 sequence: the cut point backs up to the nearest earlier
 /// character boundary when the exact octet limit would land inside one.
-fn fold_line(line: &str) -> String {
+pub(crate) fn fold_line(line: &str) -> String {
     const FIRST_LIMIT: usize = 75;
     const CONT_LIMIT: usize = 74;
 
