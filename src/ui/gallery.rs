@@ -72,6 +72,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | PaletteNoModel
             | PaletteLong
             | PaletteLongScrolled
+            | PaletteHover
             | SettingsTop
             | SettingsBottom
             | SettingsAdvancedTop
@@ -88,7 +89,12 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
-        PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteLong | PaletteLongScrolled
+        PaletteDefault
+            | PaletteNoMatches
+            | PaletteNoModel
+            | PaletteHover
+            | PaletteLong
+            | PaletteLongScrolled
     )
 }
 
@@ -101,7 +107,12 @@ pub fn follows_theme_only(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
-        PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteLong | PaletteLongScrolled
+        PaletteDefault
+            | PaletteNoMatches
+            | PaletteNoModel
+            | PaletteHover
+            | PaletteLong
+            | PaletteLongScrolled
     )
 }
 
@@ -227,6 +238,8 @@ pub enum GalleryState {
     PaletteLong,
     /// #883: the same list scrolled to the end: the thumb at the bottom.
     PaletteLongScrolled,
+    /// #882: the mouse over a row other than the selected one.
+    PaletteHover,
     /// Issue #560: the Settings window from a default config, Advanced
     /// collapsed, scrolled to the top / bottom.
     SettingsTop,
@@ -272,6 +285,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteNoModel,
         PaletteLong,
         PaletteLongScrolled,
+        PaletteHover,
         SettingsTop,
         SettingsBottom,
         SettingsAdvancedTop,
@@ -314,6 +328,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteNoModel => "palette-no-model",
         PaletteLong => "palette-long",
         PaletteLongScrolled => "palette-long-scrolled",
+        PaletteHover => "palette-hover",
         SettingsTop => "settings-top",
         SettingsBottom => "settings-bottom",
         SettingsAdvancedTop => "settings-advanced-top",
@@ -815,10 +830,13 @@ mod driver {
             CardError => {
                 card.hide();
                 palette.hide();
-                card.show_error(
+                // Expanded and tracked, so the footer shows "Copy details"
+                // and "Report a problem" (#373).
+                card.show_error_with_details(
                     "Couldn't reach the model",
                     "The request timed out. Check your connection and try again.",
                 );
+                card.expand_for_gallery();
             }
             CardSetupNoModel | CardSetupOllamaDown => {
                 card.hide();
@@ -975,6 +993,14 @@ mod driver {
                     palette.scroll_for_test(i32::MAX);
                 }
             }
+            PaletteHover => {
+                card.hide();
+                palette.hide();
+                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                // Row 0 is the "Answer" header, row 1 the selected action:
+                // the hovered one is the action under it.
+                palette.set_hover_for_test(Some(2));
+            }
             RegionOverlay => {
                 card.hide();
                 palette.hide();
@@ -998,7 +1024,7 @@ mod driver {
             }
         }
         Ok(match state {
-            PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteLong
+            PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover | PaletteLong
             | PaletteLongScrolled => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
@@ -1211,7 +1237,7 @@ mod tests {
                 palette_states += 1;
             }
         }
-        assert_eq!(palette_states, 5, "the test must see every palette state");
+        assert_eq!(palette_states, 6, "the test must see every palette state");
     }
 
     #[test]
@@ -1226,7 +1252,7 @@ mod tests {
             );
             palette_states += usize::from(n.starts_with("palette-"));
         }
-        assert_eq!(palette_states, 5, "the test must see every palette state");
+        assert_eq!(palette_states, 6, "the test must see every palette state");
     }
 
     #[test]
@@ -1306,8 +1332,8 @@ mod tests {
         // focus = 15 card states, + 4 options card states (#307) + 3 palette
         // states + 4 settings states (#560) + the region overlay (#580) + the
         // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
-        // two long palettes (#883) = 32.
-        assert_eq!(states.len(), 32);
+        // two long palettes (#883) = 33.
+        assert_eq!(states.len(), 33);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
