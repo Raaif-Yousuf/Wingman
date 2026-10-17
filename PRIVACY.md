@@ -92,9 +92,9 @@ the palette and choose **Ask my documents**. Wingman then looks up the few
 excerpts that match your question and puts them in that one request to your
 model, marked as untrusted data. Email addresses, card numbers, IBANs and
 key-like tokens in the excerpts are replaced with markers first, whatever the
-screenshot-redaction setting says. A password written as plain words next to a
-label (`password: hunter2`) is not recognised and would be sent, so keep such
-files out of the folder. Nothing else in the folder is sent, and nothing is
+screenshot-redaction setting says. So is a value after a label such as
+`password:`, `pin` or `secret:`. A secret written in a sentence ("the password
+is hunter2") is not recognised and would be sent. Nothing else in the folder is sent, and nothing is
 sent without your question.
 
 - Where it goes: to the provider that answers, like any other request. With a

@@ -123,20 +123,40 @@ The full statement is in [PRIVACY.md](../PRIVACY.md#your-documents-folder).
 
 Sensitive numbers are removed twice.
 
-- **When indexing:** card numbers, IBANs and national id numbers are replaced
-  with `[card number]`, `[IBAN]` and `[national id]` before the text is saved,
-  so the store never holds them. The file itself is not changed.
-- **When asking:** email addresses, card numbers, IBANs and key-like tokens in
-  the passages are replaced with markers before they are sent, whatever your
-  screenshot redaction setting is.
+- **When indexing:** card numbers, IBANs, national id numbers and labelled
+  secrets are replaced with `[card number]`, `[IBAN]`, `[national id]` and
+  `[secret]` before the text is saved, so the store never holds them. The file
+  itself is not changed.
+- **When asking:** email addresses, card numbers, IBANs, labelled secrets and
+  key-like tokens in the passages are replaced with markers before they are
+  sent, whatever your screenshot redaction setting is.
 
 A masked number cannot be found or quoted: ask for it and the answer says the
 documents have none.
 
-Not masked: a password or other secret written as ordinary words next to a label,
-such as `password: hunter2` or `"pin": "1234"` in a `.json` or `.csv` file. If an
-excerpt holding one is chosen for a question, it is sent. Keep files like that
-out of the documents folder (issue #1112).
+A labelled secret is a value after a word such as `password`, `pwd`, `pin`,
+`secret`, `token`, `api key`, `Passwort`, `mot de passe` or `contraseña`
+(any capitals). `password: hunter2`, `pwd=abc` and `"pin": "1234"` become
+`password: [secret]` and so on. The value must follow a `:` or `=` (also the
+full-width forms), a table `|`, a tab, a comma written straight after the label
+(`password,hunter2`), or, after a plain space, contain a digit (`PIN 1234`), so
+"the password policy" is left alone. A short word may sit between (`PIN
+number:`, `PIN code 1234`, `password for wifi:`, `Passwort lautet:`), and
+Markdown emphasis around the label or value is skipped (`**Password:** x`).
+
+Where the value ends: a quoted value, to its closing quote. After `:` or `=`,
+to a `;` followed by a space or to the end of the line, so a flattened CSV row
+or JSON line (`Name: Jane; Password: a b; Role: x`) loses only the password.
+Because of that, text after `password:` on the same line is masked too, and an
+unquoted JSON value masks the rest of its line. After a table `|`, a comma or a
+tab, to the next one. After a plain space, one word. A value made only of
+punctuation is not a value.
+
+Not recognised: a secret written in a sentence ("the password is hunter2"),
+a password in the cell below a header (`password` in one row, the value in
+the next row of a raw `.md` table), and a label in other languages than the
+ones listed. The CSV and JSON readers write
+`header: value`, which is covered.
 
 ## Limits worth knowing
 
