@@ -7432,7 +7432,10 @@ pub(crate) fn setup_failure(raw_chain: &str) -> Option<(String, String)> {
         // Only a local server that cannot be reached is "not running"; a
         // timeout means it is there and slow.
         let rest = raw_chain[at..].to_ascii_lowercase();
-        if tag != "ollama" || rest.contains("timed out") || rest.contains("timeout") {
+        let refused = ["refused", "10061", "could not connect", "connection failed"]
+            .iter()
+            .any(|m| rest.contains(m));
+        if tag != "ollama" || !refused {
             return None;
         }
         return Some((
@@ -7441,12 +7444,20 @@ pub(crate) fn setup_failure(raw_chain: &str) -> Option<(String, String)> {
                 .to_string(),
         ));
     }
-    let digits: String = raw_chain[at..]
-        .strip_prefix(&format!("{tag}: HTTP "))?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let after = raw_chain[at..].strip_prefix(&format!("{tag}: HTTP "))?;
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
     let status: u16 = digits.parse().ok()?;
+    let shown = status;
+    // `http_error` marks a credit or key failure its status alone does not
+    // tell: `HTTP 429 (no_credit): ...`.
+    let kind = after[digits.len()..]
+        .strip_prefix(" (")
+        .and_then(|k| k.split(')').next());
+    let status = match (tag == "ollama", kind) {
+        (false, Some(crate::provider::common::KIND_NO_CREDIT)) => 402,
+        (false, Some(crate::provider::common::KIND_KEY_INVALID)) => 401,
+        _ => status,
+    };
     let (headline, fix) = match (tag == "ollama", status) {
         (false, 401) => (
             format!("The {name} key was not accepted"),
@@ -7472,7 +7483,7 @@ pub(crate) fn setup_failure(raw_chain: &str) -> Option<(String, String)> {
     };
     Some((
         headline,
-        format!("{fix} Details: {tag} answered HTTP {status}."),
+        format!("{fix} Details: {tag} answered HTTP {shown}."),
     ))
 }
 
@@ -10562,6 +10573,60 @@ mod tests {
     }
 
     #[test]
+    fn credit_and_bad_key_failures_are_read_from_the_vendor_body() {
+        let http = |tag: &str, status: u16, body: &str| {
+            format!(
+                "{:#}",
+                crate::provider::common::http_error(tag, status, body)
+            )
+        };
+        let quota = http(
+            "openai",
+            429,
+            r#"{"error":{"type":"insufficient_quota","code":"insufficient_quota","message":"quota"}}"#,
+        );
+        let (head, detail) = failure(&quota).expect("no credit");
+        assert_eq!(head, "The OpenAI account has no credit left");
+        assert!(detail.contains("HTTP 429"), "{detail}");
+        let low = http(
+            "anthropic",
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}"#,
+        );
+        assert_eq!(
+            failure(&low).expect("no credit").0,
+            "The Anthropic account has no credit left"
+        );
+        let bad = http(
+            "gemini",
+            400,
+            r#"{"error":{"code":400,"message":"API key not valid.","status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#,
+        );
+        let (head, detail) = failure(&bad).expect("bad key");
+        assert_eq!(head, "The Gemini key was not accepted");
+        assert!(detail.contains("HTTP 400"), "{detail}");
+        // A plain 400 or 429 stays on the old card.
+        assert_eq!(
+            failure(&http("anthropic", 400, r#"{"error":{"message":"bad"}}"#)),
+            None
+        );
+        assert_eq!(
+            failure("openai: too many requests. Retry after 20 seconds."),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_refused_connection_means_ollama_is_not_running() {
+        for raw in [
+            "ollama: transport error: connect error: Connection refused (os error 10061)",
+            "ollama: transport error: ConnectionRefused",
+        ] {
+            assert_eq!(failure(raw).expect(raw).0, "Ollama is not running", "{raw}");
+        }
+    }
+
+    #[test]
     fn a_context_prefix_does_not_hide_the_failure_class() {
         let raw = "model request failed: anthropic: HTTP 401: {}";
         assert!(failure(raw).is_some());
@@ -10575,6 +10640,9 @@ mod tests {
             "openai: HTTP 429: slow down",
             "ollama: HTTP 401: nope",
             "ollama: transport error: operation timed out after 30s",
+            "ollama: transport error: connection reset by peer",
+            "ollama: transport error: could not resolve the address",
+            "openai: HTTP 429 (rate_limit): slow down",
             "openai: transport error: Connection refused",
             "No such file or directory (os error 2)",
             "openai-compat: HTTP 404: not found",
