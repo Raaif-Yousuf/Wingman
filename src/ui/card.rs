@@ -230,6 +230,14 @@ impl Card {
         Card::create(instance, TEST_CLASS_NAME)
     }
 
+    /// #991: stops losing the focus from closing this card (see
+    /// `CardInner::close_on_focus_loss`). For tests that run in parallel with
+    /// others whose windows take the foreground.
+    #[cfg(test)]
+    pub(crate) fn stay_open_on_focus_loss(&mut self) {
+        self.inner.close_on_focus_loss = false;
+    }
+
     fn create(instance: HINSTANCE, class_name: &str) -> anyhow::Result<Self> {
         let theme = detect_theme();
         // A 96 DPI guess used only to build a first, throwaway set of fonts
@@ -282,6 +290,7 @@ impl Card {
             edit_bg_brush: HBRUSH(std::ptr::null_mut()),
             pending_stage: PendingStage::Working,
             animations_enabled: true,
+            close_on_focus_loss: true,
         });
         let raw = Box::into_raw(inner);
 
@@ -1128,6 +1137,9 @@ pub(crate) const HEADLINE_MAX_LINES: i32 = 3;
 /// #885: the most lines of detail a setup card shows; the rest ends in an
 /// ellipsis, so a long config path cannot make the card taller than the screen.
 const SETUP_DETAIL_MAX_LINES: i32 = 6;
+/// #971: the link line a setup card ends with. A click anywhere on the card
+/// opens Settings; this line, in the link colour, says so.
+const SETUP_LINK_LABEL: &str = "Open Settings";
 /// Characters that fit on one collapsed headline line once the chevron's
 /// width is reserved: (352dp content - 24dp chevron) / 6.6dp per glyph = 50.
 /// A budget for callers that must fit text in `HEADLINE_MAX_LINES`
@@ -1660,6 +1672,10 @@ struct CardInner {
     /// it `false`, `paint_pending` draws a static glyph and `show_pending`
     /// never arms `TIMER_ANIM`.
     animations_enabled: bool,
+    /// #991: whether losing the keyboard focus closes an expanded card. Always
+    /// true live. A test card that checks something other than click-away turns
+    /// it off, so another test's window taking the foreground cannot close it.
+    close_on_focus_loss: bool,
 }
 
 impl CardInner {
@@ -1839,8 +1855,9 @@ impl CardInner {
         // show_answer, show_error, show_error_with_details and
         // show_settings_needed, every one of which funnels through here.
         // #885: a setup card's detail is on screen, so Narrator reads it too.
-        if open_settings && !detail.is_empty() {
-            self.set_window_text(&format!("{headline}. {detail}"));
+        // The "Open Settings" link is only painted, so the name carries it too.
+        if open_settings {
+            self.set_window_text(&setup_accessible_name(headline, detail));
         } else {
             self.set_window_text(&answer_accessible_name(headline, difficulty));
         }
@@ -2647,6 +2664,7 @@ impl CardInner {
         if self.shows_setup_detail() {
             let gap = self.scale(GAP_DP);
             height += gap + self.setup_detail_height(content_width);
+            height += gap + self.line_height(self.fonts.caption).max(1);
         }
 
         self.place_bottom_right(work, width, height);
@@ -3221,6 +3239,20 @@ impl CardInner {
                 detail_rect,
                 DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
+            let link_top = detail_rect.bottom + self.scale(GAP_DP);
+            let link_rect = RECT {
+                left: detail_rect.left,
+                top: link_top,
+                right: detail_rect.right,
+                bottom: link_top + self.line_height(self.fonts.caption).max(1),
+            };
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.link));
+            draw_text_line(
+                hdc,
+                SETUP_LINK_LABEL,
+                link_rect,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX,
+            );
         }
 
         self.paint_difficulty_badge(hdc, rc);
@@ -3665,7 +3697,9 @@ impl CardInner {
                 Some(LRESULT(0))
             }
             WM_KILLFOCUS => {
-                self.close_expanded();
+                if self.close_on_focus_loss {
+                    self.close_expanded();
+                }
                 Some(LRESULT(0))
             }
             WM_CARD_SPEECH_END => {
@@ -5163,6 +5197,26 @@ fn create_preview_button(
 /// The card's accessible name for an answer (#815): the headline, then what
 /// the difficulty badge says when one is shown, so the rating is not lost to
 /// anyone who cannot see its colour.
+/// Accessible name of a setup card: headline, detail, then the painted link,
+/// each ending in one full stop (never a doubled one).
+fn setup_accessible_name(headline: &str, detail: &str) -> String {
+    let mut name = String::new();
+    for part in [headline, detail, SETUP_LINK_LABEL] {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(part);
+        if !part.ends_with(['.', '!', '?']) {
+            name.push('.');
+        }
+    }
+    name
+}
+
 fn answer_accessible_name(headline: &str, difficulty: Option<Difficulty>) -> String {
     match difficulty {
         Some(d) => format!("{headline}. {}", d.accessible_name()),
@@ -5411,7 +5465,7 @@ mod tests {
             }
             r.bottom - r.top
         };
-        let detail = "Click here to open Settings and paste an API key, or install Ollama to run models on this PC for free.";
+        let detail = "Paste an API key, or install Ollama to run models on this PC for free.";
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.show_settings_needed("No AI model set up yet", "");
         let headline_only = height(&card);
@@ -5425,7 +5479,10 @@ mod tests {
             "a click opens Settings, so no expand chevron"
         );
         // Narrator reads the detail too (the window text is the accessible name).
-        assert!(window_text(card.hwnd()).contains("paste an API key"));
+        assert!(window_text(card.hwnd()).contains("Paste an API key"));
+        // ... and the painted "Open Settings" link, so the name is not worse
+        // than the old "Click here" wording.
+        assert!(window_text(card.hwnd()).ends_with(" Open Settings."));
         // A very long detail is capped, not taller than a few lines.
         let normal = height(&card);
         card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
@@ -5444,6 +5501,36 @@ mod tests {
     }
 
     #[test]
+    fn the_open_settings_link_line_adds_exactly_one_caption_line() {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let height = |card: &Card| {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut r);
+            }
+            r.bottom - r.top
+        };
+        let detail = "Paste an API key, or install Ollama.";
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_settings_needed("No AI model set up yet", "");
+        let headline_only = height(&card);
+        card.show_settings_needed("No AI model set up yet", detail);
+        let with_link = height(&card);
+        let gap = card.inner.scale(GAP_DP);
+        let width = card.inner.scale(CARD_WIDTH_DP) - card.inner.scale(PADDING_DP) * 2;
+        let line = card.inner.line_height(card.inner.fonts.caption).max(1);
+        let detail_h = card.inner.setup_detail_height(width);
+        assert_eq!(
+            with_link,
+            headline_only + gap + detail_h + gap + line,
+            "detail plus one link line"
+        );
+        // An ordinary answer with the same detail shows neither.
+        card.show_answer("No AI model set up yet", detail, 0, None);
+        assert_eq!(height(&card), headline_only);
+    }
+
+    #[test]
     fn clicking_a_settings_needed_card_opens_settings_instead_of_expanding() {
         // Issue #347: the old "No API key: open Edit settings" card named a
         // menu item that no longer exists. The fix is that the card's own
@@ -5454,7 +5541,10 @@ mod tests {
 
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
         card.set_owner(card.hwnd());
-        card.show_settings_needed("No AI model set up yet", "Click here to open Settings.");
+        card.show_settings_needed(
+            "No AI model set up yet",
+            "Paste an API key, or install Ollama.",
+        );
         assert_eq!(card.state(), CardState::Collapsed);
 
         let handled = card.handle_message(WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
@@ -5590,7 +5680,11 @@ mod tests {
         card.show_settings_needed("Set up Wingman", "Add a key in Settings.");
         assert_eq!(
             window_text(card.hwnd()),
-            "Set up Wingman. Add a key in Settings."
+            "Set up Wingman. Add a key in Settings. Open Settings."
+        );
+        assert_eq!(
+            setup_accessible_name("No model", ""),
+            "No model. Open Settings."
         );
     }
 

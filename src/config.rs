@@ -1865,21 +1865,8 @@ impl Config {
         // the system folder. `icacls_command` also sets CREATE_NO_WINDOW:
         // Wingman has no console, so without it every `save()` would flash
         // one.
-        let account = crate::owner_acl::grant_account()
-            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?;
-        let output = crate::owner_acl::icacls_command()
-            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?
-            .args(crate::owner_acl::owner_only_file_args(path, &account))
-            .output()
-            .context("failed to run icacls to restrict the config file's permissions")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "icacls exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+        crate::owner_acl::restrict_to_owner(path, false)
+            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))
     }
 
     /// Builds the provider fallback chain per `providers.order`, ignoring
@@ -4439,26 +4426,22 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
 
         Config::restrict_acl(&path).expect("restrict_acl should succeed");
 
-        let has_entry_for = |sid: &str| {
-            let out = crate::owner_acl::icacls_command()
-                .unwrap()
-                .arg(&path)
-                .arg("/findsid")
-                .arg(sid)
-                .output()
-                .expect("icacls should run");
-            String::from_utf8_lossy(&out.stdout).contains("SID Found")
-        };
-        let me = crate::owner_acl::grant_account().unwrap();
-        let (mine, system, admins) = (
-            has_entry_for(&me),
-            has_entry_for("*S-1-5-18"),
-            has_entry_for("*S-1-5-32-544"),
-        );
+        // Read the DACL back by SID (not icacls's localized text).
+        let me = crate::owner_acl::current_user_sid().unwrap();
+        let (_, aces) = crate::owner_acl::dacl::read(&path);
         cleanup(&path);
-        assert!(mine, "the current user lost access");
-        assert!(!system, "SYSTEM still has an entry");
-        assert!(!admins, "Administrators still has an entry");
+        assert!(
+            aces.iter().any(|a| a.sid == me),
+            "the current user lost access"
+        );
+        assert!(
+            !aces.iter().any(|a| a.sid == "S-1-5-18"),
+            "SYSTEM still has an entry"
+        );
+        assert!(
+            !aces.iter().any(|a| a.sid == "S-1-5-32-544"),
+            "Administrators still has an entry"
+        );
     }
     #[test]
     #[cfg(windows)]

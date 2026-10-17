@@ -89,8 +89,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW,
     PM_REMOVE, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT,
-    WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
     WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -741,6 +741,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             update_text_scale_label(hwnd);
             LRESULT(0)
         }
+        WM_PAINT => {
+            paint_footer_divider(hwnd);
+            LRESULT(0)
+        }
         WM_OLLAMA_STATUS => {
             let section = inner.ollama_status.lock().ok().and_then(|g| g.clone());
             if let Some(section) = section {
@@ -815,7 +819,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             learn_timed_out(inner);
             LRESULT(0)
         }
+        // #934: the text box colours (and the accent in them) are read once
+        // per change, not per paint; repaint the boxes with the new ones.
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+        | windows::Win32::UI::WindowsAndMessaging::WM_SYSCOLORCHANGE
+        | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED => {
+            invalidate_edit_style();
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                windows::Win32::Graphics::Gdi::RDW_FRAME
+                    | RDW_INVALIDATE
+                    | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
+            );
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_DESTROY => {
+            invalidate_edit_style();
             inner.alive.store(false, Ordering::SeqCst);
             if inner.owns_itself {
                 OPEN_HWND.store(0, Ordering::SeqCst);
@@ -1088,6 +1109,11 @@ const ID_GEMINI_EFFORT_LABEL: i32 = 143;
 const ID_MODEL_LIST_HINT: i32 = 144;
 /// The "Open config file" button beside the model hint (#823).
 const ID_OPEN_CONFIG: i32 = 145;
+/// #972: the two helper lines that had no id, so the hint colour could not
+/// find them: the note under the Capture group's two dropdowns and the one
+/// under the redact checkbox.
+const ID_CAPTURE_DETAIL_HINT: i32 = 146;
+const ID_REDACT_HINT: i32 = 147;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -1154,6 +1180,8 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
     ("ID_MODEL_LIST_HINT", ID_MODEL_LIST_HINT),
     ("ID_OPEN_CONFIG", ID_OPEN_CONFIG),
+    ("ID_CAPTURE_DETAIL_HINT", ID_CAPTURE_DETAIL_HINT),
+    ("ID_REDACT_HINT", ID_REDACT_HINT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1913,12 +1941,28 @@ fn create_body(parent: HWND, instance: HINSTANCE, dpi: u32) -> HWND {
     .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
-/// The text colour of the hotkey hint line (#824). Secondary text, never the
+/// Where a checkbox's own text starts, in dp from the control's left edge
+/// (13 dp box plus a 3 dp gap; MEASURED 2026-10-17 at 250 %, the one gallery scale where the system draws the box at its true size: 40 px). A
+/// note under a checkbox starts here so it lines up with the label above it
+/// (#972).
+const CHECKBOX_TEXT_INDENT_DP: i32 = 16;
+
+/// #972: whether `id` is a helper line: secondary text under or beside a
+/// control, drawn in the hint colour. Status lines that carry a result (the
+/// Ollama check, the pull progress) are not hints.
+fn is_hint_id(id: i32) -> bool {
+    matches!(
+        id,
+        ID_HOTKEY_STATUS | ID_MODEL_LIST_HINT | ID_CAPTURE_DETAIL_HINT | ID_REDACT_HINT
+    )
+}
+
+/// The text colour of the helper lines (#824, #972). Secondary text, never the
 /// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
 /// system's own button text in high contrast (where grey means disabled).
 /// Settings is drawn on the system face today; the dark-mode work swaps in
 /// the theme's tokens.
-fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
+fn hint_text_color(high_contrast: bool, btn_text: u32) -> u32 {
     if high_contrast {
         btn_text
     } else {
@@ -1938,7 +1982,15 @@ struct EditColors {
     focus_line: u32,
     /// What lies behind the box, seen in the four rounded corners.
     face: u32,
+    /// A disabled box: a quieter fill, its own text, and no focus line.
+    disabled_fill: u32,
+    disabled_border: u32,
+    disabled_text: u32,
 }
+
+/// How far a disabled box's fill moves from the text box fill toward the
+/// face behind it, in percent.
+const EDIT_DISABLED_FILL_PCT: u32 = 60;
 
 fn edit_colors(
     high_contrast: bool,
@@ -1946,18 +1998,40 @@ fn edit_colors(
     accent: u32,
     face: u32,
 ) -> EditColors {
-    use crate::ui::theme::{Theme, Tokens};
-    let t = Tokens::for_theme(Theme::resolve(true, high_contrast), sys);
+    use crate::ui::card_buttons::blend;
+    use crate::ui::theme::{menu_text_color, Theme, Tokens};
+    let theme = Theme::resolve(true, high_contrast);
+    let t = Tokens::for_theme(theme, sys);
+    let (disabled_fill, disabled_border) = if high_contrast {
+        // No tints in high contrast: the window colour, and GrayText ink.
+        (sys.window, sys.gray_text)
+    } else {
+        (
+            blend(t.control_fill, face, EDIT_DISABLED_FILL_PCT),
+            t.border,
+        )
+    };
     EditColors {
         fill: t.control_fill,
         border: t.border,
         text: t.text,
         focus_line: if high_contrast { sys.highlight } else { accent },
         face,
+        disabled_fill,
+        disabled_border,
+        disabled_text: menu_text_color(theme, &t, sys, false, true),
     }
 }
 
-/// The colours for a text box right now.
+#[cfg(test)]
+thread_local! {
+    /// How many times the colours were rebuilt (a registry read each) on
+    /// this thread: painting must not move it.
+    static EDIT_STYLE_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The colours for a text box right now. Reads the registry (the accent), so
+/// only [`edit_style`] calls it.
 unsafe fn current_edit_colors() -> EditColors {
     use crate::ui::theme::{SysColors, Theme, LIGHT};
     use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
@@ -1976,30 +2050,85 @@ unsafe fn current_edit_colors() -> EditColors {
 /// to the accent. `(left, top, right, bottom)` in window px.
 fn edit_focus_line_rect(w: i32, h: i32, dpi: u32) -> (i32, i32, i32, i32) {
     let radius = to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
-    (radius, h - to_px(2, dpi).max(2), w - radius, h)
+    (
+        radius,
+        h - to_px(crate::ui::theme::FOCUS_LINE_DP, dpi).max(2),
+        w - radius,
+        h,
+    )
 }
 
 const EDIT_SUBCLASS_ID: usize = 0x934;
 
-thread_local! {
-    /// The one brush `WM_CTLCOLOREDIT` returns: `(colour, HBRUSH)`, replaced
-    /// when the colour changes (a high contrast switch).
-    static EDIT_BRUSH: std::cell::Cell<(u32, usize)> = const { std::cell::Cell::new((0, 0)) };
+/// Everything a text box paint needs, built once per theme change: the
+/// colours and the two brushes `WM_CTLCOLOREDIT` / `WM_CTLCOLORSTATIC` hand
+/// back. Owned here and freed by [`invalidate_edit_style`].
+#[derive(Clone, Copy)]
+struct EditStyle {
+    colors: EditColors,
+    brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    disabled_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 }
 
-/// A solid brush of `fill` for `WM_CTLCOLOREDIT`, kept for the next message.
-unsafe fn edit_fill_brush(fill: u32) -> windows::Win32::Graphics::Gdi::HBRUSH {
-    use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
-    let (colour, brush) = EDIT_BRUSH.get();
-    if brush != 0 && colour == fill {
-        return HBRUSH(brush as *mut c_void);
+thread_local! {
+    static EDIT_STYLE: std::cell::Cell<Option<EditStyle>> = const { std::cell::Cell::new(None) };
+}
+
+/// The cached style, built on first use after a theme change. Painting and
+/// colour messages run on the UI thread, so they never reach the registry.
+unsafe fn edit_style() -> EditStyle {
+    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
+    if let Some(style) = EDIT_STYLE.get() {
+        return style;
     }
-    if brush != 0 {
-        let _ = DeleteObject(HGDIOBJ(brush as *mut c_void));
+    #[cfg(test)]
+    EDIT_STYLE_BUILDS.set(EDIT_STYLE_BUILDS.get() + 1);
+    let colors = current_edit_colors();
+    let solid = |c: u32| CreateSolidBrush(windows::Win32::Foundation::COLORREF(c));
+    let style = EditStyle {
+        colors,
+        brush: solid(colors.fill),
+        disabled_brush: solid(colors.disabled_fill),
+    };
+    EDIT_STYLE.set(Some(style));
+    style
+}
+
+/// Drops the cached style and its brushes; the next paint rebuilds it. Called
+/// on a theme, accent or system colour change, and when Settings closes.
+unsafe fn invalidate_edit_style() {
+    if let Some(style) = EDIT_STYLE.take() {
+        let _ = DeleteObject(HGDIOBJ(style.brush.0));
+        let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
     }
-    let made = CreateSolidBrush(windows::Win32::Foundation::COLORREF(fill));
-    EDIT_BRUSH.set((fill, made.0 as usize));
-    made
+}
+
+/// Whether `hwnd` is a text box (an `Edit`), which a disabled one reports to
+/// its parent as a static.
+unsafe fn is_edit_control(hwnd: HWND) -> bool {
+    let mut name = [0u16; 8];
+    let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut name) as usize;
+    String::from_utf16_lossy(&name[..n.min(name.len())]).eq_ignore_ascii_case("Edit")
+}
+
+/// Answers a text box's colour request: the ink and fill on `hdc`, and the
+/// brush for the box's interior. `disabled` picks the disabled look.
+unsafe fn answer_edit_colors(hdc: windows::Win32::Graphics::Gdi::HDC, disabled: bool) -> LRESULT {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+    let s = edit_style();
+    let (ink, fill, brush) = if disabled {
+        (
+            s.colors.disabled_text,
+            s.colors.disabled_fill,
+            s.disabled_brush,
+        )
+    } else {
+        (s.colors.text, s.colors.fill, s.brush)
+    };
+    SetTextColor(hdc, COLORREF(ink));
+    SetBkColor(hdc, COLORREF(fill));
+    LRESULT(brush.0 as isize)
 }
 
 /// Draws a text box's frame onto `hdc` (#934): the Windows 11 look of a
@@ -2014,6 +2143,7 @@ unsafe fn draw_edit_frame(
     dpi: u32,
     colors: &EditColors,
     focused: bool,
+    enabled: bool,
 ) {
     use windows::Win32::Graphics::Gdi::{
         CreatePen, CreateSolidBrush, ExcludeClipRect, FillRect, RoundRect, SelectObject,
@@ -2031,13 +2161,18 @@ unsafe fn draw_edit_frame(
     ExcludeClipRect(hdc, edge, edge, w - edge, h - edge);
     let face = CreateSolidBrush(rgb(colors.face));
     FillRect(hdc, &rect(0, 0, w, h), face);
-    let fill = CreateSolidBrush(rgb(colors.fill));
-    let pen = CreatePen(PS_INSIDEFRAME, 1, rgb(colors.border));
+    let (fill_c, border_c) = if enabled {
+        (colors.fill, colors.border)
+    } else {
+        (colors.disabled_fill, colors.disabled_border)
+    };
+    let fill = CreateSolidBrush(rgb(fill_c));
+    let pen = CreatePen(PS_INSIDEFRAME, 1, rgb(border_c));
     let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
     let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
     let round = 2 * to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
     let _ = RoundRect(hdc, 0, 0, w, h, round, round);
-    if focused {
+    if focused && enabled {
         let (l, t, r, b) = edit_focus_line_rect(w, h, dpi);
         let line = CreateSolidBrush(rgb(colors.focus_line));
         FillRect(hdc, &rect(l, t, r, b), line);
@@ -2067,8 +2202,9 @@ unsafe fn paint_edit_frame(hwnd: HWND) {
         wr.right - wr.left,
         wr.bottom - wr.top,
         dpi_for(hwnd),
-        &current_edit_colors(),
+        &edit_style().colors,
         GetFocus() == hwnd,
+        windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool(),
     );
     ReleaseDC(Some(hwnd), hdc);
 }
@@ -2118,6 +2254,51 @@ unsafe extern "system" fn edit_subclass(
     }
 }
 
+/// #935: the divider above the footer, as `(left, top, right, bottom)` in
+/// client px. One physical pixel on the footer's first row, directly under the
+/// body, so a row the scrolling body cuts off reads as an edge.
+fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i32, i32, i32) {
+    let top = client_h_px - to_px(FOOTER_H_DP, dpi);
+    (0, top, client_w_px, top + 1)
+}
+
+/// #935: the divider's colour. The theme's hairline token; the system's own
+/// text colour in high contrast, where a pale hairline would not show.
+fn footer_divider_color(high_contrast: bool, btn_text: u32) -> u32 {
+    if high_contrast {
+        btn_text
+    } else {
+        crate::ui::theme::LIGHT.border
+    }
+}
+
+/// Paints the footer divider (#935). The class background has already filled
+/// the client area; only the line is drawn here.
+unsafe fn paint_footer_divider(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, EndPaint, FillRect, GetSysColor, COLOR_BTNTEXT, PAINTSTRUCT,
+    };
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+        let ink = footer_divider_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+        let (l, t, r, b) =
+            footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
+        let line = windows::Win32::Foundation::RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        };
+        FillRect(hdc, &line, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    let _ = EndPaint(hwnd, &ps);
+}
+
 /// The body forwards what its controls tell their parent (button clicks, the
 /// trackbar) up to the settings window, and runs its own scrollbar.
 unsafe extern "system" fn body_wndproc(
@@ -2131,10 +2312,10 @@ unsafe extern "system" fn body_wndproc(
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
         }
-        // #824: the hotkey hint is secondary text, not the disabled grey.
+        // #824, #972: a helper line is secondary text, not the disabled grey.
         // Every other static keeps the default colours.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
-            if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == ID_HOTKEY_STATUS =>
+            if is_hint_id(GetDlgCtrlID(HWND(lparam.0 as *mut c_void))) =>
         {
             use windows::Win32::Graphics::Gdi::{
                 GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
@@ -2142,24 +2323,25 @@ unsafe extern "system" fn body_wndproc(
             };
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
             let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-            let ink = hotkey_hint_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+            let ink = hint_text_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
             SetBkMode(hdc, TRANSPARENT);
             LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
         }
         // #934: a text box is the token fill with the token text on it.
-        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT => {
-            let colors = current_edit_colors();
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
-            windows::Win32::Graphics::Gdi::SetTextColor(
-                hdc,
-                windows::Win32::Foundation::COLORREF(colors.text),
-            );
-            windows::Win32::Graphics::Gdi::SetBkColor(
-                hdc,
-                windows::Win32::Foundation::COLORREF(colors.fill),
-            );
-            LRESULT(edit_fill_brush(colors.fill).0 as isize)
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT => answer_edit_colors(
+            windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+            false,
+        ),
+        // A disabled or read-only box asks as a static; it gets the
+        // disabled look so its interior matches the frame.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            if is_edit_control(HWND(lparam.0 as *mut c_void)) =>
+        {
+            answer_edit_colors(
+                windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+                true,
+            )
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -4584,7 +4766,7 @@ fn build_ui_recorded(
         r.y,
         r.w,
         ROW_H,
-        0,
+        ID_CAPTURE_DETAIL_HINT,
     );
     r.advance();
 
@@ -4608,11 +4790,11 @@ fn build_ui_recorded(
         REDACT_HINT,
         0,
         0,
-        r.x + 20,
+        r.x + CHECKBOX_TEXT_INDENT_DP,
         r.y,
-        r.w - 20,
+        r.w - CHECKBOX_TEXT_INDENT_DP,
         ROW_H * 2,
-        0,
+        ID_REDACT_HINT,
     );
     r.advance();
     r.advance();
@@ -6864,13 +7046,96 @@ mod tests {
                     windows::Win32::Graphics::Gdi::COLOR_3DFACE,
                 )
             };
-            let ink = hotkey_hint_color(false, rgb(0, 0, 0));
+            let ink = hint_text_color(false, rgb(0, 0, 0));
             let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
             assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
         }
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
-        assert_eq!(hotkey_hint_color(true, hc), hc);
+        assert_eq!(hint_text_color(true, hc), hc);
+    }
+
+    /// #972: every helper line is drawn as a hint (secondary text colour), and
+    /// nothing else is.
+    #[test]
+    fn every_helper_line_is_a_hint_and_nothing_else_is() {
+        for id in [
+            ID_HOTKEY_STATUS,
+            ID_MODEL_LIST_HINT,
+            ID_CAPTURE_DETAIL_HINT,
+            ID_REDACT_HINT,
+        ] {
+            assert!(is_hint_id(id), "control {id} is a helper line");
+        }
+        for id in [
+            ID_PRIMARY_LABEL,
+            ID_PULL_STATUS,
+            ID_OLLAMA_STATUS,
+            ID_REDACT,
+            0,
+        ] {
+            assert!(!is_hint_id(id), "control {id} is not a helper line");
+        }
+        with_window(Config::default(), |hwnd, _raw| {
+            for id in [ID_CAPTURE_DETAIL_HINT, ID_REDACT_HINT] {
+                assert!(get_dlg_item(hwnd, id).is_some(), "hint {id} is built");
+            }
+        });
+    }
+
+    /// #972: helper lines share one left edge: the row labels' edge, or, under
+    /// a checkbox, where the checkbox's own text starts.
+    #[test]
+    fn helper_lines_share_two_left_edges_by_one_rule() {
+        use windows::Win32::Foundation::RECT;
+        let left = |hwnd: HWND, id: i32| {
+            let c = get_dlg_item(hwnd, id).expect("control exists");
+            let mut r = RECT::default();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(c, &mut r);
+            }
+            r.left
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let dpi = dpi_for(hwnd);
+            let label_edge = left(hwnd, ID_PRIMARY_LABEL);
+            assert_eq!(left(hwnd, ID_HOTKEY_STATUS), label_edge);
+            assert_eq!(left(hwnd, ID_MODEL_LIST_HINT), label_edge);
+            assert_eq!(left(hwnd, ID_CAPTURE_DETAIL_HINT), label_edge);
+            assert_eq!(
+                left(hwnd, ID_REDACT_HINT) - left(hwnd, ID_REDACT),
+                to_px(CHECKBOX_TEXT_INDENT_DP, dpi),
+                "the note under a checkbox starts at the checkbox's text"
+            );
+        });
+    }
+
+    /// #935: a 1 px line sits on the first row of the footer, directly under
+    /// the scrolling body, at every scale and for every client size, so a row
+    /// the body cuts off reads as an edge under a divider.
+    #[test]
+    fn footer_divider_sits_on_the_body_edge() {
+        for dpi in [96u32, 144, 192, 240] {
+            let (client_w, client_h) = (to_px(WIN_W_DP, dpi) + 17, to_px(700, dpi));
+            let (l, t, r, b) = footer_divider_rect(client_w, client_h, dpi);
+            let body_bottom = client_h - to_px(FOOTER_H_DP, dpi);
+            assert_eq!(
+                t, body_bottom,
+                "the line starts where the body ends ({dpi} dpi)"
+            );
+            assert_eq!(b - t, 1, "a hairline at every scale ({dpi} dpi)");
+            assert_eq!((l, r), (0, client_w), "the line spans the client width");
+        }
+    }
+
+    /// #935: the divider uses the theme's hairline token, and the system's
+    /// own text colour in high contrast (a light grey would vanish there).
+    #[test]
+    fn footer_divider_colour_comes_from_the_tokens() {
+        use crate::ui::theme::{rgb, LIGHT};
+        assert_eq!(footer_divider_color(false, rgb(1, 2, 3)), LIGHT.border);
+        let hc = rgb(255, 255, 255);
+        assert_eq!(footer_divider_color(true, hc), hc);
     }
 
     /// #934: a text box takes its fill, border and text from the theme tokens
@@ -6984,6 +7249,9 @@ mod tests {
             text: 0,
             focus_line: 0x00FF_0000,
             face: 0x0000_FF00,
+            disabled_fill: 0x0080_8080,
+            disabled_border: 0x0000_8080,
+            disabled_text: 0,
         };
         for dpi in [96u32, 240] {
             let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
@@ -6995,7 +7263,7 @@ mod tests {
                     SelectObject(dc, HGDIOBJ(bmp.0));
                     (screen, dc, bmp)
                 };
-                unsafe { draw_edit_frame(dc, w, h, dpi, &colors, focused) };
+                unsafe { draw_edit_frame(dc, w, h, dpi, &colors, focused, true) };
                 let px = |x: i32, y: i32| unsafe { GetPixel(dc, x, y).0 };
                 let (mx, my) = (w / 2, h / 2);
                 assert_eq!(px(mx, 0), colors.border, "top border ({dpi} dpi)");
@@ -7014,6 +7282,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #934: a disabled box is drawn with the disabled border, and
+    /// never gets the accent line even when it holds the focus.
+    #[test]
+    fn a_disabled_frame_uses_the_disabled_colours() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject,
+        };
+        let colors = EditColors {
+            fill: 0x00FF_FFFF,
+            border: 0x0000_00FF,
+            text: 0,
+            focus_line: 0x00FF_0000,
+            face: 0x0000_FF00,
+            disabled_fill: 0x0080_8080,
+            disabled_border: 0x0000_8080,
+            disabled_text: 0,
+        };
+        let (w, h) = (to_px(120, 96), to_px(ROW_H, 96));
+        let (screen, dc, bmp) = unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            SelectObject(dc, HGDIOBJ(bmp.0));
+            (screen, dc, bmp)
+        };
+        unsafe { draw_edit_frame(dc, w, h, 96, &colors, true, false) };
+        let px = |x: i32, y: i32| unsafe { GetPixel(dc, x, y).0 };
+        assert_eq!(px(w / 2, 0), colors.disabled_border);
+        assert_eq!(px(w / 2, h - 1), colors.disabled_border, "no focus line");
+        unsafe {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            ReleaseDC(None, screen);
+        }
+    }
+
+    /// #934: disabled colours are tokens too: GrayText ink on the window
+    /// colour in high contrast, and a fill between the box fill and the face
+    /// in a normal theme.
+    #[test]
+    fn disabled_edit_colours_come_from_the_tokens() {
+        use crate::ui::theme::{rgb, HC_BLACK};
+        let face = rgb(240, 240, 240);
+        let c = edit_colors(true, &HC_BLACK, rgb(0, 103, 192), face);
+        assert_eq!(c.disabled_fill, HC_BLACK.window);
+        assert_eq!(c.disabled_border, HC_BLACK.gray_text);
+        assert_eq!(c.disabled_text, HC_BLACK.gray_text);
+        let c = edit_colors(false, &HC_BLACK, rgb(0, 103, 192), face);
+        assert_ne!(c.disabled_fill, c.fill);
+        assert_ne!(c.disabled_text, c.text);
+    }
+
+    /// #934: painting and colour messages use the cached style: they do not
+    /// rebuild it (a registry read each). A settings change drops the cache
+    /// and the next paint builds it once. Closing frees the brushes.
+    #[test]
+    fn painting_a_text_box_does_not_read_the_registry() {
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WM_CTLCOLOREDIT, WM_NCPAINT, WM_SETTINGCHANGE,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let edit = inner
+                .children
+                .iter()
+                .map(|c| c.hwnd)
+                .find(|h| unsafe { is_edit_control(*h) })
+                .expect("a text box");
+            let parent = unsafe { GetParent(edit) }.expect("parent");
+            let ask = || unsafe {
+                let hdc = GetDC(Some(edit));
+                SendMessageW(
+                    parent,
+                    WM_CTLCOLOREDIT,
+                    Some(WPARAM(hdc.0 as usize)),
+                    Some(LPARAM(edit.0 as isize)),
+                );
+                ReleaseDC(Some(edit), hdc);
+            };
+            ask();
+            let builds = EDIT_STYLE_BUILDS.get();
+            for _ in 0..5 {
+                ask();
+                unsafe { SendMessageW(edit, WM_NCPAINT, Some(WPARAM(1)), Some(LPARAM(0))) };
+            }
+            assert_eq!(
+                EDIT_STYLE_BUILDS.get(),
+                builds,
+                "painting rebuilt the style"
+            );
+            unsafe { SendMessageW(hwnd, WM_SETTINGCHANGE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            ask();
+            assert_eq!(
+                EDIT_STYLE_BUILDS.get(),
+                builds + 1,
+                "a change rebuilds once"
+            );
+            ask();
+            assert_eq!(EDIT_STYLE_BUILDS.get(), builds + 1);
+            unsafe { invalidate_edit_style() };
+            assert!(EDIT_STYLE.get().is_none(), "the brushes are released");
+        });
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s

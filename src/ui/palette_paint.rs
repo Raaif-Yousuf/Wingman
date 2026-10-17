@@ -245,11 +245,14 @@ pub(super) fn row_slot(dpi: u32, pos: i32) -> RECT {
     )
 }
 
-/// Where a row's text starts: in from the slot's left edge, the same for
-/// action rows, headers and hints.
+/// Where a row's text goes: in from the slot's left edge, the same for action
+/// rows, headers and hints, and in from the right edge by as much, so a long
+/// name ends in its ellipsis inside the row's fill and well clear of the scroll
+/// thumb (#1000).
 fn text_slot(dpi: u32, slot: RECT) -> RECT {
     RECT {
         left: slot.left + px(TEXT_INSET_DP, dpi),
+        right: slot.right - px(TEXT_INSET_DP, dpi),
         ..slot
     }
 }
@@ -304,6 +307,73 @@ pub(super) fn thumb_rect(dpi: u32, offset: usize, row_count: usize) -> Option<RE
         right,
         top + len,
     ))
+}
+
+/// Whether a line of text ends in an ellipsis when it is wider than its
+/// rectangle (#1000). Everything does but the icon glyph, which is one
+/// character in a box of its own.
+pub(super) fn ellipsizes(face: Face) -> bool {
+    face != Face::Icon
+}
+
+/// Whole device pixels for `v` dp at `dpi`, rounded to the nearest.
+fn snap_px(v: i32, dpi: u32) -> i32 {
+    (v * dpi as i32 + 48).div_euclid(96)
+}
+
+/// A rectangle with its edges on whole device pixels, in dp (what the
+/// Direct2D target is drawn in, see the module doc). At 150 percent a 1 dp
+/// edge is 1.5 px, which Direct2D anti-aliases across two rows of pixels; the
+/// GDI path only ever has whole pixels, so the Direct2D executor snaps to match
+/// (#1001).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SnappedRect {
+    pub(super) left: f32,
+    pub(super) top: f32,
+    pub(super) right: f32,
+    pub(super) bottom: f32,
+}
+
+/// `r` (in dp) with each edge moved to the nearest whole device pixel at `dpi`.
+pub(super) fn snap_rect(r: RECT, dpi: u32) -> SnappedRect {
+    let scale = dpi as f32 / 96.0;
+    let dp = |v: i32| snap_px(v, dpi) as f32 / scale;
+    SnappedRect {
+        left: dp(r.left),
+        top: dp(r.top),
+        right: dp(r.right),
+        bottom: dp(r.bottom),
+    }
+}
+
+/// An outline for Direct2D: the path to stroke and how thick to stroke it, all
+/// in dp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SnappedStroke {
+    pub(super) rect: SnappedRect,
+    pub(super) radius: f32,
+    pub(super) width: f32,
+}
+
+/// The outline of `r` (in dp), `width_dp` thick, drawn inside `r`, crisp at
+/// `dpi` (#1001). The width is a whole number of pixels, as in the GDI path
+/// (`px`, at least one), and the path is half that width in from each snapped
+/// edge, so the stroke covers exactly whole pixel rows and columns.
+pub(super) fn snap_stroke(r: RECT, radius_dp: i32, width_dp: i32, dpi: u32) -> SnappedStroke {
+    let scale = dpi as f32 / 96.0;
+    let width_px = px(width_dp, dpi).max(1);
+    let half_px = width_px as f32 / 2.0;
+    let edge = |v: i32, inward: f32| (snap_px(v, dpi) as f32 + inward * half_px) / scale;
+    SnappedStroke {
+        rect: SnappedRect {
+            left: edge(r.left, 1.0),
+            top: edge(r.top, 1.0),
+            right: edge(r.right, -1.0),
+            bottom: edge(r.bottom, -1.0),
+        },
+        radius: ((radius_dp as f32 * scale - half_px) / scale).max(0.0),
+        width: width_px as f32 / scale,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +983,123 @@ mod tests {
             assert_ne!(c.bar, None);
             assert!(ratio(c.bar.unwrap(), t.surface) >= 3.0);
         }
+    }
+
+    #[test]
+    fn text_stops_before_the_scroll_thumb_and_inside_the_row_fill() {
+        let c = colors(Theme::Dark);
+        for dpi in DPIS {
+            let long = "x".repeat(90);
+            let mut list = vec![Row::Header(long.clone()), Row::Hint(long.clone())];
+            list.extend((0..30).map(|i| action(&format!("{long} {i}"))));
+            let thumb = thumb_rect(dpi, 0, list.len()).expect("a thumb");
+            let ops = build_ops(
+                dpi,
+                &PaintInput {
+                    rows: &list,
+                    offset: 0,
+                    selected: 2,
+                    hover: None,
+                    footer: &long,
+                    colors: &c,
+                },
+            );
+            let mut seen = 0;
+            for op in &ops {
+                let Op::Text { rect, face, .. } = op else {
+                    continue;
+                };
+                if *face == Face::Icon {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    rect.right <= thumb.left,
+                    "dpi {dpi}: text to {} runs under the thumb at {}",
+                    rect.right,
+                    thumb.left
+                );
+                assert!(rect.right > rect.left, "dpi {dpi}: room for text");
+            }
+            // Row text keeps the same padding on the right as on the left, so
+            // the ellipsis is inside the selection fill.
+            let fill = row_fill(dpi, 2);
+            let text = ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::Text { rect, text, .. } if text.ends_with(" 0") => Some(*rect),
+                    _ => None,
+                })
+                .expect("the first action row");
+            assert_eq!(fill.right - text.right, text.left - fill.left, "dpi {dpi}");
+            assert!(seen >= 12, "dpi {dpi}: the test must see the text lines");
+        }
+    }
+
+    #[test]
+    fn every_face_but_the_icon_ends_in_an_ellipsis() {
+        assert!(ellipsizes(Face::Body));
+        assert!(ellipsizes(Face::Caption));
+        assert!(!ellipsizes(Face::Icon));
+    }
+
+    #[test]
+    fn a_one_dp_border_is_whole_pixels_at_150_and_250_percent() {
+        for dpi in [96u32, 144, 168, 240] {
+            let scale = dpi as f32 / 96.0;
+            let ops = ops_for(96, &rows(3), 0, 0, None);
+            let mut seen = 0;
+            for op in &ops {
+                let Op::StrokeRound {
+                    rect,
+                    radius,
+                    width,
+                    ..
+                } = op
+                else {
+                    continue;
+                };
+                seen += 1;
+                let s = snap_stroke(*rect, *radius, *width, dpi);
+                let wpx = s.width * scale;
+                assert!((wpx - wpx.round()).abs() < 1e-3, "dpi {dpi}: width {wpx}");
+                assert!(wpx >= 1.0, "dpi {dpi}: a visible line");
+                // The outer edge of the stroke is a whole pixel on all sides.
+                let outer = [
+                    (s.rect.left - s.width / 2.0) * scale,
+                    (s.rect.top - s.width / 2.0) * scale,
+                    (s.rect.right + s.width / 2.0) * scale,
+                    (s.rect.bottom + s.width / 2.0) * scale,
+                ];
+                for e in outer {
+                    assert!((e - e.round()).abs() < 1e-3, "dpi {dpi}: edge {e} px");
+                }
+                assert!(s.radius >= 0.0);
+            }
+            assert!(seen > 0, "the test must see the query box border");
+        }
+    }
+
+    #[test]
+    fn snapped_rects_have_whole_pixel_edges_and_stay_within_half_a_pixel() {
+        let r = rect(16, 16, 544, 48);
+        for dpi in [96u32, 144, 168, 240] {
+            let scale = dpi as f32 / 96.0;
+            let s = snap_rect(r, dpi);
+            for (snapped, dp) in [
+                (s.left, r.left),
+                (s.top, r.top),
+                (s.right, r.right),
+                (s.bottom, r.bottom),
+            ] {
+                let p = snapped * scale;
+                assert!((p - p.round()).abs() < 1e-3, "dpi {dpi}: {p}");
+                assert!((p - dp as f32 * scale).abs() <= 0.5 + 1e-3, "dpi {dpi}");
+            }
+        }
+        // 1 dp at 150 percent: the 0.5 dp inset used to be 0.75 px.
+        let s = snap_stroke(rect(0, 0, 100, 40), 4, 1, 144);
+        assert_eq!(s.width, 1.0 / 1.5);
     }
 
     #[test]

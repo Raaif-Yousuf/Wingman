@@ -14,6 +14,19 @@ pub struct Chunk {
     pub tokens: usize,
 }
 
+impl Chunk {
+    /// The `span` column: `{page, heading, start, end}` as JSON.
+    pub fn span_json(&self) -> String {
+        serde_json::json!({
+            "page": self.page,
+            "heading": self.heading,
+            "start": self.start,
+            "end": self.end,
+        })
+        .to_string()
+    }
+}
+
 const MAX_HEADING_CHARS: usize = 200;
 
 /// An unbroken piece of text of at most `TARGET_CHARS`: a line, or a slice of
