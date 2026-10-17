@@ -566,8 +566,11 @@ pub(crate) const ROW_CONTROL_H_DP: i32 = 22;
 pub(crate) const ROW_PAD_DP: i32 = 6;
 /// Height of a row's title when a description sits under it, in dp.
 pub(crate) const ROW_TITLE_H_DP: i32 = 20;
-/// Height of one line of a row's description (the 12 px caption), in dp.
-pub(crate) const ROW_DESC_LINE_DP: i32 = 16;
+/// Height of one line of a row's description (the 12 px caption), in dp. One
+/// more than the caption's 16 px line: at 150 % the font's line is 25 px, a
+/// pixel over a 16 dp line, and a two-line description clipped (MEASURED
+/// 2026-10-17, #877).
+pub(crate) const ROW_DESC_LINE_DP: i32 = 17;
 /// Width of the column the controls sit in, in dp.
 pub(crate) const ROW_CONTROL_W_DP: i32 = 240;
 

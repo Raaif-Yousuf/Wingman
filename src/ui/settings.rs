@@ -1148,6 +1148,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
+            clear_accessible_names(hwnd);
             invalidate_edit_style();
             invalidate_rail_style();
             inner.closing = true;
@@ -2453,31 +2454,53 @@ const ACCESSIBLE_NAMES: [(i32, &str); 6] = [
 /// Best effort: with no service the buttons keep their short text, and the
 /// window works the same. Runs once as the window is built, never on a paint.
 fn annotate_accessible_names(hwnd: HWND) {
+    use windows::Win32::UI::Accessibility::PROPID_ACC_NAME;
+    with_prop_service(|service| unsafe {
+        for (id, name) in ACCESSIBLE_NAMES {
+            if let Some(button) = get_dlg_item(hwnd, id) {
+                let name = wide_z(name);
+                let _ = service.SetHwndPropStr(
+                    button,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    PROPID_ACC_NAME,
+                    PCWSTR(name.as_ptr()),
+                );
+            }
+        }
+    });
+}
+
+/// Takes the names of [`annotate_accessible_names`] back as the window goes:
+/// the service keeps them by window handle, and Windows recycles handles, so a
+/// later control must not inherit "Show OpenAI key".
+fn clear_accessible_names(hwnd: HWND) {
+    use windows::Win32::UI::Accessibility::PROPID_ACC_NAME;
+    with_prop_service(|service| unsafe {
+        for (id, _) in ACCESSIBLE_NAMES {
+            if let Some(button) = get_dlg_item(hwnd, id) {
+                let _ = service.ClearHwndProps(button, ACC_OBJID_CLIENT, 0, &[PROPID_ACC_NAME]);
+            }
+        }
+    });
+}
+
+const ACC_OBJID_CLIENT: u32 = 0xFFFF_FFFC;
+
+/// Runs `f` with the accessibility annotation service, when there is one.
+fn with_prop_service(f: impl FnOnce(&windows::Win32::UI::Accessibility::IAccPropServices)) {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
     };
-    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices, PROPID_ACC_NAME};
-    const OBJID_CLIENT: u32 = 0xFFFF_FFFC;
-    const CHILDID_SELF: u32 = 0;
+    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices};
     unsafe {
         // Balanced below when it took: a thread that already has COM keeps it.
         let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         if let Ok(service) =
             CoCreateInstance::<_, IAccPropServices>(&CAccPropServices, None, CLSCTX_INPROC_SERVER)
         {
-            for (id, name) in ACCESSIBLE_NAMES {
-                if let Some(button) = get_dlg_item(hwnd, id) {
-                    let name = wide_z(name);
-                    let _ = service.SetHwndPropStr(
-                        button,
-                        OBJID_CLIENT,
-                        CHILDID_SELF,
-                        PROPID_ACC_NAME,
-                        PCWSTR(name.as_ptr()),
-                    );
-                }
-            }
+            f(&service);
         }
         if init.is_ok() {
             CoUninitialize();
@@ -3475,7 +3498,8 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
         }
     }
     // A hidden Ollama card also takes its own height off the page: from the
-    // hairline above its status to the bottom of its last line.
+    // hairline above its status to the bottom of its last line and the padding
+    // under it, which the page's end counts like any row's.
     let card_top = inner
         .models_flow
         .iter()
@@ -3490,7 +3514,11 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
         .map(|f| f.y + f.h)
         .max()
         .unwrap_or(0);
-    let card_gone = if shown[3] { 0 } else { card_bottom - card_top };
+    let card_gone = if shown[3] {
+        0
+    } else {
+        card_bottom + ROW_PAD - card_top
+    };
     inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch) + card_gone;
     if !inner.hwnd.0.is_null() {
         // One repaint for the whole change, as `show_page` does: the layout
@@ -9800,6 +9828,40 @@ mod tests {
         });
     }
 
+    /// The Gemini thinking row is greyed for a 2.5 model. Its Alt letter then
+    /// goes nowhere: the focus stays where it was, it never lands on whatever
+    /// control sits next to the greyed row.
+    #[test]
+    fn the_alt_letter_of_a_greyed_row_does_not_move_focus_to_a_neighbour() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, SetFocus};
+        use windows::Win32::UI::WindowsAndMessaging::{IsDialogMessageW, MSG, WM_SYSCHAR};
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["gemini".to_string()];
+        cfg.providers.gemini.model = "gemini-2.5-pro".to_string();
+        with_window(cfg, |hwnd, raw| {
+            unsafe { show_page(&mut *raw, Page::Models) };
+            sync_gemini_thinking_enabled(hwnd);
+            let label = get_dlg_item(hwnd, ID_GEMINI_EFFORT_LABEL).expect("label");
+            let m = mnemonic_of(&get_text(label)).expect("the label has a mnemonic");
+            let combo = get_dlg_item(hwnd, ID_GEMINI_MODEL).expect("combo");
+            assert!(!unsafe { IsWindowEnabled(label) }.as_bool(), "row greyed");
+            unsafe {
+                let _ = SetFocus(Some(combo));
+                let before = GetFocus();
+                assert_eq!(before, combo, "the test needs a real focus to compare");
+                let msg = MSG {
+                    hwnd: combo,
+                    message: WM_SYSCHAR,
+                    wParam: WPARAM(m as usize),
+                    lParam: LPARAM(0),
+                    ..Default::default()
+                };
+                let _ = IsDialogMessageW(hwnd, &msg);
+                assert_eq!(GetFocus(), before, "Alt+{m} moved the focus");
+            }
+        });
+    }
+
     /// A box (a combo, a text box or a slider) is named by the static title
     /// right before it in z-order, and a button by its text or its assigned
     /// name. On a page no two share a name, so a screen reader never says the
@@ -9892,6 +9954,56 @@ mod tests {
         }
     }
 
+    /// What UI Automation (which Narrator uses) reports as the control's name.
+    fn uia_name(hwnd: HWND) -> Option<String> {
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let uia: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let element = uia.ElementFromHandle(hwnd).ok()?;
+            Some(element.CurrentName().ok()?.to_string())
+        }
+    }
+
+    /// A window's names are taken back as it goes, so a recycled handle does
+    /// not carry "Show OpenAI key" into some other control.
+    #[test]
+    fn clearing_the_names_gives_the_button_its_own_text_back() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { show_page(&mut *raw, Page::Models) };
+            let button = get_dlg_item(hwnd, ID_OPENAI_SHOW_KEY).expect("button");
+            assert_eq!(msaa_name(button).as_deref(), Some("Show OpenAI key"));
+            clear_accessible_names(hwnd);
+            assert_eq!(msaa_name(button).as_deref(), Some("Show"));
+        });
+    }
+
+    /// #877: Narrator reads UI Automation, not MSAA. The long names must come
+    /// through that path too, or "Show" is all a screen reader says.
+    #[test]
+    fn ui_automation_reports_the_vendor_names() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe {
+                show_page(&mut *raw, Page::Models);
+                reveal_providers(&mut *raw);
+            }
+            for (id, want) in [
+                (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
+                (ID_OPENAI_MODEL, "OpenAI model"),
+            ] {
+                let control = get_dlg_item(hwnd, id).expect("control");
+                let name = uia_name(control)
+                    .unwrap_or_else(|| panic!("UI Automation gave no name for {id}"));
+                assert_eq!(name, want, "control id {id}");
+            }
+        });
+    }
+
     /// The readback: what Narrator would be told, asked of the real controls.
     /// The window is hidden, so this is the system's answer for a control and
     /// not a speech test; run by hand with Narrator for that.
@@ -9925,7 +10037,10 @@ mod tests {
     }
 
     /// Every title and description fits the room its row gives it, so nothing
-    /// is cut off at the row's edge. Measured with the real fonts at 100 %.
+    /// is cut off at the row's edge. Measured with the real fonts at 100, 150
+    /// and 250 %, where the wrapped lines grow with the type but the rows grow
+    /// with the same scale. The two-line descriptions are named, so a text that
+    /// stops being measured cannot make the test pass.
     #[test]
     fn titles_and_descriptions_fit_their_rows() {
         use windows::Win32::Graphics::Gdi::{
@@ -9933,58 +10048,65 @@ mod tests {
         };
         with_window(Config::default(), |hwnd, raw| {
             let inner = unsafe { &*raw };
-            let hint_font = unsafe { build_hint_font(inner.font, 96) };
-            assert!(!hint_font.0.is_null());
             let dc = unsafe { GetDC(Some(hwnd)) };
-            let mut checked = 0;
-            for c in &inner.children {
-                if unsafe { class_of(c.hwnd) } != "Static" {
-                    continue;
-                }
-                let id = unsafe { GetDlgCtrlID(c.hwnd) };
-                let text = get_text(c.hwnd);
-                if text.is_empty() || id == ID_OLLAMA_STATUS || id == ID_PULL_STATUS {
-                    continue;
-                }
-                let font = if is_hint_id(id) {
-                    hint_font
-                } else {
-                    inner.font
-                };
-                let old = unsafe { SelectObject(dc, HGDIOBJ(font.0)) };
-                let mut rect = windows::Win32::Foundation::RECT {
-                    left: 0,
-                    top: 0,
-                    right: to_px(c.w, 96),
-                    bottom: 0,
-                };
-                let mut wide: Vec<u16> = text.encode_utf16().collect();
-                unsafe {
-                    DrawTextW(
-                        dc,
-                        &mut wide,
-                        &mut rect,
-                        DT_CALCRECT | DT_LEFT | DT_WORDBREAK,
+            for dpi in [96u32, 144, 240] {
+                let font = build_font(dpi);
+                let hint_font = unsafe { build_hint_font(font, dpi) };
+                assert!(!font.0.is_null() && !hint_font.0.is_null());
+                let mut checked = 0;
+                let mut long_ones = 0;
+                for c in &inner.children {
+                    if unsafe { class_of(c.hwnd) } != "Static" {
+                        continue;
+                    }
+                    let id = unsafe { GetDlgCtrlID(c.hwnd) };
+                    let text = get_text(c.hwnd);
+                    if text.is_empty() || id == ID_OLLAMA_STATUS || id == ID_PULL_STATUS {
+                        continue;
+                    }
+                    let used = if is_hint_id(id) { hint_font } else { font };
+                    let old = unsafe { SelectObject(dc, HGDIOBJ(used.0)) };
+                    let mut rect = windows::Win32::Foundation::RECT {
+                        left: 0,
+                        top: 0,
+                        right: to_px(c.w, dpi),
+                        bottom: 0,
+                    };
+                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                    unsafe {
+                        DrawTextW(
+                            dc,
+                            &mut wide,
+                            &mut rect,
+                            DT_CALCRECT | DT_LEFT | DT_WORDBREAK,
+                        );
+                        SelectObject(dc, old);
+                    }
+                    assert!(
+                        rect.bottom <= to_px(c.h, dpi),
+                        "{dpi} dpi: {text:?} needs {} px of {} in {} px width",
+                        rect.bottom,
+                        to_px(c.h, dpi),
+                        to_px(c.w, dpi)
                     );
-                    SelectObject(dc, old);
+                    if text == MODE_DESC || text == REDACT_HINT {
+                        long_ones += 1;
+                    }
+                    checked += 1;
+                }
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(hint_font.0));
+                    let _ = DeleteObject(HGDIOBJ(font.0));
                 }
                 assert!(
-                    rect.bottom <= to_px(c.h, 96),
-                    "{text:?} needs {} px of {} in {} px width",
-                    rect.bottom,
-                    to_px(c.h, 96),
-                    to_px(c.w, 96)
+                    checked > 20,
+                    "{dpi} dpi: only {checked} texts were measured"
                 );
-                checked += 1;
+                assert_eq!(long_ones, 2, "{dpi} dpi: Mode and Redact descriptions");
             }
-            unsafe {
-                ReleaseDC(Some(hwnd), dc);
-                let _ = DeleteObject(HGDIOBJ(hint_font.0));
-            }
-            assert!(checked > 20, "only {checked} texts were measured");
+            unsafe { ReleaseDC(Some(hwnd), dc) };
         });
     }
-
     /// A hairline sits above every row but a page's first, and none is left
     /// loose: each one is a 1 dp tall control made on a page, so it hides with
     /// its page and, on Models, with its block.
@@ -10425,6 +10547,35 @@ mod tests {
             assert!(design_y(inner, ID_OPEN_CONFIG) > hint_y_one_vendor);
         });
     }
+    /// With the Ollama card hidden, the Models page ends where every other page
+    /// does: a row's padding and the body's under its lowest visible control.
+    #[test]
+    fn a_hidden_ollama_card_leaves_the_page_ending_where_other_pages_end() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            let lowest = inner
+                .children
+                .iter()
+                .filter(|c| c.page == Some(Page::Models))
+                .filter(|c| unsafe { IsWindowVisible(c.hwnd) }.as_bool())
+                // A combo's design height is its drop-down list: the box is a row.
+                .map(|c| {
+                    c.y + if unsafe { class_of(c.hwnd) } == "ComboBox" {
+                        ROW_H
+                    } else {
+                        c.h
+                    }
+                })
+                .max()
+                .expect("a visible control");
+            assert!(!shows(hwnd, ID_PULL_STATUS), "the card is hidden");
+            let content = inner.page_content_dp[Page::Models.index()] - inner.models_shrink_dp;
+            // The last row's own padding, then the body's: as every other page.
+            assert_eq!(content, lowest + ROW_PAD + BODY_PAD_BOTTOM);
+        });
+    }
+
     #[test]
     fn gemini_thinking_applies_only_to_the_3_line() {
         assert!(gemini_thinking_applies("gemini-3.8-flash"));
