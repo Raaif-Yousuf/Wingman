@@ -26,8 +26,8 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use crate::connectors::{
-    cleanup_stale_ics_files, escape_text, fold_line, generate_uid, sanitize_filename, temp_dir_for,
-    Opener, ShellOpener,
+    cleanup_stale_ics_files, escape_text, fold_line, generate_uid, is_hidden_format,
+    sanitize_filename, temp_dir_for, Opener, ShellOpener,
 };
 use crate::ui::confirm::Confirmed;
 
@@ -174,22 +174,6 @@ fn split_name(name: &str, org: &str) -> (String, String, String, String) {
         ),
         None => whole(),
     }
-}
-
-/// True for the format characters that reorder or hide text (bidi overrides,
-/// isolates, marks and zero-width or invisible operators). The joiners ZWJ
-/// and ZWNJ are not in it: scripts need them.
-fn is_hidden_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200b}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{061c}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-    )
 }
 
 /// The vCard 3.0 text for `contact`, CRLF line endings, folded. `uid` is the

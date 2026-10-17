@@ -18191,8 +18191,10 @@ mod tests {
         let edit = body_of("edit_settings");
         let returns: Vec<usize> = edit.match_indices("return;").map(|(i, _)| i).collect();
         // #1203: the save and the open moved to a worker, so the one return
-        // left is the unreadable-%APPDATA% card.
-        assert!(!returns.is_empty(), "edit_settings candidates not found");
+        // left is the unreadable-%APPDATA% card. Count what was checked so
+        // the loop can never pass without looking at a card.
+        assert_eq!(returns.len(), 1, "edit_settings returns changed: {edit}");
+        let mut checked = 0;
         for at in returns {
             let before = &edit[at.saturating_sub(120)..at];
             if before.contains(".show_error") {
@@ -18200,7 +18202,21 @@ mod tests {
                     before.contains("set_watch(true)"),
                     "edit_settings returns after a card without arming click-away"
                 );
+                checked += 1;
             }
+        }
+        assert!(checked >= 1, "no edit_settings card was checked");
+        // #1203: the failure cards that moved to the shell-open worker path
+        // still arm click-away, and the card comes before the arming.
+        for name in ["on_shell_open_done", "spawn_shell_open"] {
+            let body = body_of(name);
+            let card = body
+                .find(".show_error")
+                .unwrap_or_else(|| panic!("{name} shows no card"));
+            let watch = body
+                .rfind("set_watch(true)")
+                .unwrap_or_else(|| panic!("{name} never arms click-away"));
+            assert!(card < watch, "{name} arms click-away before its card");
         }
     }
 
