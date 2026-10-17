@@ -187,7 +187,7 @@ const ANSWER_STOP_WORDS: &[&str] = &[
 
 /// The runs of `s` made of letters and digits, lower case.
 fn tokens(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
+    s.split(|c: char| !(c.is_alphanumeric() || is_mark(c)))
         .filter(|t| !t.is_empty())
         .map(str::to_lowercase)
         .collect()
@@ -245,6 +245,10 @@ const NUMBER_WORDS: &[(&str, u64)] = &[
     ("zehn", 10),
     ("elf", 11),
     ("zwölf", 12),
+    ("fuenf", 5),
+    ("zwoelf", 12),
+    ("fuenfzehn", 15),
+    ("fuenfzig", 50),
     ("dreizehn", 13),
     ("vierzehn", 14),
     ("fünfzehn", 15),
@@ -303,15 +307,52 @@ const NUMBER_WORDS: &[(&str, u64)] = &[
     ("mil", 1_000),
 ];
 
+/// Lower case, with the sharp s as "ss", the umlauts as their plain letter and
+/// combining marks dropped, so "Dreißig", "dreissig" and a "u" plus a combining
+/// diaeresis all compare the way a reader would read them.
+fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars().flat_map(char::to_lowercase) {
+        match c {
+            'ß' => out.push_str("ss"),
+            'ä' => out.push('a'),
+            'ö' => out.push('o'),
+            'ü' => out.push('u'),
+            c if is_mark(c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A combining mark (a letter's accent written as a separate character).
+fn is_mark(c: char) -> bool {
+    ('\u{300}'..='\u{36f}').contains(&c)
+}
+
 fn number_word(token: &str) -> Option<u64> {
+    let token = fold(token);
     NUMBER_WORDS
         .iter()
-        .find(|(w, _)| *w == token)
+        .find(|(w, _)| fold(w) == token)
         .map(|(_, v)| *v)
 }
 
-/// The values of the number words in `tokens`. A tens word followed by a
-/// units word ("twenty-one") is one value, 21. "one" is read only there.
+/// The value of a units word after a tens word: 2 to 9, or 1 as "one" (also
+/// "un", "une", "uno", "una" when `after_and`, because only the French and
+/// Spanish "and" forms use them).
+fn unit_word(token: &str, after_and: bool) -> Option<u64> {
+    match fold(token).as_str() {
+        "one" => Some(1),
+        "un" | "une" | "uno" | "una" if after_and => Some(1),
+        _ => number_word(token).filter(|u| (2..=9).contains(u)),
+    }
+}
+
+/// The values of the number words in `tokens`, which are the words of one
+/// sentence. A tens word followed by a units word ("twenty-one"), or by "et"
+/// or "y" and a units word ("vingt et un", "treinta y cinco"), is one value.
+/// "one" is read only there.
 fn word_values(tokens: &[String]) -> Vec<u64> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -320,19 +361,52 @@ fn word_values(tokens: &[String]) -> Vec<u64> {
         let Some(v) = number_word(token) else {
             continue;
         };
-        let unit = tokens.get(i).and_then(|next| match next.as_str() {
-            "one" => Some(1),
-            other => number_word(other).filter(|u| (2..=9).contains(u)),
-        });
-        match unit {
-            Some(u) if (20..=90).contains(&v) && v % 10 == 0 => {
+        if !((20..=90).contains(&v) && v % 10 == 0) {
+            out.push(v);
+            continue;
+        }
+        let direct = tokens.get(i).and_then(|t| unit_word(t, false));
+        let joined = tokens
+            .get(i)
+            .filter(|t| matches!(fold(t).as_str(), "et" | "y"))
+            .and_then(|_| tokens.get(i + 1))
+            .and_then(|t| unit_word(t, true));
+        match (direct, joined) {
+            (Some(u), _) => {
                 out.push(v + u);
                 i += 1;
+            }
+            (None, Some(u)) => {
+                out.push(v + u);
+                i += 2;
             }
             _ => out.push(v),
         }
     }
     out
+}
+
+/// The values of the number words in `text`, read one sentence at a time:
+/// a number never runs across a full stop, comma or other punctuation.
+fn number_values(text: &str) -> Vec<u64> {
+    text.split(|c: char| !(c.is_alphanumeric() || c.is_whitespace() || c == '-' || is_mark(c)))
+        .flat_map(|sentence| word_values(&tokens(sentence)))
+        .collect()
+}
+
+/// A long word that looks like a compound number ("einundzwanzig",
+/// "zweihundert") but is not one of [`NUMBER_WORDS`], so its value is unknown.
+fn unknown_compound(token: &str) -> bool {
+    const TENS: &[&str] = &[
+        "zwanzig", "dreissig", "vierzig", "funfzig", "fuenfzig", "sechzig", "siebzig", "achtzig",
+        "neunzig",
+    ];
+    let t = fold(token);
+    t.chars().count() >= 8
+        && number_word(token).is_none()
+        && (t.contains("hundert")
+            || t.contains("tausend")
+            || (t.contains("und") && TENS.iter().any(|w| t.ends_with(w))))
 }
 
 /// Whether `s` holds a redaction marker (`[email 1]`) or one of the masks
@@ -366,7 +440,17 @@ fn answer_backed(answer: &str, verified: &[Verified]) -> bool {
     let quotes: Vec<String> = verified.iter().map(|v| normalize(&v.quote)).collect();
     let numbers = digit_runs(answer);
     let quote_words: Vec<String> = quotes.iter().flat_map(|q| tokens(q)).collect();
-    let word_numbers = word_values(&quote_words);
+    // Each quote on its own, sentence by sentence: the end of one quote and
+    // the start of the next never make one number.
+    let word_numbers: Vec<u64> = quotes.iter().flat_map(|q| number_values(q)).collect();
+    // A compound number word whose value is not known is not verified, unless
+    // a quote has that very word.
+    if tokens(answer)
+        .iter()
+        .any(|t| unknown_compound(t) && !quote_words.iter().any(|w| fold(w) == fold(t)))
+    {
+        return false;
+    }
     // A number in digits is backed by the same digits in a quote, or by the
     // word for it ("3" by "three").
     if !numbers.iter().all(|n| {
@@ -383,7 +467,7 @@ fn answer_backed(answer: &str, verified: &[Verified]) -> bool {
             .flat_map(|q| digit_runs(q))
             .filter_map(|r| r.parse::<u64>().ok()),
     );
-    if !word_values(&tokens(answer))
+    if !number_values(answer)
         .iter()
         .all(|v| quoted_values.contains(v))
     {
@@ -821,6 +905,84 @@ mod tests {
         assert_eq!(finalize(&p("One of the people."), &q)["supported"], true);
     }
 
+    #[test]
+    fn number_words_are_read_per_quote_and_per_sentence() {
+        let doc = [snip(
+            "w.txt",
+            "Staff count is twenty. One manager here too. Vingt employes. Treinta anos.",
+        )];
+        let p = |quotes: &[&str], a: &str| {
+            let ev: Vec<Value> = quotes.iter().map(|q| json!({"n": 1, "quote": q})).collect();
+            finalize(&json!({"evidence": ev, "answer": a, "found": true}), &doc)["supported"]
+                .clone()
+        };
+        // "twenty" and "One" are in different sentences and different quotes.
+        let joined = ["Staff count is twenty. One manager here too"];
+        let apart = ["Staff count is twenty", "One manager here too"];
+        for quotes in [&joined[..], &apart[..]] {
+            assert_eq!(p(quotes, "Twenty-one managers on staff."), json!(false));
+            assert_eq!(p(quotes, "21 managers on staff."), json!(false));
+            assert_eq!(p(quotes, "Twenty managers on staff."), json!(true));
+        }
+    }
+
+    #[test]
+    fn compound_numbers_across_languages_are_composed_or_refused() {
+        let doc = [snip(
+            "w.txt",
+            "Mitarbeiter zwanzig und Büro. Einundzwanzig Mitarbeiter. Staff vingt et un. Staff treinta y cinco. Staff vingt.",
+        )];
+        let p = |quote: &str, a: &str| {
+            finalize(
+                &json!({"evidence": [{"n": 1, "quote": quote}], "answer": a, "found": true}),
+                &doc,
+            )["supported"]
+                .clone()
+        };
+        // French and Spanish "and" forms are composed on both sides.
+        assert_eq!(p("Staff vingt et un", "Vingt et un staff."), json!(true));
+        assert_eq!(p("Staff vingt.", "Vingt et un staff."), json!(false));
+        assert_eq!(
+            p("Staff treinta y cinco", "Treinta y cinco staff."),
+            json!(true)
+        );
+        assert_eq!(p("Staff vingt.", "Treinta y cinco staff."), json!(false));
+        // A German compound is refused unless the quote has the same word.
+        assert_eq!(
+            p("Mitarbeiter zwanzig und Büro", "Einundzwanzig Mitarbeiter."),
+            json!(false)
+        );
+        assert_eq!(
+            p("Einundzwanzig Mitarbeiter", "Einundzwanzig Mitarbeiter."),
+            json!(true)
+        );
+        assert_eq!(
+            p("Mitarbeiter zwanzig und Büro", "Zweihundert Mitarbeiter."),
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn number_words_match_across_case_sharp_s_and_composed_letters() {
+        let doc = [snip(
+            "w.txt",
+            "Dreissig Mitarbeiter und 5 Büros und sechs Autos",
+        )];
+        let p = |a: &str| {
+            finalize(
+                &json!({"evidence": [{"n": 1, "quote": "Dreissig Mitarbeiter und 5 Büros und sechs Autos"}], "answer": a, "found": true}),
+                &doc,
+            )["supported"]
+                .clone()
+        };
+        assert_eq!(p("Dreißig Mitarbeiter."), json!(true));
+        assert_eq!(p("DREISSIG Mitarbeiter."), json!(true));
+        // "fünf" typed as u plus a combining diaeresis is still five.
+        assert_eq!(p("Fu\u{308}nf Büros."), json!(true));
+        assert_eq!(p("Fünf Büros."), json!(true));
+        assert_eq!(p("Sieben Büros."), json!(false));
+        assert_eq!(p("Dreizig Mitarbeiter und Fu\u{308}nfzehn."), json!(false));
+    }
     #[test]
     fn a_redaction_marker_never_reaches_the_card_as_document_text() {
         let snippets = vec![snip(
