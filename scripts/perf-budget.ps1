@@ -57,4 +57,10 @@ foreach ($r in Get-BudgetResult -Budgets $budgets -Measured $measured -Names 'ex
     "$($r.Name): measured $($r.Measured), budget $($r.Max) ($status)"
     if (-not $r.Passed) { $failed = $true }
 }
+# One line per run in the job summary, so the size trend reads without opening logs.
+if ($env:GITHUB_STEP_SUMMARY) {
+    $sha = if ($env:GITHUB_SHA) { $env:GITHUB_SHA.Substring(0, [Math]::Min(7, $env:GITHUB_SHA.Length)) } else { 'local' }
+    "Exe size: $($measured.exe_size_bytes) bytes at $sha" |
+        Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+}
 if ($failed) { exit 1 }

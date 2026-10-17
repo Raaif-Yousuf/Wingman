@@ -292,6 +292,17 @@ pub(crate) fn invalid_line(label: &str, why: &str) -> String {
     format!("Error: {label}. {why}")
 }
 
+/// The reason shown for a write that failed. An Undo the file refused (it was
+/// edited since) gets its own plain sentence instead of the writer's advice to
+/// save again, which would not undo anything.
+pub(crate) fn failure_reason(undoing: bool, reason: &str) -> String {
+    if undoing && reason.contains("was changed in config.toml") {
+        "The file changed since. Undo was not applied.".to_string()
+    } else {
+        reason.to_string()
+    }
+}
+
 /// A write that did not happen.
 pub(crate) fn failed_line(label: &str, reason: &str) -> String {
     format!("Not saved: {label}. {reason} Wingman is still using the old value.")
@@ -398,7 +409,6 @@ impl Tracker {
         self.failed.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn failed(&self, field: Field) -> Option<&str> {
         self.failed
             .iter()
@@ -662,6 +672,18 @@ pub(crate) mod tests {
         assert!(invalid(Field::CardCorner, "anything").is_none());
         let why = invalid(Field::CardSeconds, "x").unwrap();
         assert!(!why.contains('\u{2014}'), "{why}");
+    }
+
+    #[test]
+    fn a_refused_undo_says_so_in_plain_words() {
+        let refusal = "`ui.card_seconds` was changed in config.toml while Settings was open, \
+                       so Wingman did not overwrite it. Open Settings again and save once more";
+        let shown = failure_reason(true, refusal);
+        assert_eq!(shown, "The file changed since. Undo was not applied.");
+        assert!(!shown.contains('\u{2014}') && !shown.contains("save once more"));
+        // A normal write keeps the writer's words, and so does any other undo failure.
+        assert_eq!(failure_reason(false, refusal), refusal);
+        assert_eq!(failure_reason(true, "disk full"), "disk full");
     }
 
     #[test]

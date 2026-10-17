@@ -776,6 +776,9 @@ struct SettingsInner {
     /// The window is not the active one (`WM_ACTIVATE` inactive): a key box that
     /// loses the focus for that reason is not applied.
     deactivated: bool,
+    /// The key box that lost the focus while the window was deactivated and has
+    /// not been applied: applied on close if nothing applied it sooner.
+    deferred_key: Option<Field>,
     /// #875: the file's path and the modified time the window last read, so
     /// coming back to the window reads it again only when it moved. `None` in the
     /// tests' windows (rule 9: they never read the real file).
@@ -870,6 +873,7 @@ impl SettingsInner {
             undo_shown: false,
             closing: false,
             deactivated: false,
+            deferred_key: None,
             file_path: None,
             file_mtime: None,
             refreshing: false,
@@ -923,6 +927,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // applied first. A destroyed window does not reliably send
             // `EN_KILLFOCUS`.
             commit_focused(inner);
+            // A key box that lost the focus to a deactivation (alt-tab) was held
+            // back; closing is the last chance. A key that fits is applied, one
+            // that does not becomes a failed row, which the close card counts.
+            if let Some(field) = inner.deferred_key.take() {
+                commit_field(inner, field);
+            }
             inner.closing = true;
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -1154,6 +1164,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         // text: a half-typed key must not be stored. Enter and moving to another
         // control of Settings apply it.
         if inner.deactivated {
+            inner.deferred_key = commit_trigger(id, notify);
             return;
         }
         if let Some(field) = commit_trigger(id, notify) {
@@ -1467,6 +1478,9 @@ fn commit_field(inner: &mut SettingsInner, field: Field) {
         commit_autostart(inner);
         return;
     }
+    if inner.deferred_key == Some(field) {
+        inner.deferred_key = None;
+    }
     let raw = read_raw_form(inner);
     let refused = commit::invalid(field, raw_text(&raw, field))
         .or_else(|| key_refusal(&inner.original, field, &raw));
@@ -1645,7 +1659,8 @@ fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
                     inner.baseline = back;
                 }
             }
-            fail_row(inner, field, reason);
+            let shown = commit::failure_reason(entry.undoing, reason);
+            fail_row(inner, field, &shown);
         }
     }
     true
@@ -1736,6 +1751,14 @@ fn escape_with(inner: &mut SettingsInner, focus: HWND) {
         if text_pending(field, &get_text(focus), &inner.original) {
             let applied = inner.original.clone();
             show_field(inner, field, &applied);
+            // The bad or half-typed text is gone, so a row failed for it is fine.
+            if inner.tracker.failed(field).is_some() {
+                inner.tracker.clear_failed(field);
+                set_status(inner, "", false);
+            }
+            if inner.deferred_key == Some(field) {
+                inner.deferred_key = None;
+            }
             return;
         }
     }
@@ -14817,6 +14840,53 @@ mod tests {
             leave(hwnd, ID_ANTHROPIC_KEY);
             assert_eq!(seen.borrow().len(), 1);
             assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+        });
+    }
+
+    /// Esc puts the applied text back, which also ends a row that failed for the
+    /// text that was there.
+    #[test]
+    fn esc_after_a_bad_entry_clears_the_failed_row() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            let inner = unsafe { &mut *raw };
+            let seconds = get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap();
+            set_text(seconds, "2ooo");
+            leave(hwnd, ID_CARD_SECONDS);
+            assert_eq!(inner.tracker.failed_count(), 1);
+            escape_with(inner, seconds);
+            assert_eq!(inner.tracker.failed_count(), 0, "a false unsaved count");
+            assert!(!status(hwnd).starts_with("Error"), "{}", status(hwnd));
+        });
+    }
+
+    /// A key typed, then the window deactivated, then closed: it is applied if it
+    /// fits and counted as not saved if it does not. Never silently dropped.
+    #[test]
+    fn closing_while_inactive_does_not_drop_a_typed_key() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE;
+        let away = |hwnd: HWND, key: &str| unsafe {
+            set_text(get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(), key);
+            SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(0)), Some(LPARAM(0)));
+            leave(hwnd, ID_OPENAI_KEY);
+        };
+        with_open_window(|hwnd, owner| {
+            away(hwnd, "not-a-key");
+            // Drain the activation message so the left count is the close's.
+            while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
+            close_now();
+            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
+            assert_eq!(left.wParam.0, 1, "a key that does not fit is counted");
+        });
+        with_open_window(|hwnd, owner| {
+            away(hwnd, "sk-a-whole-key");
+            while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
+            close_now();
+            assert!(
+                take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some(),
+                "a key that fits is applied on close"
+            );
         });
     }
 
