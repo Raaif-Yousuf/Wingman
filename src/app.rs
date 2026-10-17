@@ -1722,6 +1722,14 @@ fn result_is_current(posted_run: usize, current_run: u64) -> bool {
     posted_run == 0 || posted_run as u64 == current_run
 }
 
+/// #1182: whether a result for `result_run` ends the run a held screen step
+/// belongs to, so the step is dropped. The selection was enough (or the run
+/// failed); the step must not wait for the next selection-first run to be
+/// replaced. A result with no generation (0) or for another run leaves it.
+fn finished_run_drops_step(held_run: Option<u64>, result_run: usize) -> bool {
+    result_run != 0 && held_run == Some(result_run as u64)
+}
+
 /// #709: what to do with a worker's request for the screen.
 #[derive(Debug, PartialEq, Eq)]
 enum NeedScreenStep {
@@ -10218,6 +10226,10 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // Take ownership of the box the worker leaked into the message.
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Answer, String>) };
+            // #1182: the run is over, so a screen step it held is not needed.
+            if finished_run_drops_step(app.screen_step.as_ref().map(|(r, _)| *r), wparam.0) {
+                app.screen_step = None;
+            }
             app.on_result(result);
             LRESULT(0)
         }
@@ -12719,6 +12731,26 @@ mod tests {
         assert_eq!(step(4, 5, true, true, true), S::Stale);
         // The follow-up work is gone: an error card, never a hang.
         assert_eq!(step(5, 5, true, false, false), S::Lost);
+    }
+
+    /// #1182: a selection that was enough ends the run without the screen step
+    /// ever being taken; the result for that run drops the held step.
+    #[test]
+    fn a_finished_run_drops_its_held_screen_step() {
+        use super::finished_run_drops_step as drops;
+        assert!(drops(Some(5), 5));
+        assert!(!drops(Some(5), 4), "another run's result");
+        assert!(!drops(Some(5), 0), "a result with no generation");
+        assert!(!drops(None, 5), "nothing held");
+        let src = lf(include_str!("app.rs"));
+        let arm = body_between(
+            &src,
+            "        WM_APP_RESULT => {\n            // Take",
+            "\n        }\n",
+        );
+        assert!(!arm.is_empty());
+        let drop_at = arm.find("finished_run_drops_step(").expect("not wired");
+        assert!(drop_at < arm.find("app.on_result(").unwrap(), "{arm}");
     }
 
     /// #709: the wiring. The selection is read on the worker, the capture is

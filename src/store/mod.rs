@@ -208,6 +208,9 @@ enum Heal {
     Replaced(String),
     /// Could not finish. The text says why. Tried again after [`RETRY_GAP`].
     Stuck(String),
+    /// Only the index rebuild could not finish; the file itself is fine and
+    /// history is still saved. Tried again after [`RETRY_GAP`].
+    IndexStuck(String),
 }
 
 /// Wait between tries after a heal failed, so a file that stays held does not
@@ -354,6 +357,13 @@ impl Store {
                     note_recovery(runtime_recovery_notice(Err(&why)));
                 }
             }
+            Heal::IndexStuck(why) => {
+                state.not_before = Some(now + self.retry_gap);
+                if !state.told {
+                    state.told = true;
+                    note_recovery(index_stuck_notice(&why));
+                }
+            }
         }
     }
 
@@ -407,7 +417,7 @@ impl Store {
                         RebuildVerdict::Damaged => {}
                         // Busy or disk full: the index is still wrong, so
                         // try again later instead of calling it healthy.
-                        RebuildVerdict::Retry(why) => return Heal::Stuck(why),
+                        RebuildVerdict::Retry(why) => return Heal::IndexStuck(why),
                     }
                 }
                 // Closing the old connection first: Windows will not rename an open file.
@@ -551,6 +561,14 @@ fn runtime_recovery_notice(kept: Result<&Path, &str>) -> String {
             "Wingman's saved data was damaged while it was running and could not be replaced ({why}), so history is not being saved for now. Wingman will try again. The damaged file was not deleted."
         ),
     }
+}
+
+/// The card text when only the search index could not be rebuilt (#1182):
+/// history and documents are still saved.
+fn index_stuck_notice(why: &str) -> String {
+    format!(
+        "Wingman's search index could not be rebuilt ({why}), so searching saved data may miss results for now. Your history is still being saved. Wingman will try again."
+    )
 }
 
 /// Pragmas set on every connection; the reasons are in the design spec.
@@ -1944,6 +1962,16 @@ mod tests {
         for t in [kept, stuck] {
             assert!(!t.contains('\u{2014}'), "{t}");
         }
+    }
+
+    #[test]
+    fn a_stuck_index_rebuild_does_not_claim_history_is_lost() {
+        // #1182: only the search index is affected, history is still saved.
+        let t = index_stuck_notice("disk full");
+        assert!(t.contains("disk full"), "{t}");
+        assert!(t.contains("search"), "{t}");
+        assert!(!t.contains("not being saved"), "{t}");
+        assert!(!t.contains('\u{2014}'), "{t}");
     }
 
     #[test]
