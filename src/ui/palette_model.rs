@@ -558,7 +558,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 /// `claude-opus-4-8` -> `Claude Opus 4.8`, `gemini-3.8-flash` -> `Gemini 3.8
 /// Flash`. Anything unrecognised (Ollama tags, compat models) falls back to
 /// the model id without the provider prefix, or the raw string.
-fn friendly_model_name(provider_model: &str) -> String {
+pub(crate) fn friendly_model_name(provider_model: &str) -> String {
     let model = provider_model
         .split_once(':')
         .map(|(_, model)| model)
