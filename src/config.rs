@@ -1140,17 +1140,38 @@ fn repair_changes(
 }
 
 /// Compat names that cannot own a store target alone: empty, or used by more
-/// than one entry (#1225). Their keys are never imported, so one cannot
-/// overwrite the other.
+/// than one entry, compared case-insensitively because Credential Manager
+/// target names are (#1225). Returned lowercased; test membership with
+/// [`is_shared_name`]. Their keys are never imported, written, deleted or
+/// hydrated, so one entry can never overwrite or read another's slot.
 fn shared_compat_names(compat: &[CompatConfig]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (i, e) in compat.iter().enumerate() {
-        let repeated = compat[..i].iter().any(|o| o.name == e.name);
-        if (e.name.is_empty() || repeated) && !out.contains(&e.name) {
-            out.push(e.name.clone());
+        let folded = e.name.to_lowercase();
+        let repeated = compat[..i].iter().any(|o| o.name.to_lowercase() == folded);
+        if (folded.is_empty() || repeated) && !out.contains(&folded) {
+            out.push(folded);
         }
     }
     out
+}
+
+fn is_shared_name(shared: &[String], name: &str) -> bool {
+    shared.contains(&name.to_lowercase())
+}
+
+/// What the startup card calls a compat key left in the file because its name
+/// is shared. [`is_shared_name_label`] recognises it again.
+fn shared_name_label(name: &str) -> String {
+    if name.is_empty() {
+        "an endpoint with no name (give it a name)".to_string()
+    } else {
+        format!("{name} (name used more than once, rename one)")
+    }
+}
+
+pub(crate) fn is_shared_name_label(label: &str) -> bool {
+    label.ends_with("(give it a name)") || label.ends_with("(name used more than once, rename one)")
 }
 
 /// Names of the providers whose key `before` (as the file was read) held and
@@ -1501,7 +1522,7 @@ impl Config {
         // target and overwrite each other, so their keys stay in the file.
         let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
-            if entry.api_key.is_empty() || shared.contains(&entry.name) {
+            if entry.api_key.is_empty() || is_shared_name(&shared, &entry.name) {
                 continue;
             }
             let target = target_name(&compat_order_name(&entry.name));
@@ -1538,21 +1559,15 @@ impl Config {
             .and_then(|text| toml::from_str::<Config>(&text).ok());
         let shared = shared_compat_names(&before.providers.compat);
         let mut left = keys_still_in_file(&before, on_disk.as_ref());
-        for name in &shared {
-            let held = before
-                .providers
-                .compat
-                .iter()
-                .any(|e| &e.name == name && !e.api_key.is_empty());
-            if !held {
+        for e in &before.providers.compat {
+            if e.api_key.is_empty() || !is_shared_name(&shared, &e.name) {
                 continue;
             }
-            let label = if name.is_empty() {
-                "an endpoint with no name (give it a name)".to_string()
-            } else {
-                format!("{name} (name used more than once, rename one)")
-            };
-            match left.iter_mut().find(|n| *n == name) {
+            let label = shared_name_label(&e.name);
+            if left.contains(&label) {
+                continue;
+            }
+            match left.iter_mut().find(|n| **n == e.name) {
                 Some(slot) => *slot = label,
                 None => left.push(label),
             }
@@ -1590,8 +1605,9 @@ impl Config {
                 Err(_) => *key = UNREADABLE_KEY_MARKER.to_string(),
             }
         }
+        let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
-            if !entry.api_key.is_empty() {
+            if !entry.api_key.is_empty() || is_shared_name(&shared, &entry.name) {
                 continue;
             }
             let target = target_name(&compat_order_name(&entry.name));
@@ -1722,8 +1738,13 @@ impl Config {
         // #16: no env override for compat entries (a dynamic, user-named
         // list has no single fixed env var to check), so every entry goes
         // straight through the non-env-overridden rules above.
+        // #1225: a shared name has no slot of its own to write or clear.
+        let shared = shared_compat_names(&self.providers.compat);
         for entry in &mut self.providers.compat {
             let target = target_name(&compat_order_name(&entry.name));
+            if is_shared_name(&shared, &entry.name) {
+                continue;
+            }
             if entry.api_key == UNREADABLE_KEY_MARKER {
                 zeroize_string(&mut entry.api_key);
                 continue;
@@ -5325,6 +5346,70 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         assert_eq!(config.providers.compat[0].api_key, "k-first");
         assert_eq!(config.providers.compat[1].api_key, "k-second");
         assert_eq!(store.get(&target_name("compat:lab")).unwrap(), None);
+    }
+
+    #[test]
+    fn compat_names_that_differ_only_in_case_share_a_target_and_keep_their_keys() {
+        // Credential Manager target names are case-insensitive.
+        let mut config = Config::default();
+        let mut a = compat_entry("Lab", "http://127.0.0.1:1/v1");
+        a.api_key = "k-first".into();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key = "k-second".into();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+
+        assert!(!config.import_secrets_and_blank(&store));
+        assert_eq!(config.providers.compat[0].api_key, "k-first");
+        assert_eq!(config.providers.compat[1].api_key, "k-second");
+        assert_eq!(store.get(&target_name("compat:lab")).unwrap(), None);
+        assert_eq!(store.get(&target_name("compat:Lab")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_settings_save_never_writes_or_wipes_the_slot_of_a_shared_name() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key = "k1".into();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key = "k2".into();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+        let slot = target_name("compat:lab");
+
+        // No edits: nothing is written.
+        Config::push_changed_secrets_with(&config, &config, &store, &|_| false).unwrap();
+        assert_eq!(store.get(&slot).unwrap(), None);
+
+        // One entry is retyped: still nothing is written.
+        let mut edited = config.clone();
+        edited.providers.compat[1].api_key = "k3".into();
+        Config::push_changed_secrets_with(&config, &edited, &store, &|_| false).unwrap();
+        assert_eq!(store.get(&slot).unwrap(), None);
+
+        // A slot that already holds a key is not wiped by a cleared duplicate.
+        store.set(&slot, "kept").unwrap();
+        let mut cleared = config.clone();
+        cleared.providers.compat[1].api_key.clear();
+        Config::push_changed_secrets_with(&config, &cleared, &store, &|_| false).unwrap();
+        assert_eq!(store.get(&slot).unwrap().as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn hydrate_never_feeds_a_shared_name_the_slot_of_another() {
+        let mut config = Config::default();
+        let mut a = compat_entry("lab", "http://127.0.0.1:1/v1");
+        a.api_key.clear();
+        let mut b = compat_entry("lab", "http://127.0.0.1:2/v1");
+        b.api_key.clear();
+        config.providers.compat = vec![a, b];
+        let store = InMemoryStore::default();
+        store
+            .set(&target_name("compat:lab"), "someone-elses")
+            .unwrap();
+        config.hydrate_secrets(&store);
+        assert_eq!(config.providers.compat[0].api_key, "");
+        assert_eq!(config.providers.compat[1].api_key, "");
     }
 
     #[test]
