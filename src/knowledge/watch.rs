@@ -420,9 +420,12 @@ pub fn apply(
         }
     }
     if rescan && !stopped() {
-        let summary = ingest::scan_folder(store, root, now)?;
-        if let Some(text) = ingest::summary_notice(&summary) {
-            notice::report(&text);
+        let summary = ingest::scan_folder_until(store, root, now, stopped)?;
+        // A scan cut short says nothing about the folder: no card for it.
+        if !stopped() {
+            if let Some(text) = ingest::summary_notice(&summary) {
+                notice::report(&text);
+            }
         }
     }
     Ok(busy)
@@ -700,6 +703,12 @@ fn report_ended(root: &Path, code: Option<u32>) {
     }
 }
 
+/// True while `folder` still resolves to the canonical `root` it was started
+/// with. Any failure to look (gone, no access) is false: the safe answer.
+fn root_unchanged(folder: &Path, root: &Path) -> bool {
+    ingest::canonical_root(folder).is_ok_and(|now| now == root)
+}
+
 fn stop_requested(stop: &StopEvent) -> bool {
     // SAFETY: `stop` holds a live event handle.
     unsafe { WaitForSingleObject(stop.0, 0) == WAIT_OBJECT_0 }
@@ -734,6 +743,10 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
     let opened = store::global();
     ingest::lower_thread_priority();
     let Ok(store) = opened else { return };
+    // Replaced while the store was opening: do not bring a retired root back.
+    if stop_requested(stop) {
+        return;
+    }
     let root_key = root.to_string_lossy().into_owned();
     let root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
         Ok(id) => id,
@@ -777,7 +790,10 @@ fn watch(folder: &Path, stop: &StopEvent, ready: std::sync::mpsc::SyncSender<()>
         }
         // A folder that was deleted or renamed says nothing about its files:
         // touch nothing and stop.
-        if !root.is_dir() {
+        // The same goes for a root renamed away and replaced by a junction or
+        // another folder: what it resolves to is no longer the root that was
+        // stored, so fail closed.
+        if !root_unchanged(folder, &root) {
             report_ended(&root, None);
             return;
         }
@@ -1288,6 +1304,35 @@ mod tests {
     }
 
     #[test]
+    fn a_root_replaced_by_a_junction_is_no_longer_the_root() {
+        let base = scratch("root-swap");
+        let folder = base.join("kb");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&folder).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let root = ingest::canonical_root(&folder).unwrap();
+        assert!(root_unchanged(&folder, &root));
+        fs::rename(&folder, base.join("kb-moved")).unwrap();
+        assert!(!root_unchanged(&folder, &root), "gone fails closed");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&folder)
+            .arg(&elsewhere)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if made {
+            assert!(
+                !root_unchanged(&folder, &root),
+                "a junction is another root"
+            );
+        } else {
+            eprintln!("SKIPPED: could not create a junction, only the gone case was checked");
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn a_short_name_from_windows_is_keyed_as_the_long_name() {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows::Win32::Storage::FileSystem::GetShortPathNameW;
@@ -1302,7 +1347,10 @@ mod tests {
         let n = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
         if n == 0 {
             let _ = fs::remove_dir_all(&dir);
-            return; // 8.3 names are switched off on this volume
+            eprintln!(
+                "SKIPPED: 8.3 short names are switched off on this volume, so nothing was checked"
+            );
+            return;
         }
         let short = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
         // The short form shortens the whole path (the temp dir too), so take
@@ -1316,6 +1364,7 @@ mod tests {
         if short_rel == "a long folder/long notes file.md" {
             // THEORY (unverified): 8.3 name creation is off for this volume.
             let _ = fs::remove_dir_all(&dir);
+            eprintln!("SKIPPED: this volume gave no 8.3 short name for the test file, so nothing was checked");
             return;
         }
         assert_eq!(

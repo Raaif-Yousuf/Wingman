@@ -278,6 +278,26 @@ pub(super) struct FoundFile {
 /// Walks `root` once and brings the store in line with it. A store error
 /// stops the scan (the store is likely broken); a bad file never does.
 pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, StoreError> {
+    scan_folder_until(store, root, now, &|| false)
+}
+
+/// [`scan_folder`] that gives up once `stopped` says yes: asked before the
+/// root is inserted and before every file, and after it says yes nothing more
+/// is written (no root, no documents, no deletes). A watcher that was replaced
+/// must not bring its retired folder back while the new one is scanned.
+pub fn scan_folder_until(
+    store: &Store,
+    root: &Path,
+    now: i64,
+    stopped: &dyn Fn() -> bool,
+) -> Result<ScanSummary, StoreError> {
+    let stopped_summary = || ScanSummary {
+        incomplete: true,
+        ..Default::default()
+    };
+    if stopped() {
+        return Ok(stopped_summary());
+    }
     let root_key = root.to_string_lossy().into_owned();
     let root_id = store.ensure_root(&root_key, now)?;
     let (files, mut incomplete) = walk(root);
@@ -287,6 +307,11 @@ pub fn scan_folder(store: &Store, root: &Path, now: i64) -> Result<ScanSummary, 
     let mut summary = ScanSummary::default();
 
     for file in &files {
+        if stopped() {
+            // Returning here also keeps the deletes below from running.
+            summary.incomplete = true;
+            return Ok(summary);
+        }
         let existing = by_path.get(file.rel.as_str()).copied();
         match index_file(store, root_id, file, existing, now)? {
             Outcome::Indexed => summary.indexed += 1,
@@ -342,6 +367,17 @@ fn walk(root: &Path) -> (Vec<FoundFile>, bool) {
             if kind.is_dir() {
                 if name.starts_with('.') {
                     continue;
+                }
+                // A cloud placeholder folder has the reparse bit but is not a
+                // symlink. The watcher does not enter these (`ancestors_state`),
+                // so the scan does not either: both skip, the safer way.
+                match entry.metadata() {
+                    Ok(meta) if attributes(&meta) & ATTR_REPARSE_POINT != 0 => continue,
+                    Ok(_) => {}
+                    Err(_) => {
+                        incomplete = true;
+                        continue;
+                    }
                 }
                 if depth + 1 > MAX_DEPTH {
                     incomplete = true;
@@ -750,6 +786,50 @@ mod tests {
             section("Skills", "Rust and Win32. "),
         ]
         .concat()
+    }
+
+    #[test]
+    fn a_stopped_scan_inserts_no_root_and_no_documents() {
+        let dir = scratch("stopped-scan");
+        fs::write(dir.join("a.md"), "# A\nstoppedscanword\n").unwrap();
+        let store = Store::in_memory();
+        scan_folder_until(&store, &dir, FUT, &|| true).unwrap();
+        assert_eq!(store.fts_hits("stoppedscanword").unwrap(), 0);
+        assert_eq!(
+            store.retire_default_roots_except(None).unwrap(),
+            0,
+            "the stopped scan must not have created the root"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scan_stopped_part_way_indexes_no_more_files_and_removes_nothing() {
+        let dir = scratch("stopped-midway");
+        fs::write(dir.join("a.md"), "# A\nmidwayone\n").unwrap();
+        fs::write(dir.join("b.md"), "# B\nmidwaytwo\n").unwrap();
+        let store = Store::in_memory();
+        scan_folder(&store, &dir, FUT).unwrap();
+        fs::remove_file(dir.join("a.md")).unwrap();
+        fs::write(dir.join("c.md"), "# C\nmidwaythree\n").unwrap();
+        let asked = std::cell::Cell::new(0);
+        // Not stopped for ensure_root and the first file, stopped after.
+        let stopped = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        };
+        scan_folder_until(&store, &dir, FUT, &stopped).unwrap();
+        assert_eq!(
+            store.fts_hits("midwaythree").unwrap(),
+            0,
+            "c.md is after the stop"
+        );
+        assert_eq!(
+            store.fts_hits("midwayone").unwrap(),
+            1,
+            "no deletes after the stop"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
