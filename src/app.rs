@@ -218,6 +218,83 @@ pub const WM_APP_NEED_SCREEN: u32 = WM_APP + 31;
 /// hosts the keyboard hook, which Windows drops if it stalls. `WM_APP + 32`.
 pub const WM_APP_TOOLTIP_SPEND: u32 = WM_APP + 32;
 
+/// #1199: posted by the worker that gathered the text for "Copy diagnostics"
+/// or "Copy egress log". `lparam` is a `Box<CopyTextResult>` the handler takes
+/// (a dropped message frees it). Gathering reads up to 10,000 store rows under
+/// the store's mutex and asks Windows about Ollama's port and process, so it
+/// runs off the message thread, which also hosts the keyboard hook; the
+/// clipboard is still set on the message thread. `WM_APP + 33`.
+pub const WM_APP_COPY_TEXT_RESULT: u32 = WM_APP + 33;
+
+/// Which tray command a [`CopyTextResult`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyKind {
+    Diagnostics,
+    EgressLog,
+}
+
+/// The gathered text of one copy command, on its way to the message thread.
+pub(crate) struct CopyTextResult {
+    pub kind: CopyKind,
+    pub text: String,
+}
+
+/// The card for a copy that reached the clipboard (#124, #106).
+fn copy_done_card(kind: CopyKind) -> (&'static str, &'static str) {
+    match kind {
+        CopyKind::Diagnostics => ("Diagnostics copied", "Paste them into a bug report."),
+        CopyKind::EgressLog => (
+            "Egress log copied",
+            "Every request this app has made, oldest first.",
+        ),
+    }
+}
+
+/// The headline of the card for a copy that failed.
+fn copy_failed_headline(kind: CopyKind) -> &'static str {
+    match kind {
+        CopyKind::Diagnostics => "Couldn't copy diagnostics",
+        CopyKind::EgressLog => "Couldn't copy the egress log",
+    }
+}
+
+/// Which copy gathers are running, one flag per command, so a click on the
+/// other command during a gather still gets its own text. A second click on the
+/// same command is refused and the card says it is still gathering.
+///
+/// A gather has no timeout: it only reads local sources (the store file, the
+/// port table, the registry), so it is expected to end. If one ever hangs, its
+/// flag stays set and that command shows "still working" until restart; the
+/// other command and the rest of the app are unaffected.
+#[derive(Default)]
+struct CopyTextGate([std::sync::atomic::AtomicBool; 2]);
+
+impl CopyTextGate {
+    fn slot(&self, kind: CopyKind) -> &std::sync::atomic::AtomicBool {
+        match kind {
+            CopyKind::Diagnostics => &self.0[0],
+            CopyKind::EgressLog => &self.0[1],
+        }
+    }
+
+    /// `true` when this call took the slot; `false` when `kind` is running.
+    fn claim(&self, kind: CopyKind) -> bool {
+        !self
+            .slot(kind)
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self, kind: CopyKind) {
+        self.slot(kind)
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+static COPY_TEXT_RUNNING: CopyTextGate = CopyTextGate([
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+]);
+
 /// The spend part of the tooltip as the last worker read it (#1181). Written
 /// by the worker, read by `update_tooltip` on the UI thread: no IO there.
 static TOOLTIP_SPEND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -5554,7 +5631,26 @@ impl App {
         human_error_detail(raw_chain)
     }
 
+    /// "Copy diagnostics" (#124). The report is gathered on a worker
+    /// ([`Self::start_copy_text`], #1199) and copied by `on_copy_text_result`.
     fn copy_diagnostics(&mut self) {
+        self.start_copy_text(CopyKind::Diagnostics);
+    }
+
+    /// Gathers the text for `kind` on a one-shot worker and posts it back as
+    /// `WM_APP_COPY_TEXT_RESULT` (#1199). The click is never silent: the
+    /// working card shows at once, and the answer or the failure replaces it.
+    fn start_copy_text(&mut self, kind: CopyKind) {
+        if !COPY_TEXT_RUNNING.claim(kind) {
+            // This command is already gathering: say so, never a silent click.
+            self.card
+                .show_pending(crate::ui::card::PendingStage::StillWorking);
+            return;
+        }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
+        // What the worker needs, taken here (the app's own state is not Sync).
+        let config = self.config.clone();
         let last_error = self
             .last_error
             .as_ref()
@@ -5566,21 +5662,54 @@ impl App {
                     .as_secs(),
                 chain: e.chain.clone(),
             });
-        let report = crate::diagnostics::render_report(&crate::diagnostics::collect(
-            &self.config,
-            last_error,
-        ));
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
-            Ok(()) => self.card.show_answer(
-                "Diagnostics copied",
-                "Paste them into a bug report.",
-                6,
-                None,
-            ),
+        let target = self.hwnd_isize();
+        let spawned = std::thread::Builder::new()
+            .name("copy-text".into())
+            .spawn(move || {
+                let text = match kind {
+                    CopyKind::Diagnostics => crate::diagnostics::render_report(
+                        &crate::diagnostics::collect(&config, last_error),
+                    ),
+                    CopyKind::EgressLog => crate::diagnostics::egress_report(),
+                };
+                COPY_TEXT_RUNNING.release(kind);
+                let payload = Box::into_raw(Box::new(CopyTextResult { kind, text }));
+                unsafe {
+                    if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(HWND(target as *mut _)),
+                        WM_APP_COPY_TEXT_RESULT,
+                        WPARAM(0),
+                        LPARAM(payload as isize),
+                    )
+                    .is_err()
+                    {
+                        // Window gone: nobody will take the box, so free it here.
+                        free_boxed_payload(WM_APP_COPY_TEXT_RESULT, LPARAM(payload as isize));
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            // No thread: say so on the card the click is looking at.
+            COPY_TEXT_RUNNING.release(kind);
+            let headline = copy_failed_headline(kind);
+            let detail = self.track_error(headline, &format!("starting the worker: {e}"));
+            self.card.show_error_with_details(headline, &detail);
+        }
+    }
+
+    /// The gathered text is here: put it on the clipboard (on this thread) and
+    /// say so.
+    fn on_copy_text_result(&mut self, result: CopyTextResult) {
+        let kind = result.kind;
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(result.text)) {
+            Ok(()) => {
+                let (headline, detail) = copy_done_card(kind);
+                self.card.show_answer(headline, detail, 6, None);
+            }
             Err(e) => {
-                let detail = self.track_error("Couldn't copy diagnostics", &format!("{e}"));
-                self.card
-                    .show_error_with_details("Couldn't copy diagnostics", &detail);
+                let headline = copy_failed_headline(kind);
+                let detail = self.track_error(headline, &format!("{e}"));
+                self.card.show_error_with_details(headline, &detail);
             }
         }
     }
@@ -5661,20 +5790,7 @@ impl App {
     /// `egress::read_all`/`render_human`/`read_all_human` reachable from a
     /// real user gesture rather than from tests only.
     fn copy_egress_log(&mut self) {
-        let report = crate::diagnostics::egress_report();
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(report)) {
-            Ok(()) => self.card.show_answer(
-                "Egress log copied",
-                "Every request this app has made, oldest first.",
-                6,
-                None,
-            ),
-            Err(e) => {
-                let detail = self.track_error("Couldn't copy the egress log", &format!("{e}"));
-                self.card
-                    .show_error_with_details("Couldn't copy the egress log", &detail);
-            }
-        }
+        self.start_copy_text(CopyKind::EgressLog);
     }
 
     /// Issue #328: "Check this PC for local models". Reads RAM, GPU, battery
@@ -6169,6 +6285,7 @@ impl App {
                 DeferredMessage::PauseToggle => self.toggle_pause(),
                 DeferredMessage::NeedScreen(run) => self.on_need_screen(run as usize),
                 DeferredMessage::TooltipSpend => self.on_tooltip_spend(),
+                DeferredMessage::CopyText(result) => self.on_copy_text_result(*result),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
                 }
@@ -9137,6 +9254,9 @@ enum DeferredMessage {
     /// `WM_APP_TOOLTIP_SPEND` (#1181): re-apply the stored spend text once the
     /// menu or dialog is gone, so the tooltip does not lag a request.
     TooltipSpend,
+    /// `WM_APP_COPY_TEXT_RESULT` (#1199): the text a copy command gathered,
+    /// copied once the menu, dialog or Settings is gone.
+    CopyText(Box<CopyTextResult>),
 }
 
 /// The card for a key the hook captured for a shortcut change that could not be
@@ -9535,6 +9655,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         // #1181: no payload; delivered after the modal so the tooltip does not
         // lag a request.
         | WM_APP_TOOLTIP_SPEND
+        // #1199: a copy the user asked for must end in a card, not vanish.
+        | WM_APP_COPY_TEXT_RESULT
         // #1013: the hook swallowed the key, so it ends in a card.
         | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
@@ -9817,6 +9939,9 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
         WM_APP_NEED_SCREEN => DeferredMessage::NeedScreen(wparam.0 as u64),
         WM_APP_TOOLTIP_SPEND => DeferredMessage::TooltipSpend,
+        WM_APP_COPY_TEXT_RESULT => {
+            DeferredMessage::CopyText(unsafe { Box::from_raw(lparam.0 as *mut CopyTextResult) })
+        }
         // #1011: tray menu only; see `tray_menu_policy`.
         WM_APP_ROUTER_RESULT => {
             let (generation, result) = unsafe {
@@ -9859,6 +9984,7 @@ fn free_boxed_payload(msg: u32, lparam: LPARAM) -> bool {
             WM_APP_MACHINE_CHECK_RESULT => {
                 drop(Box::from_raw(p as *mut crate::machine::MachineFacts))
             }
+            WM_APP_COPY_TEXT_RESULT => drop(Box::from_raw(p as *mut CopyTextResult)),
             WM_APP_FIRST_RUN => drop(Box::from_raw(p as *mut FirstRun)),
             WM_APP_ROUTER_RESULT => drop(Box::from_raw(
                 p as *mut (u64, std::result::Result<router::RouterResult, String>),
@@ -9953,7 +10079,9 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         // Settings is in front. Settings takes its own Change's chord before
         // it gets here, so this one belongs to the tray; it ends in a card.
         | WM_APP_LEARNED
-        | WM_APP_MACHINE_CHECK_RESULT => ForegroundPolicy::Hold,
+        | WM_APP_MACHINE_CHECK_RESULT
+        // #1199: the copy and its card wait until Settings is left.
+        | WM_APP_COPY_TEXT_RESULT => ForegroundPolicy::Hold,
         // Advisory updates for cards, the palette and the options card, none
         // of which is showing while Settings is.
         WM_APP_PENDING_STAGE
@@ -10577,6 +10705,11 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_tooltip_spend();
             LRESULT(0)
         }
+        WM_APP_COPY_TEXT_RESULT => {
+            let result = unsafe { *Box::from_raw(lparam.0 as *mut CopyTextResult) };
+            app.on_copy_text_result(result);
+            LRESULT(0)
+        }
         WM_APP_CALENDAR_RESULT => {
             let result =
                 unsafe { *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>) };
@@ -10878,6 +11011,7 @@ mod tests {
     use super::App;
     use super::BeginPlan;
     use super::WM_APP_CONFIG_WRITTEN;
+    use super::WM_APP_COPY_TEXT_RESULT;
     use super::WM_APP_FIRST_RUN;
     use super::WM_APP_TOOLTIP_SPEND;
     use super::{
@@ -11074,6 +11208,8 @@ mod tests {
             WM_APP_LEARNED,
             // #845: an on-demand verdict is still owed a card.
             WM_APP_MACHINE_CHECK_RESULT,
+            // #1199: a copy the user asked for is still owed its card.
+            WM_APP_COPY_TEXT_RESULT,
         ] {
             assert_eq!(settings_foreground_policy(id), P::Hold, "{id}");
         }
@@ -13454,6 +13590,116 @@ mod tests {
         ));
     }
 
+    /// #1199: a copy result dropped unhandled must free its boxed text.
+    #[test]
+    fn free_boxed_payload_frees_a_copy_text_result() {
+        let payload = Box::into_raw(Box::new(super::CopyTextResult {
+            kind: super::CopyKind::EgressLog,
+            text: "row".to_string(),
+        }));
+        assert!(super::free_boxed_payload(
+            super::WM_APP_COPY_TEXT_RESULT,
+            windows::Win32::Foundation::LPARAM(payload as isize)
+        ));
+    }
+
+    /// #1199: while a menu, a dialog or Settings has the loop the result is
+    /// kept (with its text), not dropped, so the click still ends in a card.
+    #[test]
+    fn a_copy_result_during_a_modal_loop_is_deferred_with_its_text() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        let payload = Box::into_raw(Box::new(super::CopyTextResult {
+            kind: super::CopyKind::Diagnostics,
+            text: "report".to_string(),
+        }));
+        let taken = super::take_deferred(
+            super::WM_APP_COPY_TEXT_RESULT,
+            WPARAM(0),
+            LPARAM(payload as isize),
+        );
+        match taken {
+            Some(super::DeferredMessage::CopyText(r)) => {
+                assert_eq!(r.kind, super::CopyKind::Diagnostics);
+                assert_eq!(r.text, "report");
+            }
+            _ => panic!("the copy result must be deferred"),
+        }
+    }
+
+    /// #1199 review: each command has its own gather, so a click on the other
+    /// one during a gather is not answered with the wrong text; a second click
+    /// on the same one is refused (the card then says it is still gathering).
+    #[test]
+    fn each_copy_command_has_its_own_gather() {
+        let gate = super::CopyTextGate::default();
+        assert!(gate.claim(super::CopyKind::Diagnostics));
+        assert!(!gate.claim(super::CopyKind::Diagnostics), "same twice");
+        assert!(
+            gate.claim(super::CopyKind::EgressLog),
+            "the other command runs alongside"
+        );
+        gate.release(super::CopyKind::Diagnostics);
+        assert!(gate.claim(super::CopyKind::Diagnostics), "free again");
+        assert!(!gate.claim(super::CopyKind::EgressLog));
+    }
+
+    #[test]
+    fn the_copy_cards_say_what_was_copied_without_em_dashes() {
+        for kind in [super::CopyKind::Diagnostics, super::CopyKind::EgressLog] {
+            let (headline, detail) = super::copy_done_card(kind);
+            let failed = super::copy_failed_headline(kind);
+            for text in [headline, detail, failed] {
+                assert!(!text.is_empty() && !text.contains('\u{2014}'), "{text}");
+            }
+        }
+        assert_eq!(
+            super::copy_done_card(super::CopyKind::Diagnostics).0,
+            "Diagnostics copied"
+        );
+        assert_eq!(
+            super::copy_done_card(super::CopyKind::EgressLog).0,
+            "Egress log copied"
+        );
+    }
+
+    /// #1199: the gathering (store rows, Ollama and monitor queries) runs on
+    /// the worker; the tray handlers only start it, and only the result
+    /// handler touches the clipboard. Fails if a handler gathers inline again.
+    #[test]
+    fn the_copy_commands_gather_on_a_worker_and_copy_on_the_message_thread() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let body_of = |name: &str| {
+            let at = src.find(name).unwrap_or_else(|| panic!("{name} exists"));
+            let rest = &src[at..];
+            let end = rest.find("\n    }\n").expect("fn end");
+            rest[..end].to_string()
+        };
+        for name in ["    fn copy_diagnostics(", "    fn copy_egress_log("] {
+            let body = body_of(name);
+            assert!(body.contains("start_copy_text("), "{name}");
+            for banned in ["collect(", "egress_report(", "arboard"] {
+                assert!(!body.contains(banned), "{name} must not call {banned}");
+            }
+        }
+        let start = body_of("    fn start_copy_text(");
+        assert!(start.contains("thread::Builder"), "{start}");
+        assert!(
+            start.contains("show_pending("),
+            "the click must show feedback"
+        );
+        assert!(start.contains("diagnostics::collect(") && start.contains("egress_report("));
+        assert!(start.contains("WM_APP_COPY_TEXT_RESULT"));
+        assert!(
+            !start.contains("arboard"),
+            "the clipboard is set on the UI thread"
+        );
+        assert!(
+            start.contains("Err(e) = spawned"),
+            "a failed spawn ends in a card"
+        );
+        assert!(body_of("    fn on_copy_text_result(").contains("arboard::Clipboard"));
+    }
+
     #[test]
     fn choosing_a_keyed_provider_with_no_key_needs_a_key() {
         use crate::config::{ActiveProvider as P, Providers};
@@ -14945,6 +15191,7 @@ mod tests {
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
         ("WM_APP_NEED_SCREEN", WM_APP_NEED_SCREEN),
         ("WM_APP_TOOLTIP_SPEND", WM_APP_TOOLTIP_SPEND),
+        ("WM_APP_COPY_TEXT_RESULT", WM_APP_COPY_TEXT_RESULT),
     ];
 
     // -- #1181: the tooltip's spend part is read off the UI thread -----------
@@ -16248,6 +16495,11 @@ mod tests {
         (
             "WM_APP_TOOLTIP_SPEND",
             WM_APP_TOOLTIP_SPEND,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_COPY_TEXT_RESULT",
+            WM_APP_COPY_TEXT_RESULT,
             SettingsReentrancy::Defer,
         ),
     ];
