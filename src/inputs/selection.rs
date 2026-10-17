@@ -327,6 +327,23 @@ fn resolve_is_password<E>(read: Result<bool, E>) -> bool {
     read.unwrap_or(true)
 }
 
+/// #433: whether the whole-text baseline read through `TextPattern` can be
+/// trusted for a later write. The write path reads the element's text through
+/// `ValuePattern` and refuses on any difference, and splices at offsets counted
+/// in the `TextPattern` text. If the two reads disagree (a provider that
+/// spells a paragraph break differently in each), every write would be refused
+/// as "changed" and the offsets would be wrong, so no target is offered.
+/// `value` is the `ValuePattern` read: `Ok(None)` means the element has no
+/// `ValuePattern` (nothing to compare, left as before); an `Err` read fails
+/// CLOSED (no target).
+fn baseline_agrees_with_value<E>(doc_text: &str, value: Result<Option<String>, E>) -> bool {
+    match value {
+        Ok(None) => true,
+        Ok(Some(v)) => v == doc_text,
+        Err(_) => false,
+    }
+}
+
 /// Truncates `text` to at most `max_chars` Unicode scalar values (never a
 /// byte count -- see the neighbouring test with multi-byte characters),
 /// returning the truncated flag the task brief asks for. `total ==
@@ -624,8 +641,8 @@ mod com {
     };
     use windows::Win32::UI::Accessibility::{
         IUIAutomation, IUIAutomationElement, IUIAutomationTextPattern, IUIAutomationTextRange,
-        TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, UIA_TextPattern2Id,
-        UIA_TextPatternId,
+        IUIAutomationValuePattern, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
+        UIA_TextPattern2Id, UIA_TextPatternId, UIA_ValuePatternId,
     };
 
     /// Same RAII pairing as `inputs::uia::com::ComApartment`, duplicated
@@ -794,6 +811,21 @@ mod com {
         let end = start + selection_text.encode_utf16().count();
 
         let full_text = unsafe { document_range.GetText(-1) }?.to_string();
+
+        // #433: the write path compares this baseline with the element's
+        // ValuePattern text, so no target unless the two reads agree.
+        let value = match unsafe { element.GetCurrentPattern(UIA_ValuePatternId) } {
+            Err(_) => Ok(None),
+            Ok(p) => match p.cast::<IUIAutomationValuePattern>() {
+                Err(_) => Err(()),
+                Ok(vp) => unsafe { vp.CurrentValue() }
+                    .map(|b| Some(b.to_string()))
+                    .map_err(|_| ()),
+            },
+        };
+        if !super::baseline_agrees_with_value(&full_text, value) {
+            anyhow::bail!("selection text differs between TextPattern and ValuePattern");
+        }
 
         let name = unsafe { element.CurrentName() }
             .map(|b| b.to_string())
@@ -1457,6 +1489,37 @@ mod tests {
             plan_from_probe(UiaProbe::FocusedIsPassword, DEFAULT_MAX_CHARS),
             SelectionPlan::SkipPasswordField
         );
+    }
+
+    #[test]
+    fn baseline_must_equal_the_value_pattern_text_or_no_target() {
+        // #433: TextPattern and ValuePattern text compared byte for byte.
+        assert!(baseline_agrees_with_value::<()>(
+            "a\r\nb",
+            Ok(Some("a\r\nb".into()))
+        ));
+        assert!(!baseline_agrees_with_value::<()>(
+            "a\r\nb",
+            Ok(Some("a\nb".into()))
+        ));
+        assert!(!baseline_agrees_with_value::<()>(
+            "a\u{FFFC}b",
+            Ok(Some("ab".into()))
+        ));
+        assert!(!baseline_agrees_with_value::<()>(
+            "a",
+            Ok(Some(String::new()))
+        ));
+    }
+
+    #[test]
+    fn baseline_check_fails_closed_when_the_value_read_errors() {
+        assert!(!baseline_agrees_with_value::<()>("a", Err(())));
+    }
+
+    #[test]
+    fn baseline_check_leaves_an_element_without_value_pattern_alone() {
+        assert!(baseline_agrees_with_value::<()>("a", Ok(None)));
     }
 
     #[test]
