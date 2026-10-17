@@ -101,7 +101,9 @@ fn truncate_front(s: &str, max_chars: usize) -> String {
 pub fn pending_status_text(stage: &PendingStage) -> String {
     match stage {
         PendingStage::AskingModel { model_name } => {
-            format!("Asking {}...", truncate(model_name, MAX_MODEL_NAME_CHARS))
+            // #817: a plain name ("Claude Haiku 5.5"), not the provider id.
+            let plain = crate::ui::palette_model::friendly_model_name(model_name);
+            format!("Asking {}...", truncate(&plain, MAX_MODEL_NAME_CHARS))
         }
         PendingStage::ReadingSelection => "Reading your selection...".to_string(),
         PendingStage::ReadingForm => "Reading the form...".to_string(),
@@ -188,8 +190,26 @@ mod tests {
             pending_status_text(&PendingStage::AskingModel {
                 model_name: "claude-haiku".to_string()
             }),
-            "Asking claude-haiku..."
+            "Asking Claude Haiku..."
         );
+    }
+
+    /// #817: the card says "Asking Claude Haiku 5.5...", not the provider id
+    /// "anthropic:claude-haiku-5-5..." the config uses.
+    #[test]
+    fn asking_model_shows_a_plain_name_not_the_provider_id() {
+        let text = |name: &str| {
+            pending_status_text(&PendingStage::AskingModel {
+                model_name: name.to_string(),
+            })
+        };
+        assert_eq!(
+            text("anthropic:claude-haiku-5-5"),
+            "Asking Claude Haiku 5.5..."
+        );
+        assert_eq!(text("openai:gpt-5.5"), "Asking GPT-5.5...");
+        assert_eq!(text("ollama:gemma3:4b"), "Asking gemma3:4b...");
+        assert!(!text("compat:some-self-hosted-model").contains("compat:"));
     }
 
     #[test]

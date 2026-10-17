@@ -1089,6 +1089,24 @@ impl Config {
         }
     }
 
+    /// #924: the config used for a session when [`Config::load`] failed (the
+    /// first-run file could not be created). Default settings, so Mode is Auto,
+    /// but with the stored keys and the env keys read the way `load` reads
+    /// them: without them a later save would see empty key fields and delete
+    /// the user's stored credentials.
+    pub fn defaults_after_failed_load() -> Config {
+        Self::defaults_after_failed_load_with(&CredManagerStore, &|name| std::env::var(name).ok())
+    }
+
+    fn defaults_after_failed_load_with(
+        store: &dyn SecretStore,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Config {
+        let mut config = Config::default();
+        config.hydrate_secrets(store);
+        config.apply_overrides_from(lookup);
+        config
+    }
     /// Moves any non-empty `api_key` out of `self` and into `store` (target
     /// `Wingman/<provider>`), blanking the field here in memory. Returns
     /// whether anything was blanked, so the caller knows whether the file
@@ -1935,7 +1953,7 @@ impl Providers {
     /// [`Providers::build_chain`]'s own behavior. The list
     /// `diagnostics::provider_rows` iterates (issue #201).
     pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
-        self.order
+        self.effective_order()
             .iter()
             .filter_map(|name| self.describe(name))
             .collect()
@@ -1948,13 +1966,37 @@ impl Providers {
     /// `hotkeys`/`capture`/`ui` along for no reason.
     pub fn build_chain(&self) -> Chain {
         let providers: Vec<Box<dyn Provider>> = self
-            .order
+            .effective_order()
             .iter()
             .filter_map(|name| self.provider_for(name))
             .collect();
         Chain::new(providers)
     }
 
+    /// #923: `order` as it is used at runtime. Gemini is not in the stock
+    /// order, and #780 stops an untouched Save from adding it, so a Gemini key
+    /// pasted on its own would never be used. When `order` is still the stock
+    /// pair (in either order, so choosing Anthropic as Active keeps this) and
+    /// Gemini is the only cloud provider with a key, it is appended here, in
+    /// memory only: the file is not rewritten. If OpenAI or Anthropic has a
+    /// key too, nothing is added, so a `GEMINI_API_KEY` set for another tool
+    /// never becomes a silent extra fallback that gets screenshots. An edited
+    /// order is a choice and is returned unchanged.
+    fn effective_order(&self) -> Vec<String> {
+        let mut order = self.order.clone();
+        let stock_pair = order.len() == 2
+            && order.iter().any(|n| n == "openai")
+            && order.iter().any(|n| n == "anthropic");
+        let keyed = |key: &str| !unreadable_as_empty(key).is_empty();
+        if stock_pair
+            && keyed(&self.gemini.api_key)
+            && !keyed(&self.openai.api_key)
+            && !keyed(&self.anthropic.api_key)
+        {
+            order.push("gemini".to_string());
+        }
+        order
+    }
     /// #133: whether a first press with no model ready may look for a local
     /// Ollama and adopt it. Only for a setup the user has not shaped: Cloud
     /// mode is a choice to use the cloud, an `order` that already names
@@ -2019,7 +2061,12 @@ impl Providers {
     /// requests through. Kept as the one place both callers share so they
     /// can never disagree about which providers `mode` allows.
     pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
-        crate::mode::select_providers(mode, &self.order, ollama_ready, &self.local_compat_names())
+        crate::mode::select_providers(
+            mode,
+            &self.effective_order(),
+            ollama_ready,
+            &self.local_compat_names(),
+        )
     }
 
     /// #16: a compat endpoint's locality is decided by its configured
@@ -2877,6 +2924,91 @@ model = "gpt-5.5"
         }
     }
 
+    /// #923: a Gemini key on a stock order is reachable without anyone
+    /// editing `providers.order` (#780 keeps an untouched Save from adding it).
+    #[test]
+    fn a_gemini_key_on_the_stock_order_is_reachable_in_every_cloud_path() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        assert_eq!(p.order, Providers::default().order, "the file is untouched");
+        assert_eq!(
+            p.build_chain_for_mode(Mode::Cloud, false).provider_names(),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Auto, false),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.build_chain().ready_provider_names(),
+            vec!["gemini"],
+            "the mode-agnostic chain sees it too"
+        );
+        assert_eq!(p.order, Providers::default().order, "never rewritten");
+    }
+
+    #[test]
+    fn a_gemini_entry_without_a_key_is_not_added_to_the_stock_order() {
+        let p = Config::default().providers;
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+        let mut unreadable = Config::default().providers;
+        unreadable.gemini.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert_eq!(
+            unreadable.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+    }
+
+    /// A Gemini key set globally for another tool must not become a silent
+    /// extra fallback: Gemini is added only when no other cloud provider has a
+    /// key, in either order of the stock pair (choosing Anthropic as Active
+    /// makes it anthropic, openai).
+    #[test]
+    fn gemini_is_added_only_when_it_is_the_only_keyed_cloud_provider() {
+        for order in [["openai", "anthropic"], ["anthropic", "openai"]] {
+            let mut p = Config::default().providers;
+            p.order = order.iter().map(|s| s.to_string()).collect();
+            p.gemini.api_key = "g-key".to_string();
+            let mut expected: Vec<String> = p.order.clone();
+            expected.push("gemini".to_string());
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), expected);
+            p.openai.api_key = "o-key".to_string();
+            assert_eq!(
+                p.selected_order_for_mode(Mode::Cloud, false),
+                order,
+                "another keyed provider: no gemini"
+            );
+            p.openai.api_key.clear();
+            p.anthropic.api_key = "a-key".to_string();
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), order);
+        }
+    }
+    /// A hand-edited order is a choice: a keyed vendor the user left out
+    /// stays out, so a screenshot never goes to a vendor they removed.
+    #[test]
+    fn a_hand_edited_order_is_never_widened_by_a_gemini_key() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        p.order = vec!["anthropic".to_string()];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["anthropic"]
+        );
+        p.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+        ];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic", "gemini"],
+            "no duplicate when it is already listed"
+        );
+    }
+
     #[test]
     fn build_chain_for_mode_cloud_excludes_ollama() {
         let mut config = Config::default();
@@ -3332,6 +3464,31 @@ structured = "prompt"
         );
     }
 
+    /// #924: the defaults used after a failed first-run load carry the stored
+    /// keys, and saving them never deletes a stored credential.
+    #[test]
+    fn defaults_after_a_failed_load_keep_stored_keys_and_a_save_never_deletes_them() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-stored").unwrap();
+        let config = Config::defaults_after_failed_load_with(&store, &|_| None);
+        assert_eq!(config.providers.openai.api_key, "sk-stored");
+        assert_eq!(config.mode, Mode::Auto);
+
+        let path = scratch_path("924-failed-load-save");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Whether this save is allowed or refused, the credential must stay.
+        let _ = config.save_with_store(&path, &store, &|_| false);
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-stored")
+        );
+        cleanup(&path);
+
+        let env = Config::defaults_after_failed_load_with(&store, &|n| {
+            (n == "ANTHROPIC_API_KEY").then(|| "sk-env".to_string())
+        });
+        assert_eq!(env.providers.anthropic.api_key, "sk-env");
+    }
     #[test]
     fn push_secrets_to_store_deletes_the_compat_credential_when_the_field_is_cleared() {
         let mut config = Config::default();
