@@ -7990,6 +7990,9 @@ mod tests {
             inner.hwnd = hwnd;
             inner.font = font;
             inner.adopt(built);
+            // The Ollama group is on the Models page; its button only shows
+            // while that page does.
+            unsafe { show_page(inner, Page::Models) };
             inner.ollama_status.clone()
         };
         let alive = unsafe { &*raw }.alive.clone();
