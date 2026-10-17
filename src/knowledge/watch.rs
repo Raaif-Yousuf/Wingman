@@ -796,6 +796,11 @@ fn watch(
             // The store file was replaced: read the root id again and index
             // the whole folder into the fresh database (an overflow is
             // exactly that: one rescan).
+            // A stop that arrived with the swap wins: a retired root must not
+            // come back (#1072).
+            if stop_requested(stop) {
+                return;
+            }
             root_id = match store.ensure_root(&root_key, ingest::now_unix()) {
                 Ok(id) => id,
                 Err(e) => {
@@ -1505,8 +1510,6 @@ mod tests {
         let watcher = start_with(&dir.to_string_lossy(), move || Ok(for_thread))
             .unwrap()
             .expect("a thread starts for a set folder");
-        let root = ingest::canonical_root(&dir).unwrap();
-        let key = root.to_string_lossy().into_owned();
 
         fs::write(dir.join("a.md"), "# A\nswapfirstword here\n").unwrap();
         wait_for("a.md indexed", Duration::from_secs(10), || {
@@ -1515,16 +1518,22 @@ mod tests {
 
         // The file is replaced under the running watcher, then healed by the
         // next use of the store (as a card or an ask would do).
+        let swaps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _count = store.on_replaced({
+            let swaps = Arc::clone(&swaps);
+            Arc::new(move || {
+                swaps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
         store.damage_file_for_test();
         let _ = store.fts_hits("swapfirstword");
         let _ = store.fts_hits("swapfirstword");
-        assert_eq!(
-            store
-                .documents_in_root(store.ensure_root(&key, 0).unwrap())
-                .unwrap()
-                .len(),
-            0,
-            "the fresh database starts empty"
+        // The swap happened. (Whether the fresh file is still empty is not
+        // asserted: the watcher may already have indexed into it.)
+        wait_for(
+            "the store file was replaced",
+            Duration::from_secs(5),
+            || swaps.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         );
 
         // No file changed: the swap alone brings the documents back.
