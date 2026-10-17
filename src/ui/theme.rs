@@ -479,6 +479,9 @@ pub(crate) const PADDING_DP: i32 = SPACE_LG_DP;
 pub(crate) const GAP_DP: i32 = SPACE_SM_DP;
 /// Corner radius of owner-drawn controls, in dp.
 pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
+/// Space between a dropdown combo's border and its text, in dp (Windows 11
+/// leaves 8 on each side).
+pub(crate) const COMBO_TEXT_PAD_DP: i32 = SPACE_SM_DP;
 /// Thickness of the accent line under a focused text box, in dp (the
 /// Windows 11 text box underline).
 pub(crate) const FOCUS_LINE_DP: i32 = 2;

@@ -195,8 +195,8 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Knowledge {
-    /// Absolute path of a folder whose .txt and .md files Wingman indexes at
-    /// start-up so they can be searched. The text stays on this PC. Wingman
+    /// Absolute path of a folder whose text files (.txt, .md, .html, .csv, .json)
+    /// Wingman indexes, and then watches, so they can be searched. The text stays on this PC. Wingman
     /// never creates the folder. Empty: off.
     pub folder: String,
 }

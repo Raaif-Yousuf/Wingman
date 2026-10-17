@@ -634,13 +634,13 @@ impl Card {
     }
 
     /// The UI gallery's expanded answer: what a click on the card does.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn expand_for_gallery(&mut self) {
         self.inner.try_expand();
     }
 
     /// The UI gallery's focus rectangle: what the first Tab does.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn focus_first_link_for_gallery(&mut self) {
         self.inner.move_footer_focus(false);
     }
@@ -1744,6 +1744,9 @@ impl CardInner {
         let fresh = build_fonts(self.dpi, self.text_scale);
         let old = std::mem::replace(&mut self.fonts, fresh);
         old.delete();
+        if let Some(ui) = self.options.as_ref() {
+            ui.invalidate_metrics();
+        }
     }
 
     /// Clamps and applies a new text-scale multiplier, then rebuilds fonts
@@ -4725,6 +4728,7 @@ impl CardInner {
         y += btn_h;
 
         let window_h = y + padding;
+        let esc_hint_rect = esc_hint_rect(content_left, do_it.left, do_it.top, btn_h, gap, edit);
 
         PreviewLayoutMetrics {
             width,
@@ -4732,6 +4736,7 @@ impl CardInner {
             title_rect,
             error_rect,
             note_rect,
+            esc_hint_rect,
             rows,
             buttons: PreviewButtonMetrics { do_it, edit },
         }
@@ -4860,6 +4865,17 @@ impl CardInner {
             }
         }
 
+        if let Some(rect) = metrics.esc_hint_rect {
+            SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
+            SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
+            draw_text_line(
+                hdc,
+                PREVIEW_ESC_HINT,
+                rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+
         if let (Some(rect), Some(note)) = (metrics.note_rect, preview.note.as_deref()) {
             SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.hint));
@@ -4934,6 +4950,33 @@ fn label_column_width(measured: &[i32], min_w: i32, max_w: i32) -> i32 {
     let max_w = max_w.max(min_w);
     let widest = measured.iter().copied().max().unwrap_or(min_w);
     widest.clamp(min_w, max_w)
+}
+
+/// The quiet caption on the left of the preview's button row (#817): Esc closes
+/// the card, and nothing else on it says so.
+const PREVIEW_ESC_HINT: &str = "Esc to close";
+
+/// Where the caption goes: the free left side of the button row, a gap short
+/// of the confirm button, as tall as the button. `None` when the Edit button
+/// has that side, or when no room is left.
+fn esc_hint_rect(
+    content_left: i32,
+    do_it_left: i32,
+    row_top: i32,
+    row_h: i32,
+    gap: i32,
+    edit: Option<RECT>,
+) -> Option<RECT> {
+    if edit.is_some() {
+        return None;
+    }
+    let right = do_it_left - gap;
+    (right > content_left).then_some(RECT {
+        left: content_left,
+        top: row_top,
+        right,
+        bottom: row_top + row_h,
+    })
 }
 
 const ID_PREVIEW_DO_IT: i32 = 3900;
@@ -5058,6 +5101,9 @@ struct PreviewLayoutMetrics {
     error_rect: Option<RECT>,
     /// #228: where the footer note goes, `None` when there is none.
     note_rect: Option<RECT>,
+    /// #817: where the quiet "Esc to close" caption goes, `None` when the Edit
+    /// button already fills the left side of the button row.
+    esc_hint_rect: Option<RECT>,
     /// Same length and order as the `fields` slice `compute_preview_layout`
     /// was called with.
     rows: Vec<PreviewRowMetrics>,
@@ -7859,6 +7905,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- the preview's "Esc to close" caption (#817) ----------------------------
+
+    #[test]
+    fn the_esc_caption_sits_left_of_the_confirm_button_when_there_is_no_edit_button() {
+        let r = esc_hint_rect(16, 220, 100, 32, 8, None).expect("room for it");
+        assert_eq!(r.left, 16);
+        assert_eq!(r.right, 220 - 8, "a gap short of the confirm button");
+        assert_eq!((r.top, r.bottom), (100, 132), "as tall as the button row");
+    }
+
+    #[test]
+    fn no_esc_caption_when_the_edit_button_fills_the_left() {
+        let edit = RECT {
+            left: 16,
+            top: 100,
+            right: 100,
+            bottom: 132,
+        };
+        assert!(esc_hint_rect(16, 220, 100, 32, 8, Some(edit)).is_none());
+    }
+
+    #[test]
+    fn no_esc_caption_when_there_is_no_room() {
+        assert!(esc_hint_rect(16, 20, 100, 32, 8, None).is_none());
+    }
+
+    #[test]
+    fn the_caption_has_no_em_dash_and_names_the_key() {
+        assert!(!PREVIEW_ESC_HINT.contains('\u{2014}'));
+        assert!(PREVIEW_ESC_HINT.contains("Esc"));
+    }
+
+    #[test]
+    fn a_preview_without_edit_gets_the_caption_beside_do_it_and_inside_the_card() {
+        let card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let fields = vec![];
+        let m = card.inner.compute_preview_layout(&fields, false);
+        let hint = m.esc_hint_rect.expect("caption with no Edit button");
+        assert!(hint.right <= m.buttons.do_it.left, "never over Do it");
+        assert!(hint.left >= 0 && hint.bottom <= m.window_h);
+        assert_eq!(hint.top, m.buttons.do_it.top);
+        let with_edit = card.inner.compute_preview_layout(&fields, true);
+        assert!(with_edit.esc_hint_rect.is_none());
     }
 
     // -- preview_key_command: pure keyboard mapping (#26) --------------------

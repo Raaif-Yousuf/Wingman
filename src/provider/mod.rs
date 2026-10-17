@@ -778,10 +778,11 @@ impl Chain {
         self
     }
 
-    /// #792: gives the chain a deadline. A call already in flight cannot be
-    /// interrupted (blocking HTTP), but once the deadline has passed the chain
-    /// starts no further provider and sends no repair request, so a hint
-    /// nobody is waiting for is never billed twice.
+    /// #792: gives the chain a deadline. Once it has passed the chain starts no
+    /// further provider and sends no repair request, so a hint nobody is
+    /// waiting for is never billed twice. #843: a call already in flight has
+    /// its HTTP timeout capped to what is left of it, and no retry starts
+    /// after it.
     pub fn with_deadline(mut self, deadline: std::time::Instant) -> Self {
         self.deadline = Some(deadline);
         self
@@ -1240,6 +1241,9 @@ fn attempt_provider<T>(
     parse: &mut impl FnMut(&Completion) -> anyhow::Result<T>,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<T> {
+    // #843: the deadline also caps the HTTP timeout of both the call and the
+    // repair request below, so neither outlives it by a provider's full timeout.
+    let _deadline = common::scope_call_deadline(deadline);
     let completion = provider.complete(req)?;
 
     match parse(&completion) {
@@ -1655,7 +1659,7 @@ mod tests {
         // nobody waits for).
         static SECOND_CALLS: AtomicU32 = AtomicU32::new(0);
         fn slow_failure() -> anyhow::Result<Completion> {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(450));
             Err(anyhow::anyhow!("slow provider failed"))
         }
         fn counted_ok() -> anyhow::Result<Completion> {
@@ -1675,7 +1679,7 @@ mod tests {
             result: counted_ok,
         };
         let chain = Chain::new(vec![Box::new(a), Box::new(b)])
-            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(400));
         let err = chain
             .complete_parsed(&req(), |c| parse_answer(&c.text))
             .unwrap_err();
@@ -1691,7 +1695,7 @@ mod tests {
     fn the_fallback_path_also_stops_at_the_deadline() {
         static SECOND_CALLS: AtomicU32 = AtomicU32::new(0);
         fn slow_failure() -> anyhow::Result<Completion> {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(450));
             Err(anyhow::anyhow!("slow provider failed"))
         }
         fn counted_ok() -> anyhow::Result<Completion> {
@@ -1701,7 +1705,7 @@ mod tests {
         let a = VisionAwareProvider::new("a", true, slow_failure);
         let b = VisionAwareProvider::new("b", true, counted_ok);
         let chain = Chain::new(vec![Box::new(a), Box::new(b)])
-            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(400));
         let result = chain.complete_parsed_with_fallback(
             &req(),
             || Ok(non_vision_inputs_for_test()),
@@ -1718,7 +1722,7 @@ mod tests {
         static CALLS: AtomicU32 = AtomicU32::new(0);
         fn slow_unparseable() -> anyhow::Result<Completion> {
             CALLS.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(450));
             Ok(Completion {
                 text: r#"{"not":"an answer"}"#.to_string(),
                 usage: None,
@@ -1732,7 +1736,7 @@ mod tests {
             result: slow_unparseable,
         };
         let chain = Chain::new(vec![Box::new(a)])
-            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(30));
+            .with_deadline(std::time::Instant::now() + std::time::Duration::from_millis(400));
         assert!(chain
             .complete_parsed(&req(), |c| parse_answer(&c.text))
             .is_err());

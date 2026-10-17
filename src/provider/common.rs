@@ -71,6 +71,66 @@ pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce
     f()
 }
 
+// ---------------------------------------------------------------------
+// Call deadline (#843)
+//
+// The router chain stops starting calls at its wall clock, but a call
+// already in flight used to run to its own 90 s or 180 s HTTP timeout, and
+// could be billed after the palette gave up. `Chain` now scopes a deadline
+// around each provider attempt; the completion entry points (`post_json_with`
+// and `post_json_with_connect_timeout`) cap their timeout to what is left of
+// it. The model download, model list and GET helpers are not part of a chain
+// attempt and are deliberately uncapped. A thread-local (like `SEND_AUTHORIZED`) keeps
+// `Request` and every provider unchanged: the attempt runs on one thread,
+// blocking, and nothing here starts a timer or a thread.
+// ---------------------------------------------------------------------
+
+thread_local! {
+    static CALL_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// Restores the previous deadline when dropped, panic-unwind included.
+pub(crate) struct CallDeadlineScope(Option<std::time::Instant>);
+
+impl Drop for CallDeadlineScope {
+    fn drop(&mut self) {
+        CALL_DEADLINE.with(|c| c.set(self.0));
+    }
+}
+
+/// Puts `deadline` (if any) in force for this thread until the returned guard
+/// drops. A nested scope never loosens an outer one: the earlier deadline wins.
+pub(crate) fn scope_call_deadline(deadline: Option<std::time::Instant>) -> CallDeadlineScope {
+    let previous = CALL_DEADLINE.with(Cell::get);
+    let effective = match (previous, deadline) {
+        (Some(p), Some(d)) => Some(p.min(d)),
+        (p, d) => p.or(d),
+    };
+    CALL_DEADLINE.with(|c| c.set(effective));
+    CallDeadlineScope(previous)
+}
+
+/// `timeout`, capped to what is left of this thread's call deadline. `None`
+/// means the deadline has passed, so nothing may be sent (fail closed: a
+/// request nobody waits for is never started or billed).
+fn cap_to_call_deadline(timeout: Duration) -> Option<Duration> {
+    match CALL_DEADLINE.with(Cell::get) {
+        None => Some(timeout),
+        Some(d) => {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            (!left.is_zero()).then(|| timeout.min(left))
+        }
+    }
+}
+
+fn call_deadline_passed() -> bool {
+    cap_to_call_deadline(Duration::MAX).is_none()
+}
+
+fn call_deadline_error(tag: &str) -> anyhow::Error {
+    anyhow!("{tag}: the time limit for this request passed, so it was not sent")
+}
+
 /// #105: refuses to proceed when `config::egress_preview_enabled()` is on
 /// and this thread has no live [`with_send_authorized`] scope. No em dash
 /// (rule 11) -- this text reaches the result card verbatim.
@@ -660,6 +720,10 @@ pub(crate) fn post_json_with(
         // timeout (the default policy's is), but a second or third attempt
         // only gets whatever remains.
         let attempt_timeout = timeout.min(wall_clock_remaining());
+        // #843: and by the chain's call deadline, if it set one.
+        let Some(attempt_timeout) = cap_to_call_deadline(attempt_timeout) else {
+            return Err(call_deadline_error(tag));
+        };
         // #106: this attempt is a retry iff an earlier attempt in THIS call
         // already failed and asked for another try (a transport/5xx retry
         // bumps `retries`, a 429 retry-after sets `retried_429`) -- read
@@ -695,6 +759,7 @@ pub(crate) fn post_json_with(
                 if retries < policy.max_retries
                     && !backoff_remaining.is_zero()
                     && wall_clock_remaining() > policy.retry_floor
+                    && !call_deadline_passed()
                 {
                     let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                     env.sleeper.sleep(delay);
@@ -719,7 +784,10 @@ pub(crate) fn post_json_with(
                         return Err(http_error(tag, 429, &resp.body));
                     }
                     let retry_after = parse_retry_after(&resp.headers, env.clock);
-                    if !retried_429 && wall_clock_remaining() > policy.retry_floor {
+                    if !retried_429
+                        && wall_clock_remaining() > policy.retry_floor
+                        && !call_deadline_passed()
+                    {
                         if let Some(delay) = retry_after {
                             if delay <= policy.max_retry_after {
                                 env.sleeper.sleep(delay);
@@ -736,6 +804,7 @@ pub(crate) fn post_json_with(
                     if retries < policy.max_retries
                         && !backoff_remaining.is_zero()
                         && wall_clock_remaining() > policy.retry_floor
+                        && !call_deadline_passed()
                     {
                         let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                         env.sleeper.sleep(delay);
@@ -1373,6 +1442,14 @@ pub(crate) fn post_json_with_connect_timeout(
     // #191: no retry loop here (Ollama is local/loopback and unbilled), so
     // an attempt logged from this function is never a retry.
     let bytes_sent = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+
+    // #843: both phases are capped to the chain's call deadline, if any.
+    let (Some(connect_timeout), Some(total_timeout)) = (
+        cap_to_call_deadline(connect_timeout),
+        cap_to_call_deadline(total_timeout),
+    ) else {
+        return Err(call_deadline_error(tag));
+    };
 
     let mut builder = ureq::post(url);
     for (name, value) in headers {
@@ -3692,6 +3769,161 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    // -- #843: a call deadline reaches the HTTP timeout ---------------------
+
+    /// Records the timeout each attempt was given and optionally sleeps, then
+    /// answers with a scripted pre-response failure.
+    struct TimeoutProbe {
+        seen: Mutex<Vec<Duration>>,
+        sleep: Duration,
+    }
+
+    impl Transport for TimeoutProbe {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &Value,
+            timeout: Duration,
+        ) -> std::result::Result<RawResponse, TransportError> {
+            self.seen.lock().unwrap().push(timeout);
+            std::thread::sleep(self.sleep);
+            no_response("connection reset")
+        }
+    }
+
+    fn probe_call(
+        probe: &TimeoutProbe,
+        sleeper: &RecordingSleeper,
+        timeout: Duration,
+    ) -> Result<String> {
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: probe,
+            sleeper,
+            clock: &FixedClock(0),
+            policy: &policy,
+        };
+        post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            json!({}),
+            timeout,
+            "anthropic",
+        )
+    }
+
+    #[test]
+    fn a_call_deadline_caps_the_attempt_timeout() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::ZERO,
+        };
+        let _scope =
+            scope_call_deadline(Some(std::time::Instant::now() + Duration::from_millis(400)));
+        let _ = probe_call(&probe, &RecordingSleeper::new(), Duration::from_secs(90));
+        let first = probe.seen.lock().unwrap()[0];
+        assert!(first <= Duration::from_millis(400), "got {first:?}");
+    }
+
+    #[test]
+    fn without_a_call_deadline_the_requested_timeout_is_used() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::ZERO,
+        };
+        let _ = probe_call(&probe, &RecordingSleeper::new(), Duration::from_secs(1));
+        assert_eq!(probe.seen.lock().unwrap()[0], Duration::from_secs(1));
+    }
+
+    #[test]
+    fn no_retry_starts_after_the_call_deadline() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::from_millis(80),
+        };
+        let sleeper = RecordingSleeper::new();
+        let _scope =
+            scope_call_deadline(Some(std::time::Instant::now() + Duration::from_millis(30)));
+        let result = probe_call(&probe, &sleeper, Duration::from_secs(90));
+        assert!(result.is_err());
+        assert_eq!(probe.seen.lock().unwrap().len(), 1, "no second attempt");
+        assert!(sleeper.recorded().is_empty(), "no backoff sleep either");
+    }
+
+    #[test]
+    fn a_call_deadline_already_past_sends_nothing() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::ZERO,
+        };
+        let past = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("clock is past 5 ms");
+        let _scope = scope_call_deadline(Some(past));
+        let err =
+            probe_call(&probe, &RecordingSleeper::new(), Duration::from_secs(90)).unwrap_err();
+        assert!(probe.seen.lock().unwrap().is_empty());
+        assert!(format!("{err:#}").contains("time limit"), "{err:#}");
+    }
+
+    #[test]
+    fn the_scope_restores_the_previous_deadline_and_keeps_the_earlier_one() {
+        let now = std::time::Instant::now();
+        let outer = now + Duration::from_secs(5);
+        {
+            let _a = scope_call_deadline(Some(outer));
+            {
+                let _b = scope_call_deadline(Some(now + Duration::from_secs(60)));
+                assert_eq!(
+                    CALL_DEADLINE.with(Cell::get),
+                    Some(outer),
+                    "later one never loosens"
+                );
+            }
+            assert_eq!(CALL_DEADLINE.with(Cell::get), Some(outer));
+        }
+        assert_eq!(CALL_DEADLINE.with(Cell::get), None);
+    }
+
+    /// The real thing: a server that accepts and never answers. With a 300 ms
+    /// call deadline the Ollama-style call (30 s total timeout) is abandoned
+    /// at about that time instead of at its own timeout.
+    #[test]
+    fn a_silent_server_is_abandoned_at_the_call_deadline() {
+        let _g = network_guard();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let held = listener.accept();
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let result = {
+            let _scope = scope_call_deadline(Some(started + Duration::from_millis(300)));
+            post_json_with_connect_timeout(
+                &format!("http://127.0.0.1:{port}/api/chat"),
+                &[],
+                json!({}),
+                Duration::from_secs(3),
+                Duration::from_secs(30),
+                "ollama",
+            )
+        };
+        let took = started.elapsed();
+        let _ = stop_tx.send(());
+        let _ = server.join();
+        assert!(result.is_err());
+        assert!(took < Duration::from_secs(3), "took {took:?}");
     }
 
     // -- #941 / #942: one shared HTTP error builder -------------------------
