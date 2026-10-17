@@ -11063,29 +11063,58 @@ mod tests {
     #[test]
     fn opening_the_palette_sends_no_model_request() {
         let src = lf(include_str!("app.rs"));
-        let start = src
-            .find("    fn toggle_palette(&mut self) {")
-            .expect("toggle_palette exists");
-        let body = &src[start..];
-        let end = body.find("\n    }\n").expect("toggle_palette ends");
-        let body = &body[..end];
-        assert!(
-            body.contains("palette.show("),
-            "the scan found the wrong body"
-        );
-        for forbidden in [
-            "show_options_card",
-            "router_worker",
-            "capture::",
-            "grab_raw",
-            "thread::spawn",
-            "set_router_pending",
-        ] {
-            assert!(
-                !body.contains(forbidden),
-                "toggle_palette starts a request again: {forbidden}"
-            );
+        // The body of `fn name(&mut self` or `fn name(&self`, up to the first
+        // method-closing brace.
+        let body_of = |name: &str| -> Option<String> {
+            let start = ["(&mut self", "(&self"]
+                .iter()
+                .find_map(|recv| src.find(&format!("    fn {name}{recv}")))?;
+            let body = &src[start..];
+            Some(body[..body.find("\n    }\n")?].to_owned())
+        };
+        // Everything `toggle_palette` reaches through `self.helper(` calls
+        // defined in this file, so a request hidden behind a new helper is
+        // found too (#886).
+        let mut todo = vec!["toggle_palette".to_owned()];
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(name) = todo.pop() {
+            if seen.contains(&name) {
+                continue;
+            }
+            let Some(body) = body_of(&name) else {
+                continue;
+            };
+            if name == "toggle_palette" {
+                assert!(
+                    body.contains("palette.show("),
+                    "the scan found the wrong body"
+                );
+            }
+            for forbidden in [
+                "show_options_card",
+                "router_worker",
+                "capture::",
+                "grab_raw",
+                "thread::spawn",
+                "set_router_pending",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "opening the palette starts a request again, in {name}: {forbidden}"
+                );
+            }
+            for (i, _) in body.match_indices("self.") {
+                let rest = &body[i + 5..];
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                if rest[end..].starts_with('(') {
+                    todo.push(rest[..end].to_owned());
+                }
+            }
+            seen.push(name);
         }
+        assert!(seen.len() > 1, "the scan followed no helper calls");
     }
 
     /// #723: the stuck bound covers every provider in a chain at its own
