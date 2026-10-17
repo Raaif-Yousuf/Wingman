@@ -1300,12 +1300,15 @@ fn fill_focus_line_d2d(
 
 /// Draws a paint list with GDI into `hdc`, whose client area is `client`:
 /// the `WM_PRINTCLIENT` picture, and the fallback when Direct2D is missing.
-/// Corners are GDI's `RoundRect`, as everywhere else in the app.
-fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
+/// Filled and stroked rounded shapes are anti-aliased (#989), except in high
+/// contrast, where they are GDI's plain `RoundRect` so every pixel is a system
+/// colour.
+fn paint_ops_gdi(hdc: HDC, dpi: u32, theme: Theme, client: RECT, ops: &[Op]) {
     use windows::Win32::Graphics::Gdi::{
-        CombineRgn, CreatePen, CreateRectRgn, CreateRoundRectRgn, FillRgn, GetStockObject,
-        RoundRect, DT_CENTER, NULL_BRUSH, PS_INSIDEFRAME, RGN_AND, RGN_DIFF, RGN_ERROR,
+        CombineRgn, CreateRectRgn, CreateRoundRectRgn, FillRgn, GetStockObject, DT_CENTER,
+        NULL_BRUSH, RGN_AND, RGN_DIFF, RGN_ERROR,
     };
+    let smooth = theme != Theme::HighContrast;
     unsafe {
         SetBkMode(hdc, TRANSPARENT);
         let body = gdi_font(dpi, FW_NORMAL.0 as i32);
@@ -1325,27 +1328,8 @@ fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
                     radius,
                     color,
                 } => {
-                    // The pen is the fill's own colour, drawn inside the
-                    // rectangle, so the shape is exactly `rect`.
-                    let brush = CreateSolidBrush(COLORREF(*color));
-                    let pen = CreatePen(PS_INSIDEFRAME, 1, COLORREF(*color));
-                    let (ob, op_) = (
-                        SelectObject(hdc, HGDIOBJ(brush.0)),
-                        SelectObject(hdc, HGDIOBJ(pen.0)),
-                    );
-                    let _ = RoundRect(
-                        hdc,
-                        rect.left,
-                        rect.top,
-                        rect.right,
-                        rect.bottom,
-                        radius * 2,
-                        radius * 2,
-                    );
-                    SelectObject(hdc, ob);
-                    SelectObject(hdc, op_);
-                    let _ = DeleteObject(pen.into());
-                    let _ = DeleteObject(brush.into());
+                    // Smoothed corners: `RoundRect` has no anti-aliasing (#989).
+                    crate::ui::round_rect::paint(hdc, *rect, *radius, Some(*color), None, smooth);
                 }
                 Op::StrokeRound {
                     rect,
@@ -1353,19 +1337,14 @@ fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
                     width,
                     color,
                 } => {
-                    let pen = CreatePen(PS_INSIDEFRAME, *width, COLORREF(*color));
-                    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
-                    let _ = RoundRect(
+                    crate::ui::round_rect::paint(
                         hdc,
-                        rect.left,
-                        rect.top,
-                        rect.right,
-                        rect.bottom,
-                        radius * 2,
-                        radius * 2,
+                        *rect,
+                        *radius,
+                        None,
+                        Some((*color, *width)),
+                        smooth,
                     );
-                    SelectObject(hdc, old_pen);
-                    let _ = DeleteObject(pen.into());
                 }
                 Op::FocusLine {
                     rect,
@@ -1895,7 +1874,7 @@ impl PaletteInner {
                 colors: &self.colors,
             },
         );
-        paint_ops_gdi(hdc, self.dpi, rc, &ops);
+        paint_ops_gdi(hdc, self.dpi, self.theme, rc, &ops);
     }
 
     fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -2195,7 +2174,7 @@ mod tests {
                 let mem = CreateCompatibleDC(Some(screen));
                 let bmp = CreateCompatibleBitmap(screen, w, h);
                 let old = SelectObject(mem, bmp.into());
-                paint_ops_gdi(mem, dpi, client, &ops);
+                paint_ops_gdi(mem, dpi, Theme::Dark, client, &ops);
                 for y in (b.bottom - radius)..b.bottom {
                     for x in b.left..(b.left + radius) {
                         if GetPixel(mem, x, y).0 == colors.focus_line {
@@ -3494,5 +3473,62 @@ mod tests {
             avg < 100.0,
             "#25's Done-when is under 100 ms; measured avg {avg:.2} ms"
         );
+    }
+
+    #[test]
+    fn the_gdi_paint_smooths_a_rounded_row_corner() {
+        // #989: GDI's RoundRect left stair steps at 250 percent. The corner
+        // of a filled row must now hold pixels between the fill and the
+        // background, and in high contrast none: every pixel is a system
+        // colour there.
+        assert!(gdi_row_corner_has_blend(Theme::Dark));
+        assert!(!gdi_row_corner_has_blend(Theme::HighContrast));
+    }
+
+    /// Paints a filled row in `theme` and says whether any pixel on its
+    /// corner is neither the fill nor the background.
+    fn gdi_row_corner_has_blend(theme: Theme) -> bool {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        let (bg, fill) = (0x0000_0000u32, 0x00FF_FFFFu32);
+        let dpi = 240;
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 120,
+            bottom: 80,
+        };
+        let row = RECT {
+            left: 10,
+            top: 10,
+            right: 110,
+            bottom: 70,
+        };
+        let ops = [
+            Op::Clear { color: bg },
+            Op::FillRound {
+                rect: row,
+                radius: 16,
+                color: fill,
+            },
+        ];
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 120, 80);
+            let old = SelectObject(mem, HGDIOBJ(bmp.0));
+            paint_ops_gdi(mem, dpi, theme, client, &ops);
+            let mixed = (0..16).any(|d| {
+                let p = GetPixel(mem, 10 + d, 10 + (15 - d)).0;
+                p != bg && p != fill
+            });
+            assert_eq!(GetPixel(mem, 60, 40).0, fill);
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            mixed
+        }
     }
 }
