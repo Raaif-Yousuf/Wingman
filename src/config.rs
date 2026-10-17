@@ -1124,13 +1124,14 @@ fn keys_still_in_file(before: &Config, on_disk: Option<&Config>) -> Vec<String> 
     .map(|(name, ..)| name.to_string())
     .collect();
     for was in &b.compat {
-        let now = d.map(|d| {
+        // Any same-name entry still holding a key counts: names can repeat.
+        let still = d.map(|d| {
             d.compat
                 .iter()
-                .find(|e| e.name == was.name)
-                .map_or("", |e| e.api_key.as_str())
+                .any(|e| e.name == was.name && !e.api_key.is_empty())
         });
-        if left(&was.api_key, now) {
+        let is_left = !was.api_key.is_empty() && still.unwrap_or(true);
+        if is_left && !out.contains(&was.name) {
             out.push(was.name.clone());
         }
     }
@@ -5009,6 +5010,25 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
             keys_still_in_file(&before, Some(&reordered)),
             vec!["lab".to_string()]
         );
+    }
+
+    #[test]
+    fn a_key_left_in_a_second_same_name_entry_is_still_reported() {
+        let entry = |key: &str| CompatConfig {
+            name: "lab".into(),
+            api_key: key.to_string(),
+            ..Default::default()
+        };
+        let mut before = Config::default();
+        before.providers.compat = vec![entry("k1"), entry("k2")];
+        let mut on_disk = Config::default();
+        on_disk.providers.compat = vec![entry(""), entry("k2")];
+        assert_eq!(
+            keys_still_in_file(&before, Some(&on_disk)),
+            vec!["lab".to_string()]
+        );
+        on_disk.providers.compat = vec![entry(""), entry("")];
+        assert!(keys_still_in_file(&before, Some(&on_disk)).is_empty());
     }
 
     #[test]
