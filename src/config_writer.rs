@@ -462,9 +462,10 @@ pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
     for change in changes {
         change_value(&mut value, change)?;
     }
-    let mut out: Config = value
-        .try_into()
-        .context("could not apply the unsaved change")?;
+    // Through text, not `Value::try_into`: that would compile a second copy of
+    // every `Config` deserializer, for `toml::Value` as well as for the parser (#1096).
+    let text = toml::to_string(&value).context("could not apply the unsaved change")?;
+    let mut out: Config = toml::from_str(&text).context("could not apply the unsaved change")?;
     out.unreadable_secrets = config.unreadable_secrets.clone();
     out.keys_left_in_file = config.keys_left_in_file.clone();
     out.load_problem = config.load_problem.clone();
