@@ -9,6 +9,15 @@ tagged release.
 
 ### Changed
 
+- Settings has no Save or Cancel button any more. A change applies when you
+  make it: a list or a checkbox when you pick it, a number or text box when you
+  press Enter or leave the box, the text size when you let go of the slider. The
+  line under the page says "Saved: Card corner" with an Undo button, or says why
+  the change was not saved and puts the old value back. Close the window and the
+  change is already in `config.toml`; coming back to the window shows anything you
+  edited by hand meanwhile. Wingman changes only the one setting you touched, so
+  comments and other edits in `config.toml` stay.
+
 - One press of the Wingman key now shows the options card (a few choices for
   what is on screen) instead of running Check my work. This costs one small
   model call for the card, then one more for the choice you pick. To keep the
