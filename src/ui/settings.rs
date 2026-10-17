@@ -1246,6 +1246,12 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         }
         return;
     }
+    // #1143: a combo whose list opens is no longer under the pointer.
+    if notify == windows::Win32::UI::WindowsAndMessaging::CBN_DROPDOWN {
+        if let Some(combo) = get_dlg_item(inner.hwnd, id) {
+            set_combo_hover(combo, false);
+        }
+    }
     match id {
         ID_UNDO if notify == BN_CLICKED => undo_last(inner),
         // Enter in a box (#875): apply it.
@@ -7786,6 +7792,9 @@ pub(crate) const CARD_CORNER_COMBO: i32 = ID_CARD_CORNER;
 
 /// `WM_MOUSELEAVE`, sent once after `TrackMouseEvent(TME_LEAVE)`.
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_ENABLE: u32 = 0x000A;
+const WM_SHOWWINDOW: u32 = 0x0018;
+const WM_CAPTURECHANGED: u32 = 0x0215;
 
 thread_local! {
     /// #1109: the combo the mouse is over (0: none). One mouse, one hover.
@@ -7887,6 +7896,18 @@ unsafe extern "system" fn combo_subclass(
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_MOUSELEAVE => {
+            set_combo_hover(hwnd, false);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        // #1143: Windows does not always send `WM_MOUSELEAVE` to a combo that is
+        // disabled, hidden or has lost the mouse capture to its list, so those
+        // end the hover themselves. (The list opening is `CBN_DROPDOWN`, which
+        // the window handles.)
+        WM_ENABLE | WM_SHOWWINDOW if wparam.0 == 0 => {
+            set_combo_hover(hwnd, false);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_CAPTURECHANGED => {
             set_combo_hover(hwnd, false);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
@@ -11488,6 +11509,55 @@ mod tests {
             assert_eq!(combo_hover_repaints(), base + 2);
             send(combo, WM_MOUSELEAVE);
             assert_eq!(combo_hover_repaints(), base + 2);
+        });
+    }
+
+    /// #1143: a combo that is disabled, hidden or opened does not keep the
+    /// hovered border, whether or not Windows still sends `WM_MOUSELEAVE`.
+    #[test]
+    fn a_combo_loses_the_hover_when_disabled_hidden_or_opened() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CBN_DROPDOWN, WM_CAPTURECHANGED, WM_ENABLE, WM_MOUSEMOVE, WM_SHOWWINDOW,
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let combo = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            let hover = || unsafe {
+                SendMessageW(
+                    combo,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(0x0005_0005)),
+                );
+            };
+            let send = |msg: u32, w: usize| unsafe {
+                SendMessageW(combo, msg, Some(WPARAM(w)), Some(LPARAM(0)));
+            };
+            // Staying enabled or shown, or a capture change, are told apart.
+            hover();
+            assert!(combo_is_hovered(combo));
+            send(WM_ENABLE, 1);
+            send(WM_SHOWWINDOW, 1);
+            assert!(combo_is_hovered(combo), "enabled and shown keep the hover");
+            send(WM_ENABLE, 0);
+            assert!(!combo_is_hovered(combo), "disabled");
+            hover();
+            send(WM_SHOWWINDOW, 0);
+            assert!(!combo_is_hovered(combo), "hidden");
+            hover();
+            send(WM_CAPTURECHANGED, 0);
+            assert!(!combo_is_hovered(combo), "capture moved away");
+            hover();
+            assert!(combo_is_hovered(combo));
+            let id = ID_CARD_CORNER as usize;
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(((CBN_DROPDOWN as usize) << 16) | id)),
+                    Some(LPARAM(combo.0 as isize)),
+                );
+            }
+            assert!(!combo_is_hovered(combo), "its list opened");
         });
     }
 
