@@ -172,7 +172,12 @@ function Invoke-CleanQuit {
         Exit-InstallSmoke 'could not post WM_CLOSE to the owner window'
     }
     if (-not $Process.WaitForExit(15000)) { Exit-InstallSmoke 'the app did not exit within 15 s of WM_CLOSE' }
-    if ($Process.ExitCode -ne 0) { Exit-InstallSmoke "the app exited with code $($Process.ExitCode)" }
+    # A process found with Get-Process (the sparse install started it, not us)
+    # reports an empty exit code, MEASURED 2026-10-17 on a runner. Only a code
+    # that is there and not 0 fails; the exit itself is still checked above.
+    if ($null -ne $Process.ExitCode -and "$($Process.ExitCode)" -ne '' -and $Process.ExitCode -ne 0) {
+        Exit-InstallSmoke "the app exited with code $($Process.ExitCode)"
+    }
     if (-not (Wait-Until -TimeoutMs 5000 -Condition { -not (Test-MutexHeld -Name $InstanceMutexName) })) {
         Exit-InstallSmoke 'the single-instance name is still held after exit'
     }
