@@ -379,6 +379,20 @@ pub fn is_foreground() -> bool {
     open != 0 && unsafe { GetForegroundWindow() }.0 as isize == open
 }
 
+/// Enables or disables the open Settings window (#1013), so an OS dialog that
+/// is not owned by it can stand in for a modal. Returns whether a window was
+/// there to change. UI thread only.
+pub fn set_enabled(on: bool) -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return false;
+    }
+    unsafe {
+        let _ = EnableWindow(HWND(open as *mut c_void), on);
+    }
+    true
+}
+
 thread_local! {
     /// The address of the `SettingsInner` the window procedure freed in
     /// `WM_NCDESTROY` (0: none). `open_impl` reads it when `CreateWindowExW`
