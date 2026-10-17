@@ -15,6 +15,7 @@
 use super::chunk::chunk_text;
 use super::hash::sha256_hex;
 use super::mask::mask_sensitive;
+use super::notice;
 use super::parse::{parse, parser_for, Parser, MAX_FILE_BYTES, PARSER_VERSION};
 use crate::store::chunks::IndexedChunk;
 use crate::store::knowledge::{DocumentRow, DocumentUpdate};
@@ -95,12 +96,86 @@ pub fn root_key(folder: &str) -> String {
 /// Until Settings can add folders, `[knowledge] folder` is the whole
 /// configuration. When Settings lands, this value is imported into
 /// `knowledge_root` once and this function goes away.
-pub fn start_scan(folder: &str) -> Option<std::thread::JoinHandle<()>> {
+///
+/// An `Err` is a plain sentence for a card (the thread could not be created,
+/// so no index will be made this run). A setting that is invalid is told
+/// apart before this by [`startup_problem`], which the start-up card shows.
+pub fn start_scan(folder: &str) -> Result<std::thread::JoinHandle<()>, String> {
     let setting = read_setting(folder);
     std::thread::Builder::new()
         .name("knowledge-scan".into())
-        .spawn(move || run_scan(setting))
-        .ok()
+        .spawn(move || guarded(|| run_scan(setting)))
+        .map_err(|e| spawn_failed_notice(&e.to_string()))
+}
+
+/// What is wrong with the `[knowledge] folder` setting itself, knowable
+/// without touching the disk, for the start-up card. `None` when the setting
+/// is empty or usable. (A folder that does not exist is only known on the scan
+/// thread, which queues its own notice.)
+pub fn startup_problem(folder: &str) -> Option<String> {
+    match read_setting(folder) {
+        Setting::Invalid(why) => Some(why.to_string()),
+        Setting::Off | Setting::Folder(_) => None,
+    }
+}
+
+fn spawn_failed_notice(error: &str) -> String {
+    format!(
+        "Your knowledge folder could not be indexed this time: the background task could not be started ({}).",
+        error.trim()
+    )
+}
+
+/// Runs the scan body so a panic is caught and ends in a notice instead of
+/// nothing. Only matters where panics unwind (dev and test builds): the
+/// release profile is `panic = "abort"`, where nothing can be caught and the
+/// crash note (`crash_note.rs`) shows a card at the next start instead. The
+/// panic text is never shown (it can come from file contents).
+fn guarded(work: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+        notice::report(
+            "Indexing your knowledge folder stopped unexpectedly. Wingman keeps running; it will try again at the next start.",
+        );
+    }
+}
+
+/// Why a file could not be opened, in the two ways that matter: it may be
+/// free next time, or it never will be.
+#[derive(Debug, PartialEq, Eq)]
+enum OpenFailure {
+    /// In use right now (a sharing or lock violation), or gone since it was
+    /// listed: try again at the next scan.
+    Busy,
+    /// Refused by permissions: retrying at every start only repeats the same
+    /// notice, so it is recorded as failed and left alone until the file changes.
+    Denied,
+}
+
+fn open_failure(e: &std::io::Error) -> OpenFailure {
+    // ERROR_ACCESS_DENIED
+    if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5) {
+        OpenFailure::Denied
+    } else {
+        OpenFailure::Busy
+    }
+}
+
+/// The one sentence a finished scan leaves for the next card, if any.
+fn summary_notice(summary: &ScanSummary) -> Option<String> {
+    let unreadable = summary.failed + summary.pending;
+    if unreadable > 0 {
+        Some(format!(
+            "{unreadable} {} in your knowledge folder could not be read.",
+            if unreadable == 1 { "file" } else { "files" }
+        ))
+    } else if summary.incomplete {
+        Some(
+            "Part of your knowledge folder could not be listed, so some files may be missing from the index."
+                .to_string(),
+        )
+    } else {
+        None
+    }
 }
 
 fn run_scan(setting: Setting) {
@@ -111,16 +186,14 @@ fn run_scan(setting: Setting) {
     lower_thread_priority();
     let wanted = match setting {
         Setting::Off => None,
-        Setting::Invalid(why) => {
-            store::report_text(why);
-            None
-        }
+        // Shown on the start-up card (`startup_problem`), not queued twice.
+        Setting::Invalid(_) => None,
         Setting::Folder(folder) => match canonical_root(&folder) {
             Ok(root) => Some(root),
             Err(why) => {
                 // The folder may be on a drive that is not connected right
                 // now: keep what was indexed, say so, and try next start.
-                store::report_text(&why);
+                notice::report(&why);
                 return;
             }
         },
@@ -135,16 +208,8 @@ fn run_scan(setting: Setting) {
     let Some(root) = wanted else { return };
     match scan_folder(&store, &root, now_unix()) {
         Ok(summary) => {
-            let unreadable = summary.failed + summary.pending;
-            if unreadable > 0 {
-                store::report_text(&format!(
-                    "{unreadable} {} in your knowledge folder could not be read.",
-                    if unreadable == 1 { "file" } else { "files" }
-                ));
-            } else if summary.incomplete {
-                store::report_text(
-                    "Part of your knowledge folder could not be listed, so some files may be missing from the index.",
-                );
+            if let Some(text) = summary_notice(&summary) {
+                notice::report(&text);
             }
         }
         Err(e) => store::report(&e),
@@ -382,15 +447,27 @@ fn index_file(
         }
     }
 
-    let Some(bytes) = read_capped(&file.path) else {
-        store.mark_document(
-            root_id,
-            &file.rel,
-            "pending",
-            Some("the file could not be opened, it may be in use"),
-            &DocumentUpdate::default(),
-        )?;
-        return Ok(Outcome::Pending);
+    let bytes = match read_capped(&file.path) {
+        Ok(bytes) => bytes,
+        Err(OpenFailure::Denied) => {
+            return fail(
+                store,
+                root_id,
+                file,
+                &stamp,
+                "the file could not be opened or read (permission refused or damaged)",
+            );
+        }
+        Err(OpenFailure::Busy) => {
+            store.mark_document(
+                root_id,
+                &file.rel,
+                "pending",
+                Some("the file could not be opened, it may be in use"),
+                &DocumentUpdate::default(),
+            )?;
+            return Ok(Outcome::Pending);
+        }
     };
     let Ok(hash) = sha256_hex(&bytes) else {
         return fail(
@@ -483,14 +560,27 @@ fn fail(
 }
 
 /// The file's bytes, at most one byte past the size cap, so a file that grew
-/// since it was listed is still bounded. `None` if it cannot be opened or read.
-fn read_capped(path: &Path) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
+/// since it was listed is still bounded. An `Err` says whether trying again at
+/// the next scan can help.
+fn read_capped(path: &Path) -> Result<Vec<u8>, OpenFailure> {
+    let file = std::fs::File::open(path).map_err(|e| open_failure(&e))?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
-    Some(bytes)
+        .map_err(|e| read_failure(&e))?;
+    Ok(bytes)
+}
+
+/// A read that failed after the file opened. Only a sharing or lock violation
+/// (or a file gone since it was listed) is worth retrying at the next scan;
+/// any other read error (a damaged or EFS file) would repeat, so it is
+/// recorded as failed once and retried when the file changes.
+fn read_failure(e: &std::io::Error) -> OpenFailure {
+    match e.raw_os_error() {
+        Some(32 | 33) => OpenFailure::Busy,
+        _ if e.kind() == std::io::ErrorKind::NotFound => OpenFailure::Busy,
+        _ => OpenFailure::Denied,
+    }
 }
 
 #[cfg(test)]
@@ -837,6 +927,148 @@ mod tests {
         let root_id = store.ensure_root(&root.to_string_lossy(), 0).unwrap();
         assert_eq!(store.chunks_of(root_id, "n.md").unwrap().len(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_locked_file_is_retried_but_a_denied_file_is_not() {
+        use std::io::{Error, ErrorKind};
+        // 32 is ERROR_SHARING_VIOLATION, 33 ERROR_LOCK_VIOLATION: in use now.
+        assert_eq!(
+            open_failure(&Error::from_raw_os_error(32)),
+            OpenFailure::Busy
+        );
+        assert_eq!(
+            open_failure(&Error::from_raw_os_error(33)),
+            OpenFailure::Busy
+        );
+        assert_eq!(
+            open_failure(&Error::from(ErrorKind::NotFound)),
+            OpenFailure::Busy
+        );
+        assert_eq!(
+            open_failure(&Error::from(ErrorKind::PermissionDenied)),
+            OpenFailure::Denied
+        );
+        assert_eq!(
+            open_failure(&Error::from_raw_os_error(5)),
+            OpenFailure::Denied
+        );
+    }
+
+    #[test]
+    fn a_read_error_is_retried_only_when_the_file_is_in_use_or_gone() {
+        use std::io::{Error, ErrorKind};
+        for busy in [
+            Error::from_raw_os_error(32),
+            Error::from_raw_os_error(33),
+            Error::from(ErrorKind::NotFound),
+        ] {
+            assert_eq!(read_failure(&busy), OpenFailure::Busy, "{busy:?}");
+        }
+        for permanent in [
+            Error::from_raw_os_error(23),
+            Error::from(ErrorKind::InvalidData),
+            Error::from(ErrorKind::UnexpectedEof),
+        ] {
+            assert_eq!(
+                read_failure(&permanent),
+                OpenFailure::Denied,
+                "{permanent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_denied_access_is_reported_once_and_not_on_the_next_scan() {
+        let dir = scratch("denied");
+        // Opening a folder as a file is refused with "access denied".
+        let file = FoundFile {
+            rel: "locked.md".into(),
+            path: dir.clone(),
+            size: 10,
+            mtime: Some(100),
+            attributes: 0,
+            parser: parser_for("locked.md").unwrap(),
+        };
+        let store = Store::in_memory();
+        let root = store.ensure_root("C:\\denied-root", 0).unwrap();
+        let first = index_file(&store, root, &file, None, FUT).unwrap();
+        assert!(matches!(first, Outcome::Failed), "denied is a failure");
+        let (status, why) = store.document_state(root, "locked.md").unwrap().unwrap();
+        assert_eq!(status, "failed");
+        assert!(why.unwrap().contains("permission refused"));
+        let known = store.documents_in_root(root).unwrap();
+        let again = index_file(&store, root, &file, known.first(), FUT).unwrap();
+        assert!(
+            matches!(again, Outcome::Unchanged),
+            "a denied file is not counted again at the next start"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_summary_notice_says_how_many_could_not_be_read() {
+        assert_eq!(summary_notice(&ScanSummary::default()), None);
+        let one = ScanSummary {
+            failed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            summary_notice(&one).as_deref(),
+            Some("1 file in your knowledge folder could not be read.")
+        );
+        let many = ScanSummary {
+            failed: 1,
+            pending: 2,
+            ..Default::default()
+        };
+        assert!(summary_notice(&many).unwrap().starts_with("3 files"));
+        let partial = ScanSummary {
+            incomplete: true,
+            ..Default::default()
+        };
+        assert!(summary_notice(&partial)
+            .unwrap()
+            .contains("could not be listed"));
+        for s in [&one, &many, &partial] {
+            assert!(!summary_notice(s).unwrap().contains('\u{2014}'));
+        }
+    }
+
+    #[test]
+    fn a_bad_setting_has_a_start_up_problem_and_a_good_one_has_none() {
+        assert_eq!(startup_problem(""), None);
+        assert_eq!(startup_problem(r"C:\Notes"), None);
+        assert!(startup_problem("Notes").unwrap().contains("full path"));
+        assert!(startup_problem(r"C:\")
+            .unwrap()
+            .contains("not a whole drive"));
+    }
+
+    #[test]
+    fn a_panic_in_the_scan_body_is_caught_and_ends_in_a_notice() {
+        // Tests build with unwind; a release build aborts and the crash note
+        // (crash_note.rs) covers that instead.
+        // The notice queue is process-wide and the start_scan tests fill it.
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = notice::take();
+        guarded(|| panic!("boom in the scan"));
+        let text = notice::take().expect("a panic must leave a notice");
+        assert!(text.contains("stopped unexpectedly"), "{text}");
+        assert!(
+            !text.contains("boom"),
+            "the panic text is never shown: {text}"
+        );
+        guarded(|| {});
+        assert_eq!(notice::take(), None, "a clean run leaves nothing");
+    }
+
+    #[test]
+    fn a_thread_that_cannot_start_is_a_plain_sentence() {
+        let text = spawn_failed_notice("not enough resources");
+        assert!(text.contains("could not be started"), "{text}");
+        assert!(text.contains("not enough resources"), "{text}");
+        assert!(!text.contains('\u{2014}'));
     }
 
     #[test]
