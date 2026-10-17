@@ -3161,7 +3161,7 @@ impl App {
         // #92: the line typed in the palette, and whether a documents folder
         // is set, for an action that lists `text` or `knowledge`.
         let line = line.to_string();
-        let knowledge_folder_set = !self.config.knowledge.folder.trim().is_empty();
+        let knowledge_folder = self.config.knowledge.folder.clone();
         let answers_from_documents = action.proposal == actions::knowledge_answer::PROPOSAL_KIND;
         // #68: an action that writes the answer over the selection needs the
         // selection's UIA identity as well as its text.
@@ -3238,18 +3238,25 @@ impl App {
                     // line, no folder, nothing indexed and nothing matching each
                     // end here as a card, before any model is asked.
                     let mut excerpts = Vec::new();
+                    // Names the excerpts in the egress row and the send preview
+                    // for every request this worker sends; dropped with the closure.
+                    let mut _excerpt_labels = None;
                     if actions::generic_inputs::wants_text(&inputs) {
                         gathered.text = Some(line.clone());
                     }
                     if actions::generic_inputs::wants_knowledge(&inputs) {
-                        let store = crate::store::global().map_err(|e| {
-                            GenericFailure::UserState(format!(
-                                "Couldn't open your documents index: {e}"
-                            ))
-                        })?;
+                        // The line and the folder setting are checked before the
+                        // store is opened, so a store problem never replaces them.
                         let found =
-                            actions::knowledge_answer::prepare(&store, knowledge_folder_set, &line)
-                                .map_err(GenericFailure::UserState)?;
+                            actions::knowledge_answer::gather(&knowledge_folder, &line, || {
+                                crate::store::global()
+                                    .map_err(|e| format!("Couldn't open your documents index: {e}"))
+                            })
+                            .map_err(GenericFailure::UserState)?;
+                        _excerpt_labels = Some(crate::egress::KnowledgeScope::new(
+                            found.labels.clone(),
+                            found.bytes,
+                        ));
                         gathered.knowledge = Some(found.block);
                         excerpts = found.included;
                     }
@@ -9520,8 +9527,12 @@ mod tests {
             .find("gathered.text = Some(line.clone())")
             .expect("line unused");
         let prep = worker
-            .find("knowledge_answer::prepare(")
+            .find("knowledge_answer::gather(")
             .expect("no retrieval");
+        // The excerpts are named for the egress row before the request goes.
+        let scope = worker
+            .find("egress::KnowledgeScope::new(")
+            .expect("excerpts not labelled for the egress row");
         let plan = worker
             .find("plan_generic_inputs(&inputs, &gathered)")
             .expect("plan moved");
@@ -9532,7 +9543,7 @@ mod tests {
             .find("knowledge_answer::finalize(")
             .expect("answer unchecked");
         assert!(
-            text < plan && prep < plan && plan < ask && ask < fin,
+            text < plan && prep < scope && scope < plan && plan < ask && ask < fin,
             "{worker}"
         );
     }

@@ -73,6 +73,19 @@ fn read_setting(folder: &str) -> Setting {
     Setting::Folder(path)
 }
 
+/// The key the store holds the configured folder's root under: the folder as
+/// the scan canonicalizes it, or as typed when that is not possible (a
+/// disconnected drive), which then matches no indexed root.
+pub fn root_key(folder: &str) -> String {
+    match read_setting(folder) {
+        Setting::Folder(path) => canonical_root(&path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned(),
+        _ => folder.trim().to_string(),
+    }
+}
+
 /// Starts the start-up pass on a background thread that ends with it. With a
 /// folder set it indexes that folder. With the setting empty or invalid it
 /// reads no folder at all and only retires a folder indexed earlier (a cheap

@@ -88,6 +88,10 @@ pub struct Snippet {
     pub page: Option<u32>,
     pub heading: Option<String>,
     pub text: String,
+    /// Ordinal of the first chunk merged into this snippet.
+    pub chunk: i64,
+    /// First 8 hex characters of that chunk's text hash.
+    pub hash8: String,
     /// `1 / (60 + rank)` of the best chunk merged into this snippet. Not a
     /// sum: neighbours of a mediocre match would otherwise outrank a single
     /// top chunk.
@@ -168,6 +172,8 @@ fn snippets_from(hits: Vec<ChunkHit>) -> Vec<Snippet> {
                 label: clean_label(&r.hit.rel_path),
                 page: r.page,
                 heading: r.heading,
+                chunk: r.hit.ordinal,
+                hash8: r.hit.text_hash.chars().take(8).collect(),
                 text: r.hit.text,
                 score: r.score,
             },
@@ -198,6 +204,15 @@ fn join_piece(next: &str, prev_end: Option<usize>, next_start: Option<usize>) ->
         }
     }
     format!("\n{next}")
+}
+
+impl Snippet {
+    /// The label the egress log and the send preview show for this excerpt:
+    /// `resume.pdf#chunk 12:ab12cd34` (file, chunk number, 8 hex characters of
+    /// the chunk hash). Never the text. The file name is already masked.
+    pub fn egress_label(&self) -> String {
+        format!("{}#chunk {}:{}", self.label, self.chunk, self.hash8)
+    }
 }
 
 /// A label on one line, masked.
@@ -337,6 +352,8 @@ mod tests {
             page: None,
             heading: None,
             text: text.to_string(),
+            chunk: 0,
+            hash8: "ab12cd34".to_string(),
             score: 1.0,
         }
     }
@@ -602,6 +619,7 @@ mod tests {
             text: text.to_string(),
             span: None,
             rel_path: format!("d{doc_id}.txt"),
+            text_hash: format!("{doc_id:04x}{ordinal:04x}ffff"),
         }
     }
 
