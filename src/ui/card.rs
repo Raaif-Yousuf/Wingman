@@ -299,6 +299,7 @@ impl Card {
             pending_stage: PendingStage::Working,
             animations_enabled: true,
             close_on_focus_loss: true,
+            show_serial: 0,
         });
         let raw = Box::into_raw(inner);
 
@@ -492,6 +493,12 @@ impl Card {
 
     pub fn state(&self) -> CardState {
         self.inner.state
+    }
+
+    /// #901: how many cards have been put on screen so far. Unchanged while
+    /// the same card stays up (a stage change is not a new card).
+    pub fn show_serial(&self) -> u64 {
+        self.inner.show_serial
     }
 
     /// Enters the preview (confirmation) state (#26). `schema` is the
@@ -1722,6 +1729,10 @@ struct CardInner {
     /// true live. A test card that checks something other than click-away turns
     /// it off, so another test's window taking the foreground cannot close it.
     close_on_focus_loss: bool,
+    /// #901: counts every time a card is put on screen (`reveal`, the one path
+    /// every show goes through). A caller that remembers the count after its
+    /// own card can tell later whether another card has replaced it.
+    show_serial: u64,
 }
 
 impl CardInner {
@@ -1982,6 +1993,7 @@ impl CardInner {
     }
 
     fn reveal(&mut self) {
+        self.show_serial = self.show_serial.wrapping_add(1);
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(
@@ -5571,6 +5583,42 @@ mod tests {
     fn instance() -> HINSTANCE {
         let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
         HINSTANCE(h.0)
+    }
+
+    /// #901: every kind of show moves the serial, a stage change and a hide do
+    /// not, so "is this still my card" has one answer for every caller.
+    #[test]
+    fn every_show_moves_the_show_serial() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.stay_open_on_focus_loss();
+        let mut last = card.show_serial();
+        let moved = |card: &Card, last: &mut u64, what: &str| {
+            let now = card.show_serial();
+            assert_ne!(now, *last, "{what} did not move the serial");
+            *last = now;
+        };
+        card.show_pending(PendingStage::Working);
+        moved(&card, &mut last, "show_pending");
+        card.set_pending_stage(PendingStage::StillWorking);
+        assert_eq!(card.show_serial(), last, "a stage change is the same card");
+        card.show_answer("a", "b", 5, None);
+        moved(&card, &mut last, "show_answer");
+        card.show_error("a", "b");
+        moved(&card, &mut last, "show_error");
+        card.show_settings_needed("a", "b");
+        moved(&card, &mut last, "show_settings_needed");
+        card.show_pending(PendingStage::Working);
+        moved(&card, &mut last, "show_pending again");
+        card.hide();
+        assert_eq!(card.show_serial(), last);
+        let src = include_str!("card.rs").replace('\r', "");
+        let at = src
+            .find("    fn reveal(&mut self) {")
+            .expect("reveal moved");
+        assert!(
+            src[at..at + 200].contains("show_serial"),
+            "reveal never counts"
+        );
     }
 
     #[test]

@@ -610,7 +610,7 @@ struct App {
     /// #901: a Reload put its Working card up and has not taken it down. Only
     /// then (and not while a model run is busy, whose cards are its own) is a
     /// Pending card the reload's to hide or replace; see `reload_owns_card`.
-    reload_card: bool,
+    reload_card: Option<u64>,
     /// #870: writes handed to the writer thread whose reply has not come back.
     /// Only the last reply swaps in the loaded config; an earlier one was read
     /// before a later choice was made.
@@ -980,7 +980,7 @@ pub fn run() -> Result<()> {
         config,
         unsaved: Vec::new(),
         carried_reload: None,
-        reload_card: false,
+        reload_card: None,
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
         settings_save_starts: VecDeque::new(),
@@ -4721,7 +4721,7 @@ impl App {
         self.busy = busy;
         if busy {
             // A run's cards replace the reload's Working card.
-            self.reload_card = false;
+            self.reload_card = None;
         }
         BUSY_STUCK.with(|c| c.set(false));
         let hwnd = self.hwnd();
@@ -5155,7 +5155,7 @@ impl App {
         RELOAD_STUCK.with(|c| c.set(false));
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
-        self.reload_card = true;
+        self.reload_card = Some(self.card.show_serial());
         // The writer answers in well under a second when it is alive; if it
         // never does, the Working card must not stay forever.
         unsafe {
@@ -5179,7 +5179,7 @@ impl App {
             .pending_writes
             .load(std::sync::atomic::Ordering::SeqCst);
         if reload_is_stuck(self.reload_owns_card(), in_flight) {
-            self.reload_card = false;
+            self.reload_card = None;
             let (headline, detail) = reload_stuck_card();
             self.card.show_error(headline, detail);
             self.set_watch(true);
@@ -5190,6 +5190,7 @@ impl App {
     fn reload_owns_card(&self) -> bool {
         reload_owns_card_rule(
             self.reload_card,
+            self.card.show_serial(),
             self.busy,
             matches!(self.card.state(), crate::ui::card::CardState::Pending),
         )
@@ -5820,7 +5821,7 @@ impl App {
             if self.reload_owns_card() {
                 self.hide_card();
             }
-            self.reload_card = false;
+            self.reload_card = None;
             self.carried_reload.take()
         } else {
             None
@@ -9004,8 +9005,13 @@ const KEY_NOT_STORED_HEADLINE: &str = "Settings saved, but the key was not store
 
 /// A Pending card is the reload's own only when the reload put it up, no model
 /// run has taken the card over, and it is still a Pending card (#901).
-fn reload_owns_card_rule(reload_card: bool, run_busy: bool, card_pending: bool) -> bool {
-    reload_card && !run_busy && card_pending
+fn reload_owns_card_rule(
+    reload_card: Option<u64>,
+    card_serial: u64,
+    run_busy: bool,
+    card_pending: bool,
+) -> bool {
+    reload_card == Some(card_serial) && !run_busy && card_pending
 }
 
 /// The note when a write that followed a reload failed: the reload's values
@@ -10313,13 +10319,19 @@ mod tests {
     #[test]
     fn a_model_pending_card_is_not_the_reloads_to_touch() {
         use super::{reload_is_stuck, reload_owns_card_rule};
-        assert!(reload_owns_card_rule(true, false, true));
-        assert!(!reload_owns_card_rule(false, false, true), "a model card");
-        assert!(!reload_owns_card_rule(true, true, true), "a run is busy");
-        assert!(!reload_owns_card_rule(true, false, false), "card moved on");
+        assert!(reload_owns_card_rule(Some(4), 4, false, true));
+        assert!(!reload_owns_card_rule(None, 4, false, true), "a model card");
+        assert!(
+            !reload_owns_card_rule(Some(4), 4, true, true),
+            "a run is busy"
+        );
+        assert!(!reload_owns_card_rule(Some(4), 4, false, false), "moved on");
+        // Any other card shown since (an options card, an error) disowns it,
+        // even when it is Pending again and no run is busy.
+        assert!(!reload_owns_card_rule(Some(4), 5, false, true));
         // The stuck timer replaces nothing it does not own.
         assert!(!reload_is_stuck(
-            reload_owns_card_rule(false, false, true),
+            reload_owns_card_rule(None, 4, false, true),
             1
         ));
         let src = lf(include_str!("app.rs"));
@@ -10332,9 +10344,12 @@ mod tests {
         let end = handler[at..].find("return;").unwrap();
         assert!(!handler[at..at + end].contains("hide_card"), "{handler}");
         let busy = body_between(&src, "    fn set_busy(", "\n    }\n");
-        assert!(busy.contains("self.reload_card = false"), "{busy}");
+        assert!(busy.contains("self.reload_card = None"), "{busy}");
         let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
-        assert!(reload.contains("self.reload_card = true"), "{reload}");
+        assert!(
+            reload.contains("self.reload_card = Some(self.card.show_serial())"),
+            "{reload}"
+        );
     }
 
     #[test]
