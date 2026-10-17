@@ -627,13 +627,13 @@ impl Card {
     }
 
     /// The UI gallery's expanded answer: what a click on the card does.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn expand_for_gallery(&mut self) {
         self.inner.try_expand();
     }
 
     /// The UI gallery's focus rectangle: what the first Tab does.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn focus_first_link_for_gallery(&mut self) {
         self.inner.move_footer_focus(false);
     }
