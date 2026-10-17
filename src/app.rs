@@ -772,12 +772,8 @@ pub fn run() -> Result<()> {
     // while Settings still reports it as enabled.
     crate::autostart::repair_if_stale();
 
-    // One-time copilot-ask -> Wingman migration. Both steps are individually
-    // idempotent (a no-op once done), so this runs unconditionally on every
-    // launch rather than needing its own "have we migrated yet" flag.
-    if let (Ok(old_path), Ok(new_path)) = (Config::old_path(), Config::path()) {
-        let _ = Config::migrate_from(&old_path, &new_path);
-    }
+    // The copilot-ask -> Wingman config copy runs inside `Config::load` (#1018),
+    // so a failure shows a card and is retried on the next load.
     let _ = crate::autostart::remove_old_run_value();
 
     // #769: delete old calendar files once at startup, on a short-lived
