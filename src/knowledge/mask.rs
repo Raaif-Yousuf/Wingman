@@ -13,9 +13,150 @@
 use crate::payment_denylist::{card_number_spans, iban_spans, national_id_spans};
 use std::ops::Range;
 
-/// `text` with every card number, IBAN and national id replaced by a marker.
+/// Words that label a secret, lower case. A space inside a label matches a run
+/// of spaces, `_` and `-`, so `api key`, `API_KEY` and `api-key` all match.
+const SECRET_LABELS: &[&str] = &[
+    "password",
+    "passwd",
+    "passcode",
+    "passphrase",
+    "pwd",
+    "pin",
+    "secret",
+    "token",
+    "api key",
+    "apikey",
+    "access key",
+    "passwort",
+    "kennwort",
+    "geheimzahl",
+    "mot de passe",
+    "mdp",
+    "code secret",
+    "contraseña",
+    "contrasena",
+    "clave secreta",
+];
+
+/// Marker for a value that followed a secret label.
+const SECRET_MARKER: &str = "[secret]";
+
+fn lower(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Index after `label` if it matches `chars` at `at`, ignoring case.
+fn match_label(chars: &[(usize, char)], at: usize, label: &str) -> Option<usize> {
+    let mut i = at;
+    for lc in label.chars() {
+        if lc == ' ' {
+            let start = i;
+            while chars
+                .get(i)
+                .is_some_and(|&(_, c)| matches!(c, ' ' | '_' | '-' | '\t'))
+            {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+        } else {
+            let &(_, c) = chars.get(i)?;
+            if lower(c) != lc {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+/// Byte ranges of values that follow a secret label: `password: hunter2`,
+/// `pwd=abc`, `"pin": "1234"`, `PIN 1234`. The value runs to the next
+/// whitespace, never past the end of the line. A label alone does not count
+/// ("the password policy"): a `:` or `=` must follow it, or, with only a space,
+/// the next word must hold a digit. Spans are on character boundaries.
+fn secret_spans(text: &str) -> Vec<Range<usize>> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let at_word_start = i == 0 || !chars[i - 1].1.is_alphanumeric();
+        let first = lower(chars[i].1);
+        let end = if at_word_start {
+            SECRET_LABELS
+                .iter()
+                .filter(|l| l.starts_with(first))
+                .filter_map(|l| match_label(&chars, i, l))
+                .max()
+        } else {
+            None
+        };
+        let Some(mut j) = end else {
+            i += 1;
+            continue;
+        };
+        // A plural label ("passwords:").
+        if chars.get(j).is_some_and(|&(_, c)| lower(c) == 's')
+            && !chars.get(j + 1).is_some_and(|&(_, c)| c.is_alphanumeric())
+        {
+            j += 1;
+        }
+        if chars.get(j).is_some_and(|&(_, c)| c.is_alphanumeric()) {
+            i += 1;
+            continue;
+        }
+        // A closing quote around the label (`"pin":`).
+        if chars
+            .get(j)
+            .is_some_and(|&(_, c)| matches!(c, '"' | '\'' | '`'))
+        {
+            j += 1;
+        }
+        let blanks_start = j;
+        while chars.get(j).is_some_and(|&(_, c)| is_blank(c)) {
+            j += 1;
+        }
+        let spaced = j > blanks_start;
+        let explicit = chars.get(j).is_some_and(|&(_, c)| c == ':' || c == '=');
+        if explicit {
+            j += 1;
+            if chars.get(j).is_some_and(|&(_, c)| c == '>') {
+                j += 1;
+            }
+            while chars.get(j).is_some_and(|&(_, c)| is_blank(c)) {
+                j += 1;
+            }
+        } else if !spaced {
+            i += 1;
+            continue;
+        }
+        let value_start = j;
+        while chars.get(j).is_some_and(|&(_, c)| !c.is_whitespace()) {
+            j += 1;
+        }
+        let value = &chars[value_start..j];
+        if value.is_empty() || (!explicit && !value.iter().any(|&(_, c)| c.is_ascii_digit())) {
+            i += 1;
+            continue;
+        }
+        let start = chars[value_start].0;
+        let stop = chars.get(j).map_or(text.len(), |&(b, _)| b);
+        spans.push(start..stop);
+        i = j;
+    }
+    spans
+}
+
+/// `text` with every card number, IBAN, national id and labelled secret
+/// replaced by a marker.
 pub fn mask_sensitive(text: &str) -> String {
     let mut spans: Vec<(Range<usize>, &'static str)> = Vec::new();
+    spans.extend(secret_spans(text).into_iter().map(|r| (r, SECRET_MARKER)));
     spans.extend(
         card_number_spans(text)
             .into_iter()
@@ -83,6 +224,82 @@ mod tests {
         for c in crate::knowledge::chunk::chunk_text(&masked) {
             assert!(!c.text.contains("4111") && !c.text.contains("1111 1111"));
         }
+    }
+
+    #[test]
+    fn a_labelled_secret_value_is_masked_and_the_label_kept() {
+        for (text, want) in [
+            ("password: hunter2", "password: [secret]"),
+            (
+                "Password = hunter2 and more",
+                "Password = [secret] and more",
+            ),
+            ("pwd=abc123;port=1", "pwd=[secret]"),
+            ("PIN 1234 for the door", "PIN [secret] for the door"),
+            ("Secret: s3cr3t.", "Secret: [secret]"),
+            ("db_password=xyz", "db_password=[secret]"),
+            ("API key: sk_live_abc", "API key: [secret]"),
+            ("api-key=abc", "api-key=[secret]"),
+            ("client_secret: abc", "client_secret: [secret]"),
+            (
+                "{\"pin\": \"1234\", \"x\": 1}",
+                "{\"pin\": [secret] \"x\": 1}",
+            ),
+            ("passwords: a1", "passwords: [secret]"),
+            ("Passwort: geheim", "Passwort: [secret]"),
+            ("Mot de passe : Zz9", "Mot de passe : [secret]"),
+            ("Contraseña: Zz9", "Contraseña: [secret]"),
+            ("CONTRASEÑA=Zz9", "CONTRASEÑA=[secret]"),
+            ("token:\tabc", "token:\t[secret]"),
+        ] {
+            assert_eq!(mask_sensitive(text), want, "input: {text}");
+        }
+    }
+
+    #[test]
+    fn prose_about_passwords_is_left_alone() {
+        for text in [
+            "the password policy says to change it",
+            "Reset your password.",
+            "A pin is a small nail. Pinned to the wall.",
+            "password hunter",
+            "tokenizer: fast",
+            "mypassword: x",
+            "password:",
+            "password:   \nnext line",
+            "secretary: Ann",
+            "the token",
+        ] {
+            assert_eq!(mask_sensitive(text), text, "input: {text}");
+        }
+    }
+
+    #[test]
+    fn a_secret_value_stops_at_the_end_of_the_line() {
+        assert_eq!(
+            mask_sensitive("password: hunter2\nuser: bob"),
+            "password: [secret]\nuser: bob"
+        );
+    }
+
+    #[test]
+    fn secret_masking_never_panics_on_odd_text() {
+        for text in [
+            "",
+            "pin",
+            "pin ",
+            "password:",
+            "ñ password: ñ𝄞",
+            "pin 𝄞1",
+            "password\u{0}=\u{0}",
+            "mot de ",
+            "passwords",
+            &"pin ".repeat(5000),
+            &format!("pin{}", " ".repeat(50_000)),
+        ] {
+            let _ = mask_sensitive(text);
+        }
+        assert_eq!(mask_sensitive("ñ password: ñ𝄞"), "ñ password: [secret]");
     }
 
     #[test]

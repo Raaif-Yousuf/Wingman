@@ -643,6 +643,24 @@ mod tests {
         assert!(!ctx.included[0].label.contains("4111"));
     }
 
+    #[test]
+    fn a_labelled_password_never_reaches_the_prompt() {
+        let store = store_with(&[(
+            "wifi notes.txt",
+            "Wifi notes. password: hunter2 and PIN 4821 for the router admin.",
+        )]);
+        let found = search(&store, "wifi router").unwrap();
+        assert!(!found.is_empty());
+        let raw = snip("wifi.txt", "password: hunter2 and PIN 4821");
+        for ctx in [format_context(&found, 2_000), format_context(&[raw], 2_000)] {
+            assert!(!ctx.text.is_empty());
+            for needle in ["hunter2", "4821"] {
+                assert!(!ctx.text.contains(needle), "{needle} leaked: {}", ctx.text);
+            }
+            assert!(ctx.text.contains("[secret]"));
+        }
+    }
+
     fn hit(doc_id: i64, ordinal: i64, text: &str) -> ChunkHit {
         ChunkHit {
             doc_id,

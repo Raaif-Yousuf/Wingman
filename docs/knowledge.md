@@ -123,20 +123,25 @@ The full statement is in [PRIVACY.md](../PRIVACY.md#your-documents-folder).
 
 Sensitive numbers are removed twice.
 
-- **When indexing:** card numbers, IBANs and national id numbers are replaced
-  with `[card number]`, `[IBAN]` and `[national id]` before the text is saved,
-  so the store never holds them. The file itself is not changed.
-- **When asking:** email addresses, card numbers, IBANs and key-like tokens in
-  the passages are replaced with markers before they are sent, whatever your
-  screenshot redaction setting is.
+- **When indexing:** card numbers, IBANs, national id numbers and labelled
+  secrets are replaced with `[card number]`, `[IBAN]`, `[national id]` and
+  `[secret]` before the text is saved, so the store never holds them. The file
+  itself is not changed.
+- **When asking:** email addresses, card numbers, IBANs, labelled secrets and
+  key-like tokens in the passages are replaced with markers before they are
+  sent, whatever your screenshot redaction setting is.
 
 A masked number cannot be found or quoted: ask for it and the answer says the
 documents have none.
 
-Not masked: a password or other secret written as ordinary words next to a label,
-such as `password: hunter2` or `"pin": "1234"` in a `.json` or `.csv` file. If an
-excerpt holding one is chosen for a question, it is sent. Keep files like that
-out of the documents folder (issue #1112).
+A labelled secret is a value after a word such as `password`, `pwd`, `pin`,
+`secret`, `token`, `api key`, `Passwort`, `mot de passe` or `contraseña`
+(any capitals). `password: hunter2`, `pwd=abc` and `"pin": "1234"` become
+`password: [secret]` and so on. The value must follow a `:` or `=`, or, after
+a plain space, contain a digit (`PIN 1234`), so "the password policy" is left
+alone. The value ends at the next space or the end of the line. A secret
+written in some other way, such as "the password is hunter2", is not
+recognised.
 
 ## Limits worth knowing
 
