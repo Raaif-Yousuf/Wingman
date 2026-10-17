@@ -31,13 +31,15 @@ Describe 'Get-OwnerOnlyAclProblem' {
         Get-OwnerOnlyAclProblem -IsProtected $true -Rules $rules -OwnerSid $me | Should -Match 'S-1-1-0'
     }
 
-    It 'allows SYSTEM and Administrators beside the owner' {
+    It 'flags SYSTEM and Administrators beside the owner (#966)' {
         $rules = @(
             [pscustomobject]@{ Sid = 'S-1-5-18'; Type = 'Allow' },
             [pscustomobject]@{ Sid = 'S-1-5-32-544'; Type = 'Allow' },
             [pscustomobject]@{ Sid = $me; Type = 'Allow' }
         )
-        @(Get-OwnerOnlyAclProblem -IsProtected $true -Rules $rules -OwnerSid $me).Count | Should -Be 0
+        $text = (Get-OwnerOnlyAclProblem -IsProtected $true -Rules $rules -OwnerSid $me) -join ';'
+        $text | Should -Match 'S-1-5-18'
+        $text | Should -Match 'S-1-5-32-544'
     }
 
     It 'flags a list with no owner entry or no entries' {

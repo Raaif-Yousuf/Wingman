@@ -58,17 +58,14 @@ $ReleaseZipExtras = @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'PRIVACY.md', 'config
 #   $IsProtected  inheritance is cut (icacls /inheritance:r)
 #   $Rules        objects with Sid (string) and Type ('Allow' or 'Deny')
 #   $AlsoAllowed  SIDs that may hold an entry besides the owner. Default:
-#                 SYSTEM and Administrators. MEASURED 2026-10-17 on a GitHub
-#                 runner (elevated admin): after the app's icacls restriction
-#                 the file still lists SYSTEM, Administrators and the user as
-#                 explicit entries, from the creating token's default DACL.
-#                 Both can take the file anyway; anyone else is a problem.
+#                 none. The app removes the SYSTEM and Administrators entries
+#                 an elevated creator leaves behind (#966).
 function Get-OwnerOnlyAclProblem {
     param(
         [Parameter(Mandatory)] [bool] $IsProtected,
         [AllowEmptyCollection()] [object[]] $Rules = @(),
         [Parameter(Mandatory)] [string] $OwnerSid,
-        [string[]] $AlsoAllowed = @('S-1-5-18', 'S-1-5-32-544')
+        [string[]] $AlsoAllowed = @()
     )
     $problems = @()
     if (-not $IsProtected) { $problems += 'inheritance is not cut, so the folder entries apply too' }
