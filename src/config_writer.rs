@@ -456,7 +456,7 @@ fn write_batch(path: &Path, jobs: &[&[FieldChange]]) -> Vec<Result<(), String>> 
 /// `config` with `changes` applied on top, for changes that could not be written
 /// to the file but are live until quit: a reload from disk would otherwise
 /// silently revert them. Load-time notes that are not part of the file
-/// (`unreadable_secrets`, `load_problem`) carry over.
+/// (`unreadable_secrets`, `keys_left_in_file`, `load_problem`) carry over.
 pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
     let mut value = toml::Value::try_from(config).context("could not read the settings")?;
     for change in changes {
@@ -466,6 +466,7 @@ pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
         .try_into()
         .context("could not apply the unsaved change")?;
     out.unreadable_secrets = config.unreadable_secrets.clone();
+    out.keys_left_in_file = config.keys_left_in_file.clone();
     out.load_problem = config.load_problem.clone();
     Ok(out)
 }
@@ -586,6 +587,11 @@ fn effective_on_disk(text: &str, changes: &[FieldChange]) -> Option<toml::Value>
 /// Reads `path` fresh, applies `changes`, writes atomically. See the module doc
 /// for the rules.
 pub fn write_changes(path: &Path, changes: &[FieldChange]) -> Result<()> {
+    // No changes (a reload, #901) is no write: not even a file that does not
+    // parse is refused for it.
+    if changes.is_empty() {
+        return Ok(());
+    }
     write_changes_with(path, changes, &mut |_| {})
 }
 
@@ -730,6 +736,10 @@ pub struct Outcome {
     /// an answer already on screen, and a press of the Wingman key is refused until
     /// its answer has been applied.
     pub from_settings: bool,
+    /// The job is the tray's Reload settings: a reload is the file as the truth
+    /// again, so a change that failed to save earlier is dropped, and a key the
+    /// store could not give back is said.
+    pub from_reload: bool,
     /// Say nothing when the write works: something else on screen (the Settings
     /// window's own controls) already shows the change. A failure still ends in a
     /// card.
@@ -748,7 +758,19 @@ impl Outcome {
             fail_headline: format!("Using {label}: not saved"),
             fail_note: "It will revert when you quit.".to_string(),
             from_settings: false,
+            from_reload: false,
             quiet_ok: false,
+        }
+    }
+
+    /// "Reload settings" from the tray (#901): no field changes, only the read.
+    pub fn reload() -> Self {
+        Self {
+            ok_headline: "Settings reloaded".to_string(),
+            fail_headline: "Couldn't reload settings".to_string(),
+            fail_note: "Wingman is still using the settings it had.".to_string(),
+            from_reload: true,
+            ..Self::simple("Settings reloaded")
         }
     }
 
@@ -775,6 +797,7 @@ impl Outcome {
                         fixing this."
                 .to_string(),
             from_settings: true,
+            from_reload: false,
             quiet_ok: false,
         }
     }
@@ -1013,6 +1036,36 @@ x = 1
 
     fn cleanup(path: &Path) {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// #901: a reload sends no changes, so it must neither refuse nor touch a
+    /// file that does not parse (the load then reports it as a problem card).
+    #[test]
+    fn no_changes_write_nothing_and_do_not_refuse_a_broken_file() {
+        let path = scratch("no-changes");
+        std::fs::write(&path, "mode = [unclosed\r\n").unwrap();
+        write_changes(&path, &[]).expect("an empty job is not a write");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mode = [unclosed\r\n"
+        );
+        let missing = path.with_file_name("absent.toml");
+        write_changes(&missing, &[]).expect("nothing to write");
+        assert!(!missing.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_reload_outcome_is_marked_and_worded() {
+        let o = Outcome::reload();
+        assert!(o.from_reload && !o.from_settings && !o.ok_setup);
+        assert_eq!(o.ok_headline, "Settings reloaded");
+        assert_eq!(o.fail_headline, "Couldn't reload settings");
+        assert!(!o.fail_headline.contains("Using"), "{}", o.fail_headline);
+        assert!(!o.fail_note.contains("revert"), "{}", o.fail_note);
+        assert!(!o.fail_headline.contains('\u{2014}') && !o.fail_note.contains('\u{2014}'));
+        assert!(!Outcome::simple("x").from_reload);
+        assert!(!Outcome::settings_save().from_reload);
     }
 
     fn crlf(s: &str) -> String {
@@ -1941,6 +1994,17 @@ x = 1
     }
 
     #[test]
+    fn reapply_keeps_the_keys_left_in_the_file() {
+        // #899: a load-time note, like `unreadable_secrets`, must survive.
+        let loaded = Config {
+            keys_left_in_file: vec!["openai".into()],
+            ..Default::default()
+        };
+        let out = reapply(&loaded, &[FieldChange::mode(Mode::Offline)]).unwrap();
+        assert_eq!(out.keys_left_in_file, vec!["openai".to_string()]);
+    }
+
+    #[test]
     fn reapply_puts_unsaved_changes_back_on_a_freshly_loaded_config() {
         let mut loaded = Config::default();
         loaded.providers.openai.api_key = "sk-hydrated".into();
@@ -2254,8 +2318,13 @@ x = 1
     #[test]
     fn a_reload_forgets_the_unsaved_changes() {
         let app = include_str!("app.rs").replace('\r', "");
-        let reload = body_of(&app, "    fn reload(&mut self) {");
-        assert!(reload.contains("unsaved.clear()"), "{reload}");
+        // #901: the reload's answer is applied by the write handler, which
+        // clears them when the job is a reload.
+        let handler = body_of(&app, "    fn on_config_written(");
+        let at = handler
+            .find("outcome.from_reload")
+            .expect("no reload branch");
+        assert!(handler[at..].contains("unsaved.clear()"), "{handler}");
     }
 
     /// Settings saves through the writer: its Save builds the changes with

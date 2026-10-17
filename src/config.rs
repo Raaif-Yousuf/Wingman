@@ -1098,7 +1098,8 @@ fn repair_changes(
 /// import, or `None` when it cannot be (every key it held is then reported).
 /// Compat entries are matched by name.
 fn keys_still_in_file(before: &Config, on_disk: Option<&Config>) -> Vec<String> {
-    let left = |was: &str, now: Option<&str>| !was.is_empty() && now.is_none_or(|n| !n.is_empty());
+    let left =
+        |was: &str, now: Option<&str>| !was.is_empty() && now.map_or(true, |n| !n.is_empty());
     let b = &before.providers;
     let d = on_disk.map(|c| &c.providers);
     let mut out: Vec<String> = [
