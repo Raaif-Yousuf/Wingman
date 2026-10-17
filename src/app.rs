@@ -578,6 +578,10 @@ struct App {
     /// press of the Wingman key is refused (`settings_hold_card`) rather than run
     /// on settings the user has just changed.
     settings_saves: Arc<std::sync::atomic::AtomicU32>,
+    /// #1013: when each save still in flight was sent, oldest first (the one
+    /// writer thread answers in order), so a save that never answers is
+    /// reported as stuck by its own age (`save_is_stuck`).
+    settings_save_starts: VecDeque<Instant>,
     /// #870: the newest good load an earlier (not last) reply left unadopted.
     skipped_mtime: Option<Option<std::time::SystemTime>>,
     /// #339: whether a password manager was in front before Wingman's own UI
@@ -909,6 +913,7 @@ pub fn run() -> Result<()> {
         unsaved: Vec::new(),
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
+        settings_save_starts: VecDeque::new(),
         skipped_mtime: None,
         chain,
         card,
@@ -4933,8 +4938,10 @@ impl App {
         let saves = self
             .settings_saves
             .load(std::sync::atomic::Ordering::SeqCst);
-        if let Some((headline, detail)) = settings_hold_card(false, saves) {
+        let stuck = self.saves_stuck(saves);
+        if let Some((headline, detail)) = settings_hold_card(false, saves, stuck) {
             self.card.show_answer(headline, detail, 3, None);
+            self.set_watch(true);
             return;
         }
         // #1017: the user may be about to start Ollama or add a key.
@@ -4991,6 +4998,8 @@ impl App {
             original,
             edited,
         } = save;
+        // Remember when this save was sent, for "Saving is stuck".
+        self.settings_save_starts.push_back(Instant::now());
         self.settings_saves
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.persist_changes_with(
@@ -4998,6 +5007,14 @@ impl App {
             changes,
             Some((original, edited)),
         );
+    }
+
+    /// Whether the oldest save still in flight has gone unanswered for too
+    /// long (#1013). A reply that could not be posted never reaches this
+    /// thread to pop its start, so the list is trimmed to the live count.
+    fn saves_stuck(&mut self, saves_in_flight: u32) -> bool {
+        let oldest = oldest_save_start(&mut self.settings_save_starts, saves_in_flight);
+        save_is_stuck(saves_in_flight, oldest, Instant::now())
     }
 
     /// The card that explains why a model action does not start because of the
@@ -5012,9 +5029,13 @@ impl App {
             settings::is_foreground(),
             TRAY_COMMAND_RUNNING.with(|c| c.get()),
         );
-        match settings_hold_card(stops, saves) {
+        let stuck = self.saves_stuck(saves);
+        match settings_hold_card(stops, saves, stuck) {
             Some((headline, detail)) => {
                 self.card.show_answer(headline, detail, 3, None);
+                // #1013: a click in Settings (or anywhere) clears it, like any
+                // card that is waiting to be read.
+                self.set_watch(true);
                 true
             }
             None => false,
@@ -8220,9 +8241,17 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
 fn settings_hold_card(
     settings_in_front: bool,
     saves_in_flight: u32,
+    saves_stuck: bool,
 ) -> Option<(&'static str, &'static str)> {
     if settings_in_front {
         Some(("Settings is open", "Close it, then press the key again."))
+    } else if saves_in_flight > 0 && saves_stuck {
+        // #1013: the gate stays closed (the running settings are still the old
+        // ones), but a write that never answers must not look like a pause.
+        Some((
+            "Saving is stuck",
+            "Your settings did not finish saving. Quit Wingman from the tray and start it again.",
+        ))
     } else if saves_in_flight > 0 {
         Some(("Saving your settings", "Try again in a moment."))
     } else {
@@ -8362,6 +8391,28 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         app.password_manager_hint = false;
     }
     LRESULT(0)
+}
+
+/// How long a Settings save may go unanswered before the refusal card says it
+/// is stuck (#1013). The writer does a file write, `icacls` and Credential
+/// Manager calls; a healthy save answers well inside a second.
+const SAVE_STUCK_AFTER: Duration = Duration::from_secs(30);
+
+/// Whether the oldest save still in flight has gone unanswered for too long
+/// (`since` is when the count last rose from zero).
+fn save_is_stuck(saves_in_flight: u32, since: Option<Instant>, now: Instant) -> bool {
+    saves_in_flight > 0
+        && since.is_some_and(|s| now.saturating_duration_since(s) >= SAVE_STUCK_AFTER)
+}
+
+/// The send time of the oldest save still in flight. `starts` holds one entry
+/// per save sent, oldest first; replies settle in the same order, so the ones
+/// already answered are the front entries beyond the live count.
+fn oldest_save_start(starts: &mut VecDeque<Instant>, saves_in_flight: u32) -> Option<Instant> {
+    while starts.len() > saves_in_flight as usize {
+        starts.pop_front();
+    }
+    starts.front().copied()
 }
 
 /// Marks a tray command as running for as long as it lives (#1012).
@@ -9170,15 +9221,71 @@ mod tests {
     #[test]
     fn a_press_is_refused_while_settings_is_in_front_or_a_save_is_being_applied() {
         use super::settings_hold_card;
-        let open = settings_hold_card(true, 0).expect("refused while open");
+        let open = settings_hold_card(true, 0, false).expect("refused while open");
         assert_eq!(open.0, "Settings is open");
-        let saving = settings_hold_card(false, 1).expect("refused while saving");
+        let saving = settings_hold_card(false, 1, false).expect("refused while saving");
         assert_eq!(saving.0, "Saving your settings");
-        assert!(settings_hold_card(true, 2).is_some());
-        assert_eq!(settings_hold_card(false, 0), None);
+        assert!(settings_hold_card(true, 2, false).is_some());
+        assert_eq!(settings_hold_card(false, 0, false), None);
         for (headline, detail) in [open, saving] {
             assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         }
+    }
+
+    /// #1013 item 3: a save that never answers is said so, not "try in a
+    /// moment" forever. The gate stays closed (the running settings are still
+    /// the old ones), but the card names what is stuck and the way out.
+    #[test]
+    fn a_save_that_never_answers_gets_its_own_card() {
+        use super::{save_is_stuck, settings_hold_card, SAVE_STUCK_AFTER};
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let later = |d: Duration| start + d;
+        assert!(!save_is_stuck(0, Some(start), later(SAVE_STUCK_AFTER * 9)));
+        assert!(!save_is_stuck(1, None, later(SAVE_STUCK_AFTER * 9)));
+        assert!(!save_is_stuck(
+            1,
+            Some(start),
+            later(Duration::from_secs(1))
+        ));
+        assert!(save_is_stuck(1, Some(start), later(SAVE_STUCK_AFTER)));
+        let normal = settings_hold_card(false, 1, false).expect("saving");
+        let stuck = settings_hold_card(false, 1, true).expect("stuck");
+        assert_eq!(normal.0, "Saving your settings");
+        assert_ne!(stuck.0, normal.0);
+        assert!(stuck.1.contains("Quit"), "{}", stuck.1);
+        assert!(!stuck.0.contains('\u{2014}') && !stuck.1.contains('\u{2014}'));
+        // In front still wins, and nothing in flight is never stuck.
+        assert_eq!(
+            settings_hold_card(true, 1, true).unwrap().0,
+            "Settings is open"
+        );
+        assert_eq!(settings_hold_card(false, 0, true), None);
+        let src = lf(include_str!("app.rs"));
+        let save = body_between(&src, "    fn on_settings_save(", "\n    }\n");
+        assert!(save.contains("settings_save_starts.push_back"), "{save}");
+        // A second save does not inherit the first one's age: once the first
+        // is answered, the oldest start is the second's own.
+        use super::oldest_save_start;
+        let mut starts = std::collections::VecDeque::from([start, later(Duration::from_secs(40))]);
+        assert_eq!(oldest_save_start(&mut starts, 2), Some(start));
+        assert_eq!(
+            oldest_save_start(&mut starts, 1),
+            Some(later(Duration::from_secs(40)))
+        );
+        assert_eq!(oldest_save_start(&mut starts, 0), None);
+    }
+
+    /// #1013 item 4: the refusal card can be clicked away, like every card
+    /// that is waiting to be read. Without the watch it sits over the form
+    /// for its whole 3 seconds.
+    #[test]
+    fn the_settings_refusal_card_arms_the_click_away_watch() {
+        let src = lf(include_str!("app.rs"));
+        let refuse = body_between(&src, "    fn refuse_for_settings(", "\n    }\n");
+        let show = refuse.find("show_answer(").expect("card moved");
+        let watch = refuse.find("self.set_watch(true)").expect("no click-away");
+        assert!(show < watch, "{refuse}");
     }
 
     /// #1012: a tray command never sees Settings in front (the menu took the
