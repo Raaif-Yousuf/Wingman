@@ -4504,7 +4504,7 @@ impl App {
             // On the writer thread (or here, if the writer could not start). The
             // reload is the slow part, so it happens here and not in the handler.
             let loaded = (reply.result.is_ok() && !crate::config_writer::shutting_down())
-                .then(|| Config::load().map(Box::new).map_err(|e| format!("{e:#}")));
+                .then(crate::config_writer::load_after_write);
             let payload = Box::into_raw(Box::new(Written {
                 reply,
                 changes: sent,

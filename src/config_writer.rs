@@ -470,6 +470,12 @@ pub struct Written {
     pub loaded: Option<Result<Box<Config>, String>>,
 }
 
+/// `Config::load` for the handler of [`Written`], with the error as a sentence.
+/// Runs on the writer thread.
+pub fn load_after_write() -> Result<Box<Config>, String> {
+    Config::load().map(Box::new).map_err(|e| format!("{e:#}"))
+}
+
 struct Job {
     changes: Vec<FieldChange>,
     label: String,
@@ -1525,13 +1531,14 @@ x = 1
         let end = rest.find("\n    }\n").expect("end of on_config_written");
         let handler = &rest[..end];
         assert!(!handler.contains("Config::load"), "{handler}");
+        assert!(!handler.contains("load_after_write"), "{handler}");
         let start = app
             .find("    fn persist_field(")
             .expect("persist_field moved");
         let rest = &app[start..];
         let end = rest.find("\n    }\n").expect("end of persist_field");
         assert!(
-            rest[..end].contains("Config::load"),
+            rest[..end].contains("load_after_write"),
             "the writer thread must reload"
         );
     }
