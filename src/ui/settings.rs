@@ -8124,7 +8124,7 @@ fn build_ui_recorded(
         );
         SendMessageW(track, TBM_SETLINESIZE, None, Some(LPARAM(5)));
         SendMessageW(track, TBM_SETPAGESIZE, None, Some(LPARAM(10)));
-        crate::ui::settings_trackbar::track_hover(track);
+        crate::ui::settings_trackbar::track_hover(track, || edit_style().paints_face);
         let pos = (clamp_text_scale(config.ui.text_scale) * 100.0).round() as i32;
         SendMessageW(
             track,
@@ -13808,6 +13808,38 @@ mod tests {
             assert!(dot_width() > rest, "hot again");
             unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(LPARAM(0))) };
             assert_eq!(dot_width(), rest, "mouse moved off the thumb");
+            // Hiding or disabling it ends the hover, with no leave message.
+            for (msg, off) in [(WM_SHOWWINDOW, 0usize), (WM_ENABLE, 0)] {
+                unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at)) };
+                assert!(dot_width() > rest, "hot before {msg:#x}");
+                unsafe { SendMessageW(track, msg, Some(WPARAM(off)), Some(LPARAM(0))) };
+                assert!(
+                    !crate::ui::settings_trackbar::is_hot(track),
+                    "{msg:#x} ends it"
+                );
+            }
+            unsafe { SendMessageW(track, WM_MOUSEMOVE, Some(WPARAM(0)), Some(at)) };
+            unsafe { SendMessageW(track, WM_CAPTURECHANGED, None, None) };
+            assert!(!crate::ui::settings_trackbar::is_hot(track), "capture lost");
+        });
+    }
+
+    /// #1240 review: light never tracks the thumb.
+    #[test]
+    fn light_does_not_track_the_trackbar_thumb() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        let _forced = Forced::new(Theme::Light);
+        with_window(Config::default(), |hwnd, _raw| {
+            let track = get_dlg_item(hwnd, ID_TEXT_SCALE_TRACK).expect("the trackbar");
+            unsafe {
+                SendMessageW(
+                    track,
+                    WM_MOUSEMOVE,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(0x0008_0040)),
+                )
+            };
+            assert!(!crate::ui::settings_trackbar::is_hot(track));
         });
     }
 

@@ -202,7 +202,7 @@ pub(crate) unsafe fn handle_custom_draw(
     // 2026-10-17: a real cursor over it, painted, `uItemState` stayed 0), so the
     // hover is tracked by `track_hover`.
     let mut state = state_from_cdis(nm.uItemState.0, IsWindowEnabled(hwnd).as_bool());
-    if state == ThumbState::Normal && THUMB_HOT.get() == hwnd.0 as isize {
+    if state == ThumbState::Normal && is_hot(hwnd) {
         state = ThumbState::Hot;
     }
     let colors = look(state, palette);
@@ -242,6 +242,11 @@ thread_local! {
     static THUMB_HOT: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether the mouse is over the thumb of `track`.
+pub(crate) fn is_hot(track: windows::Win32::Foundation::HWND) -> bool {
+    THUMB_HOT.get() == track.0 as isize
+}
+
 const SUBCLASS_ID: usize = 0x1240;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
@@ -253,13 +258,15 @@ pub(crate) fn over_thumb(thumb: &RECT, x: i32, y: i32) -> bool {
 /// Makes `track` report the mouse over its thumb (#1240). Event driven: a
 /// `WM_MOUSEMOVE` that changes the answer repaints the thumb only, and Windows
 /// sends one `WM_MOUSELEAVE` when the mouse goes. Nothing runs while still.
-pub(crate) fn track_hover(track: windows::Win32::Foundation::HWND) {
+/// `paints_face` says whether Settings draws the trackbar itself right now; when
+/// it does not (light, the system's high contrast) nothing is tracked.
+pub(crate) fn track_hover(track: windows::Win32::Foundation::HWND, paints_face: fn() -> bool) {
     unsafe {
         let _ = windows::Win32::UI::Shell::SetWindowSubclass(
             track,
             Some(hover_subclass),
             SUBCLASS_ID,
-            0,
+            paints_face as usize,
         );
     }
 }
@@ -287,14 +294,19 @@ unsafe extern "system" fn hover_subclass(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: LPARAM,
     _id: usize,
-    _data: usize,
+    data: usize,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
-    use windows::Win32::UI::WindowsAndMessaging::{WM_MOUSEMOVE, WM_NCDESTROY};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CAPTURECHANGED, WM_ENABLE, WM_MOUSEMOVE, WM_NCDESTROY, WM_SHOWWINDOW,
+    };
+    // SAFETY: `data` is the `fn() -> bool` `track_hover` stored.
+    let paints_face: fn() -> bool = std::mem::transmute::<usize, fn() -> bool>(data);
     match msg {
+        WM_MOUSEMOVE if !paints_face() => {}
         WM_MOUSEMOVE => {
             let mut thumb = RECT::default();
             SendMessageW(
@@ -319,7 +331,10 @@ unsafe extern "system" fn hover_subclass(
             }
             set_hot(hwnd, over);
         }
-        WM_MOUSELEAVE => set_hot(hwnd, false),
+        // A disabled or hidden trackbar, or one that lost the capture, may not get
+        // `WM_MOUSELEAVE`, so those end the hover themselves.
+        WM_MOUSELEAVE | WM_CAPTURECHANGED => set_hot(hwnd, false),
+        WM_ENABLE | WM_SHOWWINDOW if wparam.0 == 0 => set_hot(hwnd, false),
         WM_NCDESTROY => {
             set_hot(hwnd, false);
             let _ = RemoveWindowSubclass(hwnd, Some(hover_subclass), SUBCLASS_ID);
