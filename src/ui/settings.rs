@@ -10728,6 +10728,21 @@ impl GalleryWindow {
         }
     }
 
+    /// Gives the Text scale trackbar the keyboard focus with the focus cue
+    /// showing and moves it off the default, for the gallery.
+    pub(crate) fn focus_text_scale_track(&mut self) {
+        const WM_UPDATEUISTATE: u32 = 0x0128;
+        let inner = unsafe { &mut *self.raw };
+        if let Some(track) = get_dlg_item(inner.hwnd, ID_TEXT_SCALE_TRACK) {
+            unsafe {
+                SendMessageW(track, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(140)));
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(track));
+                // UIS_CLEAR (2) of UISF_HIDEFOCUS (1): show the cue.
+                SendMessageW(track, WM_UPDATEUISTATE, Some(WPARAM(2 | (1 << 16))), None);
+            }
+        }
+    }
+
     /// The window of the open drop list of the combo `id`, if it is showing.
     pub(crate) fn combo_list_hwnd(&self, id: i32) -> Option<HWND> {
         use windows::Win32::UI::Controls::COMBOBOXINFO;
@@ -13517,7 +13532,6 @@ mod tests {
                 }
                 let (disc, dot) = crate::ui::settings_trackbar::thumb_rects(
                     &thumb,
-                    dpi_for(track),
                     crate::ui::settings_trackbar::ThumbState::Normal,
                 );
                 let cy = (thumb.top + thumb.bottom) / 2;
@@ -13564,11 +13578,19 @@ mod tests {
         assert_eq!(disc, DARK.text, "the thumb");
         assert_eq!(face, DARK.surface, "the background behind the rail");
         assert_eq!(marks, 0, "no stock end mark under the rail");
-        let (_, light_rail, ..) = probe(Theme::Light);
-        assert_ne!(
-            light_rail, DARK.control_border,
-            "light keeps the stock rail"
-        );
+        // Light keeps the stock trackbar: none of the four pixels is any colour
+        // the dark paint uses.
+        let (l_filled, l_rail, l_dot, l_disc, _, _) = probe(Theme::Light);
+        for (name, pixel) in [
+            ("rail before the thumb", l_filled),
+            ("rail after the thumb", l_rail),
+            ("dot", l_dot),
+            ("thumb", l_disc),
+        ] {
+            for token in [DARK.control_border, DARK.text, DARK.surface, accent] {
+                assert_ne!(pixel, token, "light {name} must stay stock");
+            }
+        }
     }
 
     /// #582 slice 2: the manifest took effect in the process that runs

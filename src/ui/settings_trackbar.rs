@@ -16,7 +16,7 @@
 
 use crate::ui::card_buttons::HighContrast;
 use crate::ui::settings_buttons::{Palette, NM_CUSTOMDRAW_CODE};
-use crate::ui::theme::{scale_for_dpi, TRACK_CHANNEL_DP, TRACK_THUMB_DP};
+use crate::ui::theme::{scale_for_dpi, TRACK_CHANNEL_DP};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::UI::Controls::NMCUSTOMDRAW;
@@ -155,11 +155,11 @@ pub(crate) fn channel_rects(rc: &RECT, dpi: u32, thumb_x: i32) -> (RECT, RECT) {
 
 /// The thumb's disc and the dot inside it, centred on the thumb rectangle `rc`.
 /// The disc never leaves `rc` (the control repaints only that rectangle when
-/// the thumb moves), so it is the smaller of the rectangle's sides and the
-/// token diameter.
-pub(crate) fn thumb_rects(rc: &RECT, dpi: u32, state: ThumbState) -> (RECT, RECT) {
+/// the thumb moves), so it is the smaller of the rectangle's two sides (about
+/// 11 px at 100%, the size the system gives the thumb).
+pub(crate) fn thumb_rects(rc: &RECT, state: ThumbState) -> (RECT, RECT) {
     let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-    let d = scale_for_dpi(TRACK_THUMB_DP, dpi).min(w).min(h).max(0);
+    let d = w.min(h).max(0);
     let (cx, cy) = ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
     let disc = rect(cx - d / 2, cy - d / 2, cx - d / 2 + d, cy - d / 2 + d);
     let dd = d * dot_percent(state) / 100;
@@ -216,7 +216,7 @@ pub(crate) unsafe fn handle_custom_draw(
             Some(CDRF_SKIPDEFAULT)
         }
         TBCD_THUMB => {
-            let (disc, dot) = thumb_rects(&nm.rc, dpi, state);
+            let (disc, dot) = thumb_rects(&nm.rc, state);
             fill_pill(nm.hdc, disc, colors.thumb, smooth);
             if let Some(dot_color) = colors.dot {
                 fill_pill(nm.hdc, dot, dot_color, smooth);
@@ -329,7 +329,7 @@ mod tests {
                     40 + scale_for_dpi(11, dpi),
                     2 + scale_for_dpi(21, dpi),
                 );
-                let (disc, dot) = thumb_rects(&rc, dpi, state);
+                let (disc, dot) = thumb_rects(&rc, state);
                 assert_eq!(disc.right - disc.left, disc.bottom - disc.top, "round");
                 assert!(disc.left >= rc.left && disc.right <= rc.right);
                 assert!(disc.top >= rc.top && disc.bottom <= rc.bottom);
@@ -337,7 +337,7 @@ mod tests {
                 assert!(dot.top >= disc.top && dot.bottom <= disc.bottom);
             }
         }
-        let (disc, dot) = thumb_rects(&rect(0, 0, 0, 0), 96, ThumbState::Normal);
+        let (disc, dot) = thumb_rects(&rect(0, 0, 0, 0), ThumbState::Normal);
         assert!(disc.right >= disc.left && dot.right >= dot.left);
     }
 
