@@ -14516,6 +14516,23 @@ mod tests {
             .then_some(m)
     }
 
+    /// Removes every queued message of `id` posted to `to`.
+    fn drain_posted(to: HWND, id: u32) {
+        while take_posted(to, id).is_some() {}
+    }
+
+    /// Takes the newest message of `id` posted to `to`, and drops the older
+    /// ones. A real activation change of the hidden window can post an earlier
+    /// "left" (count 0) of its own before the close's, so a test that reads the
+    /// close's count reads the last one.
+    fn take_last_posted(to: HWND, id: u32) -> Option<MSG> {
+        let mut last = None;
+        while let Some(m) = take_posted(to, id) {
+            last = Some(m);
+        }
+        last
+    }
+
     /// Opens a real, hidden Settings window the way `open` does, on the tests'
     /// class, and runs `body` with it. Always closes it.
     fn with_open_window(body: impl FnOnce(HWND, HWND)) {
@@ -14896,14 +14913,16 @@ mod tests {
                 unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
             inner.tracker.fail(Field::CardCorner, "disk full");
             inner.tracker.fail(Field::Redact, "disk full");
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 2);
         });
         with_open_window(|_hwnd, owner| {
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
             assert_eq!(left.wParam.0, 0);
         });
     }
@@ -14974,8 +14993,9 @@ mod tests {
             pick(hwnd, ID_CARD_CORNER, "Top left");
             assert!(answer(hwnd, "Card corner", Ok(())));
             assert!(!status(hwnd).starts_with("Error"), "the status moved on");
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "the dropped number must be counted");
         });
@@ -15363,27 +15383,21 @@ mod tests {
         with_open_window(|hwnd, owner| {
             away(hwnd, "not-a-key");
             // Drain the activation message so the left count is the close's.
-            while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             // The close button: `WM_CLOSE`, not a bare destroy.
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
-            // A real activation change of this hidden window, while other tests
-            // make windows, can post an earlier "left" (count 0) of its own:
-            // the close's is the last one posted.
-            let mut last = None;
-            while let Some(m) = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT) {
-                last = Some(m);
-            }
-            let left = last.expect("closing tells the owner");
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "a key that does not fit is counted");
         });
         with_open_window(|hwnd, owner| {
             away(hwnd, "sk-a-whole-key");
-            while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
             // #876: the key was still being checked, so it was not stored, and
             // closing counts it as not saved instead of dropping it silently.
             assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_none());
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "an unchecked key is counted");
         });
