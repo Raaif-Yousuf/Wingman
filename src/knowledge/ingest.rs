@@ -22,7 +22,7 @@ use crate::store::knowledge::{DocumentRow, DocumentUpdate};
 use crate::store::{self, Store, StoreError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,49 @@ const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 /// queue) take turns on this, here and in the watcher's tests.
 #[cfg(test)]
 pub(super) static GLOBAL_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How many files the index holds for the configured folder, kept up to date
+/// by the scan and the watcher after each pass, so the tray menu reads one
+/// number and never queries the store on the UI thread (#81).
+static INDEXED_FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// The cached count of indexed files. Zero until the first pass ends.
+pub fn indexed_files() -> usize {
+    INDEXED_FILES.load(Ordering::Relaxed)
+}
+
+/// Forgets the count: the folder changed or was cleared, so the old number
+/// would be wrong until the next pass.
+pub fn reset_indexed_files() {
+    INDEXED_FILES.store(0, Ordering::Relaxed);
+}
+
+/// The files of `rows` that are searchable: indexed, not failed or waiting.
+fn count_indexed(rows: &[DocumentRow]) -> usize {
+    rows.iter().filter(|d| d.status == "indexed").count()
+}
+
+/// Reads the count off the store (on the scan or watcher thread, never the UI
+/// thread) and caches it. A store that cannot answer leaves the old number.
+pub(super) fn publish_indexed_files(store: &Store, root: &Path) {
+    let key = root.to_string_lossy();
+    if let Ok(id) = store.ensure_root(&key, now_unix()) {
+        if let Ok(rows) = store.documents_in_root(id) {
+            INDEXED_FILES.store(count_indexed(&rows), Ordering::Relaxed);
+        }
+    }
+}
+
+/// For the tray menu: `Some(count)` while a usable folder is set, `None` when
+/// the setting is empty or unusable (the entry is then hidden).
+pub fn menu_files(folder: &str) -> Option<usize> {
+    watch_target(folder).map(|_| indexed_files())
+}
+
+/// The folder "Open knowledge folder" opens, if the setting is usable.
+pub fn folder_to_open(folder: &str) -> Option<PathBuf> {
+    watch_target(folder)
+}
 
 /// What one scan did, for the notice and the tests.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -242,9 +285,15 @@ fn run_scan(setting: Setting, stop: &AtomicBool) {
     let opened = store::global();
     lower_thread_priority();
     let wanted = match setting {
-        Setting::Off => None,
+        Setting::Off => {
+            reset_indexed_files();
+            None
+        }
         // Shown on the start-up card (`startup_problem`), not queued twice.
-        Setting::Invalid(_) => None,
+        Setting::Invalid(_) => {
+            reset_indexed_files();
+            None
+        }
         Setting::Folder(folder) => match canonical_root(&folder) {
             Ok(root) => Some(root),
             Err(why) => {
@@ -272,6 +321,7 @@ fn run_scan(setting: Setting, stop: &AtomicBool) {
         // A stopped scan is incomplete on purpose: no notice for it.
         Ok(_) if stopped() => {}
         Ok(summary) => {
+            publish_indexed_files(&store, &root);
             if let Some(text) = summary_notice(&summary) {
                 notice::report(&text);
             }
@@ -872,6 +922,50 @@ mod tests {
             .unwrap();
         let store = store::global().unwrap();
         assert_eq!(store.fts_hits("startupstoppedword").unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn row(status: &str) -> DocumentRow {
+        DocumentRow {
+            id: 0,
+            rel_path: String::new(),
+            size: None,
+            mtime_unix: None,
+            content_hash: None,
+            parser_ver: None,
+            status: status.into(),
+            ingested_unix: None,
+        }
+    }
+
+    #[test]
+    fn only_indexed_files_are_counted() {
+        let rows = [
+            row("indexed"),
+            row("failed"),
+            row("pending"),
+            row("indexed"),
+        ];
+        assert_eq!(count_indexed(&rows), 2);
+        assert_eq!(count_indexed(&[]), 0);
+    }
+
+    /// #81 wired-to-nothing: the number the tray shows comes from the scan.
+    #[test]
+    fn a_finished_scan_publishes_the_file_count_the_tray_reads() {
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("published-count");
+        fs::write(dir.join("a.md"), "# A\npublishedcountone\n").unwrap();
+        fs::write(dir.join("b.md"), "# B\npublishedcounttwo\n").unwrap();
+        reset_indexed_files();
+        start_scan(&dir.to_string_lossy()).unwrap().join().unwrap();
+        assert_eq!(menu_files(&dir.to_string_lossy()), Some(2));
+        assert_eq!(menu_files(""), None, "no folder, no entry");
+        assert_eq!(
+            menu_files("relative\\path"),
+            None,
+            "an unusable folder, no entry"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
