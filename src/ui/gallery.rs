@@ -82,6 +82,8 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsKeyChecking
+            | SettingsKeyRejected
     )
 }
 
@@ -143,6 +145,8 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsKeyChecking
+            | SettingsKeyRejected
     )
 }
 
@@ -295,6 +299,10 @@ pub enum GalleryState {
     SettingsInvalid,
     /// #875: a write that failed, on the status line.
     SettingsNotSaved,
+    /// #876: the Models page while a typed key is being checked.
+    SettingsKeyChecking,
+    /// #876: the Models page after a vendor refused a typed key.
+    SettingsKeyRejected,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -356,6 +364,8 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsSaved,
         SettingsInvalid,
         SettingsNotSaved,
+        SettingsKeyChecking,
+        SettingsKeyRejected,
         RegionOverlay,
         TrayMenu,
         TrayMenuSubmenu,
@@ -415,6 +425,8 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsSaved => "settings-saved",
         SettingsInvalid => "settings-invalid",
         SettingsNotSaved => "settings-not-saved",
+        SettingsKeyChecking => "settings-key-checking",
+        SettingsKeyRejected => "settings-key-rejected",
         RegionOverlay => "region-overlay",
         TrayMenu => "tray-menu",
         TrayMenuSubmenu => "tray-menu-submenu",
@@ -877,7 +889,9 @@ mod driver {
         match state {
             GalleryState::SettingsModels
             | GalleryState::SettingsModelsClaude
-            | GalleryState::SettingsModelsMoreProviders => Page::Models,
+            | GalleryState::SettingsModelsMoreProviders
+            | GalleryState::SettingsKeyChecking
+            | GalleryState::SettingsKeyRejected => Page::Models,
             GalleryState::SettingsPrivacy => Page::Privacy,
             GalleryState::SettingsActions => Page::Actions,
             GalleryState::SettingsAdvanced | GalleryState::SettingsAdvancedPromptOpen => {
@@ -1230,7 +1244,9 @@ mod driver {
             | SettingsAdvancedPromptOpen
             | SettingsSaved
             | SettingsInvalid
-            | SettingsNotSaved => {
+            | SettingsNotSaved
+            | SettingsKeyChecking
+            | SettingsKeyRejected => {
                 card.hide();
                 palette.hide();
                 let mut w = GalleryWindow::open(instance, variant.dpi)
@@ -1250,6 +1266,12 @@ mod driver {
                     }
                     SettingsNotSaved => w.show_status(
                         "Not saved: Card corner. The disk is full. Wingman is still using the old value.",
+                        false,
+                    ),
+                    // #876: a typed key being asked of its vendor, and refused.
+                    SettingsKeyChecking => w.show_status("Checking key...", false),
+                    SettingsKeyRejected => w.show_status(
+                        "Error: OpenAI key. OpenAI did not accept that key. Check it and try again.",
                         false,
                     ),
                     _ => {}
@@ -1274,7 +1296,9 @@ mod driver {
             | SettingsAdvancedPromptOpen
             | SettingsSaved
             | SettingsInvalid
-            | SettingsNotSaved => settings
+            | SettingsNotSaved
+            | SettingsKeyChecking
+            | SettingsKeyRejected => settings
                 .as_ref()
                 .map(|w| w.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
@@ -1899,8 +1923,8 @@ mod tests {
         // Models page with Claude active and with every provider shown (#874)
         // = 41, + the palette with a widened thumb (#988) = 42, + the preview's
         // button states (#818) = 46, + the status line saved, not valid and not
-        // saved (#875) = 49.
-        assert_eq!(states.len(), 49);
+        // saved (#875) = 49, + the key being checked and refused (#876) = 51.
+        assert_eq!(states.len(), 51);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1942,14 +1966,16 @@ mod tests {
             "settings-saved",
             "settings-invalid",
             "settings-not-saved",
+            "settings-key-checking",
+            "settings-key-rejected",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 6,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874) and the status line three (#875)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 8,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874) and the status line five (#875, #876)"
         );
     }
 
