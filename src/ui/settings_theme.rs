@@ -49,6 +49,19 @@ pub(crate) fn title_bar_dark(theme: Theme) -> Option<bool> {
     }
 }
 
+/// The visual-style class that darkens a non-client scrollbar. Documented API
+/// (`SetWindowTheme`) with an undocumented name; MEASURED 2026-10-16 to darken a
+/// `WS_VSCROLL` bar with no ordinal call, and to change nothing on edits, combos
+/// or the trackbar, so it is applied to the scrolling body only (spec: Scrollbar).
+pub(crate) const DARK_SCROLLBAR_CLASS: &str = "DarkMode_Explorer";
+
+/// Whether the body's scrollbar takes the dark visual style. Only dark does:
+/// light and high contrast keep the stock bar (high contrast included when the
+/// gallery forces it, since the system draws that bar from its own colours).
+pub(crate) fn scrollbar_is_dark(theme: Theme) -> bool {
+    theme == Theme::Dark
+}
+
 /// Whether `button` is a common controls v6 button. `BCM_GETIDEALSIZE` exists
 /// only in v6 (a v5 button answers 0), so this asks the control itself, not
 /// the DLL, and is true exactly when `NM_CUSTOMDRAW` will arrive for it (the
@@ -107,6 +120,14 @@ mod tests {
         assert_eq!(face_color(HighContrast, false, &LIGHT, system), system);
         let hc = Tokens::for_theme(HighContrast, &HC_BLACK);
         assert_eq!(face_color(HighContrast, true, &hc, system), HC_BLACK.window);
+    }
+
+    #[test]
+    fn only_dark_darkens_the_scrollbar() {
+        assert!(scrollbar_is_dark(Dark));
+        assert!(!scrollbar_is_dark(Light));
+        assert!(!scrollbar_is_dark(HighContrast), "the system draws it");
+        assert_eq!(DARK_SCROLLBAR_CLASS, "DarkMode_Explorer");
     }
 
     #[test]
