@@ -504,7 +504,20 @@ pub fn run() -> Result<()> {
     // run. If the path cannot be found, say it existed: no welcome is the
     // safe side.
     let config_existed = Config::path().map(|p| p.exists()).unwrap_or(true);
-    let config = Config::load().unwrap_or_default();
+    // #924: a load that failed (the first-run file could not be written) runs
+    // on defaults, and the card below says why. Env keys still apply.
+    let (config, create_failed) = match Config::load() {
+        Ok(config) => (config, None),
+        Err(e) => {
+            let mut config = Config::default();
+            config.apply_env_overrides();
+            let folder = Config::path()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_else(|| "the Wingman settings folder".to_string());
+            (config, Some((folder, format!("{e:#}"))))
+        }
+    };
     // Issue #19: publish the loaded mode to the process-wide atomic BEFORE
     // anything below can start a request (the hotkey hook isn't installed
     // yet, but `--settings`'s `open_settings` path below can still save,
@@ -556,6 +569,9 @@ pub fn run() -> Result<()> {
         &config.unreadable_secrets,
         crate::single_instance::lock_squatted(),
         config.load_problem.as_deref(),
+        create_failed
+            .as_ref()
+            .map(|(folder, error)| (folder.as_str(), error.as_str())),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -719,6 +735,7 @@ fn startup_card(
     unreadable: &[String],
     lock_squatted: bool,
     config_problem: Option<&str>,
+    create_failed: Option<(&str, &str)>,
 ) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
@@ -729,6 +746,9 @@ fn startup_card(
     let mut cards = Vec::new();
     if let Some(problem) = config_problem {
         cards.push(config_problem_card(problem));
+    }
+    if let Some((folder, error)) = create_failed {
+        cards.push(settings_create_failed_card(folder, error));
     }
     if !unreadable.is_empty() {
         cards.push(unreadable_secrets_card(unreadable));
@@ -850,6 +870,26 @@ fn config_problem_card(problem: &str) -> (String, String) {
             "{problem}. Wingman is using default settings in Offline mode (nothing leaves this \
              computer) and will not save over your file. Fix it, then choose Reload settings \
              from the tray menu."
+        ),
+    )
+}
+
+/// #924: the first launch could not create config.toml (folder not writable,
+/// the permission step blocked). Names the folder and the cause, capped so a
+/// long `icacls` message cannot fill the card. No em dash (rule 11).
+fn settings_create_failed_card(folder: &str, error: &str) -> (String, String) {
+    let error: String = error.trim().chars().take(240).collect();
+    let cause = if error.is_empty() {
+        String::new()
+    } else {
+        format!(" ({error})")
+    };
+    (
+        "Settings file not created".to_string(),
+        format!(
+            "Wingman could not create its settings file in {folder}{cause}. It is using default \
+             settings for this session, so a key you paste in Settings will not be kept. Fix the \
+             folder, then restart Wingman."
         ),
     )
 }
@@ -9391,12 +9431,12 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false, None), None);
-        let only_keys = super::startup_card(&keys, false, None).unwrap();
+        assert_eq!(super::startup_card(&[], false, None, None), None);
+        let only_keys = super::startup_card(&keys, false, None, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true, None).unwrap();
+        let only_squat = super::startup_card(&[], true, None, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true, None).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
@@ -9408,12 +9448,13 @@ mod tests {
     #[test]
     fn startup_card_reports_a_config_file_that_did_not_parse() {
         let problem = "config.toml has an error at line 3, column 7";
-        let (headline, detail) = super::startup_card(&[], false, Some(problem)).unwrap();
+        let (headline, detail) = super::startup_card(&[], false, Some(problem), None).unwrap();
         assert!(headline.contains("Settings file"), "{headline}");
         assert!(detail.contains(problem), "{detail}");
         assert!(detail.contains("Reload settings"), "{detail}");
         assert!(!detail.contains('\u{2014}'));
-        let (_, both) = super::startup_card(&["openai".to_string()], true, Some(problem)).unwrap();
+        let (_, both) =
+            super::startup_card(&["openai".to_string()], true, Some(problem), None).unwrap();
         assert!(
             both.contains(problem) && both.contains("startup lock"),
             "{both}"
@@ -9422,6 +9463,37 @@ mod tests {
         assert!(both.contains("Offline"), "{both}");
     }
 
+    /// #924: a first-run config file that could not be written is a card
+    /// (rule 7) naming the folder and the error, and it joins the others.
+    #[test]
+    fn startup_card_reports_a_settings_file_that_could_not_be_created() {
+        let failed = Some((
+            "C:\\Users\\x\\AppData\\Roaming\\Wingman",
+            "Access is denied. (os error 5)",
+        ));
+        let (headline, detail) = super::startup_card(&[], false, None, failed).unwrap();
+        assert!(headline.contains("Settings file"), "{headline}");
+        assert!(detail.contains("AppData\\Roaming\\Wingman"), "{detail}");
+        assert!(detail.contains("Access is denied"), "{detail}");
+        assert!(detail.contains("default settings"), "{detail}");
+        assert!(!detail.contains('\u{2014}'));
+        let (_, both) = super::startup_card(&[], true, None, failed).unwrap();
+        assert!(
+            both.contains("Access is denied") && both.contains("startup lock"),
+            "{both}"
+        );
+    }
+
+    /// A long error (an `icacls` message) is capped, and a blank one still
+    /// reads as a sentence.
+    #[test]
+    fn settings_create_failed_card_caps_and_tidies_the_error() {
+        let long = "x".repeat(2000);
+        let (_, detail) = super::settings_create_failed_card("C:\\f", &long);
+        assert!(detail.chars().count() < 600, "{}", detail.chars().count());
+        let (_, blank) = super::settings_create_failed_card("C:\\f", "  ");
+        assert!(blank.contains("C:\\f") && !blank.contains("()"), "{blank}");
+    }
     /// #237: the owner window must exist before the single-instance name is
     /// taken, or a duplicate arriving in the gap finds the name held and no
     /// window to poke. Source scan over `run`'s body, so it needs no window.
