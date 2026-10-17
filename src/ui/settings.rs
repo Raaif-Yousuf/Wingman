@@ -6,32 +6,47 @@
 //! # Public API
 //!
 //! ```ignore
-//! pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config>;
+//! pub fn open(instance: HINSTANCE, owner: HWND, config: &Config) -> bool;
+//! pub fn pre_dispatch(msg: &MSG) -> bool;
 //! ```
 //!
-//! `show_modal` creates the window, runs its own `GetMessageW` loop until
-//! the window is closed, and returns the edited config on Save or `None` on
-//! Cancel/close. The caller (the integrating agent's tray/app glue) is
-//! responsible for persisting (`Config::save`) and applying the result --
-//! this module never touches disk.
+//! The window is **modeless** (#871). `open` creates it and returns at once;
+//! there is no loop of its own and no `&mut App` held while it is open, so Quit,
+//! the tray, the pause key and every worker result are handled as they arrive.
+//! `owner` is the main window: the window posts to it when it loses the
+//! foreground or closes (`WM_APP_SETTINGS_LEFT`), and the writer's answer
+//! returns to it (`WM_APP_CONFIG_WRITTEN`).
 //!
-//! Notes for the integrating agent:
-//! - If a settings window is already open, a second `show_modal` call does
-//!   not open a second one: it brings the existing window to the front and
-//!   returns `None` immediately. This is guarded by a process-wide static,
-//!   not by anything the caller has to manage.
-//! - The message loop here pumps *all* thread messages (`GetMessageW` with
-//!   `hwnd = NULL`), not just this window's -- a window with child controls
-//!   cannot filter by its own `HWND`, because input messages for a control
-//!   are addressed to that control's `HWND`, not its parent's, and
-//!   `GetMessageW(hwnd)` only ever returns messages addressed to exactly
-//!   that handle. Filtering here would leave every edit/combo/button
-//!   keystroke and click undelivered. Consequently, anything else already
-//!   queued on this thread (e.g. a posted hotkey message aimed at the main
-//!   app window) can still be dispatched to its own window proc while this
-//!   modal loop runs. Whether that should be suppressed is a decision for
-//!   the integrating app's own message handling, not something this module
-//!   can enforce without owning that window.
+//! Save no longer returns a `Config`. It sends only the fields the user changed
+//! (`config_writer::diff` of the config the window opened with against the
+//! form) to the `settings-writer` thread, which patches them onto the file as it
+//! is on disk now, so a hand edit made meanwhile survives, and then closes the
+//! window. This module never touches the disk or the network on the UI thread.
+//!
+//! The window has a left navigation rail and five pages (#872): General,
+//! Models, Privacy, Actions and Advanced. Every control is created once, tagged
+//! with its page, and the rail shows one page's controls and hides the rest, so
+//! a hidden page is out of the Tab order and the accessibility tree. Ctrl+1 to
+//! Ctrl+5, Ctrl+PageUp and Ctrl+PageDown change the page from anywhere, F6
+//! moves between the rail and the page. Save and Cancel are still pinned under
+//! the pages and still send every touched field at once.
+//!
+//! The General page's Mode row and Pause and Resume buttons act at once, not on
+//! Save (#873): they post `WM_APP_SETTINGS_COMMAND` to the owner, which runs the
+//! tray's own `set_mode`, `pause_for` and `resume`. The app calls [`sync_live`]
+//! after any change, so the controls follow the tray and the pause key too. The
+//! pause shortcut is staged and saved like the other two.
+//!
+//! Notes for the integrating app:
+//! - If a settings window is already open, `open` brings it to the front and
+//!   returns `true` without opening a second one. The guard is a process-wide
+//!   static, not something the caller manages.
+//! - The window has no message loop, so the app's own pump must offer every
+//!   message to [`pre_dispatch`] first: it takes Enter, Esc and the wheel,
+//!   gives the dialog manager Tab and the mnemonics (`IsDialogMessage`), scrolls
+//!   a newly focused control into view, and takes a captured shortcut
+//!   (`WM_APP_LEARNED`, posted to the main window) while a Change is pending.
+//!   It is one atomic load when no window is open.
 //! - **Theme**: this window is always drawn with the stock (light) system
 //!   control appearance, regardless of the OS light/dark setting. Unlike
 //!   `card.rs` (which paints its own surface and can safely follow
@@ -52,10 +67,10 @@
 //! - `hotkeys.primary` / `hotkeys.secondary` are shown with a Change button
 //!   each (#345). Change arms the tray's own learn mode (`hotkey::arm_learning`),
 //!   and the captured chord comes back as `WM_APP_LEARNED`, posted to the main
-//!   window. This module's message loop takes that message off the queue
-//!   itself (`take_learned`) while a Change is pending, because the main
-//!   window's proc ignores it whenever Settings is open. The new chord is
-//!   only staged in the window and saved with everything else on Save.
+//!   window. [`pre_dispatch`] takes that message off the queue itself
+//!   (`take_learned`) while a Change is pending, so the app never sees it as a
+//!   rebind. The new chord is only staged in the window and saved with
+//!   everything else on Save.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -81,61 +96,107 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, VK_ESC
 use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
-    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
-    IsDialogMessageW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, PM_REMOVE, SPI_GETNONCLIENTMETRICS,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
-    WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    IsChild, IsDialogMessageW, IsWindow, KillTimer, LoadCursorW, PeekMessageW, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW,
+    PM_REMOVE, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetScrollInfo, GetWindow, CBN_SELCHANGE, GW_CHILD, GW_HWNDNEXT,
-    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
-    SM_CXVSCROLL, WM_MOUSEWHEEL, WM_VSCROLL,
+    GetClientRect, GetParent, GetScrollInfo, GetWindow, IsWindowVisible, CBN_SELCHANGE, GW_CHILD,
+    GW_HWNDNEXT, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE,
+    SIF_TRACKPOS, SM_CXVSCROLL, WM_CTLCOLORLISTBOX, WM_DRAWITEM, WM_MEASUREITEM, WM_MOUSEWHEEL,
+    WM_VSCROLL,
 };
 
 use crate::config::{ActiveProvider, CardCorner, Config, Hotkeys, OllamaConfig, RequireTickFor};
 use crate::hotkey::{
     apply_learned, arm_learning, chord_to_string, disarm_learning, judge_learned, Chord,
-    LearnedVerdict, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
+    LearnedVerdict, HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
 };
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::ollama_gpu_fix;
 use crate::provider::DEFAULT_PROMPT;
+use crate::ui::settings_models::{self, Slot};
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Opens the settings window modally and pumps messages until it is closed.
-/// Returns the edited config on Save, `None` on Cancel/close.
-///
-/// If a settings window is already open, brings it to the front and returns
-/// `None` without opening a second one.
-pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
+/// Opens the settings window and returns at once (#871): the window lives on
+/// the caller's message loop, which must offer every message to
+/// [`pre_dispatch`]. `owner` is the main window (see the module docs). Returns
+/// `false` only when Windows would not create the window; an already open one
+/// is brought to the front and counts as success.
+pub fn open(instance: HINSTANCE, owner: HWND, config: &Config) -> bool {
     let existing = OPEN_HWND.load(Ordering::SeqCst);
     if existing != 0 {
         let hwnd = HWND(existing as *mut c_void);
         unsafe {
             let _ = SetForegroundWindow(hwnd);
         }
-        return None;
+        return true;
     }
 
     if !ensure_class_registered(instance) {
-        return None;
+        return false;
     }
+    open_impl(instance, owner, config, CLASS_NAME, true)
+}
+
+/// [`open`] without the "already open" check and the class registration. `live`
+/// is false in the tests: the window is not shown or activated and the
+/// background probes (Ollama, the cloud model lists) are not started. The
+/// tests give their own class name (rule 9).
+fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, live: bool) -> bool {
     ensure_common_controls();
 
-    let inner = Box::new(SettingsInner::new(config.clone()));
+    let mut inner = Box::new(SettingsInner::new(config.clone()));
+    // The window owns this box from here: `WM_NCDESTROY` frees it.
+    inner.owner = owner;
+    inner.owns_itself = true;
+    let owner_raw = owner.0 as isize;
+    // What the FILE held when the window opened, defaults for keys it does not
+    // spell out. The running config is not that (a tray change not yet written,
+    // a default never written), and comparing with it refuses a save that
+    // touched nothing by hand. Tests do not read the real file (rule 9).
+    let file_baseline = if live {
+        crate::config::Config::path()
+            .ok()
+            .and_then(|p| crate::config_writer::file_baseline(&p))
+    } else {
+        None
+    };
+    inner.save_sink = Some(Box::new(move |original: &Config, edited: &Config| {
+        let changes = crate::config_writer::diff(original, edited).map_err(|e| format!("{e:#}"))?;
+        // A list changed here replaces the whole list in the file, so it is
+        // written only if the file's list is still the one this window opened
+        // with; a hand edit of a sibling entry is not silently dropped.
+        let changes = crate::config_writer::guard_whole_values(
+            changes,
+            file_baseline.as_ref().unwrap_or(original),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        crate::app::post_settings_save(
+            owner_raw,
+            crate::app::SettingsSave {
+                changes,
+                original: original.clone(),
+                edited: edited.clone(),
+            },
+        )
+    }));
     let raw = Box::into_raw(inner);
 
-    let class_name = wide_z(CLASS_NAME);
+    let class_name = wide_z(class);
     let title = wide_z("Wingman settings");
+    // See `FREED_BY_WINDOW`: forget a stale answer before creating.
+    FREED_BY_WINDOW.with(|c| c.set(0));
 
     // 96dpi guess for the very first CreateWindowExW call, before we have an
     // HWND to ask GetDpiForWindow about -- corrected immediately below, same
@@ -163,10 +224,15 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let hwnd = match create_result {
         Ok(hwnd) => hwnd,
         Err(_) => {
-            unsafe {
-                drop(Box::from_raw(raw));
+            // Windows destroys a window whose creation failed after
+            // `WM_NCCREATE`, and `WM_NCDESTROY` has already freed the box then.
+            // Freeing it again here would be a double free.
+            if FREED_BY_WINDOW.with(|c| c.replace(0)) != raw as usize {
+                unsafe {
+                    drop(Box::from_raw(raw));
+                }
             }
-            return None;
+            return false;
         }
     };
 
@@ -212,30 +278,32 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
     inner_ref.adopt(built);
     sync_card_display_enabled(hwnd);
-    // #527, #568: the Ollama status and button arrive later, off the UI
-    // thread; the group says "Checking Ollama..." until then.
-    spawn_ollama_status_probe(
-        hwnd,
-        config.providers.ollama.clone(),
-        config.providers.order.iter().any(|p| p == "ollama"),
-        inner_ref.ollama_status.clone(),
-        inner_ref.alive.clone(),
-    );
-    // #183: the model list arrives later, off the UI thread.
-    spawn_ollama_models_fetch(
-        hwnd,
-        config.providers.ollama.base_url.clone(),
-        inner_ref.ollama_tags.clone(),
-        inner_ref.alive.clone(),
-    );
-    // #380: the cloud providers' live model lists, the same way.
-    spawn_cloud_models_fetch(
-        hwnd,
-        config,
-        inner_ref.cloud_models.clone(),
-        inner_ref.cloud_sync.clone(),
-        inner_ref.alive.clone(),
-    );
+    if live {
+        // #527, #568: the Ollama status and button arrive later, off the UI
+        // thread; the group says "Checking Ollama..." until then.
+        spawn_ollama_status_probe(
+            hwnd,
+            config.providers.ollama.clone(),
+            config.providers.order.iter().any(|p| p == "ollama"),
+            inner_ref.ollama_status.clone(),
+            inner_ref.alive.clone(),
+        );
+        // #183: the model list arrives later, off the UI thread.
+        spawn_ollama_models_fetch(
+            hwnd,
+            config.providers.ollama.base_url.clone(),
+            inner_ref.ollama_tags.clone(),
+            inner_ref.alive.clone(),
+        );
+        // #380: the cloud providers' live model lists, the same way.
+        spawn_cloud_models_fetch(
+            hwnd,
+            config,
+            inner_ref.cloud_models.clone(),
+            inner_ref.cloud_sync.clone(),
+            inner_ref.alive.clone(),
+        );
+    }
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
     unsafe {
@@ -259,31 +327,22 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
         }
     }
 
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-        // #346: without an explicit initial focus, keyboard focus landed
-        // wherever it happened to fall (reported as the Max edge box) --
-        // pin it to the first field instead, so Tab order starts from the
-        // top of the window every time it opens.
-        if let Some(first) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
-            let _ = SetFocus(Some(first));
+    if live {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            // #346: without an explicit initial focus, keyboard focus landed
+            // wherever it happened to fall (reported as the Max edge box) --
+            // pin it to the first field instead, so Tab order starts from the
+            // top of the window every time it opens.
+            // #872: the rail, the first stop; the page is a Tab away.
+            if let Some(first) = get_dlg_item(hwnd, ID_RAIL) {
+                let _ = SetFocus(Some(first));
+            }
         }
     }
 
-    run_message_loop(hwnd, inner_ref.prompt_edit);
-
-    // #345: a key captured while Save was being pressed may still be queued
-    // for the main window, which would take it as a rebind. Free it unused.
-    drain_learned_messages();
-
-    // `inner_ref` is only valid up to WM_NCDESTROY, which has already run by
-    // the time DestroyWindow (called from our WM_CLOSE/command handling)
-    // returns, and that happens synchronously inside the message loop above.
-    // Reclaim the box now to read the result and free everything.
-    let inner = unsafe { Box::from_raw(raw) };
-    OPEN_HWND.store(0, Ordering::SeqCst);
-    inner.result
+    true
 }
 
 /// Asks the open Settings window to close without saving (#673), as its own
@@ -303,6 +362,67 @@ pub fn request_close() {
     }
 }
 
+/// Closes the open Settings window at once, without saving. For the app's own
+/// shutdown: Settings is a top-level window of its own, so it does not go away
+/// with the main window. Must run on the UI thread. A no-op when none is open.
+pub fn close_now() {
+    let existing = OPEN_HWND.load(Ordering::SeqCst);
+    if existing != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(existing as *mut c_void));
+        }
+    }
+}
+
+/// Whether the Settings window exists (#1012), in front or not.
+pub fn is_open() -> bool {
+    OPEN_HWND.load(Ordering::SeqCst) != 0
+}
+
+/// Whether the Settings window is open and is the foreground window. The app
+/// holds back anything that would put a card on top of it while this is true.
+pub fn is_foreground() -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    open != 0 && unsafe { GetForegroundWindow() }.0 as isize == open
+}
+
+/// Enables or disables the open Settings window (#1013), so an OS dialog that
+/// is not owned by it can stand in for a modal. Returns whether a window was
+/// there to change. UI thread only.
+pub fn set_enabled(on: bool) -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return false;
+    }
+    unsafe {
+        let _ = EnableWindow(HWND(open as *mut c_void), on);
+    }
+    true
+}
+
+/// Brings the open Settings window back to the front (#1013), after an OS
+/// dialog that disabled it closed and Windows activated another app. Does
+/// nothing when Settings is gone. UI thread only.
+pub fn bring_to_front() {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return;
+    }
+    let hwnd = HWND(open as *mut c_void);
+    unsafe {
+        if IsWindow(Some(hwnd)).as_bool() {
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+thread_local! {
+    /// The address of the `SettingsInner` the window procedure freed in
+    /// `WM_NCDESTROY` (0: none). `open_impl` reads it when `CreateWindowExW`
+    /// fails, to know whether the window already took the box with it.
+    static FREED_BY_WINDOW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Process-wide guard: 0 when no settings window is open, else the open
 /// window's `HWND` value. `isize` rather than a `Mutex<HWND>` because `HWND`
 /// is just a pointer-sized value and this only ever needs a single atomic
@@ -315,7 +435,8 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
         ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
-        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
+        | ID_CHANGE_SECONDARY | ID_CHANGE_PAUSE | ID_PAUSE_BUTTON | ID_RESUME_BUTTON
+        | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
         // #635: Enter in the Pull model box starts the pull.
         ID_PULL_NAME => ID_PULL_BUTTON,
         _ => ID_SAVE,
@@ -356,6 +477,29 @@ unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
         }
         return true;
     }
+    // #872: Ctrl+1 to Ctrl+5 and Ctrl+PageUp and PageDown change the page from
+    // anywhere in the window; F6 swaps focus between the rail and the page;
+    // Enter on the rail goes into the page instead of saving.
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyState, VK_CONTROL, VK_F6, VK_MENU,
+        };
+        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+        let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+        let request = match page_key(vk, ctrl, alt) {
+            Some(PageKey::Pick(page)) => Some((PAGE_PICK, page.index() as isize)),
+            Some(PageKey::Step(by)) => Some((PAGE_STEP, by)),
+            None if vk == VK_F6.0 as u32 => Some((PAGE_SWAP_FOCUS, 0)),
+            None if vk == VK_RETURN.0 as u32 && GetDlgCtrlID(msg.hwnd) == ID_RAIL => {
+                Some((PAGE_ENTER, 0))
+            }
+            None => None,
+        };
+        if let Some((what, arg)) = request {
+            let _ = PostMessageW(Some(hwnd), WM_SETTINGS_PAGE, WPARAM(what), LPARAM(arg));
+            return true;
+        }
+    }
     // Enter submits, except inside the multiline prompt box, where
     // ES_WANTRETURN means Enter should insert a newline instead, and on a
     // focused push button, where it presses that button (#342).
@@ -372,68 +516,76 @@ unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
     false
 }
 
-fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
-    // #481: the focused window as of the last message, to scroll a newly
-    // focused control into view without a timer.
-    let mut last_focus = HWND(std::ptr::null_mut());
-    loop {
-        let mut msg = MSG::default();
-        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if ret.0 <= 0 {
-            // WM_QUIT (0) or an error (-1). We never post WM_QUIT ourselves,
-            // but bail cleanly either way rather than spin.
-            break;
-        }
+/// The window that had the keyboard focus after the last message this module
+/// looked at, to scroll a newly focused control into view without a timer
+/// (#481).
+static LAST_FOCUS: AtomicIsize = AtomicIsize::new(0);
 
+/// The settings window's share of the app's message pump (#871). Called with
+/// every message before it is translated and dispatched; returns true when the
+/// message was used here and must not go any further. Messages that are not
+/// the open window's, or its children's, pass straight through.
+pub fn pre_dispatch(msg: &MSG) -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return false;
+    }
+    let hwnd = HWND(open as *mut c_void);
+    unsafe {
         // #345: the hook posts a captured key to the MAIN window, so it is
         // not addressed to us. While a Change is pending it is ours.
-        if msg.message == WM_APP_LEARNED && unsafe { take_learned(hwnd, &msg) } {
-            continue;
+        if msg.message == WM_APP_LEARNED && take_learned(hwnd, msg) {
+            return true;
         }
-
-        let belongs_to_us = msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
-
-        if belongs_to_us
-            && msg.message == WM_KEYDOWN
-            && unsafe { handle_key(hwnd, &msg, prompt_edit) }
-        {
-            continue;
+        let ours = msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd).as_bool();
+        if !ours {
+            return false;
         }
-
+        let prompt_edit = prompt_edit_of(hwnd);
+        if msg.message == WM_KEYDOWN && handle_key(hwnd, msg, prompt_edit) {
+            return true;
+        }
         // #481: the wheel scrolls the body wherever the pointer is in the
         // window (a control under it would otherwise eat the notch).
-        if belongs_to_us && unsafe { scroll_with_wheel(hwnd, &msg, prompt_edit) } {
-            continue;
+        if scroll_with_wheel(hwnd, msg, prompt_edit) {
+            return true;
         }
+        let used = IsDialogMessageW(hwnd, msg).as_bool();
+        let focus = GetFocus();
+        if LAST_FOCUS.swap(focus.0 as isize, Ordering::SeqCst) != focus.0 as isize
+            // Only keyboard moves scroll: scrolling between a click's
+            // mouse-down and mouse-up would cancel the click.
+            && !is_mouse_message(msg.message)
+        {
+            follow_focus(hwnd, focus);
+        }
+        used
+    }
+}
 
-        unsafe {
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            let focus = GetFocus();
-            if focus != last_focus {
-                last_focus = focus;
-                // Only keyboard moves scroll: scrolling between a click's
-                // mouse-down and mouse-up would cancel the click.
-                if !is_mouse_message(msg.message) {
-                    follow_focus(hwnd, focus);
-                }
-            }
-        }
+/// The multi-line prompt box of the window `hwnd`, or null.
+unsafe fn prompt_edit_of(hwnd: HWND) -> HWND {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if ptr.is_null() {
+        HWND(std::ptr::null_mut())
+    } else {
+        (*ptr).prompt_edit
+    }
+}
 
-        // SAFETY: `hwnd` is still alive until WM_NCDESTROY finishes, which
-        // is dispatched synchronously above; GWLP_USERDATA was set to a
-        // valid, still-owned SettingsInner pointer at WM_NCCREATE time.
-        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SettingsInner;
-        let should_close = if ptr.is_null() {
-            true
-        } else {
-            unsafe { (*ptr).should_close }
-        };
-        if should_close {
-            break;
-        }
+/// Tells the owner window that Settings lost the foreground or closed, so what
+/// waited for it can be shown. A window with no owner (the tests') says nothing.
+fn tell_owner_left(owner: HWND) {
+    if owner.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            Some(owner),
+            crate::app::WM_APP_SETTINGS_LEFT,
+            WPARAM(0),
+            LPARAM(0),
+        );
     }
 }
 
@@ -499,6 +651,9 @@ unsafe fn register_class_named(instance: HINSTANCE, name: &str) -> bool {
 struct SettingsInner {
     hwnd: HWND,
     font: HFONT,
+    /// The smaller font of the helper lines (#1015); null until the first
+    /// layout, when they use `font`.
+    hint_font: HFONT,
     /// The window's current DPI; updated by `WM_DPICHANGED` (#233).
     dpi: u32,
     /// Every child with its design rect, for re-layout on a DPI change.
@@ -507,6 +662,23 @@ struct SettingsInner {
     content_top_dp: i32,
     win_h_dp: i32,
     prompt_edit: HWND,
+    /// #872: the navigation rail and the page it shows.
+    rail: HWND,
+    page: Page,
+    /// Each page's content height in dp, padding included, indexed by
+    /// [`Page::index`]. The Advanced entry is for the prompt closed.
+    page_content_dp: [i32; 5],
+    /// #874: the Models page controls that move or hide with the provider
+    /// choice, and what the choice currently hides.
+    models_flow: Vec<FlowChild>,
+    /// The user pressed "Add another provider": every vendor shows.
+    models_revealed: bool,
+    /// Which provider blocks show now: OpenAI, Anthropic, Gemini, Ollama.
+    models_shown: [bool; 4],
+    /// Whether "Add another provider" is offered now.
+    models_add_shown: bool,
+    /// How much shorter the Models page is than with every block, in dp.
+    models_shrink_dp: i32,
     /// #481: the scrolling body that holds every group above the footer.
     body: HWND,
     /// The dpi the body's scroll position is expressed in, so a dpi change
@@ -515,6 +687,9 @@ struct SettingsInner {
     /// #343: where the Ollama group's link button goes, if it has one. Set
     /// when the status probe reports (#527).
     ollama_link_url: Option<&'static str>,
+    /// Whether the Ollama group's button has something to offer (#343). It is
+    /// shown only then, and only while the Models page is.
+    ollama_link_shown: bool,
     /// #382: the button is "Fix it" (the Intel GPU fix) rather than a link.
     ollama_fix: bool,
     /// #527: the Ollama status probe's result, filled by its worker.
@@ -548,10 +723,16 @@ struct SettingsInner {
     /// The config this window was opened with -- fields not touched by the
     /// UI (e.g. model lists, hotkeys) are carried through from here.
     original: Config,
-    /// What `config.toml` looked like when this window opened (#851). Save
-    /// refuses to write over a file that changed since, so a hand edit made
-    /// through "Open config file" is never lost.
-    config_stamp: Option<ConfigStamp>,
+    /// The main window, told when this one loses the foreground or closes. Null
+    /// in the tests' windows.
+    owner: HWND,
+    /// True for the window `open` creates: it frees its own state in
+    /// `WM_NCDESTROY` and owns the `OPEN_HWND` guard. The tests' windows are
+    /// reclaimed by the test and leave both alone.
+    owns_itself: bool,
+    /// Where Save sends the edit: in production the writer thread (see `open`).
+    /// `None` in the tests' windows, which only record `result`.
+    save_sink: Option<SaveSink>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and only reaches the returned config on Save.
     hotkeys: Hotkeys,
@@ -560,9 +741,30 @@ struct SettingsInner {
     /// #345: the `(slot, chord)` last warned about, so pressing the same
     /// conflicting chord again confirms it (same flow as the tray's).
     pending_conflict: Option<(usize, Chord)>,
-    /// Set on Save; left `None` on Cancel/close.
+    /// The config the last Save produced; `None` until then and on
+    /// Cancel/close.
     result: Option<Config>,
-    should_close: bool,
+}
+
+/// Takes the config the window opened with and the one Save built, and hands
+/// the difference to whatever persists it. An `Err` is a plain sentence and
+/// keeps the window open.
+type SaveSink = Box<dyn Fn(&Config, &Config) -> Result<(), String>>;
+
+// Counts the `SettingsInner` values dropped on this thread, so a test can tell
+// a double free from a single one. Per thread on purpose: many other tests
+// build and drop a `SettingsInner` in parallel without taking the open-guard
+// lock, and a process-wide count would include their drops.
+#[cfg(test)]
+thread_local! {
+    static INNERS_DROPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+impl Drop for SettingsInner {
+    fn drop(&mut self) {
+        INNERS_DROPPED.with(|c| c.set(c.get() + 1));
+    }
 }
 
 impl SettingsInner {
@@ -570,14 +772,24 @@ impl SettingsInner {
         SettingsInner {
             hwnd: HWND(std::ptr::null_mut()),
             font: HFONT(std::ptr::null_mut()),
+            hint_font: HFONT(std::ptr::null_mut()),
             dpi: 96,
             children: Vec::new(),
             content_top_dp: 0,
             win_h_dp: WIN_H_DP,
             prompt_edit: HWND(std::ptr::null_mut()),
+            rail: HWND(std::ptr::null_mut()),
+            page: Page::General,
+            page_content_dp: [0; 5],
+            models_flow: Vec::new(),
+            models_revealed: false,
+            models_shown: [true; 4],
+            models_add_shown: false,
+            models_shrink_dp: 0,
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
+            ollama_link_shown: false,
             ollama_fix: false,
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
@@ -590,12 +802,13 @@ impl SettingsInner {
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
-            config_stamp: current_config_stamp(),
+            owner: HWND(std::ptr::null_mut()),
+            owns_itself: false,
+            save_sink: None,
             learning: None,
             pending_conflict: None,
             original,
             result: None,
-            should_close: false,
         }
     }
 
@@ -603,11 +816,17 @@ impl SettingsInner {
     /// the controls were laid out for it.
     fn adopt(&mut self, built: BuiltUi) {
         self.prompt_edit = built.prompt_edit;
+        self.rail = built.rail;
+        self.page_content_dp = built.page_content_dp;
         self.body = built.body;
         self.body_dpi = self.dpi;
         self.children = built.children;
+        self.models_flow = built.models_flow;
         self.content_top_dp = built.content_top_dp;
         self.win_h_dp = built.win_h_dp;
+        // The Models page starts with the active provider's rows only, and
+        // only the first page shows.
+        unsafe { sync_models_flow(self) };
     }
 }
 
@@ -624,6 +843,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+    if msg == WM_PAUSE_MENU {
+        run_pause_menu(hwnd);
+        return LRESULT(0);
+    }
     let inner = &mut *ptr;
 
     match msg {
@@ -639,6 +862,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HSCROLL => {
             update_text_scale_label(hwnd);
+            LRESULT(0)
+        }
+        // #872: the rail draws itself through us.
+        WM_DRAWITEM => {
+            if is_rail_draw_item(lparam) {
+                draw_rail_item(lparam);
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        WM_MEASUREITEM => {
+            let mis = &*(lparam.0 as *const windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+            if mis.CtlID == ID_RAIL as u32 {
+                measure_rail_item(lparam, inner.dpi);
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+        // The rail's background is the window's, not the list box's white.
+        WM_CTLCOLORLISTBOX => LRESULT(
+            windows::Win32::Graphics::Gdi::GetSysColorBrush(
+                windows::Win32::Graphics::Gdi::COLOR_3DFACE,
+            )
+            .0 as isize,
+        ),
+        WM_SETTINGS_PAGE => {
+            handle_page_request(inner, wparam.0, lparam.0);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            paint_footer_divider(hwnd);
             LRESULT(0)
         }
         WM_OLLAMA_STATUS => {
@@ -702,14 +958,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // in another app would otherwise be captured as the new shortcut.
             stop_learning(inner);
             set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            tell_owner_left(inner.owner);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // #871: losing the foreground releases whatever waited for it (a
+        // finished request's card, a press of the Wingman key).
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) == 0 => {
+            tell_owner_left(inner.owner);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER if wparam.0 == LEARN_TIMER_ID => {
             learn_timed_out(inner);
             LRESULT(0)
         }
+        // #934: the text box colours (and the accent in them) are read once
+        // per change, not per paint; repaint the boxes with the new ones.
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
+        | windows::Win32::UI::WindowsAndMessaging::WM_SYSCOLORCHANGE
+        | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED
+        | WM_DWMCOLORIZATIONCOLORCHANGED_MSG => {
+            invalidate_edit_style();
+            invalidate_rail_style();
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                windows::Win32::Graphics::Gdi::RDW_FRAME
+                    | RDW_INVALIDATE
+                    | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
+            );
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_DESTROY => {
+            invalidate_edit_style();
+            invalidate_rail_style();
             inner.alive.store(false, Ordering::SeqCst);
+            if inner.owns_itself {
+                OPEN_HWND.store(0, Ordering::SeqCst);
+            }
             // #566: closing the window mid-pull stops the download.
             if let Some(cancel) = inner.pull_cancel.take() {
                 cancel.store(true, Ordering::SeqCst);
@@ -718,18 +1004,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = KillTimer(Some(hwnd), LEARN_TIMER_ID);
                 disarm_learning();
             }
+            if !inner.hint_font.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
+                inner.hint_font = HFONT(std::ptr::null_mut());
+            }
             if !inner.font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
                 inner.font = HFONT(std::ptr::null_mut());
             }
-            inner.should_close = true;
+            if inner.owns_itself {
+                // #345: a key captured while Save was being pressed may still be
+                // queued for the main window, which would take it as a rebind.
+                // Free it unused.
+                drain_learned_messages();
+                tell_owner_left(inner.owner);
+            }
             LRESULT(0)
         }
         WM_NCDESTROY => {
             // Detach GWLP_USERDATA so no later message can dereference a
-            // pointer whose Box the caller is about to reclaim.
+            // pointer whose Box is about to be freed.
+            let owned = inner.owns_itself;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if owned {
+                // `inner` is not used again: this is the window's last message.
+                FREED_BY_WINDOW.with(|c| c.set(ptr as usize));
+                drop(Box::from_raw(ptr));
+            }
+            result
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -751,15 +1054,6 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 }
                 return;
             }
-            // #851: the file changed while this window was open (a hand edit
-            // from "Open config file", or the tray). Saving the snapshot taken
-            // at open would silently overwrite it.
-            if config_changed_since(inner.config_stamp, current_config_stamp()) {
-                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                    set_text(msg, CONFIG_CHANGED_MESSAGE);
-                }
-                return;
-            }
             let raw = read_raw_form(inner);
             // #344: an invalid numeric field must not be silently kept at
             // its old value -- reject the Save, keep the window open, focus
@@ -769,7 +1063,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
                     set_text(msg, invalid.message());
                 }
-                focus_and_select_field(inner.hwnd, invalid.control_id());
+                focus_and_select_field(inner, invalid.control_id());
                 return;
             }
             if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
@@ -795,7 +1089,21 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                     return;
                 }
             }
-            inner.result = Some(finalize_config(inner, &raw));
+            let edited = finalize_config(inner, &raw);
+            // Only the fields that differ from what this window opened with go
+            // on, patched onto the file as it is now (#871), so a hand edit
+            // made while the window was open (#851's concern) is never undone.
+            if let Some(sink) = &inner.save_sink {
+                if let Err(reason) = sink(&inner.original, &edited) {
+                    // Rule 7: say so inline and keep the window, never a
+                    // dialog or a silent no-op.
+                    if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                        set_text(msg, &format!("Could not save: {reason}"));
+                    }
+                    return;
+                }
+            }
+            inner.result = Some(edited);
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
             }
@@ -804,6 +1112,13 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             inner.result = None;
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
+            }
+        }
+        // #872: the rail picked a page (a click, an arrow key, Home or End).
+        ID_RAIL if notify == LBN_SELCHANGE => {
+            let picked = unsafe { SendMessageW(inner.rail, LB_GETCURSEL, None, None).0 };
+            if let Some(page) = Page::from_index(picked) {
+                unsafe { show_page(inner, page) };
             }
         }
         ID_OLLAMA_LINK if notify == BN_CLICKED && inner.ollama_fix => start_gpu_fix(inner),
@@ -822,6 +1137,8 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_RESET_PROMPT => {
             set_text(inner.prompt_edit, &prompt_to_edit(DEFAULT_PROMPT));
         }
+        ID_ACTIVE_PROVIDER if notify == CBN_SELCHANGE => unsafe { sync_models_flow(inner) },
+        ID_ADD_PROVIDER if notify == BN_CLICKED => unsafe { reveal_providers(inner) },
         ID_CARD_CORNER if notify == CBN_SELCHANGE => sync_card_display_enabled(inner.hwnd),
         ID_GEMINI_MODEL if notify == CBN_SELCHANGE => sync_gemini_thinking_enabled(inner.hwnd),
         // #635: the user picked a model themselves, so a pending "select the
@@ -829,6 +1146,29 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_OLLAMA_MODEL if notify == CBN_SELCHANGE => inner.pull_select = None,
         ID_CHANGE_PRIMARY if notify == BN_CLICKED => start_change(inner, HK_PRIMARY),
         ID_CHANGE_SECONDARY if notify == BN_CLICKED => start_change(inner, HK_SECONDARY),
+        ID_CHANGE_PAUSE if notify == BN_CLICKED => start_change(inner, HK_PAUSE),
+        ID_MODE if notify == CBN_SELCHANGE => {
+            if let Some(combo) = get_dlg_item(inner.hwnd, ID_MODE) {
+                let picked = unsafe { SendMessageW(combo, CB_GETCURSEL, None, None).0 };
+                if let Some(mode) = mode_at(picked) {
+                    send_command(inner, crate::app::SettingsCommand::Mode(mode));
+                }
+            }
+        }
+        ID_PAUSE_BUTTON if notify == BN_CLICKED => {
+            // A pending Change leaves the keyboard hook capturing, which would
+            // eat the menu's arrow keys and Esc as a new shortcut.
+            if inner.learning.is_some() {
+                stop_learning(inner);
+                set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            }
+            unsafe {
+                let _ = PostMessageW(Some(inner.hwnd), WM_PAUSE_MENU, WPARAM(0), LPARAM(0));
+            }
+        }
+        ID_RESUME_BUTTON if notify == BN_CLICKED => {
+            send_command(inner, crate::app::SettingsCommand::Resume)
+        }
         ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
             inner.prompt_expanded = !inner.prompt_expanded;
             unsafe { show_prompt_state(inner) };
@@ -867,11 +1207,20 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
 /// from a direct unit-test call) -- `EM_SETSEL` on a `CBS_DROPDOWNLIST`
 /// combo with no editable text portion is simply a no-op, so no special case
 /// is needed here any more.
-fn focus_and_select_field(hwnd: HWND, id: i32) {
-    let Some(ctrl) = get_dlg_item(hwnd, id) else {
+fn focus_and_select_field(inner: &mut SettingsInner, id: i32) {
+    let Some(ctrl) = get_dlg_item(inner.hwnd, id) else {
         return;
     };
     unsafe {
+        // A control on a hidden page cannot take focus: show its page first.
+        if let Some(page) = inner
+            .children
+            .iter()
+            .find(|c| c.hwnd == ctrl)
+            .and_then(|c| c.page)
+        {
+            show_page(inner, page);
+        }
         let _ = SetFocus(Some(ctrl));
         SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
     }
@@ -960,6 +1309,190 @@ const ID_GEMINI_EFFORT_LABEL: i32 = 143;
 const ID_MODEL_LIST_HINT: i32 = 144;
 /// The "Open config file" button beside the model hint (#823).
 const ID_OPEN_CONFIG: i32 = 145;
+/// #972: the two helper lines that had no id, so the hint colour could not
+/// find them: the note under the Capture group's two dropdowns and the one
+/// under the redact checkbox.
+const ID_CAPTURE_DETAIL_HINT: i32 = 146;
+const ID_REDACT_HINT: i32 = 147;
+/// #872: the navigation rail (a list box), a direct child of the window.
+const ID_RAIL: i32 = 148;
+/// #872: the Actions page's explanation. That page has no setting yet.
+const ID_ACTIONS_NOTE: i32 = 149;
+/// #873: the Mode combo, the pause line with its Pause and Resume buttons, and
+/// the pause shortcut's label and Change button, all on General. Mode and
+/// Pause act at once through the tray's own handlers; they are not form fields.
+const ID_MODE: i32 = 150;
+const ID_PAUSE_STATUS: i32 = 151;
+const ID_PAUSE_BUTTON: i32 = 152;
+const ID_RESUME_BUTTON: i32 = 153;
+const ID_PAUSE_LABEL: i32 = 154;
+const ID_CHANGE_PAUSE: i32 = 155;
+/// #874: "Add another provider", which shows the vendors that are hidden.
+const ID_ADD_PROVIDER: i32 = 156;
+
+/// #872: the five pages of the window, in rail order. Each existing control
+/// lives on exactly one (see [`PAGE_CONTROLS`]); the rail shows one page at a
+/// time and hides the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Page {
+    General,
+    Models,
+    Privacy,
+    Actions,
+    Advanced,
+}
+
+impl Page {
+    const ALL: [Page; 5] = [
+        Page::General,
+        Page::Models,
+        Page::Privacy,
+        Page::Actions,
+        Page::Advanced,
+    ];
+
+    /// The rail item's text, which is also the page's name for a screen reader.
+    fn label(self) -> &'static str {
+        match self {
+            Page::General => "General",
+            Page::Models => "Models",
+            Page::Privacy => "Privacy",
+            Page::Actions => "Actions",
+            Page::Advanced => "Advanced",
+        }
+    }
+
+    /// The rail item's Segoe Fluent Icons glyph.
+    fn glyph(self) -> char {
+        match self {
+            Page::General => '\u{E713}',
+            Page::Models => '\u{E9D9}',
+            Page::Privacy => '\u{E72E}',
+            Page::Actions => '\u{E945}',
+            Page::Advanced => '\u{E90F}',
+        }
+    }
+
+    fn index(self) -> usize {
+        Page::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// The page at rail position `index`; `None` for a position past the list
+    /// (a list box answers `LB_ERR`, -1, for "nothing selected").
+    fn from_index(index: isize) -> Option<Page> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| Page::ALL.get(i).copied())
+    }
+
+    /// The page after (`+1`) or before (`-1`) this one, wrapping at the ends
+    /// (Ctrl+PageDown and Ctrl+PageUp).
+    fn step(self, by: isize) -> Page {
+        let n = Page::ALL.len() as isize;
+        let i = (self.index() as isize + by).rem_euclid(n);
+        Page::ALL[i as usize]
+    }
+
+    /// The page Ctrl plus this key picks: `1` to `5`, in rail order.
+    fn from_digit_key(vk: u32) -> Option<Page> {
+        let digit = vk.checked_sub('1' as u32)?;
+        Page::ALL.get(digit as usize).copied()
+    }
+}
+
+/// The rail's pages by name, in order: what the gallery checks it has a
+/// picture of every one of.
+#[cfg(test)]
+pub(crate) fn page_labels() -> Vec<&'static str> {
+    Page::ALL.iter().map(|p| p.label()).collect()
+}
+
+/// The rail's accessible name.
+const RAIL_NAME: &str = "Settings pages";
+
+/// The Actions page's note, in plain words. Import and export still live in
+/// the tray's Help group.
+const ACTIONS_NOTE: &str = "Actions are what Wingman does once you confirm: reply to an email, fill in a form, add a calendar event. Importing and exporting your own actions is in the tray menu, under Help.";
+
+/// Every control id on each page, for the test that nothing is lost or listed
+/// twice. The window builds its pages with the same grouping (`Ctx::page`),
+/// and a test compares the two.
+#[cfg(test)]
+const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
+    (
+        Page::General,
+        &[
+            ID_MODE,
+            ID_PAUSE_STATUS,
+            ID_PAUSE_BUTTON,
+            ID_RESUME_BUTTON,
+            ID_PRIMARY_LABEL,
+            ID_CHANGE_PRIMARY,
+            ID_SECONDARY_LABEL,
+            ID_CHANGE_SECONDARY,
+            ID_PAUSE_LABEL,
+            ID_CHANGE_PAUSE,
+            ID_HOTKEY_STATUS,
+            ID_AUTOSTART,
+            ID_CARD_SECONDS,
+            ID_TEXT_SCALE_TRACK,
+            ID_TEXT_SCALE_LABEL,
+            ID_CARD_CORNER,
+            ID_CARD_MONITOR_LABEL,
+            ID_CARD_MONITOR,
+        ],
+    ),
+    (
+        Page::Models,
+        &[
+            ID_ACTIVE_PROVIDER,
+            ID_OPENAI_KEY,
+            ID_OPENAI_SHOW_KEY,
+            ID_OPENAI_MODEL,
+            ID_OPENAI_EFFORT,
+            ID_ANTHROPIC_KEY,
+            ID_ANTHROPIC_SHOW_KEY,
+            ID_ANTHROPIC_MODEL,
+            ID_ANTHROPIC_EFFORT,
+            ID_GEMINI_KEY,
+            ID_GEMINI_SHOW_KEY,
+            ID_GEMINI_MODEL,
+            ID_GEMINI_EFFORT_LABEL,
+            ID_GEMINI_EFFORT,
+            ID_ADD_PROVIDER,
+            ID_MODEL_LIST_HINT,
+            ID_OPEN_CONFIG,
+            ID_OLLAMA_MODEL,
+            ID_OLLAMA_STATUS,
+            ID_OLLAMA_LINK,
+            ID_PULL_NAME,
+            ID_PULL_BUTTON,
+            ID_PULL_STATUS,
+        ],
+    ),
+    (
+        Page::Privacy,
+        &[
+            ID_MAX_EDGE,
+            ID_MONITOR,
+            ID_CAPTURE_DETAIL_HINT,
+            ID_REDACT,
+            ID_REDACT_HINT,
+            ID_REQUIRE_TICK_FOR,
+        ],
+    ),
+    (Page::Actions, &[ID_ACTIONS_NOTE]),
+    (
+        Page::Advanced,
+        &[ID_PROMPT_TOGGLE, ID_PROMPT_EDIT, ID_RESET_PROMPT],
+    ),
+];
+
+/// The ids that belong to no page: the rail, the scrolling body that holds the
+/// pages, and the footer.
+#[cfg(test)]
+const CHROME_IDS: &[i32] = &[ID_RAIL, ID_BODY, ID_SAVE, ID_CANCEL, ID_VALIDATION_MESSAGE];
+
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -1026,6 +1559,17 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
     ("ID_MODEL_LIST_HINT", ID_MODEL_LIST_HINT),
     ("ID_OPEN_CONFIG", ID_OPEN_CONFIG),
+    ("ID_CAPTURE_DETAIL_HINT", ID_CAPTURE_DETAIL_HINT),
+    ("ID_REDACT_HINT", ID_REDACT_HINT),
+    ("ID_RAIL", ID_RAIL),
+    ("ID_ACTIONS_NOTE", ID_ACTIONS_NOTE),
+    ("ID_MODE", ID_MODE),
+    ("ID_PAUSE_STATUS", ID_PAUSE_STATUS),
+    ("ID_PAUSE_BUTTON", ID_PAUSE_BUTTON),
+    ("ID_RESUME_BUTTON", ID_RESUME_BUTTON),
+    ("ID_PAUSE_LABEL", ID_PAUSE_LABEL),
+    ("ID_CHANGE_PAUSE", ID_CHANGE_PAUSE),
+    ("ID_ADD_PROVIDER", ID_ADD_PROVIDER),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1603,7 @@ const TBM_SETPAGESIZE: u32 = 0x0415;
 const TBM_SETLINESIZE: u32 = 0x0417;
 const CBS_DROPDOWNLIST: i32 = 0x0003;
 const CBS_HASSTRINGS: i32 = 0x0200;
+const CBS_OWNERDRAWFIXED: i32 = 0x0010;
 const ES_PASSWORD: i32 = 0x0020;
 const ES_MULTILINE: i32 = 0x0004;
 const ES_WANTRETURN: i32 = 0x1000;
@@ -1153,19 +1698,19 @@ fn clamp_suggested_to_work(
     (x, y, w, h)
 }
 
-const WIN_W_DP: i32 = 620;
-/// #403 review: raised from 820 by the Forms group's full height (68dp: see
-/// `CONTENT_TOP_DP`'s comment). #341 raised it again by 30dp (one more
-/// `ROW_H + ROW_GAP` row: the Capture group's new "higher reads small text
-/// better" hint line) so the default window still has room for the Prompt
-/// group at something close to its natural size instead of always falling
-/// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
-/// never overlaps regardless of this constant, but a taller default is nicer
-/// than always squeezing. #427 added one more row (the hint under the cloud
-/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`. #822 gave
-/// each Thinking dropdown (three) and the Capture Screen dropdown their own
-/// row, four more.
-const WIN_H_DP: i32 = 918 + 8 * (ROW_H + ROW_GAP);
+/// The width of one page, in dp: what the single column used to be.
+const PAGE_W_DP: i32 = 620;
+/// The navigation rail's width, in dp, and the size of its items.
+const RAIL_W_DP: i32 = crate::ui::theme::RAIL_W_DP;
+const RAIL_ITEM_H_DP: i32 = crate::ui::theme::RAIL_ITEM_H_DP;
+const RAIL_TOP_PAD_DP: i32 = crate::ui::theme::RAIL_TOP_PAD_DP;
+/// The client width: the rail and one page.
+const WIN_W_DP: i32 = RAIL_W_DP + PAGE_W_DP;
+/// The tallest the window is made, in dp, when the Check my work prompt is open
+/// (#342): the prompt box takes what is left. With it closed the window is as
+/// tall as the fullest page (`SettingsInner::tallest_page_dp`), never taller
+/// than this or the monitor allows.
+const WIN_H_DP: i32 = 760;
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
 const MODEL_LIST_HINT: &str = "Missing a model? Add it in the config file.";
@@ -1209,8 +1754,11 @@ const FOOTER_H_DP: i32 = BTN_H + MARGIN * 2;
 const BODY_PAD_BOTTOM: i32 = MARGIN / 2;
 
 const MARGIN: i32 = 16;
+/// Where a page's first group starts, in dp from the top of the body (#872):
+/// level with the rail's first item.
+const PAGE_TOP_PAD_DP: i32 = crate::ui::theme::SPACE_SM_DP;
 const ROW_H: i32 = 22;
-const ROW_GAP: i32 = 8;
+const ROW_GAP: i32 = 6;
 const GROUP_GAP: i32 = 14;
 const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
 const LABEL_W: i32 = 140;
@@ -1232,6 +1780,12 @@ fn dpi_for(hwnd: HWND) -> u32 {
 thread_local! {
     /// The gallery's simulated DPI for this thread's Settings window, if any.
     static FORCED_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// The Settings window's real DPI while the gallery simulates another one.
+    static NATIVE_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -1340,14 +1894,15 @@ fn footer_layout(content_top: i32, win_h_dp: i32, expanded: bool) -> PromptFoote
 /// `fitted_dp` is what [`fitted_height_for_work_px`] allows on this monitor
 /// and `nc_dp` the title bar and borders. Expanded keeps the old behaviour
 /// (the full fitted height, the prompt box takes what is left). Collapsed is
-/// just tall enough for the whole body and the footer, and never taller than
-/// the fit; anything beyond the fit scrolls (#481).
-fn window_height_dp(content_top: i32, expanded: bool, fitted_dp: i32, nc_dp: i32) -> i32 {
+/// just tall enough for the fullest page (`tallest_page_dp`, its content with
+/// the prompt closed) and the footer, and never taller than the fit; anything
+/// beyond the fit scrolls (#481). The height is the same whichever page shows,
+/// so switching pages never resizes the window (#872).
+fn window_height_dp(tallest_page_dp: i32, expanded: bool, fitted_dp: i32, nc_dp: i32) -> i32 {
     if expanded {
         return fitted_dp;
     }
-    let client = footer_layout(content_top, 0, false).content_h() + FOOTER_H_DP;
-    (client + nc_dp).min(fitted_dp)
+    (tallest_page_dp + FOOTER_H_DP + nc_dp).min(fitted_dp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,6 +1997,9 @@ enum Anchor {
 /// A child control and the design (96dpi) rect it was created with.
 #[derive(Clone, Copy, Debug)]
 struct ChildLayout {
+    /// The page this control is on, or `None` for the footer, which every page
+    /// shares (#872).
+    page: Option<Page>,
     hwnd: HWND,
     x: i32,
     y: i32,
@@ -1501,6 +2059,7 @@ fn child_rect_px(
 /// and re-lays-out every child at the new scale.
 unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPARAM) {
     inner.dpi = dpi_from_wparam(wparam.0);
+    invalidate_rail_style();
     if lparam.0 != 0 {
         let rect = &*(lparam.0 as *const windows::Win32::Foundation::RECT);
         let mut pos = suggested_pos(rect);
@@ -1522,6 +2081,13 @@ unsafe fn on_dpi_changed(inner: &mut SettingsInner, wparam: WPARAM, lparam: LPAR
 /// window's current client size: the footer is pinned to the bottom, the body
 /// fills the rest, and its scroll range follows the content (#481).
 unsafe fn apply_dpi(inner: &mut SettingsInner) {
+    apply_layout(inner, true);
+}
+
+/// [`apply_dpi`], optionally keeping the current font. A layout change that
+/// is not a DPI or font change (a provider switch, #874) passes `false`, so no
+/// new `HFONT` is made for it.
+unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
     let dpi = inner.dpi;
     let mut rc = windows::Win32::Foundation::RECT::default();
     let (client_w_px, client_h_px) = if GetClientRect(inner.hwnd, &mut rc).is_ok() {
@@ -1537,7 +2103,8 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     // The body is the client area above the footer. Its scroll position
     // carries over a dpi change (rescaled) and is kept inside the new range.
     let view_px = (client_h_px - to_px(FOOTER_H_DP, dpi)).max(1);
-    let content_px = to_px(new.content_h(), dpi);
+    let content_px = to_px(page_content_dp(inner, &new), dpi);
+    let rail_px = to_px(RAIL_W_DP, dpi);
     let have_body = !inner.body.0.is_null();
     let old_pos = if have_body {
         body_scroll_info(inner.body).nPos
@@ -1551,7 +2118,18 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     );
     inner.body_dpi = dpi;
 
-    let new_font = build_font(dpi);
+    let new_font = if rebuild_font || inner.font.0.is_null() {
+        build_font(dpi)
+    } else {
+        inner.font
+    };
+    // #1015: the helper-line font follows the body font: kept when the body
+    // font is kept, rebuilt when it is.
+    let new_hint_font = if new_font == inner.font && !inner.hint_font.0.is_null() {
+        inner.hint_font
+    } else {
+        build_hint_font(new_font, dpi)
+    };
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
@@ -1559,12 +2137,15 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         let _ = SetWindowPos(
             inner.body,
             None,
+            rail_px,
             0,
-            0,
-            client_w_px.max(1),
+            (client_w_px - rail_px).max(1),
             view_px,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+    if !inner.rail.0.is_null() {
+        place_rail(inner.rail, dpi, new_font);
     }
     for c in &inner.children {
         let (x, y, w, h) = child_rect_px(c, &old, &new, dpi);
@@ -1575,11 +2156,20 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         } else {
             (x, y - pos)
         };
+        if is_combo(c.hwnd) {
+            set_combo_heights(c.hwnd, dpi);
+        }
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        // #1015: helper lines are set smaller than the labels.
+        let font = if !new_hint_font.0.is_null() && is_hint_id(GetDlgCtrlID(c.hwnd)) {
+            new_hint_font
+        } else {
+            new_font
+        };
         SendMessageW(
             c.hwnd,
             WM_SETFONT,
-            Some(WPARAM(new_font.0 as usize)),
+            Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
         );
     }
@@ -1587,10 +2177,14 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         set_body_scroll(inner.body, content_px, view_px, pos);
     }
     // Every child now uses the new font, so the old one can go.
-    if !inner.font.0.is_null() {
+    if new_font != inner.font && !inner.font.0.is_null() {
         let _ = DeleteObject(HGDIOBJ(inner.font.0));
     }
     inner.font = new_font;
+    if new_hint_font != inner.hint_font && !inner.hint_font.0.is_null() {
+        let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
+    }
+    inner.hint_font = new_hint_font;
     // `win_h_dp` stays the baseline the recorded design rects were built
     // for, so every later change diffs against the same reference.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
@@ -1602,20 +2196,178 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     );
 }
 
+/// The current page's content height in dp, padding included. Advanced follows
+/// the prompt's state through `layout`; every other page is fixed.
+fn page_content_dp(inner: &SettingsInner, layout: &PromptFooterLayout) -> i32 {
+    if inner.page == Page::Advanced {
+        layout.content_h()
+    } else if inner.page == Page::Models {
+        inner.page_content_dp[Page::Models.index()] - inner.models_shrink_dp
+    } else {
+        inner.page_content_dp[inner.page.index()]
+    }
+}
+
+/// The height of the fullest page in dp, with the prompt closed: what the
+/// window is made tall enough for (#872).
+fn tallest_page_dp(inner: &SettingsInner) -> i32 {
+    Page::ALL
+        .iter()
+        .map(|p| page_max_dp(inner, *p))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The tallest `page` gets in dp. The Models page is longest with every
+/// provider showing, and then "Add another provider" has gone (#874).
+fn page_max_dp(inner: &SettingsInner, page: Page) -> i32 {
+    let full = inner.page_content_dp[page.index()];
+    if page == Page::Models {
+        full - (ROW_H + ROW_GAP)
+    } else {
+        full
+    }
+}
+
+/// Whether the child `c` should be visible: it is on the page that shows, and
+/// the few controls with a state of their own are in the state that shows them
+/// (the Ollama button only has something to offer sometimes, the prompt box is
+/// folded away until asked for). The footer is on every page.
+unsafe fn child_visible(inner: &SettingsInner, c: &ChildLayout) -> bool {
+    let Some(page) = c.page else {
+        return true;
+    };
+    if page != inner.page {
+        return false;
+    }
+    if page == Page::Models {
+        if let Some(f) = inner.models_flow.iter().find(|f| f.hwnd == c.hwnd) {
+            if !settings_models::slot_shown(f.slot, inner.models_shown, inner.models_add_shown) {
+                return false;
+            }
+        }
+    }
+    match GetDlgCtrlID(c.hwnd) {
+        ID_OLLAMA_LINK => inner.ollama_link_shown,
+        ID_PROMPT_EDIT | ID_RESET_PROMPT => inner.prompt_expanded,
+        _ => true,
+    }
+}
+
+/// #874: works out which provider blocks the Models page shows (the active
+/// one, any with a key typed or stored, everything once "Add another provider"
+/// was pressed), moves the blocks under a hidden one up, and re-lays-out. The
+/// hidden controls keep their text, so Save and a switch back lose nothing.
+/// It reads two combo selections and a few text lengths: nothing slow, so it
+/// is safe on the UI thread, and it only runs on a choice, never on a paint.
+unsafe fn sync_models_flow(inner: &mut SettingsInner) {
+    let hwnd = inner.hwnd;
+    let active = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER)
+        .map(|c| SendMessageW(c, CB_GETCURSEL, None, None).0)
+        .filter(|i| *i >= 0)
+        .map(|i| ActiveProvider::from_index(i as usize));
+    let typed = |id: i32| {
+        get_dlg_item(hwnd, id)
+            .is_some_and(|h| windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(h) > 0)
+    };
+    let configured = [
+        typed(ID_OPENAI_KEY),
+        typed(ID_ANTHROPIC_KEY),
+        typed(ID_GEMINI_KEY),
+        inner.original.providers.order.iter().any(|p| p == "ollama"),
+    ];
+    let shown = settings_models::shown_providers(active, configured, inner.models_revealed);
+    let add = settings_models::add_button_shown(shown, inner.models_revealed);
+    inner.models_shown = shown;
+    inner.models_add_shown = add;
+    let pitch = ROW_H + ROW_GAP;
+    for f in &inner.models_flow {
+        let dy = settings_models::slot_dy(f.slot, shown, add, pitch);
+        if let Some(c) = inner.children.iter_mut().find(|c| c.hwnd == f.hwnd) {
+            if f.slot == Slot::Frame {
+                c.h = f.h + dy;
+            } else {
+                c.y = f.y + dy;
+            }
+        }
+    }
+    // A hidden Ollama card also takes its own height off the page. Its group
+    // frame is the tallest control made under the slot.
+    let card_h = inner
+        .models_flow
+        .iter()
+        .filter(|f| f.slot == Slot::OllamaCard)
+        .map(|f| f.h)
+        .max()
+        .unwrap_or(0);
+    let card_gone = if shown[3] { 0 } else { card_h + GROUP_GAP };
+    inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch) + card_gone;
+    if !inner.hwnd.0.is_null() {
+        // One repaint for the whole change, as `show_page` does: the layout
+        // pass below turns redraw back on and repaints.
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+    }
+    sync_visibility(inner);
+    if !inner.hwnd.0.is_null() {
+        apply_layout(inner, false);
+        // Focus never stays on a control that just went away.
+        let focus = GetFocus();
+        if !focus.0.is_null()
+            && IsChild(inner.hwnd, focus).as_bool()
+            && !IsWindowVisible(focus).as_bool()
+        {
+            if let Some(combo) = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER) {
+                let _ = SetFocus(Some(combo));
+            }
+        }
+    }
+}
+
+/// The control that takes focus when "Add another provider" shows the blocks
+/// that were hidden `before`: the first field of the first one that appeared.
+fn reveal_focus_id(before: [bool; 4], after: [bool; 4]) -> i32 {
+    const FIRST_FIELD: [i32; 4] = [
+        ID_OPENAI_KEY,
+        ID_ANTHROPIC_KEY,
+        ID_GEMINI_KEY,
+        ID_OLLAMA_MODEL,
+    ];
+    settings_models::first_revealed(before, after)
+        .map(|i| FIRST_FIELD[i])
+        .unwrap_or(ID_ACTIVE_PROVIDER)
+}
+
+/// "Add another provider": shows every vendor and puts focus on the first one
+/// that was hidden, since the button that had focus is gone.
+unsafe fn reveal_providers(inner: &mut SettingsInner) {
+    let before = inner.models_shown;
+    inner.models_revealed = true;
+    sync_models_flow(inner);
+    let target = reveal_focus_id(before, inner.models_shown);
+    if let Some(h) = get_dlg_item(inner.hwnd, target) {
+        let _ = SetFocus(Some(h));
+    }
+}
+
+/// Shows the controls of the current page and hides every other control, so a
+/// hidden page is out of the Tab order and the accessibility tree (#872).
+unsafe fn sync_visibility(inner: &SettingsInner) {
+    for c in &inner.children {
+        let cmd = if child_visible(inner, c) {
+            SW_SHOW
+        } else {
+            SW_HIDE
+        };
+        let _ = ShowWindow(c.hwnd, cmd);
+    }
+}
+
 /// #342: makes the window match `inner.prompt_expanded`: shows or hides the
 /// prompt box and its reset button, relabels the toggle, resizes the window
 /// (kept inside the monitor's work area) and re-lays-out the children.
 /// The prompt text stays in the hidden edit, so Save still reads it.
 unsafe fn show_prompt_state(inner: &mut SettingsInner) {
-    let cmd = if inner.prompt_expanded {
-        SW_SHOW
-    } else {
-        SW_HIDE
-    };
-    let _ = ShowWindow(inner.prompt_edit, cmd);
-    if let Some(reset) = get_dlg_item(inner.hwnd, ID_RESET_PROMPT) {
-        let _ = ShowWindow(reset, cmd);
-    }
+    sync_visibility(inner);
     if let Some(toggle) = get_dlg_item(inner.hwnd, ID_PROMPT_TOGGLE) {
         set_text(toggle, prompt_toggle_label(inner.prompt_expanded));
     }
@@ -1638,7 +2390,7 @@ unsafe fn show_prompt_state(inner: &mut SettingsInner) {
     }
     let nc_dp = ((wr.bottom - wr.top) - (cr.bottom - cr.top)) * 96 / dpi as i32;
     let h = to_px(
-        window_height_dp(inner.content_top_dp, inner.prompt_expanded, fitted, nc_dp),
+        window_height_dp(tallest_page_dp(inner), inner.prompt_expanded, fitted, nc_dp),
         dpi,
     );
     let mut y = wr.top;
@@ -1785,17 +2537,461 @@ fn create_body(parent: HWND, instance: HINSTANCE, dpi: u32) -> HWND {
     .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
-/// The text colour of the hotkey hint line (#824). Secondary text, never the
+/// Where a checkbox's own text starts, in dp from the control's left edge
+/// (13 dp box plus a 3 dp gap; MEASURED 2026-10-17 at 250 %, the one gallery scale where the system draws the box at its true size: 40 px). A
+/// note under a checkbox starts here so it lines up with the label above it
+/// (#972).
+const CHECKBOX_TEXT_INDENT_DP: i32 = 16;
+
+/// #972: whether `id` is a helper line: secondary text under or beside a
+/// control, drawn in the hint colour. Status lines that carry a result (the
+/// Ollama check, the pull progress) are not hints.
+fn is_hint_id(id: i32) -> bool {
+    matches!(
+        id,
+        ID_HOTKEY_STATUS | ID_MODEL_LIST_HINT | ID_CAPTURE_DETAIL_HINT | ID_REDACT_HINT
+    )
+}
+
+/// The text colour of the helper lines (#824, #972). Secondary text, never the
 /// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
 /// system's own button text in high contrast (where grey means disabled).
 /// Settings is drawn on the system face today; the dark-mode work swaps in
 /// the theme's tokens.
-fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
+fn hint_text_color(high_contrast: bool, btn_text: u32) -> u32 {
     if high_contrast {
         btn_text
     } else {
         crate::ui::theme::LIGHT.text_dim
     }
+}
+
+/// #934: the colours of a text box. Tokens in a normal theme, system colours in
+/// high contrast. Settings is drawn on the system face and does not follow
+/// dark mode yet, so a normal theme here is always the light one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditColors {
+    fill: u32,
+    border: u32,
+    text: u32,
+    /// The line along the bottom of a box that has the keyboard focus.
+    focus_line: u32,
+    /// What lies behind the box, seen in the four rounded corners.
+    face: u32,
+    /// A disabled box: a quieter fill, its own text, and no focus line.
+    disabled_fill: u32,
+    disabled_border: u32,
+    disabled_text: u32,
+}
+
+/// How far a disabled box's fill moves from the text box fill toward the
+/// face behind it, in percent.
+const EDIT_DISABLED_FILL_PCT: u32 = 60;
+
+fn edit_colors(
+    high_contrast: bool,
+    sys: &crate::ui::theme::SysColors,
+    accent: u32,
+    face: u32,
+) -> EditColors {
+    use crate::ui::card_buttons::blend;
+    use crate::ui::theme::{menu_text_color, Theme, Tokens};
+    let theme = Theme::resolve(true, high_contrast);
+    let t = Tokens::for_theme(theme, sys);
+    let (disabled_fill, disabled_border) = if high_contrast {
+        // No tints in high contrast: the window colour, and GrayText ink.
+        (sys.window, sys.gray_text)
+    } else {
+        (
+            blend(t.control_fill, face, EDIT_DISABLED_FILL_PCT),
+            t.border,
+        )
+    };
+    EditColors {
+        fill: t.control_fill,
+        border: t.border,
+        text: t.text,
+        focus_line: if high_contrast { sys.highlight } else { accent },
+        face,
+        disabled_fill,
+        disabled_border,
+        disabled_text: menu_text_color(theme, &t, sys, false, true),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the colours were rebuilt (a registry read each) on
+    /// this thread: painting must not move it.
+    static EDIT_STYLE_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The colours for a text box right now. Reads the registry (the accent), so
+/// only [`edit_style`] calls it.
+unsafe fn current_edit_colors() -> EditColors {
+    use crate::ui::theme::{SysColors, Theme, LIGHT};
+    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_3DFACE};
+    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+    edit_colors(
+        high_contrast,
+        &SysColors::read(),
+        crate::ui::card_buttons::system_accent(Theme::Light, LIGHT.surface),
+        GetSysColor(COLOR_3DFACE),
+    )
+}
+
+/// The focus line of a text box `w` by `h` px: along the bottom, between the
+/// rounded corners, as thick as Windows 11's 2 dp accent underline. The
+/// bottom border row is part of it, so the line reads as the border turning
+/// to the accent. `(left, top, right, bottom)` in window px.
+fn edit_focus_line_rect(w: i32, h: i32, dpi: u32) -> (i32, i32, i32, i32) {
+    let radius = to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+    (
+        radius,
+        h - to_px(crate::ui::theme::FOCUS_LINE_DP, dpi).max(2),
+        w - radius,
+        h,
+    )
+}
+
+const EDIT_SUBCLASS_ID: usize = 0x934;
+
+/// `WM_DWMCOLORIZATIONCOLORCHANGED`: the accent changed (#1055).
+const WM_DWMCOLORIZATIONCOLORCHANGED_MSG: u32 = 0x0320;
+
+/// Everything a text box paint needs, built once per theme change: the
+/// colours and the two brushes `WM_CTLCOLOREDIT` / `WM_CTLCOLORSTATIC` hand
+/// back. Owned here and freed by [`invalidate_edit_style`].
+#[derive(Clone, Copy)]
+struct EditStyle {
+    colors: EditColors,
+    brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    disabled_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+}
+
+thread_local! {
+    static EDIT_STYLE: std::cell::Cell<Option<EditStyle>> = const { std::cell::Cell::new(None) };
+}
+
+/// The cached style, built on first use after a theme change. Painting and
+/// colour messages run on the UI thread, so they never reach the registry.
+unsafe fn edit_style() -> EditStyle {
+    use windows::Win32::Graphics::Gdi::CreateSolidBrush;
+    if let Some(style) = EDIT_STYLE.get() {
+        return style;
+    }
+    #[cfg(test)]
+    EDIT_STYLE_BUILDS.set(EDIT_STYLE_BUILDS.get() + 1);
+    let colors = current_edit_colors();
+    let solid = |c: u32| CreateSolidBrush(windows::Win32::Foundation::COLORREF(c));
+    let style = EditStyle {
+        colors,
+        brush: solid(colors.fill),
+        disabled_brush: solid(colors.disabled_fill),
+    };
+    EDIT_STYLE.set(Some(style));
+    style
+}
+
+/// Drops the cached style and its brushes; the next paint rebuilds it. Called
+/// on a theme, accent or system colour change, and when Settings closes.
+unsafe fn invalidate_edit_style() {
+    if let Some(style) = EDIT_STYLE.take() {
+        let _ = DeleteObject(HGDIOBJ(style.brush.0));
+        let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
+    }
+}
+
+/// Whether `hwnd` is a text box (an `Edit`), which a disabled one reports to
+/// its parent as a static.
+unsafe fn is_edit_control(hwnd: HWND) -> bool {
+    let mut name = [0u16; 8];
+    let n = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut name) as usize;
+    String::from_utf16_lossy(&name[..n.min(name.len())]).eq_ignore_ascii_case("Edit")
+}
+
+/// Answers a text box's colour request: the ink and fill on `hdc`, and the
+/// brush for the box's interior. `disabled` picks the disabled look.
+unsafe fn answer_edit_colors(hdc: windows::Win32::Graphics::Gdi::HDC, disabled: bool) -> LRESULT {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor};
+    let s = edit_style();
+    let (ink, fill, brush) = if disabled {
+        (
+            s.colors.disabled_text,
+            s.colors.disabled_fill,
+            s.disabled_brush,
+        )
+    } else {
+        (s.colors.text, s.colors.fill, s.brush)
+    };
+    SetTextColor(hdc, COLORREF(ink));
+    SetBkColor(hdc, COLORREF(fill));
+    LRESULT(brush.0 as isize)
+}
+
+/// Draws a text box's frame onto `hdc` (#934): the Windows 11 look of a
+/// control, a 1 px border with 4 dp corners on the token fill, and the accent
+/// line along the bottom while it has the focus. `w` by `h` is the whole box
+/// in px. Only the ring the system reserves for the edge is drawn, so the
+/// client area, any scrollbar and the text are the edit's own.
+unsafe fn draw_edit_frame(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    w: i32,
+    h: i32,
+    dpi: u32,
+    colors: &EditColors,
+    focused: bool,
+    enabled: bool,
+) {
+    use windows::Win32::Graphics::Gdi::{
+        CreatePen, CreateSolidBrush, ExcludeClipRect, FillRect, RoundRect, SelectObject,
+        PS_INSIDEFRAME,
+    };
+    let rgb = |c: u32| windows::Win32::Foundation::COLORREF(c);
+    let rect = |l, t, r, b| windows::Win32::Foundation::RECT {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    };
+    let edge =
+        GetSystemMetricsForDpi(windows::Win32::UI::WindowsAndMessaging::SM_CXEDGE, dpi).max(1);
+    ExcludeClipRect(hdc, edge, edge, w - edge, h - edge);
+    let face = CreateSolidBrush(rgb(colors.face));
+    FillRect(hdc, &rect(0, 0, w, h), face);
+    let (fill_c, border_c) = if enabled {
+        (colors.fill, colors.border)
+    } else {
+        (colors.disabled_fill, colors.disabled_border)
+    };
+    let fill = CreateSolidBrush(rgb(fill_c));
+    let pen = CreatePen(PS_INSIDEFRAME, 1, rgb(border_c));
+    let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
+    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+    let round = 2 * to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+    let _ = RoundRect(hdc, 0, 0, w, h, round, round);
+    if focused && enabled {
+        let (l, t, r, b) = edit_focus_line_rect(w, h, dpi);
+        let line = CreateSolidBrush(rgb(colors.focus_line));
+        FillRect(hdc, &rect(l, t, r, b), line);
+        let _ = DeleteObject(HGDIOBJ(line.0));
+    }
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    let _ = DeleteObject(HGDIOBJ(pen.0));
+    let _ = DeleteObject(HGDIOBJ(fill.0));
+    let _ = DeleteObject(HGDIOBJ(face.0));
+}
+
+/// Paints `hwnd`'s frame on its own window DC (see [`draw_edit_frame`]).
+unsafe fn paint_edit_frame(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{GetWindowDC, ReleaseDC};
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+    let mut wr = windows::Win32::Foundation::RECT::default();
+    if GetWindowRect(hwnd, &mut wr).is_err() {
+        return;
+    }
+    let hdc = GetWindowDC(Some(hwnd));
+    if hdc.is_invalid() {
+        return;
+    }
+    draw_edit_frame(
+        hdc,
+        wr.right - wr.left,
+        wr.bottom - wr.top,
+        dpi_for(hwnd),
+        &edit_style().colors,
+        GetFocus() == hwnd,
+        windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool(),
+    );
+    ReleaseDC(Some(hwnd), hdc);
+}
+
+/// Gives every Settings text box the frame of [`paint_edit_frame`] (#934).
+unsafe extern "system" fn edit_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWL_STYLE, WM_KILLFOCUS, WM_NCPAINT, WM_SETFOCUS, WS_HSCROLL,
+    };
+    match msg {
+        WM_NCPAINT => {
+            // A box with a scrollbar (the prompt) lets the system draw that
+            // first; the frame goes on top of the ring either way.
+            let scrolls = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & (WS_VSCROLL.0 | WS_HSCROLL.0);
+            let result = if scrolls != 0 {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            } else {
+                LRESULT(0)
+            };
+            paint_edit_frame(hwnd);
+            result
+        }
+        // The focus line comes and goes with the focus.
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                windows::Win32::Graphics::Gdi::RDW_FRAME | RDW_INVALIDATE,
+            );
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(edit_subclass), EDIT_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            if edit_may_change_scroll_need(msg) && GetDlgCtrlID(hwnd) == ID_PROMPT_EDIT {
+                sync_prompt_scrollbar(hwnd);
+            }
+            result
+        }
+    }
+}
+
+/// Messages after which the prompt box may need a scroll bar, or no longer
+/// need one: its size, its text and the keys and clipboard that change it.
+fn edit_may_change_scroll_need(msg: u32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CHAR, WM_CLEAR, WM_CUT, WM_KEYDOWN, WM_LBUTTONUP, WM_PASTE, WM_SETFONT, WM_SETTEXT,
+        WM_SHOWWINDOW, WM_SIZE, WM_UNDO,
+    };
+    const EM_REPLACESEL: u32 = 0x00C2;
+    matches!(
+        msg,
+        WM_SIZE
+            | WM_SETTEXT
+            | WM_SHOWWINDOW
+            | WM_CHAR
+            // Delete and Backspace edit on the key, not through WM_CHAR (Delete
+            // sends none); a new font (apply_dpi) re-wraps; a mouse drop of
+            // text ends on the button release.
+            | WM_KEYDOWN
+            | WM_SETFONT
+            | WM_LBUTTONUP
+            | WM_CUT
+            | WM_PASTE
+            | WM_CLEAR
+            | WM_UNDO
+            | EM_REPLACESEL
+    )
+}
+
+/// #1014: whether `lines` wrapped lines of height `line_h` need a bar in a box
+/// whose text area is `rect_h` tall (all px). Unmeasurable (no height yet) keeps
+/// the bar, so the safe outcome of an unreadable box is the bar. The scroll
+/// range cannot be used: an edit without WS_VSCROLL stops keeping it, so a
+/// hidden bar would never come back.
+fn scrollbar_needed(lines: i32, rect_h: i32, line_h: i32) -> bool {
+    line_h <= 0 || rect_h <= 0 || lines > rect_h / line_h
+}
+
+thread_local! {
+    /// Set while [`sync_prompt_scrollbar`] runs: showing or hiding the bar
+    /// resizes the box, which comes back through the subclass.
+    static SYNCING_PROMPT_BAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// #1014: the prompt box shows a vertical scroll bar only while its text is
+/// taller than the box. An edit control keeps a disabled bar when the text
+/// fits, which reads as an empty strip down the right side.
+unsafe fn sync_prompt_scrollbar(hwnd: HWND) {
+    use windows::Win32::UI::Controls::ShowScrollBar;
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+    if SYNCING_PROMPT_BAR.get() {
+        return;
+    }
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetTextMetricsW, ReleaseDC, SelectObject, HFONT, TEXTMETRICW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+    const EM_GETRECT: u32 = 0x00B2;
+    const EM_GETLINECOUNT: u32 = 0x00BA;
+    let lines = SendMessageW(hwnd, EM_GETLINECOUNT, None, None).0 as i32;
+    let mut rect = RECT::default();
+    SendMessageW(
+        hwnd,
+        EM_GETRECT,
+        None,
+        Some(LPARAM(&mut rect as *mut RECT as isize)),
+    );
+    let mut line_h = 0;
+    let hdc = GetDC(Some(hwnd));
+    if !hdc.is_invalid() {
+        let font = HFONT(SendMessageW(hwnd, WM_GETFONT, None, None).0 as *mut _);
+        let old = (!font.is_invalid()).then(|| SelectObject(hdc, font.into()));
+        let mut tm = TEXTMETRICW::default();
+        if GetTextMetricsW(hdc, &mut tm).as_bool() {
+            line_h = tm.tmHeight;
+        }
+        if let Some(old) = old {
+            SelectObject(hdc, old);
+        }
+        ReleaseDC(Some(hwnd), hdc);
+    }
+    let need = scrollbar_needed(lines, rect.bottom - rect.top, line_h);
+    let shown = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_VSCROLL.0 != 0;
+    if need != shown {
+        SYNCING_PROMPT_BAR.set(true);
+        let _ = ShowScrollBar(hwnd, SB_VERT, need);
+        SYNCING_PROMPT_BAR.set(false);
+    }
+}
+
+/// #935: the divider above the footer, as `(left, top, right, bottom)` in
+/// client px. One physical pixel on the footer's first row, directly under the
+/// body, so a row the scrolling body cuts off reads as an edge.
+fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i32, i32, i32) {
+    let top = client_h_px - to_px(FOOTER_H_DP, dpi);
+    // The footer sits under the pages, right of the rail (#872).
+    (to_px(RAIL_W_DP, dpi), top, client_w_px, top + 1)
+}
+
+/// #935: the divider's colour: the hairline token of the current theme, which
+/// is the system's window text in high contrast, where a pale hairline would
+/// not show. Settings does not follow dark mode yet, so a normal theme here is
+/// the light one (as for the text boxes).
+fn footer_divider_color(high_contrast: bool, sys: &crate::ui::theme::SysColors) -> u32 {
+    use crate::ui::theme::{Theme, Tokens};
+    Tokens::for_theme(Theme::resolve(true, high_contrast), sys).border
+}
+
+/// Paints the footer divider (#935). The class background has already filled
+/// the client area; only the line is drawn here.
+unsafe fn paint_footer_divider(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, EndPaint, FillRect, PAINTSTRUCT,
+    };
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+        let ink = footer_divider_color(high_contrast, &crate::ui::theme::SysColors::read());
+        let (l, t, r, b) =
+            footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
+        let line = windows::Win32::Foundation::RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        };
+        FillRect(hdc, &line, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 /// The body forwards what its controls tell their parent (button clicks, the
@@ -1811,10 +3007,13 @@ unsafe extern "system" fn body_wndproc(
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
         }
-        // #824: the hotkey hint is secondary text, not the disabled grey.
+        // #854: the dropdown combos draw their own text.
+        WM_DRAWITEM if draw_combo_item(lparam) => LRESULT(1),
+        WM_MEASUREITEM if measure_combo_item(lparam, dpi_for(hwnd)) => LRESULT(1),
+        // #824, #972: a helper line is secondary text, not the disabled grey.
         // Every other static keeps the default colours.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
-            if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == ID_HOTKEY_STATUS =>
+            if is_hint_id(GetDlgCtrlID(HWND(lparam.0 as *mut c_void))) =>
         {
             use windows::Win32::Graphics::Gdi::{
                 GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
@@ -1822,10 +3021,25 @@ unsafe extern "system" fn body_wndproc(
             };
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
             let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-            let ink = hotkey_hint_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+            let ink = hint_text_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
             SetBkMode(hdc, TRANSPARENT);
             LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
+        }
+        // #934: a text box is the token fill with the token text on it.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT => answer_edit_colors(
+            windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+            false,
+        ),
+        // A disabled or read-only box asks as a static; it gets the
+        // disabled look so its interior matches the frame.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            if is_edit_control(HWND(lparam.0 as *mut c_void)) =>
+        {
+            answer_edit_colors(
+                windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+                true,
+            )
         }
         WM_VSCROLL => {
             let si = body_scroll_info(hwnd);
@@ -1875,8 +3089,11 @@ unsafe fn set_body_scroll(body: HWND, content_px: i32, view_px: i32, pos: i32) {
     SetScrollInfo(body, SB_VERT, &si, true);
 }
 
-/// The width of a vertical scrollbar at `dpi`.
+/// The width of a vertical scrollbar at `dpi`. In the gallery at a simulated
+/// scale the scrollbar is the window's real one, so that is measured instead.
 fn scrollbar_width_px(dpi: u32) -> i32 {
+    #[cfg(any(test, debug_assertions))]
+    let dpi = NATIVE_DPI.with(std::cell::Cell::get).unwrap_or(dpi);
     unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) }.max(0)
 }
 
@@ -2204,6 +3421,9 @@ fn build_font(dpi: u32) -> HFONT {
             lf
         };
         lf.lfWeight = FW_NORMAL.0 as i32;
+        // The face comes from the system; the size from the type ramp, so labels
+        // are the 14 px body and helper lines the 12 px caption (#1015).
+        lf.lfHeight = body_font_height(dpi);
 
         let f = CreateFontIndirectW(&lf);
         if f.0.is_null() {
@@ -2217,6 +3437,35 @@ fn build_font(dpi: u32) -> HFONT {
             f
         }
     }
+}
+
+/// The labels' `lfHeight` at `dpi`: the type ramp's 14 px body (#1015).
+fn body_font_height(dpi: u32) -> i32 {
+    crate::ui::theme::type_height_px(crate::ui::theme::TYPE_BODY_PX, dpi, 1.0)
+}
+
+/// #1015: a helper line's `lfHeight` at `dpi`: the ramp's 12 px caption, the
+/// smallest size Windows 11 uses for text, so never below 12 px at 96 DPI.
+fn hint_font_height(dpi: u32) -> i32 {
+    crate::ui::theme::type_height_px(crate::ui::theme::TYPE_CAPTION_PX, dpi, 1.0)
+}
+
+/// The helper-line font: the body font `body` with the smaller height of
+/// [`hint_font_height`]. Null when the body font cannot be read, so the caller
+/// keeps the body font. The caller deletes it.
+unsafe fn build_hint_font(body: HFONT, dpi: u32) -> HFONT {
+    use windows::Win32::Graphics::Gdi::GetObjectW;
+    let mut lf = LOGFONTW::default();
+    let got = GetObjectW(
+        HGDIOBJ(body.0),
+        std::mem::size_of::<LOGFONTW>() as i32,
+        Some(&mut lf as *mut LOGFONTW as *mut c_void),
+    );
+    if got <= 0 {
+        return HFONT(std::ptr::null_mut());
+    }
+    lf.lfHeight = hint_font_height(dpi);
+    CreateFontIndirectW(&lf)
 }
 
 // ---------------------------------------------------------------------------
@@ -2245,12 +3494,28 @@ struct Ctx {
     /// Where [`Ctx::create`] puts the next control: the scrolling body, then
     /// the window itself for the pinned footer (#481).
     parent: std::cell::Cell<HWND>,
+    /// The page the next control belongs to (#872); `None` for the footer.
+    page: std::cell::Cell<Option<Page>>,
     instance: HINSTANCE,
     dpi: u32,
     font: HFONT,
     /// Every child created through [`Ctx::create`], with its design (96dpi)
     /// rect, so a later `WM_DPICHANGED` can re-lay-out each one (#233).
     children: std::cell::RefCell<Vec<ChildLayout>>,
+    /// #874: the part of the Models page the next control belongs to, if it
+    /// is one that moves or hides when the active provider changes.
+    slot: std::cell::Cell<Option<Slot>>,
+    /// Every control made under a slot, at the place it has when all show.
+    flow: std::cell::RefCell<Vec<FlowChild>>,
+}
+
+/// A Models page control that moves or hides with the provider choice (#874).
+struct FlowChild {
+    hwnd: HWND,
+    slot: Slot,
+    /// Its design `y` and `h` when every provider shows.
+    y: i32,
+    h: i32,
 }
 
 impl Ctx {
@@ -2269,6 +3534,13 @@ impl Ctx {
     ) -> HWND {
         let class_w = wide_z(class);
         let text_w = wide_z(text);
+        // #854: every dropdown paints its own text, so it can sit 8 dp in from
+        // the border like a Windows 11 combo. The control keeps its role.
+        let style = if class == WC_COMBOBOX {
+            style | CBS_OWNERDRAWFIXED as u32
+        } else {
+            style
+        };
         let hwnd = unsafe {
             CreateWindowExW(
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(ex_style),
@@ -2298,7 +3570,33 @@ impl Ctx {
                     Some(LPARAM(1)),
                 );
             }
+            if class == WC_COMBOBOX {
+                unsafe {
+                    set_combo_heights(hwnd, self.dpi);
+                    let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+                        hwnd,
+                        Some(combo_subclass),
+                        COMBO_SUBCLASS_ID,
+                        0,
+                    );
+                }
+            }
+            if class == WC_EDIT {
+                // #934: the frame of a Windows 11 text box.
+                unsafe {
+                    let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+                        hwnd,
+                        Some(edit_subclass),
+                        EDIT_SUBCLASS_ID,
+                        0,
+                    );
+                }
+            }
+            if let Some(slot) = self.slot.get() {
+                self.flow.borrow_mut().push(FlowChild { hwnd, slot, y, h });
+            }
             self.children.borrow_mut().push(ChildLayout {
+                page: self.page.get(),
                 hwnd,
                 x,
                 y,
@@ -2836,15 +4134,9 @@ fn apply_ollama_section(inner: &mut SettingsInner, section: &OllamaSection) {
         } else if let Some((label, _)) = section.link {
             set_text(link, label);
         }
-        let cmd = if section.link.is_some() || section.fix {
-            SW_SHOW
-        } else {
-            SW_HIDE
-        };
-        unsafe {
-            let _ = ShowWindow(link, cmd);
-        }
     }
+    inner.ollama_link_shown = section.link.is_some() || section.fix;
+    unsafe { sync_visibility(inner) };
 }
 
 /// Posted to the Settings window when the pull worker has stored a new
@@ -3223,11 +4515,8 @@ fn with_gpu_fix(mut section: OllamaSection, offer: Option<String>) -> OllamaSect
 fn start_gpu_fix(inner: &mut SettingsInner) {
     inner.ollama_fix = false;
     // Hidden first, so a refusal below never leaves a dead "Fix it".
-    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
-        unsafe {
-            let _ = ShowWindow(link, SW_HIDE);
-        }
-    }
+    inner.ollama_link_shown = false;
+    unsafe { sync_visibility(inner) };
     let cfg = inner.original.providers.ollama.clone();
     // Refuse before touching anything, and say so inline (rule 7).
     let refusal = if !ollama_gpu_fix::is_loopback_base_url(&cfg.base_url) {
@@ -3246,11 +4535,6 @@ fn start_gpu_fix(inner: &mut SettingsInner) {
             set_text(status, msg);
         }
         return;
-    }
-    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
-        unsafe {
-            let _ = ShowWindow(link, SW_HIDE);
-        }
     }
     if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
         set_text(status, ollama_gpu_fix::RUNNING_TEXT);
@@ -3350,36 +4634,196 @@ fn secondary_label(chord: &crate::hotkey::Chord) -> String {
     format!("Shortcut for any keyboard: {}", chord_to_string(chord))
 }
 
-/// When `config.toml` was last written and how long it was (#851). Enough to
-/// notice an edit without reading the file, which holds keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ConfigStamp {
-    modified: Option<std::time::SystemTime>,
-    len: u64,
+/// The Mode combo's rows: the tray submenu's four, in its order, labelled by
+/// `Mode::label` so the two cannot drift (#873).
+const MODE_CHOICES: [crate::mode::Mode; 4] = [
+    crate::mode::Mode::Cloud,
+    crate::mode::Mode::Local,
+    crate::mode::Mode::Auto,
+    crate::mode::Mode::Offline,
+];
+
+/// The combo row for `mode`.
+fn mode_index(mode: crate::mode::Mode) -> usize {
+    MODE_CHOICES.iter().position(|m| *m == mode).unwrap_or(0)
 }
 
-/// The stamp of the config file now; `None` when it is missing or unreadable.
-fn current_config_stamp() -> Option<ConfigStamp> {
-    let meta = std::fs::metadata(Config::path().ok()?).ok()?;
-    Some(ConfigStamp {
-        modified: meta.modified().ok(),
-        len: meta.len(),
-    })
+/// The mode on combo row `index`; `None` for CB_ERR (-1) or a row past the list.
+fn mode_at(index: isize) -> Option<crate::mode::Mode> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| MODE_CHOICES.get(i).copied())
 }
 
-/// Whether the file changed since the window opened. Any difference counts,
-/// including the file appearing or disappearing. If the stamp cannot be read
-/// both times, nothing is known to have changed.
-fn config_changed_since(opened: Option<ConfigStamp>, now: Option<ConfigStamp>) -> bool {
-    opened != now
+/// The line beside the Pause buttons (#873). `paused` is the tray's own wording
+/// of the state (`pause::tooltip_text`), or `None` while running.
+fn pause_status_line(paused: Option<&str>) -> String {
+    match paused {
+        None => "Wingman is running.".to_string(),
+        Some(text) => format!("{text}."),
+    }
 }
 
-/// Shown on the validation line when Save is refused for that reason.
-const CONFIG_CHANGED_MESSAGE: &str =
-    "config.toml changed while Settings was open. Close Settings and open it again.";
+/// Which of (Pause, Resume) can be used: one or the other, as in the tray menu.
+fn pause_buttons_enabled(paused: bool) -> (bool, bool) {
+    (!paused, paused)
+}
+
+/// What the Pause button offers, in the tray's order and words.
+const PAUSE_MENU: [(crate::pause::PauseChoice, &str); 3] = [
+    (crate::pause::PauseChoice::OneHour, "1 hour"),
+    (crate::pause::PauseChoice::UntilTomorrow, "Until tomorrow"),
+    (crate::pause::PauseChoice::UntilResumed, "Until resumed"),
+];
+
+/// The pause shortcut's line; it may be unset (#873).
+fn pause_label(chord: &Option<crate::hotkey::Chord>) -> String {
+    match chord {
+        Some(c) => format!("Pause shortcut: {}", chord_to_string(c)),
+        None => format!(
+            "Pause shortcut: {}",
+            crate::hotkey::pause_binding_label(None)
+        ),
+    }
+}
+
+/// Shows the app's current mode and pause state in the open Settings window, so
+/// it follows a change made from the tray (#873). `paused` is the tray's wording
+/// of the pause (`None` while running). A no-op when no window is open. Must run
+/// on the UI thread.
+pub fn sync_live(mode: crate::mode::Mode, paused: Option<&str>) {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open != 0 {
+        apply_live(HWND(open as *mut c_void), mode, paused);
+    }
+}
+
+/// [`sync_live`] on a given window. `CB_SETCURSEL` sends no notification, so this
+/// never echoes back to the app as a new choice.
+fn apply_live(hwnd: HWND, mode: crate::mode::Mode, paused: Option<&str>) {
+    if let Some(combo) = get_dlg_item(hwnd, ID_MODE) {
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_SETCURSEL,
+                Some(WPARAM(mode_index(mode))),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+    if let Some(line) = get_dlg_item(hwnd, ID_PAUSE_STATUS) {
+        let text = pause_status_line(paused);
+        if get_text(line) != text {
+            set_text(line, &text);
+        }
+    }
+    let (can_pause, _) = pause_buttons_enabled(paused.is_some());
+    let pause = get_dlg_item(hwnd, ID_PAUSE_BUTTON);
+    let resume = get_dlg_item(hwnd, ID_RESUME_BUTTON);
+    if let (Some(pause), Some(resume)) = (pause, resume) {
+        unsafe {
+            // A button that is switched off while it has the keyboard focus
+            // would strand the focus: hand it to the one that takes over.
+            let (off, on) = if can_pause {
+                (resume, pause)
+            } else {
+                (pause, resume)
+            };
+            let had_focus = GetFocus() == off;
+            let _ = EnableWindow(on, true);
+            let _ = EnableWindow(off, false);
+            if had_focus {
+                let _ = SetFocus(Some(on));
+            }
+        }
+    }
+}
+
+/// Asks the app to do `command` (#873). The app runs the handler the tray menu
+/// item runs. A window with no owner (the tests') asks nobody.
+fn send_command(inner: &SettingsInner, command: crate::app::SettingsCommand) {
+    send_command_to(inner.hwnd, inner.owner, command);
+}
+
+/// [`send_command`] with the two handles copied out, for code that holds no
+/// borrow of the window's state.
+fn send_command_to(hwnd: HWND, owner: HWND, command: crate::app::SettingsCommand) {
+    if owner.0.is_null() {
+        return;
+    }
+    if !crate::app::post_settings_command(owner.0 as isize, command) {
+        // Rule 7: say so inline, never a silent no-op.
+        if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
+            set_text(msg, "Wingman's main window is not running.");
+        }
+    }
+}
+
+/// Posted by the Pause button to the window itself. The menu's own message
+/// loop must not run inside `handle_command`, which holds `&mut SettingsInner`:
+/// a Quit during the menu can free that state, and other messages handled in the
+/// loop take their own borrow. The window procedure runs it before it borrows.
+const WM_PAUSE_MENU: u32 = 0x8000 + 0x873;
+
+/// The Pause button's menu: a small menu under it with the three choices; the pick
+/// is sent to the app. Dismissing the menu does nothing. Holds no borrow of the
+/// window's state: the owner is copied first, and nothing of the state is read
+/// after the menu, which may have outlived the window.
+unsafe fn run_pause_menu(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+    };
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if state.is_null() {
+        return;
+    }
+    let owner = (*state).owner;
+    let Some(button) = get_dlg_item(hwnd, ID_PAUSE_BUTTON) else {
+        return;
+    };
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+    for (i, (_, label)) in PAUSE_MENU.iter().enumerate() {
+        let text = wide_z(label);
+        unsafe {
+            let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(text.as_ptr()));
+        }
+    }
+    let mut at = windows::Win32::Foundation::RECT::default();
+    let picked = unsafe {
+        let _ = GetWindowRect(button, &mut at);
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            at.left,
+            at.bottom,
+            None,
+            hwnd,
+            None,
+        )
+    };
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+    // A Quit while the menu was up closed the window: say nothing to it.
+    if !IsWindow(Some(hwnd)).as_bool() {
+        return;
+    }
+    let choice = usize::try_from(picked.0)
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| PAUSE_MENU.get(i));
+    if let Some((choice, _)) = choice {
+        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
+    }
+}
 
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
+/// #874: the width of "Add another provider".
+const ADD_PROVIDER_W: i32 = 170;
 
 /// Shown on the validation line when the config file cannot be opened (rule 7:
 /// never a silent no-op, never a dialog).
@@ -3572,9 +5016,15 @@ fn build_ui(
 /// What [`build_ui`] built, plus what a later DPI change needs to redo it.
 struct BuiltUi {
     prompt_edit: HWND,
+    /// The navigation rail (#872).
+    rail: HWND,
+    /// See [`SettingsInner::page_content_dp`].
+    page_content_dp: [i32; 5],
     /// The scrolling window the groups live in (#481).
     body: HWND,
     children: Vec<ChildLayout>,
+    /// See [`SettingsInner::models_flow`].
+    models_flow: Vec<FlowChild>,
     /// Where the fixed-height groups end, in dp (the Prompt group's top).
     content_top_dp: i32,
     /// The client height (dp) the elastic region was laid out for.
@@ -3589,22 +5039,32 @@ fn build_ui_recorded(
     config: &Config,
     win_h_dp: i32,
 ) -> BuiltUi {
-    // #481: created first, so it is first in tab order; the footer controls
-    // made last are the last stops.
+    // #872: the rail is the first tab stop, then the body (#481); the footer
+    // controls made last are the last stops.
+    let rail = create_rail(hwnd, instance, dpi, font);
     let body = create_body(hwnd, instance, dpi);
     let ctx = Ctx {
         parent: std::cell::Cell::new(if body.0.is_null() { hwnd } else { body }),
+        page: std::cell::Cell::new(None),
         instance,
         dpi,
         font,
         children: std::cell::RefCell::new(Vec::new()),
+        slot: std::cell::Cell::new(None),
+        flow: std::cell::RefCell::new(Vec::new()),
     };
     let content_x = MARGIN;
-    let content_w = WIN_W_DP - 2 * MARGIN;
+    let content_w = PAGE_W_DP - 2 * MARGIN;
 
-    let mut y = MARGIN;
+    // Every page stacks its groups from the top; these follow where the next
+    // group of each page starts and where its last one ended (dp).
+    let mut page_y = [PAGE_TOP_PAD_DP; 5];
+    let mut page_bottom = [0i32; 5];
+    let mut y;
 
-    // -- Providers ----------------------------------------------------
+    // -- Providers (Models) --------------------------------------------
+    ctx.page.set(Some(Page::Models));
+    y = page_y[Page::Models.index()];
     let providers_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -3639,6 +5099,7 @@ fn build_ui_recorded(
     r.advance();
 
     // OpenAI
+    ctx.slot.set(Some(Slot::OpenAi));
     ctx.create(
         WC_STATIC,
         "OpenAI API key:",
@@ -3726,6 +5187,7 @@ fn build_ui_recorded(
     r.advance();
 
     // Anthropic
+    ctx.slot.set(Some(Slot::Anthropic));
     ctx.create(
         WC_STATIC,
         "Anthropic API key:",
@@ -3813,6 +5275,7 @@ fn build_ui_recorded(
     r.advance();
 
     // Gemini (#195): same three rows as the other cloud providers.
+    ctx.slot.set(Some(Slot::Gemini));
     ctx.create(
         WC_STATIC,
         "Gemini API key:",
@@ -3903,33 +5366,7 @@ fn build_ui_recorded(
     // Ollama (#183): no key, only which pulled model to use. The combo starts
     // with the configured model alone; the pulled models are added when the
     // background fetch reports in (see `spawn_ollama_models_fetch`).
-    // #427: the cloud model dropdowns list what the provider offers (or
-    // what is in config.toml), so say where to add one that is missing.
-    // Ollama's list comes from what is pulled, so this sits above its row.
-    ctx.create(
-        WC_STATIC,
-        model_list_hint_for(config.mode),
-        0,
-        0,
-        r.x,
-        r.y,
-        r.w - OPEN_CONFIG_W - 8,
-        ROW_H,
-        ID_MODEL_LIST_HINT,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Open config file",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
-        0,
-        r.x + r.w - OPEN_CONFIG_W,
-        r.y,
-        OPEN_CONFIG_W,
-        ROW_H,
-        ID_OPEN_CONFIG,
-    );
-    r.advance();
-
+    ctx.slot.set(Some(Slot::Ollama));
     ctx.create(
         WC_STATIC,
         "Ollama model:",
@@ -3961,13 +5398,59 @@ fn build_ui_recorded(
     }
     r.advance();
 
-    let providers_bottom = r.y + ROW_H + 8;
+    // #874: shows the providers that are hidden. Under the blocks it
+    // reveals, so a reader reaches it after the rows they can already see.
+    ctx.slot.set(Some(Slot::AddButton));
+    ctx.create(
+        WC_BUTTON,
+        "Add another provider",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + LABEL_W,
+        r.y,
+        ADD_PROVIDER_W,
+        ROW_H,
+        ID_ADD_PROVIDER,
+    );
+    r.advance();
+
+    // #427: the cloud model dropdowns list what the provider offers (or
+    // what is in config.toml), so say where to add one that is missing.
+    ctx.slot.set(Some(Slot::Hint));
+    ctx.create(
+        WC_STATIC,
+        model_list_hint_for(config.mode),
+        0,
+        0,
+        r.x,
+        r.y,
+        r.w - OPEN_CONFIG_W - 8,
+        ROW_H,
+        ID_MODEL_LIST_HINT,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Open config file",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - OPEN_CONFIG_W,
+        r.y,
+        OPEN_CONFIG_W,
+        ROW_H,
+        ID_OPEN_CONFIG,
+    );
+    r.advance();
+    ctx.slot.set(None);
+
+    // `r` already moved past the last row and its gap (#785).
+    let providers_bottom = r.y + 4;
     // Created last, once the real extent of what it should enclose is
     // known, so its height doesn't need to be precomputed by hand. This
     // does put it on top in z-order, but a BS_GROUPBOX only ever paints its
     // frame outline and caption text (its interior is left untouched, not
     // filled), and this layout keeps that outline/caption clear of every
     // field it encloses, so nothing ends up visually covered.
+    ctx.slot.set(Some(Slot::Frame));
     ctx.create(
         WC_BUTTON,
         "Providers",
@@ -3979,8 +5462,13 @@ fn build_ui_recorded(
         providers_bottom - providers_top,
         0,
     );
+    // The Ollama card under the frame shows with the Ollama block and moves
+    // up with the frame (#874).
+    ctx.slot.set(Some(Slot::OllamaCard));
 
     y = providers_bottom + GROUP_GAP;
+    page_y[Page::Models.index()] = y;
+    page_bottom[Page::Models.index()] = providers_bottom;
 
     // -- Ollama status (#14, #15) ----------------------------------------
     // One read-only line: whether anything answers on the configured
@@ -3993,6 +5481,7 @@ fn build_ui_recorded(
     // Read-only: choosing Ollama as the active provider and its model is
     // done in the Providers group above (#183). `base_url` stays a
     // config.toml setting.
+    y = page_y[Page::Models.index()];
     let ollama_top = y;
     y += GROUP_LABEL_TOP;
     // The text is a placeholder until the worker reports (#527, #568), so the
@@ -4080,7 +5569,7 @@ fn build_ui_recorded(
         ID_PULL_STATUS,
     );
     y += ROW_H * 2;
-    let ollama_bottom = y + 8;
+    let ollama_bottom = y + 4;
     ctx.create(
         WC_BUTTON,
         "Ollama",
@@ -4093,13 +5582,76 @@ fn build_ui_recorded(
         0,
     );
     y = ollama_bottom + GROUP_GAP;
+    page_y[Page::Models.index()] = y;
+    page_bottom[Page::Models.index()] = ollama_bottom;
+    ctx.slot.set(None);
 
-    // -- Hotkeys --------------------------------------------------------
+    // -- Hotkeys (General) --------------------------------------------------------
+    ctx.page.set(Some(Page::General));
+    y = page_y[Page::General.index()];
     let hotkeys_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
     let change_w = 90;
     let label_w = r.w - change_w - 12;
+    // #873: Mode and Pause act at once, through the tray's own handlers.
+    ctx.create(WC_STATIC, "Mode:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    let mode_combo = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + LABEL_W,
+        r.y,
+        r.w - LABEL_W,
+        ROW_H * 5,
+        ID_MODE,
+    );
+    for m in MODE_CHOICES {
+        combo_add(mode_combo, m.label());
+    }
+    combo_select(mode_combo, config.mode.label());
+    r.advance();
+    let paused_now = crate::pause::is_paused_now();
+    let (can_pause, can_resume) = pause_buttons_enabled(paused_now);
+    ctx.create(
+        WC_STATIC,
+        &pause_status_line(paused_now.then_some("Paused")),
+        0,
+        0,
+        r.x,
+        r.y,
+        label_w - change_w - 8,
+        ROW_H,
+        ID_PAUSE_STATUS,
+    );
+    let pause_button = ctx.create(
+        WC_BUTTON,
+        "Pause...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - 2 * change_w - 8,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_PAUSE_BUTTON,
+    );
+    let resume_button = ctx.create(
+        WC_BUTTON,
+        "Resume",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - change_w,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_RESUME_BUTTON,
+    );
+    unsafe {
+        let _ = EnableWindow(pause_button, can_pause);
+        let _ = EnableWindow(resume_button, can_resume);
+    }
+    r.advance();
     ctx.create(
         WC_STATIC,
         &format!("Copilot key: {}", chord_to_string(&config.hotkeys.primary)),
@@ -4144,6 +5696,30 @@ fn build_ui_recorded(
         change_w,
         ROW_H,
         ID_CHANGE_SECONDARY,
+    );
+    r.advance();
+    // #873: the pause shortcut, moved here from the tray menu.
+    ctx.create(
+        WC_STATIC,
+        &pause_label(&config.hotkeys.pause),
+        0,
+        0,
+        r.x,
+        r.y,
+        label_w,
+        ROW_H,
+        ID_PAUSE_LABEL,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Change...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - change_w,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_CHANGE_PAUSE,
     );
     r.advance();
     // The learn flow's whole conversation happens on this one line, inline:
@@ -4196,8 +5772,12 @@ fn build_ui_recorded(
         0,
     );
     y = hotkeys_bottom + GROUP_GAP;
+    page_y[Page::General.index()] = y;
+    page_bottom[Page::General.index()] = hotkeys_bottom;
 
-    // -- Capture ----------------------------------------------------------
+    // -- Capture (Privacy) ----------------------------------------------------------
+    ctx.page.set(Some(Page::Privacy));
+    y = page_y[Page::Privacy.index()];
     let capture_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4267,7 +5847,7 @@ fn build_ui_recorded(
         r.y,
         r.w,
         ROW_H,
-        0,
+        ID_CAPTURE_DETAIL_HINT,
     );
     r.advance();
 
@@ -4291,14 +5871,14 @@ fn build_ui_recorded(
         REDACT_HINT,
         0,
         0,
-        r.x + 20,
+        r.x + CHECKBOX_TEXT_INDENT_DP,
         r.y,
-        r.w - 20,
+        r.w - CHECKBOX_TEXT_INDENT_DP,
         ROW_H * 2,
-        0,
+        ID_REDACT_HINT,
     );
-    r.advance();
-    r.advance();
+    // The note's own two rows, then the group's usual bottom padding (#785).
+    r.y += ROW_H * 2;
     let capture_bottom = r.y + 4;
     ctx.create(
         WC_BUTTON,
@@ -4312,8 +5892,12 @@ fn build_ui_recorded(
         0,
     );
     y = capture_bottom + GROUP_GAP;
+    page_y[Page::Privacy.index()] = y;
+    page_bottom[Page::Privacy.index()] = capture_bottom;
 
-    // -- Card ---------------------------------------------------------
+    // -- Card (General) ---------------------------------------------------------
+    ctx.page.set(Some(Page::General));
+    y = page_y[Page::General.index()];
     let card_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4464,8 +6048,12 @@ fn build_ui_recorded(
         0,
     );
     y = card_bottom + GROUP_GAP;
+    page_y[Page::General.index()] = y;
+    page_bottom[Page::General.index()] = card_bottom;
 
-    // -- Forms (#403) -------------------------------------------------
+    // -- Forms (#403, Privacy) -------------------------------------------------
+    ctx.page.set(Some(Page::Privacy));
+    y = page_y[Page::Privacy.index()];
     let forms_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4513,9 +6101,43 @@ fn build_ui_recorded(
         forms_bottom - forms_top,
         0,
     );
-    y = forms_bottom + GROUP_GAP;
+    page_bottom[Page::Privacy.index()] = forms_bottom;
 
-    // -- Prompt (grows to fill remaining space above the button row) ------
+    // -- Actions (#872): no setting yet, so one note, never an empty page ---
+    ctx.page.set(Some(Page::Actions));
+    y = page_y[Page::Actions.index()];
+    let actions_top = y;
+    y += GROUP_LABEL_TOP;
+    let note_h = ROW_H * 3;
+    ctx.create(
+        WC_STATIC,
+        ACTIONS_NOTE,
+        0,
+        0,
+        content_x + MARGIN,
+        y,
+        content_w - 2 * MARGIN,
+        note_h,
+        ID_ACTIONS_NOTE,
+    );
+    y += note_h;
+    let actions_bottom = y + 4;
+    ctx.create(
+        WC_BUTTON,
+        "Your actions",
+        BS_GROUPBOX as u32,
+        0,
+        content_x,
+        actions_top,
+        content_w,
+        actions_bottom - actions_top,
+        0,
+    );
+    page_bottom[Page::Actions.index()] = actions_bottom;
+
+    // -- Prompt (Advanced; grows to fill the space above the button row) ----
+    ctx.page.set(Some(Page::Advanced));
+    y = page_y[Page::Advanced.index()];
     let footer = footer_layout(y, win_h_dp, false);
     let prompt_top = footer.prompt_top;
     let prompt_bottom = footer.prompt_bottom;
@@ -4598,7 +6220,9 @@ fn build_ui_recorded(
 
     // -- Save / Cancel ------------------------------------------------
     // Pinned footer: a sibling of the body, not inside it, so it never scrolls.
+    // It belongs to no page and sits under the pages, right of the rail.
     ctx.parent.set(hwnd);
+    ctx.page.set(None);
     let buttons_y = footer.buttons_y;
     // #344: inline "that field is wrong" message, blank until a Save
     // attempt fails validation. Sits to the left of the Save/Cancel row so
@@ -4608,7 +6232,7 @@ fn build_ui_recorded(
         "",
         0x4000, // SS_ENDELLIPSIS
         0,
-        content_x + MARGIN,
+        RAIL_W_DP + content_x + MARGIN,
         buttons_y + (BTN_H - ROW_H) / 2,
         content_w - 2 * MARGIN - 2 * BTN_W - 12 - 12,
         ROW_H,
@@ -4656,6 +6280,7 @@ fn build_ui_recorded(
         ID_PROMPT_EDIT,
         ID_SAVE,
         ID_AUTOSTART,
+        ID_MODE,
     ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_GROUP.0);
@@ -4679,6 +6304,7 @@ fn build_ui_recorded(
         ID_MAX_EDGE,
         ID_MONITOR,
         ID_REDACT,
+        ID_MODE,
         ID_CARD_SECONDS,
         ID_TEXT_SCALE_TRACK,
         ID_CARD_CORNER,
@@ -4698,12 +6324,729 @@ fn build_ui_recorded(
         }
     }
 
+    let mut page_content_dp = [0i32; 5];
+    for page in Page::ALL {
+        let i = page.index();
+        page_content_dp[i] = if page == Page::Advanced {
+            footer.content_h()
+        } else {
+            page_bottom[i] + BODY_PAD_BOTTOM
+        };
+    }
+
     BuiltUi {
         prompt_edit,
+        rail,
+        page_content_dp,
         body,
         children: ctx.children.into_inner(),
+        models_flow: ctx.flow.into_inner(),
         content_top_dp,
         win_h_dp,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The navigation rail (#872)
+// ---------------------------------------------------------------------------
+// A single-select list box, owner-drawn so it looks like the Windows 11
+// Settings navigation: an icon and a name per page, the selected one on a
+// soft fill with a short accent pill. The list box keeps the arrow keys, Home,
+// End, type-ahead and the list and selection accessibility patterns; only the
+// painting is ours.
+
+const LB_ADDSTRING: u32 = 0x0180;
+const LB_SETCURSEL: u32 = 0x0186;
+const LB_GETCURSEL: u32 = 0x0188;
+const LB_SETITEMHEIGHT: u32 = 0x01A0;
+const LBN_SELCHANGE: u32 = 1;
+const LBS_NOTIFY: u32 = 0x0001;
+const LBS_OWNERDRAWFIXED: u32 = 0x0010;
+const LBS_HASSTRINGS: u32 = 0x0040;
+const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
+const ODS_SELECTED: u32 = 0x0001;
+const ODS_FOCUS: u32 = 0x0010;
+const ODS_DISABLED: u32 = 0x0004;
+const ODS_COMBOBOXEDIT: u32 = 0x1000;
+const ODT_COMBOBOX: u32 = 3;
+const ODS_NOFOCUSRECT: u32 = 0x0200;
+const WC_LISTBOX: &str = "LISTBOX";
+
+/// Posted to the window to change the page or move focus between the rail and
+/// the page. `wparam` says what (the `PAGE_*` codes), `lparam` is its argument.
+const WM_SETTINGS_PAGE: u32 = 0x8000 + 45; // WM_APP + 45
+/// `lparam` is the page's rail position.
+const PAGE_PICK: usize = 0;
+/// `lparam` is how many pages to move (negative goes back), wrapping.
+const PAGE_STEP: usize = 1;
+/// Focus goes into the page (Enter on the rail).
+const PAGE_ENTER: usize = 2;
+/// Focus goes to the rail, or into the page when it is already there (F6).
+const PAGE_SWAP_FOCUS: usize = 3;
+
+/// What a key does to the pages, apart from the rail's own arrow keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageKey {
+    Pick(Page),
+    Step(isize),
+}
+
+/// The page command for a key press: Ctrl+1 to Ctrl+5 pick a page, Ctrl+PageDown
+/// and Ctrl+PageUp move to the next and the previous. Nothing without Ctrl, so
+/// typing in a box is never taken. AltGr reads as Ctrl+Alt, so with Alt down
+/// the key is left alone: AltGr+2 and AltGr+3 type @ and # on some layouts.
+fn page_key(vk: u32, ctrl: bool, alt: bool) -> Option<PageKey> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NEXT, VK_PRIOR};
+    if !ctrl || alt {
+        return None;
+    }
+    if vk == VK_NEXT.0 as u32 {
+        return Some(PageKey::Step(1));
+    }
+    if vk == VK_PRIOR.0 as u32 {
+        return Some(PageKey::Step(-1));
+    }
+    Page::from_digit_key(vk).map(PageKey::Pick)
+}
+
+/// Creates the rail, filled and with the first page selected.
+fn create_rail(parent: HWND, instance: HINSTANCE, dpi: u32, font: HFONT) -> HWND {
+    // A list box has no name of its own (MEASURED 2026-10-17, UI Automation:
+    // the window text is ignored), but the static before a control names it.
+    // This one is a pixel, so it takes no room and is read as the list's name.
+    let static_class = wide_z(WC_STATIC);
+    let name = wide_z(RAIL_NAME);
+    unsafe {
+        let _ = CreateWindowExW(
+            Default::default(),
+            PCWSTR(static_class.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
+        );
+    }
+    let class = wide_z(WC_LISTBOX);
+    let title = wide_z(RAIL_NAME);
+    let style = WS_CHILD.0
+        | WS_VISIBLE.0
+        | WS_TABSTOP.0
+        | WS_GROUP.0
+        | LBS_NOTIFY
+        | LBS_OWNERDRAWFIXED
+        | LBS_HASSTRINGS
+        | LBS_NOINTEGRALHEIGHT;
+    let rail = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
+            0,
+            0,
+            to_px(RAIL_W_DP, dpi),
+            to_px(RAIL_ITEM_H_DP, dpi) * Page::ALL.len() as i32,
+            Some(parent),
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                ID_RAIL as *mut c_void,
+            )),
+            Some(instance),
+            None,
+        )
+    }
+    .unwrap_or(HWND(std::ptr::null_mut()));
+    if rail.0.is_null() {
+        return rail;
+    }
+    for page in Page::ALL {
+        let text = wide_z(page.label());
+        unsafe {
+            SendMessageW(
+                rail,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+        }
+    }
+    unsafe {
+        SendMessageW(
+            rail,
+            LB_SETCURSEL,
+            Some(WPARAM(Page::General.index())),
+            None,
+        );
+    }
+    place_rail(rail, dpi, font);
+    rail
+}
+
+/// Sizes and fonts the rail for `dpi`: the left edge of the window, a little
+/// below the top, exactly five items tall.
+fn place_rail(rail: HWND, dpi: u32, font: HFONT) {
+    let item_h = to_px(RAIL_ITEM_H_DP, dpi);
+    unsafe {
+        let _ = SetWindowPos(
+            rail,
+            None,
+            0,
+            to_px(RAIL_TOP_PAD_DP, dpi),
+            to_px(RAIL_W_DP, dpi),
+            item_h * Page::ALL.len() as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        SendMessageW(
+            rail,
+            LB_SETITEMHEIGHT,
+            Some(WPARAM(0)),
+            Some(LPARAM(item_h as isize)),
+        );
+        SendMessageW(
+            rail,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    }
+}
+
+/// The colours of one rail item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RailColors {
+    /// The item's whole rectangle: the window's face colour.
+    face: u32,
+    /// The rounded selection fill, when the item is selected.
+    fill: Option<u32>,
+    /// The name and icon.
+    text: u32,
+    /// The accent pill, when the item is selected.
+    pill: Option<u32>,
+}
+
+/// The colours of an item. High contrast is system colours only: the selected
+/// item is `Highlight` with `HighlightText` on it, the pill the same text
+/// colour. Otherwise the selection is the 6 % tint every Windows 11 list uses
+/// and the pill is the user's accent (`accent`).
+fn rail_colors(
+    selected: bool,
+    high_contrast: bool,
+    face: u32,
+    tokens: &crate::ui::theme::Tokens,
+    sys: &crate::ui::theme::SysColors,
+    accent: u32,
+) -> RailColors {
+    if !selected {
+        return RailColors {
+            face,
+            fill: None,
+            text: tokens.text,
+            pill: None,
+        };
+    }
+    if high_contrast {
+        return RailColors {
+            face,
+            fill: Some(sys.highlight),
+            text: sys.highlight_text,
+            pill: Some(sys.highlight_text),
+        };
+    }
+    RailColors {
+        face,
+        fill: Some(crate::ui::card_buttons::blend(face, tokens.text, 6)),
+        text: tokens.text,
+        pill: Some(accent),
+    }
+}
+
+/// Whether Segoe Fluent Icons is installed; looked up once.
+fn fluent_icons_installed() -> bool {
+    static FLUENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLUENT.get_or_init(|| font_face_exists(crate::ui::theme::FLUENT_ICON_FONT_FACE))
+}
+
+/// #1055: everything a rail item paint needs that costs a registry read or a
+/// GDI font: both colour sets and the icon font. Built once per theme, accent
+/// or dpi change; owned here and freed by [`invalidate_rail_style`].
+#[derive(Clone, Copy)]
+struct RailStyle {
+    dpi: u32,
+    high_contrast: bool,
+    normal: RailColors,
+    selected: RailColors,
+    /// The focus ring's ink.
+    focus_ink: u32,
+    icons: HFONT,
+}
+
+thread_local! {
+    static RAIL_STYLE: std::cell::Cell<Option<RailStyle>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the rail style was rebuilt (a registry read and a font
+    /// each) on this thread: painting must not move it.
+    static RAIL_STYLE_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The cached rail style for `dpi`, built on first use after a change.
+unsafe fn rail_style(dpi: u32) -> RailStyle {
+    use crate::ui::theme::{
+        accent_fill, read_accent_shades, SysColors, Theme, Tokens, ICON_FONT_DP,
+    };
+    use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_BTNFACE};
+    if let Some(style) = RAIL_STYLE.get() {
+        if style.dpi == dpi {
+            return style;
+        }
+        invalidate_rail_style();
+    }
+    #[cfg(test)]
+    RAIL_STYLE_BUILDS.set(RAIL_STYLE_BUILDS.get() + 1);
+    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+    let sys = SysColors::read();
+    let theme = Theme::resolve(true, high_contrast);
+    let tokens = Tokens::for_theme(theme, &sys);
+    let face = GetSysColor(COLOR_BTNFACE);
+    let accent = if high_contrast {
+        face
+    } else {
+        accent_fill(theme, read_accent_shades(), face)
+    };
+    let style = RailStyle {
+        dpi,
+        high_contrast,
+        normal: rail_colors(false, high_contrast, face, &tokens, &sys, face),
+        selected: rail_colors(true, high_contrast, face, &tokens, &sys, accent),
+        focus_ink: tokens.text,
+        icons: icon_font(ICON_FONT_DP, dpi),
+    };
+    RAIL_STYLE.set(Some(style));
+    style
+}
+
+/// Drops the cached rail style and frees its font; the next paint rebuilds
+/// it. Called on a theme, accent, system colour or dpi change, and when
+/// Settings closes.
+unsafe fn invalidate_rail_style() {
+    if let Some(style) = RAIL_STYLE.take() {
+        let _ = DeleteObject(HGDIOBJ(style.icons.0));
+    }
+}
+
+/// An icon font `dp` tall at `dpi`. The caller deletes it.
+unsafe fn icon_font(dp: i32, dpi: u32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -to_px(dp, dpi),
+        lfWeight: FW_NORMAL.0 as i32,
+        ..Default::default()
+    };
+    let face = crate::ui::theme::icon_font_face(fluent_icons_installed());
+    for (i, u) in face.encode_utf16().enumerate() {
+        if i < lf.lfFaceName.len() - 1 {
+            lf.lfFaceName[i] = u;
+        }
+    }
+    CreateFontIndirectW(&lf)
+}
+
+/// The area a combo item's text is drawn in: the item's rect with
+/// `COMBO_TEXT_PAD_DP` kept clear on each side. Never inverted, however narrow
+/// the item.
+fn combo_text_rect(
+    rc: windows::Win32::Foundation::RECT,
+    dpi: u32,
+) -> windows::Win32::Foundation::RECT {
+    let pad = to_px(crate::ui::theme::COMBO_TEXT_PAD_DP, dpi);
+    let left = rc.left + pad;
+    windows::Win32::Foundation::RECT {
+        left,
+        top: rc.top,
+        right: (rc.right - pad).max(left),
+        bottom: rc.bottom,
+    }
+}
+
+const COMBO_SUBCLASS_ID: usize = 0x854;
+
+/// An owner-drawn combo loses the system's light themed frame, so the frame is
+/// put back after each paint in the text box's look (#934): the same border,
+/// corners and accent line, which also keeps a row of controls consistent.
+unsafe extern "system" fn combo_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    match msg {
+        WM_PAINT => {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            paint_edit_frame(hwnd);
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(combo_subclass), COMBO_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// The height of a dropdown's list items: a row less the frame.
+fn combo_item_h_px(dpi: u32) -> i32 {
+    to_px(ROW_H, dpi) - to_px(COMBO_FRAME_DP, dpi)
+}
+
+/// The frame a combo adds around its selection field, in dp, as a first guess;
+/// [`set_combo_heights`] measures the real one.
+const COMBO_FRAME_DP: i32 = 4;
+
+fn is_combo(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let mut buf = [0u16; 16];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+    String::from_utf16_lossy(&buf[..n.min(buf.len())]).eq_ignore_ascii_case(WC_COMBOBOX)
+}
+
+/// Sets the item height of an owner-drawn combo: the list items (index 0) and
+/// the closed selection field (-1). The closed combo is its field plus a frame
+/// of the system's choosing, so the field is sized to leave the combo `ROW_H`
+/// tall, like the controls beside it.
+unsafe fn set_combo_heights(combo: HWND, dpi: u32) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_SETITEMHEIGHT;
+    let set = |index: usize, h: i32| {
+        SendMessageW(
+            combo,
+            CB_SETITEMHEIGHT,
+            Some(WPARAM(index)),
+            Some(LPARAM(h.max(1) as isize)),
+        );
+    };
+    let want = to_px(ROW_H, dpi);
+    set(0, combo_item_h_px(dpi));
+    // Measure the frame with a field of the wanted height, then take it off.
+    set(usize::MAX, want);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    let frame = if GetWindowRect(combo, &mut rc).is_ok() {
+        (rc.bottom - rc.top - want).clamp(0, want / 2)
+    } else {
+        to_px(COMBO_FRAME_DP, dpi)
+    };
+    set(usize::MAX, want - frame);
+}
+
+/// `WM_MEASUREITEM` for a combo. Returns false for anything else.
+unsafe fn measure_combo_item(lparam: LPARAM, dpi: u32) -> bool {
+    let mis = &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+    if mis.CtlType.0 != ODT_COMBOBOX {
+        return false;
+    }
+    mis.itemHeight = combo_item_h_px(dpi).max(1) as u32;
+    true
+}
+
+/// `WM_DRAWITEM` for a combo: the item (or the closed field) on the system
+/// colours, its text kept `COMBO_TEXT_PAD_DP` off the border. Returns false
+/// for anything else. Only system brushes and colours, so nothing to free and
+/// high contrast needs no special case.
+unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{
+        DrawTextW, FillRect, GetSysColor, GetSysColorBrush, SelectObject, SetBkMode, SetTextColor,
+        COLOR_3DFACE, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+        COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        TRANSPARENT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{CB_GETLBTEXT, CB_GETLBTEXTLEN, WM_GETFONT};
+
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    if di.CtlType.0 != ODT_COMBOBOX {
+        return false;
+    }
+    let hdc = di.hDC;
+    let rc = di.rcItem;
+    let state = di.itemState.0;
+    let disabled = state & ODS_DISABLED != 0;
+    // Only a list item highlights. The closed field gets ODS_SELECTED while the
+    // combo has the focus, and keeps the window colours; the focus line the
+    // frame draws is its focus mark.
+    let in_field = state & ODS_COMBOBOXEDIT != 0;
+    let selected = state & ODS_SELECTED != 0 && !disabled && !in_field;
+    let (face, ink) = if disabled {
+        (COLOR_3DFACE, COLOR_GRAYTEXT)
+    } else if selected {
+        (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT)
+    } else {
+        (COLOR_WINDOW, COLOR_WINDOWTEXT)
+    };
+    FillRect(hdc, &rc, GetSysColorBrush(face));
+
+    // An empty combo asks to be drawn with item id -1: just the background.
+    let Ok(index) = usize::try_from(di.itemID as i32) else {
+        return true;
+    };
+    let len = SendMessageW(di.hwndItem, CB_GETLBTEXTLEN, Some(WPARAM(index)), None).0;
+    let Ok(len) = usize::try_from(len) else {
+        return true;
+    };
+    let mut text = vec![0u16; len + 1];
+    let got = SendMessageW(
+        di.hwndItem,
+        CB_GETLBTEXT,
+        Some(WPARAM(index)),
+        Some(LPARAM(text.as_mut_ptr() as isize)),
+    )
+    .0;
+    let Ok(got) = usize::try_from(got) else {
+        return true;
+    };
+    text.truncate(got.min(len));
+
+    let dpi = dpi_for(di.hwndItem);
+    let mut area = combo_text_rect(rc, dpi);
+    let font = SendMessageW(di.hwndItem, WM_GETFONT, None, None).0;
+    let old = (font != 0).then(|| SelectObject(hdc, HGDIOBJ(font as *mut c_void)));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(GetSysColor(ink)));
+    DrawTextW(
+        hdc,
+        &mut text,
+        &mut area,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+    if let Some(old) = old {
+        SelectObject(hdc, old);
+    }
+    true
+}
+
+/// `WM_MEASUREITEM`: every rail item is the same height.
+unsafe fn measure_rail_item(lparam: LPARAM, dpi: u32) {
+    let mis = &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+    if mis.CtlID == ID_RAIL as u32 {
+        mis.itemHeight = to_px(RAIL_ITEM_H_DP, dpi).max(1) as u32;
+    }
+}
+
+/// Whether a `WM_DRAWITEM` is for the rail (the only owner-drawn control the
+/// main window itself hosts).
+unsafe fn is_rail_draw_item(lparam: LPARAM) -> bool {
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    di.CtlID == ID_RAIL as u32
+}
+
+/// `WM_DRAWITEM` for the rail: one item.
+unsafe fn draw_rail_item(lparam: LPARAM) {
+    use crate::ui::theme::{
+        CONTROL_RADIUS_DP, FOCUS_LINE_DP, RAIL_ICON_X_DP, RAIL_INSET_DP, RAIL_PILL_H_DP,
+        RAIL_PILL_W_DP, RAIL_TEXT_X_DP,
+    };
+    use windows::Win32::Foundation::{COLORREF, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        CreateSolidBrush, FillRect, FrameRect, GetStockObject, RoundRect, SelectObject, SetBkMode,
+        SetTextColor, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, NULL_PEN,
+        TRANSPARENT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    if di.CtlID != ID_RAIL as u32 {
+        return;
+    }
+    // An empty list asks for its focus rectangle with the item id -1.
+    let Some(page) = Page::from_index(di.itemID as i32 as isize) else {
+        return;
+    };
+    let hdc = di.hDC;
+    let rc: RECT = di.rcItem;
+    let dpi = dpi_for(di.hwndItem);
+    let selected = di.itemState.0 & ODS_SELECTED != 0;
+
+    // #1055: the colours and the icon font are cached, so a paint reads
+    // neither the registry nor builds a font.
+    let style = rail_style(dpi);
+    let high_contrast = style.high_contrast;
+    let colors = if selected {
+        style.selected
+    } else {
+        style.normal
+    };
+
+    let brush = CreateSolidBrush(COLORREF(colors.face));
+    FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+
+    let inset = to_px(RAIL_INSET_DP, dpi);
+    let pad_y = to_px(2, dpi);
+    let fill_rc = RECT {
+        left: rc.left + inset,
+        top: rc.top + pad_y,
+        right: rc.right - inset,
+        bottom: rc.bottom - pad_y,
+    };
+    let radius = to_px(CONTROL_RADIUS_DP, dpi);
+    let null_pen = GetStockObject(NULL_PEN);
+    if let Some(fill) = colors.fill {
+        let b = CreateSolidBrush(COLORREF(fill));
+        if high_contrast {
+            FillRect(hdc, &fill_rc, b);
+        } else {
+            let old_b = SelectObject(hdc, HGDIOBJ(b.0));
+            let old_p = SelectObject(hdc, null_pen);
+            let _ = RoundRect(
+                hdc,
+                fill_rc.left,
+                fill_rc.top,
+                fill_rc.right + 1,
+                fill_rc.bottom + 1,
+                radius * 2,
+                radius * 2,
+            );
+            SelectObject(hdc, old_b);
+            SelectObject(hdc, old_p);
+        }
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+    if let Some(pill) = colors.pill {
+        let b = CreateSolidBrush(COLORREF(pill));
+        let old_b = SelectObject(hdc, HGDIOBJ(b.0));
+        let old_p = SelectObject(hdc, null_pen);
+        let h = to_px(RAIL_PILL_H_DP, dpi);
+        let w = to_px(RAIL_PILL_W_DP, dpi);
+        let top = rc.top + (rc.bottom - rc.top - h) / 2;
+        let left = fill_rc.left;
+        let _ = RoundRect(hdc, left, top, left + w + 1, top + h + 1, w * 2, w * 2);
+        SelectObject(hdc, old_b);
+        SelectObject(hdc, old_p);
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(colors.text));
+    let flags = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS;
+    // The icon.
+    let old_font = SelectObject(hdc, HGDIOBJ(style.icons.0));
+    let mut icon_rc = rc;
+    icon_rc.left += to_px(RAIL_ICON_X_DP, dpi);
+    icon_rc.right = rc.left + to_px(RAIL_TEXT_X_DP, dpi);
+    let mut glyph = [0u8; 4];
+    crate::ui::text::draw_text_line(hdc, page.glyph().encode_utf8(&mut glyph), icon_rc, flags);
+    // The name, in the window's own font.
+    let list_font = SendMessageW(di.hwndItem, WM_GETFONT, None, None).0;
+    if list_font != 0 {
+        SelectObject(hdc, HGDIOBJ(list_font as *mut c_void));
+    }
+    let mut text_rc = rc;
+    text_rc.left += to_px(RAIL_TEXT_X_DP, dpi);
+    text_rc.right -= inset;
+    crate::ui::text::draw_text_line(hdc, page.label(), text_rc, flags);
+    SelectObject(hdc, old_font);
+
+    // A focus ring only when Windows says to draw one (keyboard use).
+    if di.itemState.0 & ODS_FOCUS != 0 && di.itemState.0 & ODS_NOFOCUSRECT == 0 {
+        let ring = to_px(FOCUS_LINE_DP, dpi).max(1);
+        let b = CreateSolidBrush(COLORREF(style.focus_ink));
+        let mut r = fill_rc;
+        for _ in 0..ring {
+            FrameRect(hdc, &r, b);
+            r.left += 1;
+            r.top += 1;
+            r.right -= 1;
+            r.bottom -= 1;
+        }
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+}
+
+/// Shows `page`: scrolls the body to its top, shows its controls and hides
+/// the rest, resizes the scroll range to it and keeps the rail on it. Focus
+/// stays where it is, unless it was on a control that just went away, and then
+/// it goes to the rail.
+unsafe fn show_page(inner: &mut SettingsInner, page: Page) {
+    if page != inner.page {
+        // A shortcut being learned belongs to the General page, and the line
+        // that tells the user to press a key goes with it.
+        if inner.learning.is_some() {
+            stop_learning(inner);
+            set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+        }
+        if !inner.body.0.is_null() {
+            scroll_body_to(inner.body, 0);
+        }
+        inner.page = page;
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+        sync_visibility(inner);
+        apply_dpi(inner);
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
+        let _ = RedrawWindow(
+            Some(inner.hwnd),
+            None,
+            None,
+            RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN,
+        );
+    }
+    if !inner.rail.0.is_null() {
+        let shown = SendMessageW(inner.rail, LB_GETCURSEL, None, None).0;
+        if shown != page.index() as isize {
+            SendMessageW(inner.rail, LB_SETCURSEL, Some(WPARAM(page.index())), None);
+        }
+        let focus = GetFocus();
+        if !focus.0.is_null()
+            && IsChild(inner.hwnd, focus).as_bool()
+            && !IsWindowVisible(focus).as_bool()
+        {
+            let _ = SetFocus(Some(inner.rail));
+        }
+    }
+}
+
+/// Moves focus to the first control of the current page that can take it.
+unsafe fn focus_into_page(inner: &SettingsInner) {
+    use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, WS_DISABLED};
+    for c in &inner.children {
+        if c.page != Some(inner.page) {
+            continue;
+        }
+        let style = GetWindowLongPtrW(c.hwnd, GWL_STYLE) as u32;
+        if IsWindowVisible(c.hwnd).as_bool()
+            && style & WS_TABSTOP.0 != 0
+            && style & WS_DISABLED.0 == 0
+        {
+            let _ = SetFocus(Some(c.hwnd));
+            return;
+        }
+    }
+    // A page with nothing to type in (Actions) leaves focus on the rail.
+}
+
+/// Runs one `WM_SETTINGS_PAGE` request.
+unsafe fn handle_page_request(inner: &mut SettingsInner, what: usize, arg: isize) {
+    match what {
+        PAGE_PICK => {
+            if let Some(page) = Page::from_index(arg) {
+                show_page(inner, page);
+            }
+        }
+        PAGE_STEP => show_page(inner, inner.page.step(arg)),
+        PAGE_ENTER => focus_into_page(inner),
+        PAGE_SWAP_FOCUS => {
+            if GetFocus() == inner.rail {
+                focus_into_page(inner);
+            } else {
+                let _ = SetFocus(Some(inner.rail));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -4872,6 +7215,9 @@ fn set_hotkey_labels(hwnd: HWND, hotkeys: &Hotkeys) {
     }
     if let Some(l) = get_dlg_item(hwnd, ID_SECONDARY_LABEL) {
         set_text(l, &secondary_label(&hotkeys.secondary));
+    }
+    if let Some(l) = get_dlg_item(hwnd, ID_PAUSE_LABEL) {
+        set_text(l, &pause_label(&hotkeys.pause));
     }
 }
 
@@ -5715,6 +8061,30 @@ const GALLERY_CLASS_NAME: &str = "Wingman.Settings.Gallery.3b8f6a52";
 #[cfg(debug_assertions)]
 pub struct GalleryWindow {
     raw: *mut SettingsInner,
+    /// Declared after `raw`: restores the thread's DPI awareness once the
+    /// window is destroyed by `Drop`.
+    _unaware: Option<UnawareScope>,
+}
+
+/// Makes the thread DPI-unaware until dropped (the gallery's real 100%).
+#[cfg(debug_assertions)]
+struct UnawareScope(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+
+#[cfg(debug_assertions)]
+impl UnawareScope {
+    fn enter() -> UnawareScope {
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_UNAWARE,
+        };
+        UnawareScope(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for UnawareScope {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0) };
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -5732,6 +8102,13 @@ impl GalleryWindow {
             return None;
         }
         ensure_common_controls();
+        // 100% is the one scale a window can really be drawn at on any
+        // screen: made DPI-unaware, Windows gives it 96 DPI and its native
+        // checkbox boxes and scrollbar come out at 96 DPI too (#1016, #1052).
+        // The thread stays unaware until the window is dropped, so the
+        // gallery's capture of it measures in the same units.
+        let unaware = (dpi == Some(96)).then(UnawareScope::enter);
+        let dpi = if unaware.is_some() { None } else { dpi };
         FORCED_DPI.with(|f| f.set(dpi.map(|d| d.max(1))));
 
         let config = Config::default();
@@ -5760,9 +8137,16 @@ impl GalleryWindow {
             return None;
         };
         // From here the window owns nothing the Drop below cannot free.
-        let gallery = GalleryWindow { raw };
+        let gallery = GalleryWindow {
+            raw,
+            _unaware: unaware,
+        };
         let inner = unsafe { &mut *raw };
         inner.hwnd = hwnd;
+        // A simulated scale cannot change the native scrollbar, which keeps
+        // the window's real DPI: remember that DPI so the width reserved for
+        // the scrollbar is the width it really takes (#1052).
+        NATIVE_DPI.with(|n| n.set(dpi.map(|_| unsafe { GetDpiForWindow(hwnd) }.max(1))));
         let dpi = dpi_for(hwnd);
         inner.font = build_font(dpi);
         let fitted_h = fitted_height_dp(hwnd, dpi);
@@ -5801,31 +8185,33 @@ impl GalleryWindow {
         unsafe { (*self.raw).hwnd }
     }
 
+    /// Picks a page (what a click on the rail does).
+    pub(crate) fn show_page(&mut self, page: Page) {
+        let inner = unsafe { &mut *self.raw };
+        unsafe { show_page(inner, page) };
+    }
+
+    /// Picks the active provider on the Models page (what the combo does).
+    pub(crate) fn pick_provider(&mut self, provider: ActiveProvider) {
+        let inner = unsafe { &mut *self.raw };
+        if let Some(combo) = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER) {
+            combo_select_index(combo, provider.index() as i32);
+            unsafe { sync_models_flow(inner) };
+        }
+    }
+
+    /// Shows every provider (what "Add another provider" does).
+    pub(crate) fn reveal_providers(&mut self) {
+        let inner = unsafe { &mut *self.raw };
+        unsafe { reveal_providers(inner) };
+    }
+
     /// Expands or collapses the Advanced group (what its toggle does).
     pub fn set_advanced(&mut self, expanded: bool) {
         let inner = unsafe { &mut *self.raw };
         if inner.prompt_expanded != expanded {
             inner.prompt_expanded = expanded;
             unsafe { show_prompt_state(inner) };
-        }
-    }
-
-    /// Scrolls the body to the top or the bottom (the scrollbar's Home and
-    /// End).
-    pub fn scroll_to_end(&mut self, bottom: bool) {
-        let inner = unsafe { &*self.raw };
-        let code = if bottom {
-            windows::Win32::UI::WindowsAndMessaging::SB_BOTTOM
-        } else {
-            windows::Win32::UI::WindowsAndMessaging::SB_TOP
-        };
-        unsafe {
-            SendMessageW(
-                inner.body,
-                WM_VSCROLL,
-                Some(WPARAM(code.0 as usize)),
-                Some(LPARAM(0)),
-            );
         }
     }
 }
@@ -5835,6 +8221,7 @@ impl Drop for GalleryWindow {
     fn drop(&mut self) {
         // WM_DESTROY frees the font and flags the close; the Box is ours.
         FORCED_DPI.with(|f| f.set(None));
+        NATIVE_DPI.with(|n| n.set(None));
         unsafe {
             let _ = DestroyWindow((*self.raw).hwnd);
             drop(Box::from_raw(self.raw));
@@ -5871,6 +8258,465 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- pages and the rail (#872) ----------------------------------------
+
+    /// The title bar and borders of the window, in dp, as the layout tests
+    /// assume (a measured window at 150 % is about 38).
+    const NC_HEIGHT_GUESS_DP: i32 = 40;
+
+    /// Whether the control `id` is shown (its own visible bit; the test
+    /// window itself is never shown).
+    fn is_shown(hwnd: HWND, id: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+        let h = get_dlg_item(hwnd, id).expect("control exists");
+        unsafe { GetWindowLongPtrW(h, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 }
+    }
+
+    #[test]
+    fn every_control_is_on_exactly_one_page_or_is_chrome() {
+        for (name, id) in ALL_CONTROL_IDS {
+            let pages: Vec<Page> = PAGE_CONTROLS
+                .iter()
+                .filter(|(_, ids)| ids.contains(id))
+                .map(|(p, _)| *p)
+                .collect();
+            if CHROME_IDS.contains(id) {
+                assert!(pages.is_empty(), "{name} is chrome but is on {pages:?}");
+            } else {
+                assert_eq!(
+                    pages.len(),
+                    1,
+                    "{name} must be on exactly one page: {pages:?}"
+                );
+            }
+        }
+        // And the table names nothing the id list does not know.
+        let known: Vec<i32> = ALL_CONTROL_IDS.iter().map(|(_, id)| *id).collect();
+        for (page, ids) in PAGE_CONTROLS {
+            assert!(!ids.is_empty(), "{page:?} would be an empty page");
+            for id in ids {
+                assert!(known.contains(id), "{page:?} lists an unknown id {id}");
+            }
+        }
+        // One entry per page, in rail order.
+        let order: Vec<Page> = PAGE_CONTROLS.iter().map(|(p, _)| *p).collect();
+        assert_eq!(order, Page::ALL.to_vec());
+    }
+
+    #[test]
+    fn the_built_controls_sit_on_the_pages_the_table_names() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for (page, ids) in PAGE_CONTROLS {
+                for id in ids {
+                    let h = get_dlg_item(hwnd, *id).unwrap_or_else(|| panic!("id {id} missing"));
+                    let child = inner
+                        .children
+                        .iter()
+                        .find(|c| c.hwnd == h)
+                        .unwrap_or_else(|| panic!("id {id} was not recorded"));
+                    assert_eq!(child.page, Some(page), "control id {id}");
+                }
+            }
+            // The footer belongs to no page.
+            for id in [ID_SAVE, ID_CANCEL, ID_VALIDATION_MESSAGE] {
+                let h = get_dlg_item(hwnd, id).expect("footer control");
+                let child = inner
+                    .children
+                    .iter()
+                    .find(|c| c.hwnd == h)
+                    .expect("recorded");
+                assert_eq!(child.page, None, "footer control id {id}");
+            }
+            // Every recorded child is on a page or in the footer: a group box
+            // or a label made on no page would show on all of them.
+            let untagged = inner.children.iter().filter(|c| c.page.is_none()).count();
+            assert_eq!(untagged, 3, "only Save, Cancel and the message line");
+        });
+    }
+
+    #[test]
+    fn only_the_current_pages_controls_are_shown() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            assert_eq!(inner.page, Page::General);
+            assert!(is_shown(hwnd, ID_AUTOSTART));
+            assert!(!is_shown(hwnd, ID_REDACT), "Privacy is not showing");
+            assert!(!is_shown(hwnd, ID_OPENAI_KEY), "Models is not showing");
+            assert!(is_shown(hwnd, ID_SAVE), "the footer is on every page");
+
+            // Ctrl+3: Privacy.
+            unsafe { handle_page_request(inner, PAGE_PICK, 2) };
+            assert_eq!(inner.page, Page::Privacy);
+            assert!(is_shown(hwnd, ID_REDACT));
+            assert!(is_shown(hwnd, ID_MAX_EDGE));
+            assert!(!is_shown(hwnd, ID_AUTOSTART));
+            assert!(is_shown(hwnd, ID_SAVE));
+            let sel = unsafe { SendMessageW(inner.rail, LB_GETCURSEL, None, None).0 };
+            assert_eq!(sel, 2, "the rail follows a keyboard pick");
+
+            // Back to General: the redaction box goes again.
+            unsafe { handle_page_request(inner, PAGE_PICK, 0) };
+            assert!(!is_shown(hwnd, ID_REDACT));
+            assert!(is_shown(hwnd, ID_AUTOSTART));
+        });
+    }
+
+    /// A control with a state of its own stays hidden on its page until that
+    /// state says to show it, and never shows on another page.
+    #[test]
+    fn the_prompt_and_the_ollama_button_keep_their_own_visibility() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            // Advanced with the prompt folded: its toggle shows, the box not.
+            unsafe { handle_page_request(inner, PAGE_PICK, 4) };
+            assert!(is_shown(hwnd, ID_PROMPT_TOGGLE));
+            assert!(!is_shown(hwnd, ID_PROMPT_EDIT));
+            inner.prompt_expanded = true;
+            unsafe { show_prompt_state(inner) };
+            assert!(is_shown(hwnd, ID_PROMPT_EDIT));
+            assert!(is_shown(hwnd, ID_RESET_PROMPT));
+            // Leaving the page hides them; coming back shows the open box.
+            unsafe { handle_page_request(inner, PAGE_PICK, 0) };
+            assert!(!is_shown(hwnd, ID_PROMPT_EDIT));
+            unsafe { handle_page_request(inner, PAGE_PICK, 4) };
+            assert!(is_shown(hwnd, ID_PROMPT_EDIT));
+
+            // The Ollama button is on Models and only when it has an offer.
+            unsafe { handle_page_request(inner, PAGE_PICK, 1) };
+            // The card is under the Ollama block, which shows on request.
+            unsafe { reveal_providers(inner) };
+            assert!(!is_shown(hwnd, ID_OLLAMA_LINK), "nothing to offer yet");
+            inner.ollama_link_shown = true;
+            unsafe { sync_visibility(inner) };
+            assert!(is_shown(hwnd, ID_OLLAMA_LINK));
+            unsafe { handle_page_request(inner, PAGE_PICK, 2) };
+            assert!(!is_shown(hwnd, ID_OLLAMA_LINK), "not on the Privacy page");
+        });
+    }
+
+    /// The rail's own message: a click or an arrow key makes the list box
+    /// tell its parent `LBN_SELCHANGE`, and the window's `WM_COMMAND` arm picks
+    /// the page. Sent the way the list box sends it.
+    #[test]
+    fn a_rail_selection_change_picks_the_page() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            unsafe {
+                SendMessageW(inner.rail, LB_SETCURSEL, Some(WPARAM(3)), None);
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_RAIL as usize | ((LBN_SELCHANGE as usize) << 16))),
+                    Some(LPARAM(inner.rail.0 as isize)),
+                );
+            }
+            assert_eq!(unsafe { &*raw }.page, Page::Actions);
+            assert!(is_shown(hwnd, ID_ACTIONS_NOTE));
+            assert!(!is_shown(hwnd, ID_AUTOSTART));
+        });
+    }
+
+    /// The posted request the keys make arrives through the window procedure
+    /// (a page request that nothing handles would change no page).
+    #[test]
+    fn a_posted_page_request_reaches_the_window_procedure() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETTINGS_PAGE,
+                    Some(WPARAM(PAGE_STEP)),
+                    Some(LPARAM(-1)),
+                );
+            }
+            assert_eq!(unsafe { &*raw }.page, Page::Advanced, "Ctrl+PageUp wraps");
+        });
+    }
+
+    #[test]
+    fn the_rail_lists_the_five_pages_under_one_name() {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            assert_eq!(get_text(inner.rail), RAIL_NAME);
+            assert_eq!(unsafe { GetDlgCtrlID(inner.rail) }, ID_RAIL);
+            let count = unsafe { SendMessageW(inner.rail, 0x018B, None, None).0 }; // LB_GETCOUNT
+            assert_eq!(count, 5);
+            for (i, page) in Page::ALL.iter().enumerate() {
+                let mut buf = [0u16; 32];
+                let n = unsafe {
+                    SendMessageW(
+                        inner.rail,
+                        0x0189, // LB_GETTEXT
+                        Some(WPARAM(i)),
+                        Some(LPARAM(buf.as_mut_ptr() as isize)),
+                    )
+                    .0
+                };
+                assert_eq!(
+                    String::from_utf16_lossy(&buf[..n.max(0) as usize]),
+                    page.label()
+                );
+            }
+            // It is one Tab stop, and the first.
+            let style = unsafe { GetWindowLongPtrW(inner.rail, GWL_STYLE) } as u32;
+            assert!(style & WS_TABSTOP.0 != 0 && style & WS_VISIBLE.0 != 0);
+            // Its name comes first, then the rail, then the pages.
+            let name = unsafe { GetWindow(hwnd, GW_CHILD) }.expect("first child");
+            assert_eq!(get_text(name), RAIL_NAME);
+            let next = unsafe { GetWindow(name, GW_HWNDNEXT) }.expect("second child");
+            assert_eq!(next, inner.rail, "the rail follows its name in z-order");
+        });
+    }
+
+    #[test]
+    fn page_keys_are_ctrl_only() {
+        assert_eq!(
+            page_key('1' as u32, true, false),
+            Some(PageKey::Pick(Page::General))
+        );
+        assert_eq!(
+            page_key('3' as u32, true, false),
+            Some(PageKey::Pick(Page::Privacy))
+        );
+        assert_eq!(
+            page_key('5' as u32, true, false),
+            Some(PageKey::Pick(Page::Advanced))
+        );
+        assert_eq!(page_key('6' as u32, true, false), None);
+        assert_eq!(page_key('0' as u32, true, false), None);
+        assert_eq!(
+            page_key('3' as u32, false, false),
+            None,
+            "typing a 3 is not a command"
+        );
+        assert_eq!(
+            page_key(0x22, true, false),
+            Some(PageKey::Step(1)),
+            "PageDown"
+        );
+        assert_eq!(
+            page_key(0x21, true, false),
+            Some(PageKey::Step(-1)),
+            "PageUp"
+        );
+        assert_eq!(page_key(0x22, false, false), None);
+        // AltGr is Ctrl+Alt: AltGr+3 and AltGr+PageDown are not commands.
+        assert_eq!(page_key('3' as u32, true, true), None);
+        assert_eq!(page_key(0x22, true, true), None);
+        assert_eq!(page_key(0x21, true, true), None);
+    }
+
+    /// Save on a bad field shows the page the field is on, then focuses it:
+    /// SetFocus on a hidden page's control does nothing.
+    #[test]
+    fn save_rejecting_a_field_shows_its_page_and_focuses_it() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "abc");
+            unsafe { show_page(inner, Page::Privacy) };
+            assert!(!is_shown(hwnd, ID_CARD_SECONDS));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_eq!(inner.page, Page::General);
+            assert!(is_shown(hwnd, ID_CARD_SECONDS));
+            assert!(
+                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "Save was rejected"
+            );
+            assert_eq!(
+                unsafe { GetFocus() },
+                get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn pages_step_round_the_ends() {
+        assert_eq!(Page::General.step(1), Page::Models);
+        assert_eq!(Page::Advanced.step(1), Page::General);
+        assert_eq!(Page::General.step(-1), Page::Advanced);
+        assert_eq!(Page::from_index(-1), None, "LB_ERR is no page");
+        assert_eq!(Page::from_index(5), None);
+        assert_eq!(Page::from_index(4), Some(Page::Advanced));
+        for (i, p) in Page::ALL.iter().enumerate() {
+            assert_eq!(p.index(), i);
+        }
+    }
+
+    #[test]
+    fn rail_colours_follow_the_theme_rules() {
+        use crate::ui::theme::{Theme, Tokens, HC_BLACK, HC_WHITE, LIGHT};
+        let face = 0x00F0_F0F0;
+        let accent = 0x00C0_6700;
+        // Not selected: just the face, the theme's text.
+        let idle = rail_colors(false, false, face, &LIGHT, &HC_BLACK, accent);
+        assert_eq!((idle.fill, idle.pill), (None, None));
+        assert_eq!(idle.text, LIGHT.text);
+        // Selected: a tint off the face and the accent pill.
+        let on = rail_colors(true, false, face, &LIGHT, &HC_BLACK, accent);
+        assert_ne!(on.fill, Some(face));
+        assert!(on.fill.is_some());
+        assert_eq!(on.pill, Some(accent));
+        // High contrast: system colours only, in both system themes, with the
+        // text on the selection readable.
+        for sys in [HC_BLACK, HC_WHITE] {
+            let tokens = Tokens::for_theme(Theme::HighContrast, &sys);
+            let c = rail_colors(true, true, sys.window, &tokens, &sys, accent);
+            assert_eq!(c.fill, Some(sys.highlight));
+            assert_eq!(c.text, sys.highlight_text);
+            assert_eq!(c.pill, Some(sys.highlight_text));
+            let ratio = crate::ui::theme::contrast_ratio(
+                crate::ui::theme::relative_luminance(c.text),
+                crate::ui::theme::relative_luminance(sys.highlight),
+            );
+            assert!(ratio >= 4.5, "selected item contrast {ratio}");
+            let idle = rail_colors(false, true, sys.window, &tokens, &sys, accent);
+            assert_eq!(idle.text, sys.window_text);
+        }
+    }
+
+    /// The rail is built from `theme.rs` tokens: five items fit under the top
+    /// pad in the height the window has at the smallest size it opens at, and
+    /// no literal pixel sizes sit in its code.
+    #[test]
+    fn the_rail_has_room_for_five_items() {
+        let rail_dp = crate::ui::theme::RAIL_TOP_PAD_DP + 5 * RAIL_ITEM_H_DP;
+        assert!(rail_dp <= MIN_WIN_H_DP.max(WIN_H_DP / 2), "{rail_dp}");
+        assert_eq!(WIN_W_DP, RAIL_W_DP + PAGE_W_DP);
+        // A page's width is what the one column used to be.
+        assert_eq!(PAGE_W_DP, 620);
+    }
+
+    /// #872's layout rule: no page scrolls at 100 % and 150 % on a 1080p
+    /// screen. The window is as tall as the fullest page (plus the footer and a
+    /// title bar of about 40 dp) when the monitor allows it.
+    #[test]
+    fn no_page_needs_scrolling_at_100_and_150_percent_on_1080p() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            // The work area of a 1080p screen with a taskbar: 1040 px.
+            for dpi in [96u32, 144] {
+                let fitted = fitted_height_for_work_px(1040, dpi);
+                for page in Page::ALL {
+                    let need = page_max_dp(inner, page) + FOOTER_H_DP + NC_HEIGHT_GUESS_DP;
+                    assert!(
+                        need <= fitted,
+                        "{page:?} needs {need} dp at {dpi} dpi, the window gets {fitted}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// #872's measurement: what UI Automation reports for the owner-drawn rail.
+    /// Run by hand: `cargo test rail_uia -- --ignored --nocapture`. It prints
+    /// the list's control type, name and each item's type, name and selection.
+    #[test]
+    #[ignore = "live UI Automation measurement; run by hand"]
+    fn rail_uia_role_is_a_list_of_named_list_items() {
+        use windows::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomation, TreeScope_Children, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            let automation: IUIAutomation =
+                unsafe { crate::inputs::uia_automation::create_automation() }.expect("UIA");
+            let rail = unsafe { automation.ElementFromHandle(inner.rail) }.expect("rail element");
+            let ctype = unsafe { rail.CurrentControlType() }.expect("type");
+            let name = unsafe { rail.CurrentName() }.expect("name").to_string();
+            println!(
+                "rail: control type {} (List is {}), name {name:?}",
+                ctype.0, UIA_ListControlTypeId.0
+            );
+            let all = unsafe { automation.CreateTrueCondition() }.expect("condition");
+            let items = unsafe { rail.FindAll(TreeScope_Children, &all) }.expect("items");
+            let n = unsafe { items.Length() }.expect("len");
+            println!("rail children: {n}");
+            let mut names = Vec::new();
+            for i in 0..n {
+                let item = unsafe { items.GetElement(i) }.expect("item");
+                let t = unsafe { item.CurrentControlType() }.expect("t");
+                let nm = unsafe { item.CurrentName() }.expect("n").to_string();
+                println!(
+                    "  item {i}: type {} (ListItem is {}), name {nm:?}",
+                    t.0, UIA_ListItemControlTypeId.0
+                );
+                names.push((t, nm));
+            }
+            unsafe { CoUninitialize() };
+            assert_eq!(ctype, UIA_ListControlTypeId, "the rail keeps the List role");
+            assert_eq!(name, RAIL_NAME);
+            assert_eq!(names.len(), 5);
+            for (page, (t, nm)) in Page::ALL.iter().zip(&names) {
+                assert_eq!(*t, UIA_ListItemControlTypeId);
+                assert_eq!(nm, page.label());
+            }
+        });
+    }
+
+    /// The keys reach the window: `handle_key` turns Ctrl+digit, Ctrl+PageUp
+    /// and PageDown, F6 and Enter on the rail into the posted page request.
+    /// A source scan (CRLF-normalised, the body must be found), because a
+    /// real key needs a real message pump.
+    #[test]
+    fn handle_key_posts_the_page_requests() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let start = src
+            .find("unsafe fn handle_key(")
+            .expect("handle_key exists");
+        let end = start + src[start..].find("\n}\n").expect("handle_key ends");
+        let body = &src[start..end];
+        assert!(!body.is_empty());
+        for needle in [
+            "page_key(vk, ctrl, alt)",
+            "VK_F6",
+            "PAGE_ENTER",
+            "WM_SETTINGS_PAGE",
+        ] {
+            assert!(body.contains(needle), "handle_key lacks {needle}");
+        }
+    }
+
+    /// Tab goes from the rail into the shown page and skips the hidden ones:
+    /// the next stop after the rail is a control of the current page.
+    #[test]
+    fn tab_from_the_rail_lands_on_the_current_page() {
+        use windows::Win32::UI::WindowsAndMessaging::GetNextDlgTabItem;
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            for page in [Page::General, Page::Privacy, Page::Advanced] {
+                unsafe { show_page(inner, page) };
+                let next = unsafe { GetNextDlgTabItem(hwnd, Some(inner.rail), false) }
+                    .expect("a tab stop after the rail");
+                let on_page = inner
+                    .children
+                    .iter()
+                    .find(|c| c.hwnd == next)
+                    .map(|c| c.page);
+                assert_eq!(on_page, Some(Some(page)), "after the rail on {page:?}");
+            }
+        });
     }
 
     // -- font_face_exists (#346) -------------------------------------------
@@ -6027,6 +8873,228 @@ mod tests {
         }
     }
 
+    // -- Models page shows the active provider (#874) -----------------------
+
+    /// Whether the control carries `WS_VISIBLE` (the window itself is not
+    /// shown in these tests, so `IsWindowVisible` would say no to everything).
+    fn shows(hwnd: HWND, id: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+        let h = get_dlg_item(hwnd, id).unwrap_or_else(|| panic!("id {id} missing"));
+        unsafe { GetWindowLongPtrW(h, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 }
+    }
+
+    const OPENAI_IDS: [i32; 4] = [
+        ID_OPENAI_KEY,
+        ID_OPENAI_SHOW_KEY,
+        ID_OPENAI_MODEL,
+        ID_OPENAI_EFFORT,
+    ];
+    const ANTHROPIC_IDS: [i32; 4] = [
+        ID_ANTHROPIC_KEY,
+        ID_ANTHROPIC_SHOW_KEY,
+        ID_ANTHROPIC_MODEL,
+        ID_ANTHROPIC_EFFORT,
+    ];
+    const GEMINI_IDS: [i32; 5] = [
+        ID_GEMINI_KEY,
+        ID_GEMINI_SHOW_KEY,
+        ID_GEMINI_MODEL,
+        ID_GEMINI_EFFORT,
+        ID_GEMINI_EFFORT_LABEL,
+    ];
+
+    fn pick_provider(inner: &mut SettingsInner, index: i32) {
+        let combo = get_dlg_item(inner.hwnd, ID_ACTIVE_PROVIDER).expect("provider combo");
+        combo_select_index(combo, index);
+        handle_command(inner, ID_ACTIVE_PROVIDER, CBN_SELCHANGE);
+    }
+
+    #[test]
+    fn the_models_page_starts_with_only_the_active_provider() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(OPENAI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(ANTHROPIC_IDS.iter().all(|id| !shows(hwnd, *id)));
+            assert!(GEMINI_IDS.iter().all(|id| !shows(hwnd, *id)));
+            assert!(!shows(hwnd, ID_OLLAMA_MODEL));
+            assert!(shows(hwnd, ID_ACTIVE_PROVIDER));
+            assert!(shows(hwnd, ID_ADD_PROVIDER));
+            assert!(shows(hwnd, ID_OPEN_CONFIG));
+        });
+    }
+
+    #[test]
+    fn switching_provider_swaps_the_visible_group_and_keeps_typed_values() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            let openai_key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(openai_key, "sk-typed-by-hand");
+            pick_provider(inner, ActiveProvider::Anthropic.index() as i32);
+            assert!(ANTHROPIC_IDS.iter().all(|id| shows(hwnd, *id)));
+            // OpenAI has typed text now, so it stays shown like a vendor with a key.
+            assert!(OPENAI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(GEMINI_IDS.iter().all(|id| !shows(hwnd, *id)));
+            pick_provider(inner, ActiveProvider::Gemini.index() as i32);
+            assert!(GEMINI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(ANTHROPIC_IDS.iter().all(|id| !shows(hwnd, *id)));
+            assert_eq!(get_text(openai_key), "sk-typed-by-hand");
+            pick_provider(inner, ActiveProvider::Ollama.index() as i32);
+            assert!(shows(hwnd, ID_OLLAMA_MODEL));
+        });
+    }
+
+    #[test]
+    fn a_stored_key_keeps_its_vendor_shown() {
+        let mut cfg = Config::default();
+        cfg.providers.openai.api_key = "sk-stored".to_string();
+        cfg.providers.order = vec!["anthropic".to_string(), "openai".to_string()];
+        with_window(cfg, |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(ANTHROPIC_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(OPENAI_IDS.iter().all(|id| shows(hwnd, *id)));
+            assert!(GEMINI_IDS.iter().all(|id| !shows(hwnd, *id)));
+        });
+    }
+
+    #[test]
+    fn add_another_provider_shows_the_rest_and_goes_away() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            for id in OPENAI_IDS
+                .iter()
+                .chain(ANTHROPIC_IDS.iter())
+                .chain(GEMINI_IDS.iter())
+            {
+                assert!(shows(hwnd, *id), "id {id}");
+            }
+            assert!(shows(hwnd, ID_OLLAMA_MODEL));
+            assert!(!shows(hwnd, ID_ADD_PROVIDER));
+            // Switching provider afterwards does not hide what was asked for.
+            pick_provider(inner, ActiveProvider::Anthropic.index() as i32);
+            assert!(shows(hwnd, ID_OPENAI_KEY));
+        });
+    }
+
+    /// The button that had focus is gone after "Add another provider", so
+    /// focus goes to the first row that appeared, never to the hidden button.
+    #[test]
+    fn focus_after_add_another_provider_goes_to_the_first_new_row() {
+        let one = [true, false, false, false];
+        assert_eq!(reveal_focus_id(one, [true; 4]), ID_ANTHROPIC_KEY);
+        assert_eq!(
+            reveal_focus_id([false, true, false, false], [true; 4]),
+            ID_OPENAI_KEY
+        );
+        assert_eq!(
+            reveal_focus_id([true, true, true, false], [true; 4]),
+            ID_OLLAMA_MODEL
+        );
+        // Nothing new appeared: the always-present provider combo.
+        assert_eq!(reveal_focus_id([true; 4], [true; 4]), ID_ACTIVE_PROVIDER);
+        // And the real window really uses it: the pick is a visible control.
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            assert!(shows(hwnd, reveal_focus_id(one, inner.models_shown)));
+        });
+    }
+
+    #[test]
+    fn the_ollama_card_hides_with_the_ollama_block() {
+        let card = [
+            ID_OLLAMA_MODEL,
+            ID_OLLAMA_STATUS,
+            ID_PULL_NAME,
+            ID_PULL_BUTTON,
+        ];
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                card.iter().all(|id| !shows(hwnd, *id)),
+                "default order has no ollama"
+            );
+            let short = inner.models_shrink_dp;
+            pick_provider(inner, ActiveProvider::Ollama.index() as i32);
+            assert!(card.iter().all(|id| shows(hwnd, *id)));
+            assert!(
+                inner.models_shrink_dp < short,
+                "the card brings its height back"
+            );
+        });
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["openai".to_string(), "ollama".to_string()];
+        with_window(cfg, |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                card.iter().all(|id| shows(hwnd, *id)),
+                "ollama is in the order"
+            );
+        });
+    }
+
+    /// A hidden vendor's hand-edited model, and a stored key on a vendor that
+    /// stays shown, both come back unchanged from the Save path (`read_form`).
+    #[test]
+    fn hidden_vendors_survive_the_save_path_unchanged() {
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["anthropic".to_string()];
+        cfg.providers.openai.model = "gpt-hand-edited".to_string();
+        cfg.providers.openai.models = vec!["gpt-hand-edited".to_string(), "gpt-other".to_string()];
+        cfg.providers.gemini.api_key = "AIza-stored-gemini-key".to_string();
+        cfg.providers.gemini.model = "gemini-hand-edited".to_string();
+        with_window(cfg.clone(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            assert!(
+                !shows(hwnd, ID_OPENAI_MODEL),
+                "OpenAI has no key and is not active"
+            );
+            assert!(
+                shows(hwnd, ID_GEMINI_KEY),
+                "a stored key keeps its vendor shown"
+            );
+            let saved = read_form(inner);
+            assert_eq!(saved.providers.openai.model, "gpt-hand-edited");
+            assert_eq!(saved.providers.openai.models, cfg.providers.openai.models);
+            assert_eq!(saved.providers.gemini.api_key, cfg.providers.gemini.api_key);
+            assert_eq!(saved.providers.gemini.model, "gemini-hand-edited");
+            assert_eq!(saved.providers.order, cfg.providers.order);
+        });
+    }
+    #[test]
+    fn a_hidden_block_leaves_no_gap_and_the_page_gets_shorter() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let design_y = |inner: &SettingsInner, id: i32| {
+                let h = get_dlg_item(hwnd, id).unwrap();
+                inner.children.iter().find(|c| c.hwnd == h).unwrap().y
+            };
+            unsafe { show_page(inner, Page::Models) };
+            let first_block_y = design_y(inner, ID_OPENAI_KEY);
+            let hint_y_one_vendor = design_y(inner, ID_OPEN_CONFIG);
+            let shrink_openai = inner.models_shrink_dp;
+            assert!(
+                shrink_openai > 0,
+                "two vendors and the Ollama row are hidden"
+            );
+            pick_provider(inner, ActiveProvider::Anthropic.index() as i32);
+            // Claude takes the place OpenAI had, right under the combo.
+            assert_eq!(design_y(inner, ID_ANTHROPIC_KEY), first_block_y);
+            // Same number of rows hidden, so the bottom did not move.
+            assert_eq!(design_y(inner, ID_OPEN_CONFIG), hint_y_one_vendor);
+            handle_command(inner, ID_ADD_PROVIDER, BN_CLICKED);
+            assert!(inner.models_shrink_dp < shrink_openai);
+            assert!(design_y(inner, ID_OPEN_CONFIG) > hint_y_one_vendor);
+        });
+    }
     #[test]
     fn gemini_thinking_applies_only_to_the_3_line() {
         assert!(gemini_thinking_applies("gemini-3.8-flash"));
@@ -6274,6 +9342,13 @@ mod tests {
             inner.hwnd = hwnd;
             inner.font = font;
             inner.adopt(built);
+            // The Ollama group is on the Models page; its button only shows
+            // while that page does.
+            unsafe { show_page(inner, Page::Models) };
+            // The card is under the Ollama block, hidden on a default config
+            // (#874); the probe still reports into it, and this checks the
+            // button once it is on show.
+            unsafe { reveal_providers(inner) };
             inner.ollama_status.clone()
         };
         let alive = unsafe { &*raw }.alive.clone();
@@ -6453,41 +9528,25 @@ mod tests {
         });
     }
 
-    /// #851: the decision on whether the file changed under the window.
+    /// #871 wired-to-nothing: Save in a real window hands the sink the config
+    /// the window opened with and the one it built, so the sink (the writer
+    /// thread in production) can send only what changed. The sink is the one
+    /// path out of the window, so if Save never called it nothing would be
+    /// saved.
     #[test]
-    fn a_changed_config_file_is_noticed() {
-        let t = std::time::UNIX_EPOCH;
-        let a = Some(ConfigStamp {
-            modified: Some(t),
-            len: 10,
-        });
-        let later = Some(ConfigStamp {
-            modified: Some(t + Duration::from_secs(5)),
-            len: 10,
-        });
-        let longer = Some(ConfigStamp {
-            modified: Some(t),
-            len: 11,
-        });
-        assert!(!config_changed_since(a, a));
-        assert!(!config_changed_since(None, None));
-        assert!(config_changed_since(a, later));
-        assert!(config_changed_since(a, longer));
-        assert!(config_changed_since(a, None), "deleted while open");
-        assert!(config_changed_since(None, a), "created while open");
-        assert!(!CONFIG_CHANGED_MESSAGE.contains('\u{2014}'));
-    }
-
-    /// #851 wired-to-nothing: Save in a real window refuses when the stamp
-    /// taken at open no longer matches, keeps the window open and says why.
-    #[test]
-    fn save_is_refused_when_the_config_file_changed_since_open() {
+    fn save_sends_only_the_touched_fields_to_the_sink() {
         use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let record = seen.clone();
         with_window(Config::default(), |hwnd, raw| {
-            unsafe { &mut *raw }.config_stamp = Some(ConfigStamp {
-                modified: None,
-                len: u64::MAX,
-            });
+            unsafe { &mut *raw }.save_sink = Some(Box::new(move |original, edited| {
+                let changes = crate::config_writer::diff(original, edited).unwrap();
+                record
+                    .borrow_mut()
+                    .extend(changes.iter().map(|c| c.path().join(".")));
+                Ok(())
+            }));
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
             unsafe {
                 SendMessageW(
                     hwnd,
@@ -6496,10 +9555,33 @@ mod tests {
                     Some(LPARAM(0)),
                 );
             }
-            let inner = unsafe { &*raw };
-            assert!(inner.result.is_none(), "Save must not produce a config");
+        });
+        assert_eq!(*seen.borrow(), vec!["ui.card_seconds"]);
+    }
+
+    /// #871: a sink that cannot take the edit keeps the window open and says
+    /// why inline (rule 7), and produces no result.
+    #[test]
+    fn a_sink_that_refuses_keeps_the_window_open_and_says_why() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { &mut *raw }.save_sink =
+                Some(Box::new(|_, _| Err("the writer is not running".into())));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert!(
+                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "window must stay"
+            );
+            assert!(unsafe { &*raw }.result.is_none());
             let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("message line");
-            assert_eq!(get_text(msg), CONFIG_CHANGED_MESSAGE);
+            assert_eq!(get_text(msg), "Could not save: the writer is not running");
         });
     }
 
@@ -6540,13 +9622,622 @@ mod tests {
                     windows::Win32::Graphics::Gdi::COLOR_3DFACE,
                 )
             };
-            let ink = hotkey_hint_color(false, rgb(0, 0, 0));
+            let ink = hint_text_color(false, rgb(0, 0, 0));
             let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
             assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
         }
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
-        assert_eq!(hotkey_hint_color(true, hc), hc);
+        assert_eq!(hint_text_color(true, hc), hc);
+    }
+
+    /// #972: every helper line is drawn as a hint (secondary text colour), and
+    /// nothing else is.
+    #[test]
+    fn every_helper_line_is_a_hint_and_nothing_else_is() {
+        for id in [
+            ID_HOTKEY_STATUS,
+            ID_MODEL_LIST_HINT,
+            ID_CAPTURE_DETAIL_HINT,
+            ID_REDACT_HINT,
+        ] {
+            assert!(is_hint_id(id), "control {id} is a helper line");
+        }
+        for id in [
+            ID_PRIMARY_LABEL,
+            ID_PULL_STATUS,
+            ID_OLLAMA_STATUS,
+            ID_REDACT,
+            0,
+        ] {
+            assert!(!is_hint_id(id), "control {id} is not a helper line");
+        }
+        with_window(Config::default(), |hwnd, _raw| {
+            for id in [ID_CAPTURE_DETAIL_HINT, ID_REDACT_HINT] {
+                assert!(get_dlg_item(hwnd, id).is_some(), "hint {id} is built");
+            }
+        });
+    }
+
+    /// #972: helper lines share one left edge: the row labels' edge, or, under
+    /// a checkbox, where the checkbox's own text starts.
+    #[test]
+    fn helper_lines_share_two_left_edges_by_one_rule() {
+        use windows::Win32::Foundation::RECT;
+        let left = |hwnd: HWND, id: i32| {
+            let c = get_dlg_item(hwnd, id).expect("control exists");
+            let mut r = RECT::default();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(c, &mut r);
+            }
+            r.left
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let dpi = dpi_for(hwnd);
+            let label_edge = left(hwnd, ID_PRIMARY_LABEL);
+            assert_eq!(left(hwnd, ID_HOTKEY_STATUS), label_edge);
+            assert_eq!(left(hwnd, ID_MODEL_LIST_HINT), label_edge);
+            assert_eq!(left(hwnd, ID_CAPTURE_DETAIL_HINT), label_edge);
+            // The layout scales `x + indent` as one sum, so the gap is the
+            // scaled indent give or take the pixel each edge rounds by.
+            let gap = left(hwnd, ID_REDACT_HINT) - left(hwnd, ID_REDACT);
+            let want = to_px(CHECKBOX_TEXT_INDENT_DP, dpi);
+            assert!(
+                (gap - want).abs() <= 1,
+                "the note under a checkbox starts at the checkbox's text ({gap} px, want {want} at {dpi} dpi)"
+            );
+        });
+    }
+
+    /// #785: a group ends a small step below its last control, not a blank
+    /// band. Measured from each group box to the lowest visible control inside
+    /// it, in dp at the test window's DPI.
+    #[test]
+    fn groups_end_close_below_their_last_control() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let dpi = dpi_for(hwnd);
+            // The control's top and its closed height: a combo's window rect
+            // also holds its dropped list.
+            let rect = |h: HWND| {
+                let (mut r, mut c) = (RECT::default(), RECT::default());
+                unsafe {
+                    let _ = GetWindowRect(h, &mut r);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut c);
+                }
+                RECT {
+                    bottom: r.top + (c.bottom - c.top),
+                    ..r
+                }
+            };
+            let shown = |h: HWND| unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+                    h,
+                    windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                ) as u32
+                    & WS_VISIBLE.0
+                    != 0
+            };
+            let groups: Vec<(String, RECT)> = inner
+                .children
+                .iter()
+                .filter(|c| unsafe { is_group_box(c.hwnd) })
+                .map(|c| (get_text(c.hwnd), rect(c.hwnd)))
+                .collect();
+            assert!(groups.len() >= 5, "found {} group boxes", groups.len());
+            let mut checked = 0;
+            for (name, page) in [
+                ("Providers", Page::Models),
+                ("Ollama", Page::Models),
+                ("Capture", Page::Privacy),
+            ] {
+                unsafe { show_page(&mut *raw, page) };
+                // Every provider shows, so both groups are at full height.
+                unsafe { reveal_providers(&mut *raw) };
+                // The group's rect is read with its page showing.
+                let groups: Vec<(String, RECT)> = inner
+                    .children
+                    .iter()
+                    .filter(|c| unsafe { is_group_box(c.hwnd) })
+                    .map(|c| (get_text(c.hwnd), rect(c.hwnd)))
+                    .collect();
+                let (_, g) = groups.iter().find(|(t, _)| t == name).expect(name);
+                let last = inner
+                    .children
+                    .iter()
+                    .filter(|c| unsafe { !is_group_box(c.hwnd) && shown(c.hwnd) })
+                    .map(|c| rect(c.hwnd))
+                    .filter(|r| r.top >= g.top && r.bottom <= g.bottom)
+                    .map(|r| r.bottom)
+                    .max()
+                    .expect("controls inside the group");
+                let slack = g.bottom - last;
+                assert!(
+                    slack <= to_px(16, dpi),
+                    "{name} group ends {slack} px below its last control"
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, 3);
+        });
+    }
+
+    /// Whether `hwnd` is a group box (a button with `BS_GROUPBOX`).
+    unsafe fn is_group_box(hwnd: HWND) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetClassNameW, GetWindowLongPtrW, GWL_STYLE,
+        };
+        let mut name = [0u16; 16];
+        let n = GetClassNameW(hwnd, &mut name) as usize;
+        String::from_utf16_lossy(&name[..n]) == "Button"
+            && (GetWindowLongPtrW(hwnd, GWL_STYLE) as i32 & 0xF) == BS_GROUPBOX
+    }
+
+    /// #935: a 1 px line sits on the first row of the footer, directly under
+    /// the scrolling body, at every scale and for every client size, so a row
+    /// the body cuts off reads as an edge under a divider.
+    #[test]
+    fn footer_divider_sits_on_the_body_edge() {
+        for dpi in [96u32, 144, 192, 240] {
+            let (client_w, client_h) = (to_px(WIN_W_DP, dpi) + 17, to_px(700, dpi));
+            let (l, t, r, b) = footer_divider_rect(client_w, client_h, dpi);
+            let body_bottom = client_h - to_px(FOOTER_H_DP, dpi);
+            assert_eq!(
+                t, body_bottom,
+                "the line starts where the body ends ({dpi} dpi)"
+            );
+            assert_eq!(b - t, 1, "a hairline at every scale ({dpi} dpi)");
+            assert_eq!(
+                (l, r),
+                (to_px(RAIL_W_DP, dpi), client_w),
+                "the line spans the pages, not the rail"
+            );
+        }
+    }
+
+    /// #935: the divider uses the theme's hairline token, and the system's
+    /// own text colour in high contrast (a light grey would vanish there).
+    #[test]
+    fn footer_divider_colour_comes_from_the_tokens() {
+        use crate::ui::theme::{HC_BLACK, HC_WHITE, LIGHT};
+        assert_eq!(footer_divider_color(false, &HC_BLACK), LIGHT.border);
+        for sys in [HC_BLACK, HC_WHITE] {
+            assert_eq!(footer_divider_color(true, &sys), sys.window_text);
+        }
+    }
+
+    /// #934: a text box takes its fill, border and text from the theme tokens
+    /// (the system colours in high contrast), and the focus line is the accent
+    /// in a normal theme and the system highlight in high contrast.
+    #[test]
+    fn edit_colours_come_from_the_tokens() {
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE, LIGHT};
+        let accent = rgb(0, 103, 192);
+        let face = rgb(240, 240, 240);
+        let c = edit_colors(false, &HC_BLACK, accent, face);
+        assert_eq!(c.fill, LIGHT.control_fill);
+        assert_eq!(c.border, LIGHT.border);
+        assert_eq!(c.text, LIGHT.text);
+        assert_eq!(c.focus_line, accent);
+        assert_eq!(c.face, face);
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, accent, face);
+            assert_eq!(c.fill, sys.window);
+            assert_eq!(c.border, sys.window_text);
+            assert_eq!(c.text, sys.window_text);
+            assert_eq!(c.focus_line, sys.highlight);
+        }
+    }
+
+    /// #934: the focus line is a bar along the bottom of the box, inside the
+    /// border and clear of the rounded corners, at every scale.
+    #[test]
+    fn the_edit_focus_line_sits_inside_the_bottom_border() {
+        for dpi in [96u32, 144, 192, 240] {
+            let (w, h) = (to_px(200, dpi), to_px(ROW_H, dpi));
+            let (l, t, r, b) = edit_focus_line_rect(w, h, dpi);
+            let radius = to_px(crate::ui::theme::CONTROL_RADIUS_DP, dpi);
+            assert_eq!(b, h, "covers the bottom border row ({dpi} dpi)");
+            assert_eq!(b - t, to_px(2, dpi).max(2), "2 dp thick ({dpi} dpi)");
+            assert_eq!(l, radius, "starts after the left corner ({dpi} dpi)");
+            assert_eq!(r, w - radius, "ends before the right corner ({dpi} dpi)");
+        }
+    }
+
+    /// #934: every text box in Settings is restyled: it carries the subclass
+    /// that paints the border, and the window above it answers
+    /// `WM_CTLCOLOREDIT` with the token fill. A box missing either would still
+    /// be the flat white one.
+    #[test]
+    fn every_settings_text_box_is_styled() {
+        use windows::Win32::Graphics::Gdi::{GetBkColor, GetDC, ReleaseDC};
+        use windows::Win32::UI::Shell::GetWindowSubclass;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, WM_CTLCOLOREDIT};
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let mut edits = 0;
+            for c in &inner.children {
+                let mut name = [0u16; 16];
+                let n = unsafe { GetClassNameW(c.hwnd, &mut name) } as usize;
+                if String::from_utf16_lossy(&name[..n]) != "Edit" {
+                    continue;
+                }
+                edits += 1;
+                let mut data = 0usize;
+                assert!(
+                    unsafe {
+                        GetWindowSubclass(
+                            c.hwnd,
+                            Some(edit_subclass),
+                            EDIT_SUBCLASS_ID,
+                            Some(&mut data),
+                        )
+                    }
+                    .as_bool(),
+                    "a text box is not subclassed"
+                );
+                let parent = unsafe { GetParent(c.hwnd) }.expect("parent");
+                let hdc = unsafe { GetDC(Some(c.hwnd)) };
+                let brush = unsafe {
+                    SendMessageW(
+                        parent,
+                        WM_CTLCOLOREDIT,
+                        Some(WPARAM(hdc.0 as usize)),
+                        Some(LPARAM(c.hwnd.0 as isize)),
+                    )
+                };
+                let bk = unsafe { GetBkColor(hdc) };
+                unsafe { ReleaseDC(Some(c.hwnd), hdc) };
+                assert_ne!(brush.0, 0, "the parent returns a brush");
+                let hc = crate::ui::card_buttons::system_high_contrast().is_some();
+                if !hc {
+                    assert_eq!(bk.0, crate::ui::theme::LIGHT.control_fill);
+                }
+            }
+            assert!(
+                edits >= 5,
+                "found {edits} text boxes, expected the whole set"
+            );
+            let _ = hwnd;
+        });
+    }
+
+    /// #934: the frame draw puts the border colour on the box's edge and
+    /// leaves the inside alone, and the accent goes on the bottom edge only
+    /// while the box has the focus. Drawn on a memory bitmap and read back.
+    #[test]
+    fn the_frame_draw_paints_border_and_focus_line() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject,
+        };
+        let colors = EditColors {
+            fill: 0x00FF_FFFF,
+            border: 0x0000_00FF,
+            text: 0,
+            focus_line: 0x00FF_0000,
+            face: 0x0000_FF00,
+            disabled_fill: 0x0080_8080,
+            disabled_border: 0x0000_8080,
+            disabled_text: 0,
+        };
+        for dpi in [96u32, 240] {
+            let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
+            for focused in [false, true] {
+                let (screen, dc, bmp) = unsafe {
+                    let screen = GetDC(None);
+                    let dc = CreateCompatibleDC(Some(screen));
+                    let bmp = CreateCompatibleBitmap(screen, w, h);
+                    SelectObject(dc, HGDIOBJ(bmp.0));
+                    (screen, dc, bmp)
+                };
+                unsafe { draw_edit_frame(dc, w, h, dpi, &colors, focused, true) };
+                let px = |x: i32, y: i32| unsafe { GetPixel(dc, x, y).0 };
+                let (mx, my) = (w / 2, h / 2);
+                assert_eq!(px(mx, 0), colors.border, "top border ({dpi} dpi)");
+                assert_eq!(px(0, my), colors.border, "left border ({dpi} dpi)");
+                assert_eq!(px(0, 0), colors.face, "corner shows what is behind");
+                if focused {
+                    assert_eq!(px(mx, h - 1), colors.focus_line, "focus line ({dpi} dpi)");
+                    assert_eq!(px(mx, 0), colors.border, "top stays the border");
+                } else {
+                    assert_eq!(px(mx, h - 1), colors.border, "bottom border at rest");
+                }
+                unsafe {
+                    let _ = DeleteDC(dc);
+                    let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    ReleaseDC(None, screen);
+                }
+            }
+        }
+    }
+
+    /// #934: a disabled box is drawn with the disabled border, and
+    /// never gets the accent line even when it holds the focus.
+    #[test]
+    fn a_disabled_frame_uses_the_disabled_colours() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+            SelectObject,
+        };
+        let colors = EditColors {
+            fill: 0x00FF_FFFF,
+            border: 0x0000_00FF,
+            text: 0,
+            focus_line: 0x00FF_0000,
+            face: 0x0000_FF00,
+            disabled_fill: 0x0080_8080,
+            disabled_border: 0x0000_8080,
+            disabled_text: 0,
+        };
+        let (w, h) = (to_px(120, 96), to_px(ROW_H, 96));
+        let (screen, dc, bmp) = unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            SelectObject(dc, HGDIOBJ(bmp.0));
+            (screen, dc, bmp)
+        };
+        unsafe { draw_edit_frame(dc, w, h, 96, &colors, true, false) };
+        let px = |x: i32, y: i32| unsafe { GetPixel(dc, x, y).0 };
+        assert_eq!(px(w / 2, 0), colors.disabled_border);
+        assert_eq!(px(w / 2, h - 1), colors.disabled_border, "no focus line");
+        unsafe {
+            let _ = DeleteDC(dc);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            ReleaseDC(None, screen);
+        }
+    }
+
+    /// #934: disabled colours are tokens too: GrayText ink on the window
+    /// colour in high contrast, and a fill between the box fill and the face
+    /// in a normal theme.
+    #[test]
+    fn disabled_edit_colours_come_from_the_tokens() {
+        use crate::ui::theme::{rgb, HC_BLACK};
+        let face = rgb(240, 240, 240);
+        let c = edit_colors(true, &HC_BLACK, rgb(0, 103, 192), face);
+        assert_eq!(c.disabled_fill, HC_BLACK.window);
+        assert_eq!(c.disabled_border, HC_BLACK.gray_text);
+        assert_eq!(c.disabled_text, HC_BLACK.gray_text);
+        let c = edit_colors(false, &HC_BLACK, rgb(0, 103, 192), face);
+        assert_ne!(c.disabled_fill, c.fill);
+        assert_ne!(c.disabled_text, c.text);
+    }
+
+    /// #934: painting and colour messages use the cached style: they do not
+    /// rebuild it (a registry read each). A settings change drops the cache
+    /// and the next paint builds it once. Closing frees the brushes.
+    #[test]
+    fn painting_a_text_box_does_not_read_the_registry() {
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WM_CTLCOLOREDIT, WM_NCPAINT, WM_SETTINGCHANGE,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let edit = inner
+                .children
+                .iter()
+                .map(|c| c.hwnd)
+                .find(|h| unsafe { is_edit_control(*h) })
+                .expect("a text box");
+            let parent = unsafe { GetParent(edit) }.expect("parent");
+            let ask = || unsafe {
+                let hdc = GetDC(Some(edit));
+                SendMessageW(
+                    parent,
+                    WM_CTLCOLOREDIT,
+                    Some(WPARAM(hdc.0 as usize)),
+                    Some(LPARAM(edit.0 as isize)),
+                );
+                ReleaseDC(Some(edit), hdc);
+            };
+            ask();
+            let builds = EDIT_STYLE_BUILDS.get();
+            for _ in 0..5 {
+                ask();
+                unsafe { SendMessageW(edit, WM_NCPAINT, Some(WPARAM(1)), Some(LPARAM(0))) };
+            }
+            assert_eq!(
+                EDIT_STYLE_BUILDS.get(),
+                builds,
+                "painting rebuilt the style"
+            );
+            unsafe { SendMessageW(hwnd, WM_SETTINGCHANGE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            ask();
+            assert_eq!(
+                EDIT_STYLE_BUILDS.get(),
+                builds + 1,
+                "a change rebuilds once"
+            );
+            ask();
+            assert_eq!(EDIT_STYLE_BUILDS.get(), builds + 1);
+            unsafe { invalidate_edit_style() };
+            assert!(EDIT_STYLE.get().is_none(), "the brushes are released");
+        });
+    }
+
+    /// #1015: a helper line is under the body height at every scale, never
+    /// below a legible floor, and never taller than the body.
+    #[test]
+    fn the_hint_font_is_smaller_than_the_body_font_but_legible() {
+        for dpi in [96u32, 120, 144, 192, 240] {
+            let body = body_font_height(dpi);
+            let hint = hint_font_height(dpi);
+            assert!(hint.abs() < body.abs(), "dpi {dpi}: {hint} vs {body}");
+            // Windows 11's floor is 12 px at 100 %, scaled.
+            assert!(
+                hint.abs() as f32 >= (12.0 * dpi as f32 / 96.0).round() - 0.5,
+                "dpi {dpi}: {hint} is below the 12 px floor"
+            );
+        }
+        // The ramp at 100 %: 14 px labels, 12 px helper lines.
+        assert_eq!(body_font_height(96), -14);
+        assert_eq!(hint_font_height(96), -12);
+    }
+
+    /// #1015: in the real window every helper line is set in a smaller font
+    /// than a label, and freed fonts do not leak into a re-layout.
+    #[test]
+    fn helper_lines_are_set_smaller_than_the_labels() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { apply_dpi(inner) };
+            let label = font_height_of(get_dlg_item(hwnd, ID_REDACT).expect("label"));
+            for id in [ID_MODEL_LIST_HINT, ID_CAPTURE_DETAIL_HINT, ID_REDACT_HINT] {
+                let hint = font_height_of(get_dlg_item(hwnd, id).expect("hint"));
+                assert!(hint < label, "hint {id}: {hint} px vs label {label} px");
+            }
+            // Laid out again: still smaller, and the old hint font is gone.
+            unsafe { apply_dpi(inner) };
+            let hint = font_height_of(get_dlg_item(hwnd, ID_REDACT_HINT).expect("hint"));
+            assert!(hint < label);
+        });
+    }
+
+    /// #1014: a page that fits needs no bar; a taller one does. An unlaid-out
+    /// box (no page) keeps the bar.
+    #[test]
+    fn a_scroll_bar_is_needed_only_when_the_text_is_taller_than_the_box() {
+        assert!(!scrollbar_needed(10, 600, 20), "30 lines of room, 10 used");
+        assert!(!scrollbar_needed(30, 600, 20), "exactly full");
+        assert!(scrollbar_needed(31, 600, 20), "one line too many");
+        assert!(scrollbar_needed(1, 0, 20), "no height yet: keep the bar");
+        assert!(scrollbar_needed(1, 600, 0), "no line height: keep the bar");
+    }
+
+    /// #1014: the prompt box has a bar while its text is longer than the box
+    /// and none when it fits, so no empty strip is left down its side.
+    #[test]
+    fn the_prompt_box_shows_a_bar_only_when_its_text_overflows() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowTextW, GWL_STYLE, SW_SHOW, WS_VSCROLL,
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let prompt = get_dlg_item(hwnd, ID_PROMPT_EDIT).expect("prompt edit");
+            let has_bar =
+                || unsafe { GetWindowLongPtrW(prompt, GWL_STYLE) } as u32 & WS_VSCROLL.0 != 0;
+            // The box is created with WS_VSCROLL, so "no bar" is the first
+            // assertion that can only pass if the sync ran.
+            unsafe {
+                let _ = ShowWindow(prompt, SW_SHOW);
+                // A real box is at least three rows tall; the unlaid-out test
+                // window leaves it one, which the 14 px labels no longer fit.
+                let _ = SetWindowPos(prompt, None, 0, 0, 300, 120, SWP_NOMOVE | SWP_NOZORDER);
+                let _ = SetWindowTextW(prompt, windows::core::w!("short"));
+            }
+            assert!(!has_bar(), "one line needs none");
+            unsafe {
+                let long: Vec<u16> = "a line\r\n".repeat(400).encode_utf16().chain([0]).collect();
+                let _ = SetWindowTextW(prompt, windows::core::PCWSTR(long.as_ptr()));
+            }
+            assert!(has_bar(), "400 lines need a bar");
+            // Select all + Delete: a key, not a text message, empties the box.
+            unsafe {
+                SendMessageW(
+                    prompt,
+                    0x00B1, /* EM_SETSEL */
+                    Some(WPARAM(0)),
+                    Some(LPARAM(-1)),
+                );
+                SendMessageW(
+                    prompt,
+                    windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                    Some(WPARAM(0x2E /* VK_DELETE */)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert!(
+                !has_bar(),
+                "the strip goes away after select all and Delete"
+            );
+            // A font change re-wraps the text.
+            unsafe {
+                let long: Vec<u16> = "a line\r\n".repeat(400).encode_utf16().chain([0]).collect();
+                let _ = SetWindowTextW(prompt, windows::core::PCWSTR(long.as_ptr()));
+                let _ = windows::Win32::UI::Controls::ShowScrollBar(prompt, SB_VERT, false);
+                SendMessageW(
+                    prompt,
+                    windows::Win32::UI::WindowsAndMessaging::WM_SETFONT,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(1)),
+                );
+            }
+            assert!(has_bar(), "a re-wrap that overflows brings the bar back");
+        });
+    }
+
+    /// #1055: painting a rail item uses the cached style: it does not rebuild
+    /// it (a registry read and a font each). A theme, accent or dpi change
+    /// drops the cache and the next paint builds it once. Closing frees the
+    /// icon font.
+    #[test]
+    fn painting_a_rail_item_does_not_read_the_registry_or_build_a_font() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC};
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODT_LISTBOX};
+        use windows::Win32::UI::WindowsAndMessaging::{WM_SETTINGCHANGE, WM_THEMECHANGED};
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let rail = inner.rail;
+            let paint = |selected: bool| unsafe {
+                let hdc = GetDC(Some(rail));
+                let di = DRAWITEMSTRUCT {
+                    CtlType: ODT_LISTBOX,
+                    CtlID: ID_RAIL as u32,
+                    itemID: 1,
+                    itemState: windows::Win32::UI::Controls::ODS_FLAGS(if selected {
+                        ODS_SELECTED
+                    } else {
+                        0
+                    }),
+                    hwndItem: rail,
+                    hDC: hdc,
+                    rcItem: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 200,
+                        bottom: 40,
+                    },
+                    itemData: 0,
+                    itemAction: Default::default(),
+                };
+                SendMessageW(
+                    hwnd,
+                    WM_DRAWITEM,
+                    Some(WPARAM(ID_RAIL as usize)),
+                    Some(LPARAM(&di as *const _ as isize)),
+                );
+                ReleaseDC(Some(rail), hdc);
+            };
+            paint(true);
+            let builds = RAIL_STYLE_BUILDS.get();
+            for _ in 0..6 {
+                paint(true);
+                paint(false);
+            }
+            assert_eq!(
+                RAIL_STYLE_BUILDS.get(),
+                builds,
+                "painting rebuilt the style"
+            );
+            unsafe { SendMessageW(hwnd, WM_THEMECHANGED, Some(WPARAM(0)), Some(LPARAM(0))) };
+            paint(true);
+            assert_eq!(
+                RAIL_STYLE_BUILDS.get(),
+                builds + 1,
+                "a change rebuilds once"
+            );
+            unsafe { SendMessageW(hwnd, WM_SETTINGCHANGE, Some(WPARAM(0)), Some(LPARAM(0))) };
+            paint(false);
+            paint(true);
+            assert_eq!(RAIL_STYLE_BUILDS.get(), builds + 2);
+            unsafe { invalidate_rail_style() };
+            assert!(RAIL_STYLE.get().is_none(), "the icon font is released");
+        });
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
@@ -7063,7 +10754,7 @@ mod tests {
     /// #427 wired-to-nothing: the hint is a real control in the built window,
     /// above the Ollama model row (Ollama has no `models` list to extend).
     #[test]
-    fn the_model_list_hint_is_built_above_the_ollama_row() {
+    fn the_model_list_hint_is_built_below_the_provider_rows() {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
@@ -7104,7 +10795,7 @@ mod tests {
             rc.top
         };
         assert!(top(gemini) < top(hint), "below the cloud model rows");
-        assert!(top(hint) < top(ollama), "above the Ollama row");
+        assert!(top(ollama) < top(hint), "below the Ollama row (#874)");
 
         unsafe {
             let _ = DestroyWindow(hwnd);
@@ -8263,6 +11954,239 @@ mod tests {
         );
     }
 
+    // -- combo text padding (#854) ----------------------------------------
+
+    #[test]
+    fn combo_text_keeps_the_standard_inner_padding_at_each_scale() {
+        use windows::Win32::Foundation::RECT;
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 400,
+            bottom: 20,
+        };
+        for (dpi, want) in [(96u32, 8), (144, 12), (192, 16), (240, 20)] {
+            let t = combo_text_rect(rc, dpi);
+            assert_eq!(t.left - rc.left, want, "left pad at {dpi} dpi");
+            assert_eq!(rc.right - t.right, want, "right pad at {dpi} dpi");
+        }
+    }
+
+    #[test]
+    fn combo_text_area_is_never_inverted() {
+        use windows::Win32::Foundation::RECT;
+        for w in [-5, 0, 3, 10, 17] {
+            let t = combo_text_rect(
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: 20,
+                },
+                96,
+            );
+            assert!(t.right >= t.left, "width {w}");
+        }
+    }
+
+    /// Draws a combo's selected item through the real `draw_combo_item` into
+    /// a white bitmap and returns the first column with ink, and the width.
+    fn first_ink_column(dpi: u32, disabled: bool) -> (i32, i32) {
+        let (first, w, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
+        (first, w)
+    }
+
+    /// [`first_ink_column`] for any item state; also returns the item's
+    /// background colour (its top-left pixel as a `COLORREF`).
+    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32) {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, GdiFlush, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
+        use windows::Win32::UI::WindowsAndMessaging::{CB_ADDSTRING, CB_SETCURSEL, WS_POPUP};
+        ensure_common_controls();
+        let class = wide_z(WC_COMBOBOX);
+        let name = wide_z("");
+        let combo = unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                PCWSTR(class.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(
+                    WS_POPUP.0 | (CBS_DROPDOWNLIST | CBS_HASSTRINGS | CBS_OWNERDRAWFIXED) as u32,
+                ),
+                0,
+                0,
+                300,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("combo");
+        let item = wide_z("Fast");
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(item.as_ptr() as isize)),
+            );
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
+        }
+        let (w, h) = (300i32, 24i32);
+        let mut first = -1;
+        let back;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w,
+                    biHeight: -h,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut pixels: *mut c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut pixels, None, 0)
+                .expect("DIB");
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let dis = DRAWITEMSTRUCT {
+                CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(ODT_COMBOBOX),
+                itemID: 0,
+                itemState: windows::Win32::UI::Controls::ODS_FLAGS(state),
+                hwndItem: combo,
+                hDC: dc,
+                rcItem: RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                ..Default::default()
+            };
+            FORCED_DPI.with(|f| f.set(Some(dpi)));
+            let drawn = draw_combo_item(LPARAM(&dis as *const DRAWITEMSTRUCT as isize));
+            FORCED_DPI.with(|f| f.set(None));
+            assert!(drawn, "a combo item is drawn by us");
+            let _ = GdiFlush();
+            let px = std::slice::from_raw_parts(pixels as *const u8, (w * h * 4) as usize);
+            let bg = [px[0], px[1], px[2]];
+            back = u32::from(px[2]) | u32::from(px[1]) << 8 | u32::from(px[0]) << 16;
+            'cols: for x in 0..w {
+                for y in 0..h {
+                    let i = ((y * w + x) * 4) as usize;
+                    if [px[i], px[i + 1], px[i + 2]] != bg {
+                        first = x;
+                        break 'cols;
+                    }
+                }
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            let _ = DestroyWindow(combo);
+        }
+        (first, w, back)
+    }
+
+    #[test]
+    fn a_focused_closed_combo_field_keeps_the_window_colours_but_a_list_item_highlights() {
+        use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT, COLOR_WINDOW};
+        let window = unsafe { GetSysColor(COLOR_WINDOW) } & 0x00FF_FFFF;
+        let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) } & 0x00FF_FFFF;
+        assert_ne!(window, highlight, "the check needs two different colours");
+        // The closed field, focused: the combo hands us ODS_SELECTED with it.
+        let (_, _, field) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
+        assert_eq!(field, window, "a focused field stays on the window colour");
+        // A list item under the pointer or cursor still highlights.
+        let (_, _, item) = probe_combo(96, ODS_SELECTED);
+        assert_eq!(item, highlight, "a selected list item highlights");
+    }
+
+    /// The combo is a real Settings combo, and the body window really draws it.
+    #[test]
+    fn a_settings_combo_is_owner_drawn_and_the_body_draws_it() {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, DRAWITEMSTRUCT_CTL_TYPE};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let w = GalleryWindow::open(HINSTANCE(h.0), Some(96)).expect("open");
+        let combo = get_dlg_item(w.hwnd(), ID_ACTIVE_PROVIDER).expect("active provider combo");
+        let style = unsafe { GetWindowLongPtrW(combo, GWL_STYLE) } as u32;
+        assert_ne!(style & CBS_OWNERDRAWFIXED as u32, 0, "owner-drawn");
+        let body = unsafe { GetParent(combo) }.expect("the body");
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let dis = DRAWITEMSTRUCT {
+                CtlType: DRAWITEMSTRUCT_CTL_TYPE(ODT_COMBOBOX),
+                CtlID: ID_ACTIVE_PROVIDER as u32,
+                itemID: 0,
+                hwndItem: combo,
+                hDC: dc,
+                rcItem: windows::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 20,
+                },
+                ..Default::default()
+            };
+            let handled = SendMessageW(
+                body,
+                WM_DRAWITEM,
+                Some(WPARAM(ID_ACTIVE_PROVIDER as usize)),
+                Some(LPARAM(&dis as *const DRAWITEMSTRUCT as isize)),
+            );
+            let _ = DeleteDC(dc);
+            assert_eq!(handled.0, 1, "the body answers a combo's WM_DRAWITEM");
+            // The main window draws rail items only: a list box with another
+            // id is left to the default handling.
+            let other = DRAWITEMSTRUCT {
+                CtlType: DRAWITEMSTRUCT_CTL_TYPE(2),
+                CtlID: ID_ACTIVE_PROVIDER as u32,
+                ..Default::default()
+            };
+            let r = SendMessageW(
+                w.hwnd(),
+                WM_DRAWITEM,
+                Some(WPARAM(ID_ACTIVE_PROVIDER as usize)),
+                Some(LPARAM(&other as *const DRAWITEMSTRUCT as isize)),
+            );
+            assert_ne!(r.0, 1, "not a rail item, so not handled as one");
+        }
+        drop(w);
+    }
+
+    #[test]
+    fn the_drawn_combo_text_starts_in_from_the_border_at_each_scale() {
+        for dpi in [96u32, 144, 192] {
+            let (first, _) = first_ink_column(dpi, false);
+            assert!(first >= 0, "text was drawn at {dpi} dpi");
+            let pad = to_px(crate::ui::theme::COMBO_TEXT_PAD_DP, dpi);
+            assert!(
+                first >= pad,
+                "text starts at {first}px, the padding is {pad}px at {dpi} dpi"
+            );
+            assert!(first <= pad + to_px(4, dpi), "and not far past it");
+        }
+    }
+
+    #[test]
+    fn a_disabled_combo_draws_its_text_in_from_the_border_too() {
+        let (first, _) = first_ink_column(96, true);
+        assert!(first >= 8, "starts at {first}px");
+    }
+
     // -- to_px --------------------------------------------------------
 
     #[test]
@@ -8304,7 +12228,16 @@ mod tests {
     /// derived, so a change to those sections has to update this test
     /// deliberately rather than silently keep passing against a moving
     /// target.
-    const CONTENT_TOP_DP: i32 = 768;
+    ///
+    /// #872 put every page's first group at the top of the body, so the Prompt
+    /// group, alone on the Advanced page, starts at the page's top pad.
+    const CONTENT_TOP_DP: i32 = 8;
+
+    /// The Advanced page's content height with the prompt folded away, in dp:
+    /// what `window_height_dp` is given when that page is the tallest.
+    fn advanced_collapsed_content_dp() -> i32 {
+        footer_layout(CONTENT_TOP_DP, 0, false).content_h()
+    }
 
     /// #481 replaced the #340 invariant. The footer no longer has to stay
     /// clear of the Prompt group by arithmetic: it is pinned to the client
@@ -8329,8 +12262,10 @@ mod tests {
         // #481's screenshots. The content is taller than the view, so it
         // scrolls instead of being cut off.
         assert!(prompt_group_is_inside_the_scrolling_content(645));
-        let f = prompt_footer_layout(CONTENT_TOP_DP, 645);
-        assert!(f.content_h() > 645 - FOOTER_H_DP);
+        // The prompt group is alone on its page now (#872), so it only
+        // outgrows the view on a very short one.
+        let f = prompt_footer_layout(CONTENT_TOP_DP, 200);
+        assert!(f.content_h() > 200 - FOOTER_H_DP);
     }
 
     #[test]
@@ -8383,12 +12318,12 @@ mod tests {
         // Compare what each state needs, not the fitted window: the
         // expanded group's minimum already ran past `WIN_H_DP` (#481).
         let nc = 40;
-        let collapsed = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
+        let collapsed = window_height_dp(advanced_collapsed_content_dp(), false, 5000, nc);
         let e = footer_layout(CONTENT_TOP_DP, 0, true);
         let expanded_needed = e.content_h() + FOOTER_H_DP + nc;
         assert!(collapsed + MIN_PROMPT_EDIT_H <= expanded_needed);
         assert_eq!(
-            window_height_dp(CONTENT_TOP_DP, true, WIN_H_DP, nc),
+            window_height_dp(advanced_collapsed_content_dp(), true, WIN_H_DP, nc),
             WIN_H_DP
         );
     }
@@ -8434,13 +12369,14 @@ mod tests {
 
     #[test]
     fn collapsed_window_never_exceeds_the_screen_fit() {
-        assert_eq!(window_height_dp(CONTENT_TOP_DP, false, 500, 40), 500);
+        // The fullest page is taller than the fit: the fit wins.
+        assert_eq!(window_height_dp(900, false, 500, 40), 500);
     }
 
     #[test]
     fn collapsed_window_height_holds_exactly_the_body_and_the_footer() {
         let nc = 40;
-        let h = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
+        let h = window_height_dp(advanced_collapsed_content_dp(), false, 5000, nc);
         let f = footer_layout(CONTENT_TOP_DP, h - nc, false);
         // No scroll range when it fits: the content is exactly the view.
         assert_eq!(f.content_h() + FOOTER_H_DP, h - nc);
@@ -8552,8 +12488,8 @@ mod tests {
 
     #[test]
     fn content_is_taller_than_a_short_view_and_fills_a_tall_one_exactly() {
-        let short = footer_layout(CONTENT_TOP_DP, 600, true);
-        assert!(short.content_h() > 600 - FOOTER_H_DP, "must scroll");
+        let short = footer_layout(CONTENT_TOP_DP, 200, true);
+        assert!(short.content_h() > 200 - FOOTER_H_DP, "must scroll");
         let tall = footer_layout(CONTENT_TOP_DP, 1500, true);
         assert_eq!(tall.content_h(), 1500 - FOOTER_H_DP, "no needless scroll");
     }
@@ -8879,6 +12815,45 @@ mod tests {
         assert_eq!(forced_dpi(), None, "closing the window clears the override");
     }
 
+    /// The width the body's own scrollbar really takes: window minus client.
+    #[cfg(debug_assertions)]
+    fn body_scrollbar_px(w: &GalleryWindow) -> i32 {
+        let body = get_dlg_item(w.hwnd(), ID_BODY).expect("body");
+        let mut wr = windows::Win32::Foundation::RECT::default();
+        let mut cr = windows::Win32::Foundation::RECT::default();
+        unsafe {
+            GetWindowRect(body, &mut wr).expect("GetWindowRect");
+            GetClientRect(body, &mut cr).expect("GetClientRect");
+        }
+        (wr.right - wr.left) - (cr.right - cr.left)
+    }
+
+    /// #1016, #1052: a Settings window "at 100%" is a real 96 DPI window
+    /// (so its checkbox boxes and scrollbar are real size), and at another
+    /// simulated scale the width reserved for the scrollbar is the one the
+    /// scrollbar really takes. On a screen above 100% (MEASURED 2026-10-17,
+    /// 250%) both fail without the fix: the scrollbar is 42 px, not 17.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_gallery_settings_scrollbar_matches_the_reserved_width() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::HiDpi::{
+            SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        let prev =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let at_100 = GalleryWindow::open(instance, Some(96)).expect("open at 96");
+        assert_eq!(unsafe { GetDpiForWindow(at_100.hwnd()) }, 96, "real 96 DPI");
+        assert_eq!(body_scrollbar_px(&at_100), scrollbar_width_px(96));
+        drop(at_100);
+        let at_150 = GalleryWindow::open(instance, Some(144)).expect("open at 144");
+        assert_eq!(body_scrollbar_px(&at_150), scrollbar_width_px(144));
+        drop(at_150);
+        unsafe { SetThreadDpiAwarenessContext(prev) };
+    }
+
     // -- WM_DPICHANGED (#233) ---------------------------------------------
 
     #[test]
@@ -8917,6 +12892,7 @@ mod tests {
 
     fn child(x: i32, y: i32, w: i32, h: i32, anchor: Anchor) -> ChildLayout {
         ChildLayout {
+            page: None,
             hwnd: HWND(std::ptr::null_mut()),
             x,
             y,
@@ -9180,7 +13156,10 @@ mod tests {
             inner.hwnd = hwnd;
             inner.font = font;
             inner.adopt(built);
-            unsafe { apply_dpi(inner) };
+            // The Models page is the longest with every provider showing, so
+            // it is the one to scroll.
+            unsafe { show_page(inner, Page::Models) };
+            unsafe { reveal_providers(inner) };
         }
         let body = unsafe { &*raw }.body;
         let view_px = client_h_px - to_px(FOOTER_H_DP, 96);
@@ -9199,9 +13178,9 @@ mod tests {
         assert!(save_y >= view_px, "Save {save_y} overlaps the body");
         assert!(save_y + to_px(BTN_H, 96) <= client_h_px, "Save is cut off");
 
-        // The Advanced toggle starts below the view and a scroll to the
-        // bottom (what the scrollbar's End does) brings it into the view.
-        let toggle = get_dlg_item(hwnd, ID_PROMPT_TOGGLE).expect("toggle");
+        // The Pull button starts below the view and a scroll to the bottom
+        // (what the scrollbar's End does) brings it into the view.
+        let toggle = get_dlg_item(hwnd, ID_PULL_BUTTON).expect("pull button");
         assert!(top_in_parent_px(body, toggle) >= view_px, "starts in view");
         unsafe {
             SendMessageW(
@@ -9329,6 +13308,7 @@ mod tests {
         };
 
         // Collapsed at start: no prompt text on screen, the toggle is.
+        unsafe { show_page(&mut *raw, Page::Advanced) };
         unsafe { show_prompt_state(&mut *raw) };
         assert!(!visible(prompt) && !visible(reset));
         assert!(visible(toggle));
@@ -9376,7 +13356,8 @@ mod tests {
             .count();
         assert!(footer >= 3, "Save, Cancel and the validation line");
         assert!(!inner.body.0.is_null(), "no scrolling body");
-        assert_eq!(direct_child_count(hwnd), footer + 1);
+        // The footer, the body, the rail and the rail's name (#872).
+        assert_eq!(direct_child_count(hwnd), footer + 3);
         assert_eq!(direct_child_count(inner.body), child_count - footer);
     }
 
@@ -9601,7 +13582,7 @@ mod tests {
     #[test]
     fn clamp_leaves_a_suggestion_that_fits_untouched() {
         // 100% 1440p-ish work area is tall: nothing to clamp.
-        let pos = (100, 100, 620, 900);
+        let pos = (100, 100, WIN_W_DP, 700);
         assert_eq!(clamp_suggested_to_work(pos, &work(0, 1400), 96), pos);
     }
 
@@ -9635,18 +13616,260 @@ mod tests {
         assert_eq!(clamp_suggested_to_work(pos, &work(0, 0), 96), pos);
     }
 
+    /// The tests that use the process-wide `OPEN_HWND` guard take this lock, so
+    /// two of them never see each other's window.
+    static OPEN_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A real top-level window of this thread to stand in for the app's main
+    /// window: Settings posts to it.
+    fn test_owner() -> HWND {
+        unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!("settings test owner"),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("owner window")
+    }
+
+    /// Takes one message of `id` posted to `to`, if any.
+    fn take_posted(to: HWND, id: u32) -> Option<MSG> {
+        let mut m = MSG::default();
+        unsafe { PeekMessageW(&mut m, Some(to), id, id, PM_REMOVE) }
+            .as_bool()
+            .then_some(m)
+    }
+
+    /// Opens a real, hidden Settings window the way `open` does, on the tests'
+    /// class, and runs `body` with it. Always closes it.
+    fn with_open_window(body: impl FnOnce(HWND, HWND)) {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        let owner = test_owner();
+        assert!(open_impl(
+            instance,
+            owner,
+            &Config::default(),
+            TEST_CLASS_NAME,
+            false
+        ));
+        let hwnd = HWND(OPEN_HWND.load(Ordering::SeqCst) as *mut c_void);
+        assert!(!hwnd.0.is_null(), "open must set the guard");
+        body(hwnd, owner);
+        close_now();
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
+    /// #871 wired-to-nothing: the window `open` makes exists with no loop of its
+    /// own, frees itself when destroyed (no `Box::from_raw` by a caller), clears
+    /// the guard, and tells the owner it is gone. If the owner post or the
+    /// self-free were not wired, this would leak, crash or time out.
     #[test]
-    fn second_show_modal_call_while_one_is_open_returns_none() {
+    fn open_makes_a_modeless_window_that_frees_itself_and_tells_the_owner() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_open_window(|hwnd, owner| {
+            assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+            let inner =
+                unsafe { &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner) };
+            assert!(inner.owns_itself);
+            assert_eq!(inner.owner, owner);
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_none());
+            close_now();
+            assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+            assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0);
+            assert!(
+                take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some(),
+                "closing must tell the owner, or a waiting card never shows"
+            );
+        });
+    }
+
+    /// #871 wired-to-nothing: Save in the real window posts the changed fields
+    /// (and only those) to the owner as `WM_APP_SETTINGS_SAVE`, then closes. If the
+    /// sink were not the production one, or the post were dropped, nothing would
+    /// reach the writer and no card would ever say "Settings saved".
+    #[test]
+    fn save_posts_only_the_changed_fields_to_the_owner_and_closes() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
+        with_open_window(|hwnd, owner| {
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            let posted = take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE)
+                .expect("Save must post the save to the owner window");
+            let save = unsafe { *Box::from_raw(posted.lParam.0 as *mut crate::app::SettingsSave) };
+            let paths: Vec<String> = save.changes.iter().map(|c| c.path().join(".")).collect();
+            assert_eq!(paths, vec!["ui.card_seconds"]);
+            assert_eq!(save.edited.ui.card_seconds, 42);
+            assert!(
+                !unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "Save closes the window"
+            );
+        });
+    }
+
+    /// #871 finding 7: Windows destroys a window whose creation fails after
+    /// `WM_NCCREATE`, and the window procedure already freed the state then. The
+    /// failure path must not free it a second time.
+    #[test]
+    fn a_window_that_fails_to_create_after_nccreate_frees_its_state_exactly_once() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::WM_CREATE;
+        const FAIL_CLASS: &str = "Wingman.Settings.Test.FailCreate.2c8e51d7";
+        unsafe extern "system" fn fail_create(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_CREATE {
+                return LRESULT(-1);
+            }
+            wndproc(hwnd, msg, wparam, lparam)
+        }
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let class = wide_z(FAIL_CLASS);
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(fail_create),
+                hInstance: instance,
+                lpszClassName: PCWSTR(class.as_ptr()),
+                ..Default::default()
+            };
+            assert!(unsafe { RegisterClassExW(&wc) } != 0);
+        });
+        let before = INNERS_DROPPED.with(|c| c.get());
+        let opened = open_impl(
+            instance,
+            HWND(std::ptr::null_mut()),
+            &Config::default(),
+            FAIL_CLASS,
+            false,
+        );
+        assert!(!opened, "the window cannot be created");
+        assert_eq!(
+            INNERS_DROPPED.with(|c| c.get()) - before,
+            1,
+            "the window state must be freed once, not twice"
+        );
+        assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0, "no guard is left set");
+    }
+
+    /// The same failure before `WM_NCCREATE` (the class does not exist): the
+    /// window never saw the state, so `open_impl` frees it, once.
+    #[test]
+    fn a_window_that_fails_before_nccreate_is_freed_once_by_the_caller() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let before = INNERS_DROPPED.with(|c| c.get());
+        let opened = open_impl(
+            HINSTANCE(h.0),
+            HWND(std::ptr::null_mut()),
+            &Config::default(),
+            "Wingman.Settings.Test.NoSuchClass.91b4",
+            false,
+        );
+        assert!(!opened);
+        assert_eq!(INNERS_DROPPED.with(|c| c.get()) - before, 1);
+    }
+
+    /// #871: Esc in the open window is taken by `pre_dispatch` and becomes a
+    /// Cancel command for the window; a key for some other window is left alone.
+    #[test]
+    fn pre_dispatch_takes_keys_for_the_settings_window_and_nothing_else() {
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, IsWindow};
+        with_open_window(|hwnd, owner| {
+            let field = get_dlg_item(hwnd, ID_CARD_SECONDS).expect("a child control");
+            let esc = MSG {
+                hwnd: field,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            };
+            assert!(pre_dispatch(&esc), "Esc in a Settings control is ours");
+            let cancel = take_posted(hwnd, WM_COMMAND).expect("Esc posts Cancel");
+            assert_eq!(cancel.wParam.0 & 0xFFFF, ID_CANCEL as usize);
+
+            let foreign = MSG {
+                hwnd: owner,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            };
+            assert!(
+                !pre_dispatch(&foreign),
+                "another window's key passes through"
+            );
+
+            // Delivering the Cancel closes it, with no loop of ours involved.
+            unsafe { DispatchMessageW(&cancel) };
+            assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        });
+    }
+
+    /// #871: with no window open, `pre_dispatch` never claims a message.
+    #[test]
+    fn pre_dispatch_ignores_everything_while_no_window_is_open() {
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0);
+        let msg = MSG {
+            message: WM_KEYDOWN,
+            wParam: WPARAM(VK_ESCAPE.0 as usize),
+            ..Default::default()
+        };
+        assert!(!pre_dispatch(&msg));
+        assert!(!is_foreground());
+    }
+
+    #[test]
+    fn a_second_open_while_one_is_open_creates_no_window() {
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Simulate "already open" without actually creating a window: set
         // the guard directly, exactly like a real open would, and confirm
-        // show_modal's early-return path is taken (no window is created,
-        // no panic, no hang).
+        // open's early-return path is taken (no window is created, no panic,
+        // no hang) and counts as success: the open one is brought forward.
         let prev = OPEN_HWND.swap(1, Ordering::SeqCst);
         let h = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }
             .expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
-        let result = show_modal(instance, &Config::default());
-        assert!(result.is_none());
+        let result = open(instance, HWND(std::ptr::null_mut()), &Config::default());
+        assert!(result);
         OPEN_HWND.store(prev, Ordering::SeqCst);
     }
 
@@ -9874,5 +14097,208 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    // -- #873: Mode, Pause and the pause shortcut on General ----------------
+
+    #[test]
+    fn the_mode_rows_are_the_trays_labels_in_the_trays_order() {
+        use crate::mode::Mode;
+        let labels: Vec<&str> = MODE_CHOICES.iter().map(|m| m.label()).collect();
+        assert_eq!(labels, ["Cloud", "Local", "Auto", "Offline"]);
+        for (i, m) in MODE_CHOICES.iter().enumerate() {
+            assert_eq!(mode_index(*m), i);
+            assert_eq!(mode_at(i as isize), Some(*m));
+        }
+        // A combo with nothing picked answers CB_ERR (-1).
+        assert_eq!(mode_at(-1), None);
+        assert_eq!(mode_at(MODE_CHOICES.len() as isize), None);
+        assert_eq!(
+            mode_at(mode_index(Mode::Offline) as isize),
+            Some(Mode::Offline)
+        );
+    }
+
+    #[test]
+    fn the_pause_line_says_running_or_how_long_it_is_paused() {
+        assert_eq!(pause_status_line(None), "Wingman is running.");
+        assert_eq!(
+            pause_status_line(Some("Paused until 14:05")),
+            "Paused until 14:05."
+        );
+        assert_eq!(pause_status_line(Some("Paused")), "Paused.");
+        for text in [pause_status_line(None), pause_status_line(Some("Paused"))] {
+            assert!(!text.contains('\u{2014}'), "no em dash in {text}");
+        }
+    }
+
+    #[test]
+    fn pause_is_offered_while_running_and_resume_while_paused() {
+        assert_eq!(pause_buttons_enabled(false), (true, false));
+        assert_eq!(pause_buttons_enabled(true), (false, true));
+    }
+
+    #[test]
+    fn the_pause_menu_offers_the_trays_three_choices_in_order() {
+        use crate::pause::PauseChoice;
+        let choices: Vec<PauseChoice> = PAUSE_MENU.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            choices,
+            [
+                PauseChoice::OneHour,
+                PauseChoice::UntilTomorrow,
+                PauseChoice::UntilResumed
+            ]
+        );
+        for (_, label) in PAUSE_MENU {
+            assert!(!label.contains('\u{2014}'), "no em dash in {label}");
+        }
+    }
+
+    /// Posts what the control would, so a combo or button wired to nothing fails.
+    fn command_posted_for(owner: HWND) -> Option<crate::app::SettingsCommand> {
+        take_posted(owner, crate::app::WM_APP_SETTINGS_COMMAND)
+            .and_then(|m| crate::app::SettingsCommand::from_wparam(m.wParam.0))
+    }
+
+    /// #873 wired-to-nothing: picking Offline in the real combo posts the
+    /// owner window the command whose handler moves the tray's check mark.
+    #[test]
+    fn picking_a_mode_in_the_combo_asks_the_owner_to_switch() {
+        use crate::mode::Mode;
+        with_open_window(|hwnd, owner| {
+            let combo = get_dlg_item(hwnd, ID_MODE).expect("mode combo");
+            combo_select(combo, Mode::Offline.label());
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(((CBN_SELCHANGE as usize) << 16) | ID_MODE as usize)),
+                    Some(LPARAM(combo.0 as isize)),
+                );
+            }
+            assert_eq!(
+                command_posted_for(owner),
+                Some(crate::app::SettingsCommand::Mode(Mode::Offline))
+            );
+        });
+    }
+
+    #[test]
+    fn the_resume_button_asks_the_owner_to_resume() {
+        with_open_window(|hwnd, owner| {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_RESUME_BUTTON as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_eq!(
+                command_posted_for(owner),
+                Some(crate::app::SettingsCommand::Resume)
+            );
+        });
+    }
+
+    /// #873: the controls follow a change made in the tray while Settings is open.
+    #[test]
+    fn the_controls_follow_the_trays_mode_and_pause() {
+        use crate::mode::Mode;
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        with_open_window(|hwnd, _owner| {
+            let status = get_dlg_item(hwnd, ID_PAUSE_STATUS).expect("pause line");
+            let pause = get_dlg_item(hwnd, ID_PAUSE_BUTTON).expect("pause button");
+            let resume = get_dlg_item(hwnd, ID_RESUME_BUTTON).expect("resume button");
+            let enabled = |h: HWND| unsafe { IsWindowEnabled(h) }.as_bool();
+
+            apply_live(hwnd, Mode::Offline, Some("Paused until 14:05"));
+            assert_eq!(combo_selected_text(hwnd, ID_MODE), "Offline");
+            assert_eq!(get_text(status), "Paused until 14:05.");
+            assert!(!enabled(pause) && enabled(resume));
+
+            apply_live(hwnd, Mode::Auto, None);
+            assert_eq!(combo_selected_text(hwnd, ID_MODE), "Auto");
+            assert_eq!(get_text(status), "Wingman is running.");
+            assert!(enabled(pause) && !enabled(resume));
+        });
+    }
+
+    /// #873: the Pause button asks for its menu by message, so the menu's own
+    /// loop never runs inside the handler that holds the window's state, and a
+    /// pending Change is cancelled first (the hook would eat the menu's keys).
+    #[test]
+    fn the_pause_button_defers_its_menu_and_cancels_a_pending_change() {
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            inner.learning = Some(HK_PRIMARY);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_PAUSE_BUTTON as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            let inner =
+                unsafe { &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner) };
+            assert_eq!(inner.learning, None, "the pending Change was not cancelled");
+            assert!(
+                take_posted(hwnd, WM_PAUSE_MENU).is_some(),
+                "the menu was not asked for by message"
+            );
+        });
+    }
+
+    /// The Change beside the pause shortcut arms the pause slot (`HK_PAUSE`):
+    /// the arm is in the handler, and pressing it speaks on the status line
+    /// (no keyboard hook runs in the test, so it says why it cannot arm).
+    #[test]
+    fn the_pause_change_button_arms_the_pause_slot() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        assert!(
+            src.contains(
+                "ID_CHANGE_PAUSE if notify == BN_CLICKED => start_change(inner, HK_PAUSE),"
+            ),
+            "the Change button is not wired to HK_PAUSE"
+        );
+        with_open_window(|hwnd, _owner| {
+            let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
+            let before = get_text(status);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_CHANGE_PAUSE as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_ne!(get_text(status), before, "pressing Change said nothing");
+            stop_learning(unsafe {
+                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner)
+            });
+        });
+    }
+
+    /// The pause shortcut is a row on General: a label and a Change button.
+    #[test]
+    fn the_pause_shortcut_label_shows_the_staged_chord_or_not_set() {
+        let mut hk = Config::default().hotkeys;
+        hk.pause = None;
+        assert_eq!(pause_label(&hk.pause), "Pause shortcut: not set");
+        let c = chord(b'P' as u32, true, false, true, false);
+        hk.pause = Some(c);
+        assert_eq!(
+            pause_label(&hk.pause),
+            format!("Pause shortcut: {}", chord_to_string(&c))
+        );
     }
 }

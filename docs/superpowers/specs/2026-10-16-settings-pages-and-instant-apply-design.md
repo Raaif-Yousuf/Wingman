@@ -134,11 +134,12 @@ the tray holds today. No "reset everything" (Open question 3).
   item. The status line is a plain, non-disabled static that raises
   `EVENT_OBJECT_LIVEREGIONCHANGED`, so "Saved: Card corner" and every error are
   announced (#781). The hotkey status line becomes non-disabled too (#824).
-- **Role of the owner-drawn rail is not assumed.** The dark spec measured that
-  owner-draw keeps a combo's role and drops a checkbox's; a listbox is
-  unmeasured. THEORY (unverified): it keeps ListBox and ListItem. Slice 2
-  measures it with UIA first; if the role is lost, the stock listbox is the
-  fallback in every theme.
+- **Role of the owner-drawn rail.** MEASURED 2026-10-17 (slice 2,
+  `rail_uia_role_is_a_list_of_named_list_items`, run by hand): the owner-drawn
+  list box keeps the List role and each item is a ListItem named for its page.
+  The list's own name is empty (a list box ignores its window text), so a
+  one pixel static before it carries "Settings pages", which UI Automation
+  reads as the list's name. The stock list box fallback is not needed.
 
 ## Instant apply
 
@@ -250,9 +251,13 @@ pump gives it `IsDialogMessage`, the single-window guard (`OPEN_HWND`) stays,
 and `WM_APP` replies are ordinary messages to the main proc.
 
 - A change reaches `App` while the window is open, which instant apply needs.
-  The #213 deferral keeps one job: an Ask that arrives while Settings is the
-  foreground window waits, so no card lands on the window (Open question 4).
+  The #213 deferral keeps one job: a card that would land on the window waits
+  until Settings is left. A press of the Wingman key made meanwhile is refused
+  with a short card, not kept (Open question 4).
   Quit, session end, tray and config apply are handled on arrival, closing #673.
+  Quit closes the window; what was typed but not saved is dropped with it, as
+  it was when the window was modal, and a Save already pressed is written
+  before the process exits.
 - `open_settings`' save branch (`self.config = edited; save`) and the "Settings
   saved" card are deleted. The tray keeps its Mode submenu and calls the same
   `App::set_mode`.
@@ -367,10 +372,14 @@ that ships slice 5.
 
 **Size.** No new `windows` feature is expected (`NotifyWinEvent` is
 `Win32_UI_Accessibility`, to confirm in slice 7). `toml_edit` (MIT or Apache-2.0)
-is the one possible dependency: THEORY (unverified) 100 to 150 KB in release.
-The exe gate has about 518 KB shared with the options card, overlay and
-knowledge work; slice 0 records the measured size and raises the gate in its PR
-if needed. `settings.rs` should shrink (modal loop, group boxes go).
+is the one possible dependency. MEASURED 2026-10-16 (slice 0, #870, same
+machine, release profile): 4,055,040 bytes on master, 4,143,104 with
+`toml_edit` and the writer, a delta of 88,064 bytes (about 86 KB), less than the
+100 to 150 KB guessed. `toml_edit` shares `toml_parser`, `toml_datetime` and
+`winnow` with `toml`, so it adds no second parser. The gate (4,500,000) is not
+raised: master measured 3,982,336 on CI, so the writer lands near 4,070,000. That
+leaves about 430 KB for the options card, overlay and knowledge work.
+`settings.rs` should shrink (modal loop, group boxes go).
 
 ## Adversarial review: the five strongest objections
 
@@ -419,6 +428,10 @@ if needed. `settings.rs` should shrink (modal loop, group boxes go).
    Undo covers a slip, and a reset needs its own account of what it keeps (keys,
    hotkeys, actions). File it if people ask once the pages ship.
 4. **Should the Wingman key still ask while Settings is the foreground window?**
-   Recommendation: keep today's behaviour (the Ask waits until another window is
-   active or Settings closes); a card over a window the user is typing in is the
-   case #213 was written for.
+   Decision: no. On the modal window the key was inert (the press was dropped),
+   so there was nothing to keep. A press made while Settings is in front, or
+   while a Settings save is still being applied, is refused with a short card
+   ("Settings is open" or "Saving your settings"). It is not queued: run later it
+   would capture another window, bill a request, and could use settings from
+   before the save (an Offline switch ignored once). Answers that finish while
+   Settings is in front are held and shown when it is left (#213).

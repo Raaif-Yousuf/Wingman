@@ -672,8 +672,7 @@ pub fn word_byte_ranges(line_text: &str, words: &[OcrWord]) -> Option<Vec<Range<
 /// in any letter case.
 /// The overlay drops a quote that contains one: the model never saw the real
 /// text, so there is nothing on screen to point at. Slice 2 of the overlay
-/// (#809) is its first non-test caller.
-#[cfg_attr(not(test), allow(dead_code))]
+/// (#809) is its first non-test caller; "Ask my documents" uses it too.
 pub fn contains_marker(text: &str) -> bool {
     // ASCII lowercasing keeps every byte offset, so no char is split.
     let text = text.to_ascii_lowercase();
@@ -1476,6 +1475,7 @@ mod tests {
             "time_list",
             "scam_check",
             "jargon_terms",
+            "contact_card",
         ];
         for id in ids {
             for want_difficulty in [false, true] {
@@ -1756,14 +1756,12 @@ mod tests {
         assert!(capture.contains("if needs_password_lookup(redact_setting, providers, mode)"));
         let app = norm(include_str!("app.rs"));
         assert_eq!(app.matches("capture::needs_password_lookup(").count(), 2);
-        // The router's capture names the window under the palette.
+        // The options card's capture looks at the foreground window: the card
+        // never takes focus, so the foreground is the user's own window.
         let app = norm(include_str!("app.rs"));
-        let at = app.find("fn maybe_start_router(").expect("router fn");
+        let at = app.find("fn show_options_card(").expect("options card fn");
         let body = &app[at..at + app[at..].find("\n    }\n").unwrap()];
-        assert!(
-            body.contains("LookupWindow::Window(underlying_window)"),
-            "{body}"
-        );
+        assert!(body.contains("LookupWindow::Foreground"), "{body}");
     }
 
     #[test]

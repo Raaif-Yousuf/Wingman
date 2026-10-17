@@ -24,6 +24,10 @@ pub struct PaletteAction {
     /// further Enter, and cannot overwrite the clipboard, may be run by a
     /// bare key press.
     pub effect: Effect,
+    /// Whether the action lists the `text` input: it answers the line typed
+    /// in the query box (#92). Such an action stays in the list whatever the
+    /// line is, because a question is not a name to match.
+    pub takes_text: bool,
 }
 
 /// What running an action can change, the `effect` column of the catalogue.
@@ -46,8 +50,27 @@ pub enum Effect {
 pub fn effect_for_executor(executor: &str) -> Effect {
     match executor {
         "none" => Effect::None,
-        "calendar_add" | "replace_text" | "fill_form" => Effect::Preview,
+        "calendar_add" | "replace_text" | "fill_form" | "contact_add" => Effect::Preview,
         _ => Effect::Clipboard,
+    }
+}
+
+/// #308, #859: whether the Wingman key may run an option by itself.
+///
+/// Only an option that cannot change anything without a further Enter and
+/// cannot overwrite the clipboard: a read-only answer or a preview. A
+/// clipboard-writing option is picked by click or by digit, never by the key.
+///
+/// The model's confidence is deliberately not an input. It comes from a model
+/// that reads the screen, so text on the screen can claim any confidence it
+/// likes (#859), and a habit press must never overwrite the clipboard with
+/// whatever the page said. The options card spec (resolved question 2) would
+/// allow a clipboard option above `palette.router_threshold`; this is the
+/// stricter rule the injection finding asked for.
+pub fn key_pickable(effect: Effect) -> bool {
+    match effect {
+        Effect::None | Effect::Preview => true,
+        Effect::Clipboard => false,
     }
 }
 
@@ -85,6 +108,11 @@ pub const NO_MODEL_HINT: &str = "Add a model in Settings to unlock more actions.
 /// #358's exact hint text, shown in place of a blank list when a non-empty
 /// query matches no action at all. No em dash (rule 11).
 pub const NO_MATCHES_HINT: &str = "No matching actions. Press Esc to clear.";
+
+/// Shown above the pinned text actions when the line matches no action name.
+/// No em dash (rule 11).
+pub const NO_ACTION_MATCH_HINT: &str =
+    "No action matches. Press Down to ask your documents with this line.";
 
 // ---------------------------------------------------------------------------
 // Fuzzy scoring
@@ -217,14 +245,34 @@ fn flat_ranked_rows(actions: &[PaletteAction], query: &str) -> Vec<Row> {
         .filter_map(|a| fuzzy_score(query, &a.name).map(|s| (s, a)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-    scored
-        .into_iter()
+    let mut rows: Vec<Row> = scored
+        .iter()
         .map(|(score, a)| Row::Action {
             id: a.id.clone(),
             name: a.name.clone(),
-            score,
+            score: *score,
         })
-        .collect()
+        .collect();
+    // Decision (#92): a non-empty line is also a question. Every action that
+    // takes typed text is listed after the matches, so the line can reach it
+    // even though it is not a subsequence of the action's name.
+    let mut pinned: Vec<&PaletteAction> = actions
+        .iter()
+        .filter(|a| a.takes_text && !scored.iter().any(|(_, s)| s.id == a.id))
+        .collect();
+    pinned.sort_by(|a, b| a.name.cmp(&b.name));
+    // With no name match the pinned rows are the whole list. A hint comes
+    // first and [`PaletteState::new`] leaves nothing selected, so a mistyped
+    // action name plus Enter sends nothing.
+    if rows.is_empty() && !pinned.is_empty() {
+        rows.push(Row::Hint(NO_ACTION_MATCH_HINT.to_string()));
+    }
+    rows.extend(pinned.into_iter().map(|a| Row::Action {
+        id: a.id.clone(),
+        name: a.name.clone(),
+        score: 0,
+    }));
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +371,29 @@ pub fn scroll_by(offset: usize, delta_rows: i32, total_rows: usize, visible_rows
     (offset as i32 + delta_rows).clamp(0, max_offset) as usize
 }
 
+/// The scroll thumb for a list scrolled to `offset` (#883), in the pixels of a
+/// track `track_len` long: `(top, length)`, or `None` when every row fits and
+/// there is nothing to say. The thumb is the visible share of the track, never
+/// shorter than `min_len` (or the track, when that is shorter), and slides
+/// from the top at offset 0 to the bottom at the last page.
+pub fn scroll_thumb(
+    offset: usize,
+    total_rows: usize,
+    visible_rows: usize,
+    track_len: i32,
+    min_len: i32,
+) -> Option<(i32, i32)> {
+    if visible_rows == 0 || total_rows <= visible_rows || track_len <= 0 {
+        return None;
+    }
+    let max_offset = total_rows - visible_rows;
+    let offset = offset.min(max_offset);
+    let share = (track_len as i64 * visible_rows as i64 / total_rows as i64) as i32;
+    let len = share.max(min_len).min(track_len);
+    let top = ((track_len - len) as i64 * offset as i64 / max_offset as i64) as i32;
+    Some((top, len))
+}
+
 /// The palette's selection state over a built row list. Rebuilt (via
 /// [`PaletteState::new`]) every time the query changes; selection resets to
 /// the first selectable (non-header, non-hint) row.
@@ -343,7 +414,13 @@ fn is_selectable(row: &Row) -> bool {
 
 impl PaletteState {
     pub fn new(rows: Vec<Row>) -> Self {
-        let selected = rows.iter().position(is_selectable).unwrap_or(0);
+        // Rule: a pinned text row is never pre-selected when no name matched
+        // (the list then starts with the hint), so Enter does nothing until
+        // the user presses Down. Otherwise the first action is selected.
+        let selected = match rows.first() {
+            Some(Row::Hint(h)) if h == NO_ACTION_MATCH_HINT => 0,
+            _ => rows.iter().position(is_selectable).unwrap_or(0),
+        };
         let offset = clamp_offset_to_selection(0, selected, rows.len(), MAX_VISIBLE_ROWS);
         Self {
             rows,
@@ -371,10 +448,20 @@ impl PaletteState {
         if selectable.is_empty() {
             return;
         }
-        let current_pos = selectable
-            .iter()
-            .position(|&i| i == self.selected)
-            .unwrap_or(0);
+        // Nothing selected (the cursor rests on a hint): Down lands on the
+        // first action, Up stays put.
+        let Some(current_pos) = selectable.iter().position(|&i| i == self.selected) else {
+            if delta > 0 {
+                self.selected = selectable[0];
+                self.offset = clamp_offset_to_selection(
+                    self.offset,
+                    self.selected,
+                    self.rows.len(),
+                    MAX_VISIBLE_ROWS,
+                );
+            }
+            return;
+        };
         let new_pos = (current_pos as i32 + delta).clamp(0, selectable.len() as i32 - 1);
         self.selected = selectable[new_pos as usize];
         self.offset = clamp_offset_to_selection(
@@ -393,28 +480,13 @@ impl PaletteState {
     }
 }
 
-/// #24: pre-selects the row whose action id is `action_id`, for the intent
-/// router's suggestion. `false` (a no-op, never a panic -- rule 7) when
-/// `action_id` isn't among today's ROWS at all -- e.g. the row only shows up
-/// once a provider is configured, and the grouped view currently has none,
-/// or the query has since filtered it out. Whether this should even be
-/// attempted (confidence vs. threshold, whether the user already
-/// typed/moved) is [`crate::router::should_apply`]'s job, not this
-/// function's -- this only performs the mechanical "does this id exist as a
-/// row right now, and if so select it" step, which is why it lives here
-/// (state mutation) rather than in `router.rs` (decision).
-pub fn preselect_action(state: &mut PaletteState, action_id: &str) -> bool {
-    match state
-        .rows
-        .iter()
-        .position(|r| matches!(r, Row::Action { id, .. } if id == action_id))
-    {
-        Some(idx) => {
-            state.selected = idx;
-            true
-        }
-        None => false,
-    }
+/// What Enter posts to the main window (#92): the selected action and the
+/// line typed in the query box. Only an action that lists the `text` input
+/// reads the line; for any other it is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteRun {
+    pub id: String,
+    pub line: String,
 }
 
 /// What handling a key should cause the caller (the Win32 layer) to do.
@@ -557,6 +629,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
             group: r.action.group.clone(),
             requires_model: action_requires_model(&r.action.id),
             effect: effect_for_executor(&r.action.executor),
+            takes_text: r.action.inputs.contains(&crate::actions::InputKind::Text),
         })
         .collect();
     out.push(PaletteAction {
@@ -565,6 +638,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
         group: None,
         requires_model: false,
         effect: Effect::None,
+        takes_text: false,
     });
     out.push(PaletteAction {
         id: COPY_REGION_ACTION_ID.to_string(),
@@ -572,6 +646,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
         group: None,
         requires_model: false,
         effect: Effect::Clipboard,
+        takes_text: false,
     });
     out
 }
@@ -584,7 +659,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 /// `claude-opus-4-8` -> `Claude Opus 4.8`, `gemini-3.8-flash` -> `Gemini 3.8
 /// Flash`. Anything unrecognised (Ollama tags, compat models) falls back to
 /// the model id without the provider prefix, or the raw string.
-fn friendly_model_name(provider_model: &str) -> String {
+pub(crate) fn friendly_model_name(provider_model: &str) -> String {
     let model = provider_model
         .split_once(':')
         .map(|(_, model)| model)
@@ -691,7 +766,59 @@ mod tests {
             group: group.map(|g| g.to_string()),
             requires_model,
             effect: Effect::None,
+            takes_text: false,
         }
+    }
+
+    // -- scroll_thumb (#883) ---------------------------------------------
+
+    #[test]
+    fn no_thumb_when_every_row_fits() {
+        assert_eq!(scroll_thumb(0, 12, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 3, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 0, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 20, 0, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 20, 12, 0, 24), None);
+    }
+
+    #[test]
+    fn the_thumb_is_the_visible_share_of_the_track() {
+        // 24 rows, 12 visible: half the track.
+        assert_eq!(scroll_thumb(0, 24, 12, 312, 24), Some((0, 156)));
+    }
+
+    #[test]
+    fn the_thumb_touches_the_top_at_offset_zero_and_the_bottom_at_the_end() {
+        let (top, len) = scroll_thumb(0, 30, 12, 312, 24).unwrap();
+        assert_eq!(top, 0);
+        let (top, len2) = scroll_thumb(18, 30, 12, 312, 24).unwrap();
+        assert_eq!(len, len2);
+        assert_eq!(top + len2, 312);
+        // Past the end is the end.
+        assert_eq!(
+            scroll_thumb(99, 30, 12, 312, 24),
+            scroll_thumb(18, 30, 12, 312, 24)
+        );
+    }
+
+    #[test]
+    fn the_thumb_moves_down_with_the_offset_and_stays_in_the_track() {
+        let mut last = 0;
+        for offset in 0..=88 {
+            let (top, len) = scroll_thumb(offset, 100, 12, 312, 24).unwrap();
+            assert!(top >= last, "offset {offset}");
+            assert!(top >= 0 && top + len <= 312, "offset {offset}");
+            last = top;
+        }
+    }
+
+    #[test]
+    fn a_very_long_list_still_gets_a_thumb_you_can_see() {
+        let (_, len) = scroll_thumb(0, 5000, 12, 312, 24).unwrap();
+        assert_eq!(len, 24);
+        // A track shorter than the minimum: the thumb is the whole track.
+        let (top, len) = scroll_thumb(0, 5000, 12, 10, 24).unwrap();
+        assert_eq!((top, len), (0, 10));
     }
 
     // -- fuzzy_score ---------------------------------------------------
@@ -830,6 +957,112 @@ mod tests {
             })
             .collect();
         assert_eq!(ids[0], "b", "prefix match must rank first: {rows:?}");
+    }
+
+    fn text_action(id: &str, name: &str) -> PaletteAction {
+        PaletteAction {
+            takes_text: true,
+            ..action(id, name, None, true)
+        }
+    }
+
+    fn ids(rows: &[Row]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|r| match r {
+                Row::Action { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_question_that_matches_no_name_still_lists_the_actions_that_take_text() {
+        let actions = [
+            action("a", "Check my work", None, true),
+            text_action("t", "Ask my documents"),
+        ];
+        let rows = build_rows(&actions, "when did I start at Acme?", true);
+        assert_eq!(ids(&rows), ["t"]);
+        assert_eq!(rows[0], Row::Hint(NO_ACTION_MATCH_HINT.to_string()));
+        assert!(!NO_ACTION_MATCH_HINT.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_pinned_row_is_not_preselected_when_no_name_matches() {
+        let actions = [
+            action("a", "Check my work", None, true),
+            text_action("t", "Ask my documents"),
+        ];
+        let mut state = PaletteState::new(build_rows(&actions, "wire money to X", true));
+        assert_eq!(state.selected_action_id(), None);
+        // Enter with nothing selected runs nothing.
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::None
+        );
+        // Up stays put, Down selects the pinned row, then Enter runs it.
+        handle_key(&mut state, PaletteKey::Up);
+        assert_eq!(state.selected_action_id(), None);
+        handle_key(&mut state, PaletteKey::Down);
+        assert_eq!(state.selected_action_id(), Some("t"));
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::Run("t".to_string())
+        );
+    }
+
+    #[test]
+    fn with_name_matches_the_first_match_is_selected_and_pinned_rows_follow() {
+        let actions = [
+            action("a", "Ask a friend", None, true),
+            text_action("z", "Zebra answers"),
+        ];
+        let rows = build_rows(&actions, "friend", true);
+        assert!(!rows.iter().any(|r| matches!(r, Row::Hint(_))));
+        let state = PaletteState::new(rows);
+        assert_eq!(state.selected_action_id(), Some("a"));
+    }
+
+    #[test]
+    fn text_actions_follow_the_matches_and_are_never_listed_twice() {
+        let actions = [
+            action("a", "Ask a friend", None, true),
+            text_action("z", "Zebra answers"),
+            text_action("t", "Ask my documents"),
+        ];
+        // "ask" matches "Ask a friend" and "Ask my documents"; "Zebra answers"
+        // is added after them, in name order, and "t" is not repeated.
+        let rows = build_rows(&actions, "ask", true);
+        assert_eq!(ids(&rows), ["a", "t", "z"]);
+        let again = build_rows(&actions, "ask", true);
+        assert_eq!(rows, again);
+    }
+
+    #[test]
+    fn with_no_text_action_an_unmatched_line_still_shows_the_hint() {
+        let actions = [action("a", "Check my work", None, true)];
+        assert_eq!(
+            build_rows(&actions, "when did I start?", true),
+            vec![Row::Hint(NO_MATCHES_HINT.to_string())]
+        );
+    }
+
+    #[test]
+    fn the_catalogue_marks_exactly_the_actions_that_list_text() {
+        let resolved: Vec<crate::actions::Resolved> = crate::actions::builtin_actions()
+            .into_iter()
+            .map(|action| crate::actions::Resolved {
+                action,
+                origin: crate::actions::Origin::Builtin,
+            })
+            .collect();
+        let cat = catalogue(&resolved);
+        let text: Vec<&str> = cat
+            .iter()
+            .filter(|a| a.takes_text)
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(text, [crate::actions::knowledge_answer::ACTION_ID]);
     }
 
     #[test]
@@ -1109,24 +1342,6 @@ mod tests {
         assert_eq!(state.offset, 20 - MAX_VISIBLE_ROWS);
     }
 
-    // -- preselect_action (#24: the intent router's palette-side half) -----
-
-    #[test]
-    fn preselect_action_selects_the_matching_row() {
-        let mut state = PaletteState::new(three_action_rows());
-        assert_eq!(state.selected_action_id(), Some("a"));
-        assert!(preselect_action(&mut state, "c"));
-        assert_eq!(state.selected_action_id(), Some("c"));
-    }
-
-    #[test]
-    fn preselect_action_false_when_the_id_is_not_a_row_right_now() {
-        let mut state = PaletteState::new(three_action_rows());
-        assert!(!preselect_action(&mut state, "not-a-row"));
-        // Selection is untouched by a failed attempt.
-        assert_eq!(state.selected_action_id(), Some("a"));
-    }
-
     // -- dispatch table: every built-in, tested (rule 8) ------------------
 
     /// Every built-in action id (from `actions::builtin_actions()`) and
@@ -1164,6 +1379,8 @@ mod tests {
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
             crate::actions::jargon::ACTION_ID,
+            crate::actions::contact::ACTION_ID,
+            crate::actions::knowledge_answer::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
@@ -1345,12 +1562,43 @@ mod tests {
     }
 
     #[test]
+    fn a_clipboard_effect_is_never_key_pickable_and_the_others_are() {
+        assert!(key_pickable(Effect::None));
+        assert!(key_pickable(Effect::Preview));
+        assert!(!key_pickable(Effect::Clipboard));
+    }
+
+    /// #859: for every action in the catalogue, an option whose effect writes
+    /// the clipboard is never key-picked, whatever confidence a router reply
+    /// (or text on the screen) gave it. The built-ins and the two tray
+    /// utilities are all checked, and the set is not empty.
+    #[test]
+    fn no_clipboard_action_in_the_catalogue_is_key_pickable() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        let clipboard: Vec<&PaletteAction> = cat
+            .iter()
+            .filter(|a| a.effect == Effect::Clipboard)
+            .collect();
+        assert!(clipboard.len() >= 3, "copy text, read QR, copy region");
+        for a in &clipboard {
+            assert!(!key_pickable(a.effect), "{}", a.id);
+        }
+        // And every non-clipboard action is, so the rule is the effect and
+        // nothing else.
+        for a in cat.iter().filter(|a| a.effect != Effect::Clipboard) {
+            assert!(key_pickable(a.effect), "{}", a.id);
+        }
+    }
+
+    #[test]
     fn effect_for_executor_never_calls_an_unknown_executor_key_pickable() {
         assert_eq!(effect_for_executor("none"), Effect::None);
         assert_eq!(effect_for_executor("clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("image_clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("replace_text"), Effect::Preview);
         assert_eq!(effect_for_executor("calendar_add"), Effect::Preview);
+        assert_eq!(effect_for_executor("contact_add"), Effect::Preview);
         assert_eq!(effect_for_executor("fill_form"), Effect::Preview);
         assert_eq!(effect_for_executor("typo"), Effect::Clipboard);
         assert_eq!(effect_for_executor(""), Effect::Clipboard);

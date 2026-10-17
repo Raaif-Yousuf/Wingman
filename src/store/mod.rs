@@ -18,8 +18,10 @@
 //! * **Only this module names `rusqlite`.** Callers get typed methods.
 
 mod acl;
+pub mod chunks;
 mod egress;
 mod import;
+pub mod knowledge;
 mod migrate;
 mod profile_field;
 mod usage_day;
@@ -382,7 +384,10 @@ fn open_default() -> Result<Store, StoreError> {
 }
 
 /// Written into the store folder once its owner-only restriction succeeded.
-const ACL_MARKER: &str = ".owner-only";
+/// The `-2` is #995: folders restricted before it still carry SYSTEM and
+/// Administrators entries, so the old marker no longer counts and the next
+/// launch restricts them again (one `icacls` call, once).
+const ACL_MARKER: &str = ".owner-only-2";
 
 /// Owner-only directory, recovery, migrations, imports.
 ///
@@ -503,6 +508,31 @@ pub fn global() -> Result<Arc<Store>, StoreError> {
     global_with(&GLOBAL, open_default)
 }
 
+/// The shared store if an earlier call already opened it, without opening it
+/// and without waiting for an open that is under way: `None` means "not ready
+/// yet". For the UI thread (#1010), where the first open (an `icacls` spawn
+/// and SQLite) would stall the keyboard hook. [`open_in_background`] does the
+/// open at start-up.
+pub fn global_if_ready() -> Option<Result<Arc<Store>, StoreError>> {
+    ready_in(&GLOBAL)
+}
+
+fn ready_in(slot: &Slot) -> Option<Result<Arc<Store>, StoreError>> {
+    slot.try_lock().ok()?.clone()
+}
+
+/// Opens the shared store once on a short-lived thread, so no UI-thread caller
+/// ever pays for the first open (#1010). One shot at start-up, no timer. If
+/// the open fails, the failure is kept and reported on the next card, exactly
+/// as when a request opens it; a request still calls [`global`] itself.
+pub fn open_in_background() {
+    let _ = std::thread::Builder::new()
+        .name("store-open".into())
+        .spawn(|| {
+            let _ = global();
+        });
+}
+
 type Slot = Mutex<Option<Result<Arc<Store>, StoreError>>>;
 
 fn global_with(
@@ -580,6 +610,203 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A store with one root and one indexed document, for the knowledge
+    /// table tests below. Goes through `open_at`, so the real pragmas
+    /// (foreign keys, trusted_schema off, secure_delete) are in force.
+    fn knowledge_store(name: &str) -> (Store, PathBuf) {
+        let dir = scratch(name);
+        let s = Store::open_at(&dir.join("wingman.db")).unwrap();
+        {
+            let conn = s.lock();
+            conn.execute_batch(
+                "INSERT INTO knowledge_root (id, path, kind, added_unix)
+                     VALUES (1, 'C:/Notes', 'default', 10);
+                 INSERT INTO document (id, root_id, rel_path, status)
+                     VALUES (1, 1, 'notes.md', 'indexed');",
+            )
+            .unwrap();
+        }
+        (s, dir)
+    }
+
+    fn fts_hits(conn: &Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH ?1",
+            [term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fresh_open_has_the_knowledge_tables() {
+        let dir = scratch("kn-tables");
+        let s = Store::open_at(&dir.join("wingman.db")).unwrap();
+        let conn = s.lock();
+        for table in ["knowledge_root", "document", "chunk", "chunk_fts"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table}");
+        }
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunk_text_is_searchable_the_moment_it_is_inserted() {
+        let (s, dir) = knowledge_store("kn-insert");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'My start date at Acme was 3 March', 'h0', 8)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "acme"), 1);
+        assert_eq!(fts_hits(&conn, "zebra"), 0);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_edited_chunk_is_searchable_by_its_new_words_only() {
+        let (s, dir) = knowledge_store("kn-update");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'alpha beta', 'h0', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chunk SET text = 'gamma delta' WHERE ordinal = 0",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "alpha"), 0);
+        assert_eq!(fts_hits(&conn, "gamma"), 1);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_document_leaves_no_chunk_and_no_full_text_row() {
+        // The done-when of #83: delete the file, and nothing of it remains.
+        let (s, dir) = knowledge_store("kn-delete");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'findable words', 'h0', 3), (1, 1, 'more findable', 'h1', 3)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "findable"), 2);
+
+        conn.execute("DELETE FROM document WHERE id = 1", [])
+            .unwrap();
+
+        let chunks: i64 = conn
+            .query_row("SELECT count(*) FROM chunk", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 0);
+        assert_eq!(fts_hits(&conn, "findable"), 0);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_a_root_cascades_to_its_documents_and_chunks() {
+        let (s, dir) = knowledge_store("kn-root");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'rooted text', 'h0', 2)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM knowledge_root WHERE id = 1", [])
+            .unwrap();
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM document) + (SELECT count(*) FROM chunk)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(fts_hits(&conn, "rooted"), 0);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_path_is_unique_within_its_root() {
+        let (s, dir) = knowledge_store("kn-unique");
+        let conn = s.lock();
+        let dup = conn.execute(
+            "INSERT INTO document (root_id, rel_path, status) VALUES (1, 'notes.md', 'pending')",
+            [],
+        );
+        assert!(dup.is_err());
+        // The same relative path under another root is a different document.
+        conn.execute(
+            "INSERT INTO knowledge_root (id, path, kind, added_unix) VALUES (2, 'D:/Vault', 'vault', 11)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO document (root_id, rel_path, status) VALUES (2, 'notes.md', 'pending')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_status_outside_the_four_known_ones_is_refused() {
+        let (s, dir) = knowledge_store("kn-status");
+        let conn = s.lock();
+        let bad = conn.execute(
+            "INSERT INTO document (root_id, rel_path, status) VALUES (1, 'x.md', 'weird')",
+            [],
+        );
+        assert!(bad.is_err());
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diacritics_do_not_hide_a_word() {
+        let (s, dir) = knowledge_store("kn-diacritics");
+        let conn = s.lock();
+        conn.execute(
+            "INSERT INTO chunk (doc_id, ordinal, text, text_hash, tokens)
+             VALUES (1, 0, 'Curriculum vitae of Zoë Müller', 'h0', 5)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(fts_hits(&conn, "zoe"), 1);
+        assert_eq!(fts_hits(&conn, "muller"), 1);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn fts5_is_compiled_in() {
         // The knowledge track (#85) needs FTS5; the bundled build must have it.
@@ -595,6 +822,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    /// #1095: the bundled SQLite is built without its JSON functions (about
+    /// 36 KB). No store SQL uses them; this fails if the flag in
+    /// `.cargo/config.toml` is dropped or stops reaching the build, and tells
+    /// the next slice that wants `json_extract` where to turn it back on.
+    #[test]
+    fn the_bundled_sqlite_has_no_json_functions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let r: rusqlite::Result<String> = conn.query_row("SELECT json('{}')", [], |r| r.get(0));
+        assert!(
+            r.is_err(),
+            "json() exists: -DSQLITE_OMIT_JSON is not applied"
+        );
     }
 
     #[test]
@@ -765,6 +1006,36 @@ mod tests {
             }
         }
         assert!(checked > 20, "only {checked} files scanned");
+    }
+
+    #[test]
+    fn global_if_ready_never_opens_the_store() {
+        // #1010: the UI thread asks this way, so it must not open anything.
+        let slot: Slot = Mutex::new(None);
+        assert!(ready_in(&slot).is_none(), "an unopened store is not ready");
+        assert!(slot.lock().unwrap().is_none(), "asking must not open it");
+    }
+
+    #[test]
+    fn global_if_ready_does_not_wait_for_an_open_in_progress() {
+        let slot: Slot = Mutex::new(None);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let slot_ref = &slot;
+            s.spawn(move || {
+                let _ = global_with(slot_ref, || {
+                    started_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Err(StoreError::Acl("slow".to_string()))
+                });
+            });
+            started_rx.recv().unwrap();
+            // The open holds the lock; the caller gets "not ready", not a wait.
+            assert!(ready_in(&slot).is_none());
+            go_tx.send(()).unwrap();
+        });
+        assert!(matches!(ready_in(&slot), Some(Err(StoreError::Acl(_)))));
     }
 
     #[test]

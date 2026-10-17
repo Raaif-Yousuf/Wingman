@@ -52,6 +52,9 @@ pub fn result_card_text(
         if proposal_kind == super::jargon::PROPOSAL_KIND {
             return super::jargon::card_text(proposal);
         }
+        if proposal_kind == super::knowledge_answer::PROPOSAL_KIND {
+            return super::knowledge_answer::card_text(proposal);
+        }
         if let Some(answer) = proposal_answer(proposal) {
             return answer;
         }

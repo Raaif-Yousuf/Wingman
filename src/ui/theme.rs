@@ -7,8 +7,8 @@
 //! helpers every surface uses to know when to call them again. Colours are GDI
 //! `COLORREF` values (`0x00BBGGRR`), the same layout `rgb` builds.
 //!
-//! The card and the region overlay paint from these tokens in light, dark and
-//! high contrast. The palette and Settings move onto them in later slices.
+//! The card, the region overlay and the palette paint from these tokens in
+//! light, dark and high contrast. Settings moves onto them in a later slice.
 
 use std::ffi::c_void;
 
@@ -172,12 +172,17 @@ pub(crate) struct Tokens {
     /// Clickable text (the card's footer links). Not greyed in high
     /// contrast, where grey text means disabled.
     pub(crate) link: u32,
-    /// Error text.
+    /// Error text and the error mark: the Windows 11 Fluent critical colour,
+    /// `#C42B1C` on light and `#FF99A4` on dark (#819).
     pub(crate) danger: u32,
     /// The overlay's note mark and its label's outline: drawn straight on
     /// the page and on the label pill, so it is held to 3:1 against the
     /// surface (a graphic, not text).
     pub(crate) mark_note: u32,
+    /// The fill of a text box, one step off the surface it sits on (Windows 11
+    /// `ControlFillColorDefault`). High contrast has no tints: the window
+    /// colour, with the border carrying the shape.
+    pub(crate) control_fill: u32,
 }
 
 /// Neither pure black nor pure white, per the card spec.
@@ -188,8 +193,9 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text_dim: rgb(90, 90, 90),
     text_faint: rgb(112, 112, 112),
     link: rgb(112, 112, 112),
-    danger: rgb(200, 50, 50),
     mark_note: rgb(0, 95, 184),
+    danger: rgb(0xC4, 0x2B, 0x1C),
+    control_fill: rgb(255, 255, 255),
 };
 
 pub(crate) const DARK: Tokens = Tokens {
@@ -199,8 +205,9 @@ pub(crate) const DARK: Tokens = Tokens {
     text_dim: rgb(190, 190, 190),
     text_faint: rgb(140, 140, 140),
     link: rgb(140, 140, 140),
-    danger: rgb(240, 100, 100),
     mark_note: rgb(96, 170, 255),
+    danger: rgb(0xFF, 0x99, 0xA4),
+    control_fill: rgb(45, 45, 45),
 };
 
 /// The Windows system colours that matter in high contrast, read again on
@@ -253,6 +260,7 @@ impl Tokens {
                 link: sys.hotlight,
                 danger: sys.window_text,
                 mark_note: sys.highlight,
+                control_fill: sys.window,
             },
         }
     }
@@ -485,9 +493,165 @@ pub(crate) const PADDING_DP: i32 = SPACE_LG_DP;
 pub(crate) const GAP_DP: i32 = SPACE_SM_DP;
 /// Corner radius of owner-drawn controls, in dp.
 pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
+/// Space between a dropdown combo's border and its text, in dp (Windows 11
+/// leaves 8 on each side).
+pub(crate) const COMBO_TEXT_PAD_DP: i32 = SPACE_SM_DP;
+/// Thickness of the accent line under a focused text box, in dp (the
+/// Windows 11 text box underline).
+pub(crate) const FOCUS_LINE_DP: i32 = 2;
+/// Height of a button, in dp (Windows 11 controls are 32 tall).
+pub(crate) const CONTROL_HEIGHT_DP: i32 = 32;
+/// Gap between stacked rows of a form, in dp.
+pub(crate) const FORM_ROW_GAP_DP: i32 = SPACE_MD_DP;
+/// Gap between a form label and its value, in dp.
+pub(crate) const LABEL_VALUE_GAP_DP: i32 = SPACE_SM_DP;
+/// The icon font on Windows 11, and the one it replaced, which Windows 10
+/// still has. Use [`icon_font_face`] to pick one.
+pub(crate) const FLUENT_ICON_FONT_FACE: &str = "Segoe Fluent Icons";
+pub(crate) const MDL2_ICON_FONT_FACE: &str = "Segoe MDL2 Assets";
+/// The magnifier glyph, the same code point in both icon fonts.
+pub(crate) const GLYPH_SEARCH: char = '\u{E721}';
+/// The error mark beside an error card's headline.
+pub(crate) const GLYPH_ERROR: char = '\u{E783}';
+/// Side of the square an icon glyph is drawn in, in dp.
+pub(crate) const ICON_BOX_DP: i32 = 16;
+/// Font size of an icon glyph in a text box or list row, in dp.
+pub(crate) const ICON_FONT_DP: i32 = 14;
+
+/// The icon font to draw glyphs in: Segoe Fluent Icons when it is installed,
+/// otherwise Segoe MDL2 Assets (Windows 10).
+pub(crate) fn icon_font_face(fluent_installed: bool) -> &'static str {
+    if fluent_installed {
+        FLUENT_ICON_FONT_FACE
+    } else {
+        MDL2_ICON_FONT_FACE
+    }
+}
+
 /// Corner radius of a top-level window, in dp (what `DWMWCP_ROUND` draws).
 #[allow(dead_code)] // ramp token for surfaces not yet moved onto it
 pub(crate) const WINDOW_RADIUS_DP: i32 = 8;
+
+// ---------------------------------------------------------------------------
+// The Settings navigation rail (#872)
+// ---------------------------------------------------------------------------
+
+/// Width of the left navigation rail, in dp.
+pub(crate) const RAIL_W_DP: i32 = 188;
+/// Height of one rail item, in dp. Five items need 200 dp, so the rail never
+/// scrolls where the window fits.
+pub(crate) const RAIL_ITEM_H_DP: i32 = 40;
+/// Space above the first item, in dp.
+pub(crate) const RAIL_TOP_PAD_DP: i32 = SPACE_SM_DP;
+/// Inset of an item's selection fill from the rail's sides, in dp.
+pub(crate) const RAIL_INSET_DP: i32 = SPACE_XS_DP;
+/// Width and height of the selected item's accent pill, in dp.
+pub(crate) const RAIL_PILL_W_DP: i32 = 3;
+pub(crate) const RAIL_PILL_H_DP: i32 = 16;
+/// Where an item's icon box starts, from the item's left edge, and where its
+/// text starts, in dp.
+pub(crate) const RAIL_ICON_X_DP: i32 = 16;
+pub(crate) const RAIL_TEXT_X_DP: i32 = 44;
+
+// ---------------------------------------------------------------------------
+// Menus (the tray menu, #825)
+// ---------------------------------------------------------------------------
+
+/// Height of one menu row, in dp. Windows 11's own flyout menus use 32.
+pub(crate) const MENU_ITEM_HEIGHT_DP: i32 = 32;
+/// Height of a separator row, in dp: a hairline with 4 dp above and below.
+pub(crate) const MENU_SEPARATOR_HEIGHT_DP: i32 = 9;
+/// Padding above the first row and below the last, and the inset of the
+/// hover pill from the menu's sides, in dp.
+pub(crate) const MENU_EDGE_PAD_DP: i32 = SPACE_XS_DP;
+/// Gap between the hover pill and the row's top and bottom, in dp.
+pub(crate) const MENU_PILL_INSET_Y_DP: i32 = 2;
+/// Width of the left gutter (icon, radio dot) measured from the pill's left
+/// edge to where the text starts, in dp.
+pub(crate) const MENU_GUTTER_DP: i32 = 36;
+/// Space reserved at the right of a row for the submenu chevron, in dp.
+pub(crate) const MENU_CHEVRON_AREA_DP: i32 = 28;
+/// Right padding of a row without a chevron, in dp.
+pub(crate) const MENU_RIGHT_PAD_DP: i32 = SPACE_LG_DP;
+/// Minimum gap between a label and its right-aligned hint, in dp.
+pub(crate) const MENU_HINT_GAP_DP: i32 = SPACE_XL_DP;
+/// Narrowest and widest a menu is allowed to be, in dp.
+pub(crate) const MENU_MIN_WIDTH_DP: i32 = 200;
+pub(crate) const MENU_MAX_WIDTH_DP: i32 = 420;
+/// Glyph size of the icon column, in px at 96 DPI.
+pub(crate) const MENU_ICON_PX: i32 = 16;
+/// How far the hover pill is moved from the surface toward the text colour,
+/// in percent. Windows 11 uses a 6% white (dark) or black (light) overlay.
+const MENU_HOVER_PCT: u32 = 6;
+/// How far disabled text is moved from the text colour toward the surface,
+/// in percent.
+const MENU_DISABLED_PCT: u32 = 55;
+
+/// The colour of the progress ring's moving arc: the user's accent, and the
+/// system highlight in high contrast. `accent` is already held to 3:1 against
+/// the card (`accent_fill`).
+pub(crate) fn progress_ring_ink(theme: Theme, sys: &SysColors, accent: u32) -> u32 {
+    match theme {
+        Theme::HighContrast => sys.highlight,
+        Theme::Light | Theme::Dark => accent,
+    }
+}
+
+/// How far a keycap is moved from the row it sits on toward the text colour,
+/// in percent: a quiet neutral chip, as Windows draws a shortcut.
+const KEYCAP_FILL_PCT: u32 = 10;
+
+/// The fill of a keycap on a row painted `row_fill`. High contrast has no
+/// tints, so it is the row colour and the border carries the shape.
+pub(crate) fn keycap_fill(theme: Theme, row_fill: u32, text: u32) -> u32 {
+    match theme {
+        Theme::HighContrast => row_fill,
+        Theme::Light | Theme::Dark => {
+            crate::ui::card_buttons::blend(row_fill, text, KEYCAP_FILL_PCT)
+        }
+    }
+}
+
+/// The fill of the hovered or keyboard-selected row. High contrast uses the
+/// system highlight, as every native menu does.
+pub(crate) fn menu_hover_fill(theme: Theme, tokens: &Tokens, sys: &SysColors) -> u32 {
+    match theme {
+        Theme::HighContrast => sys.highlight,
+        Theme::Light | Theme::Dark => {
+            crate::ui::card_buttons::blend(tokens.surface, tokens.text, MENU_HOVER_PCT)
+        }
+    }
+}
+
+/// The text colour of a row, by whether it is hovered and whether it can be
+/// used. High contrast uses `HighlightText` on the highlight and `GrayText`
+/// for a disabled row.
+pub(crate) fn menu_text_color(
+    theme: Theme,
+    tokens: &Tokens,
+    sys: &SysColors,
+    hot: bool,
+    disabled: bool,
+) -> u32 {
+    match theme {
+        Theme::HighContrast => {
+            if hot {
+                sys.highlight_text
+            } else if disabled {
+                sys.gray_text
+            } else {
+                sys.window_text
+            }
+        }
+        Theme::Light | Theme::Dark => {
+            if disabled {
+                crate::ui::card_buttons::blend(tokens.text, tokens.surface, MENU_DISABLED_PCT)
+            } else {
+                tokens.text
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -506,7 +670,9 @@ mod tests {
         assert_eq!(LIGHT.text, rgb(23, 23, 23));
         assert_eq!(LIGHT.text_dim, rgb(90, 90, 90));
         assert_eq!(LIGHT.text_faint, rgb(112, 112, 112));
-        assert_eq!(LIGHT.danger, rgb(200, 50, 50));
+        assert_eq!(LIGHT.danger, rgb(0xC4, 0x2B, 0x1C));
+        assert_eq!(LIGHT.control_fill, rgb(255, 255, 255));
+        assert_eq!(DARK.control_fill, rgb(45, 45, 45));
         assert_eq!(LIGHT.link, LIGHT.text_faint);
         assert_eq!(DARK.link, DARK.text_faint);
         assert_eq!(DARK.surface, rgb(32, 32, 32));
@@ -514,7 +680,7 @@ mod tests {
         assert_eq!(DARK.text, rgb(245, 245, 245));
         assert_eq!(DARK.text_dim, rgb(190, 190, 190));
         assert_eq!(DARK.text_faint, rgb(140, 140, 140));
-        assert_eq!(DARK.danger, rgb(240, 100, 100));
+        assert_eq!(DARK.danger, rgb(0xFF, 0x99, 0xA4));
     }
 
     #[test]
@@ -606,6 +772,53 @@ mod tests {
     }
 
     #[test]
+    fn the_icon_font_falls_back_to_mdl2_when_fluent_is_missing() {
+        assert_eq!(icon_font_face(true), "Segoe Fluent Icons");
+        assert_eq!(icon_font_face(false), "Segoe MDL2 Assets");
+        assert_eq!(GLYPH_SEARCH as u32, 0xE721);
+    }
+
+    #[test]
+    fn a_text_box_is_a_step_off_the_surface_except_in_high_contrast() {
+        assert_ne!(LIGHT.control_fill, LIGHT.surface);
+        assert_ne!(DARK.control_fill, DARK.surface);
+        let hc = Tokens::for_theme(Theme::HighContrast, &HC_WHITE);
+        assert_eq!(hc.control_fill, HC_WHITE.window);
+    }
+
+    #[test]
+    fn the_progress_ring_is_the_accent_and_the_system_highlight_in_high_contrast() {
+        let accent = rgb(0x00, 0x67, 0xC0);
+        assert_eq!(progress_ring_ink(Theme::Light, &HC_BLACK, accent), accent);
+        assert_eq!(progress_ring_ink(Theme::Dark, &HC_BLACK, accent), accent);
+        assert_eq!(
+            progress_ring_ink(Theme::HighContrast, &HC_WHITE, accent),
+            HC_WHITE.highlight
+        );
+        let ratio = |a, b| contrast_ratio(relative_luminance(a), relative_luminance(b));
+        for sys in [HC_BLACK, HC_WHITE] {
+            let ink = progress_ring_ink(Theme::HighContrast, &sys, accent);
+            assert!(ratio(ink, sys.window) >= 3.0);
+        }
+    }
+
+    #[test]
+    fn a_keycap_is_a_neutral_step_off_its_row_and_stays_readable() {
+        for (theme, sys) in [(Theme::Light, HC_BLACK), (Theme::Dark, HC_BLACK)] {
+            let t = Tokens::for_theme(theme, &sys);
+            let fill = keycap_fill(theme, t.surface, t.text);
+            assert_ne!(fill, t.surface, "{theme:?}: the cap is a step off the row");
+            let ratio = |a, b| contrast_ratio(relative_luminance(a), relative_luminance(b));
+            assert!(ratio(t.text_dim, fill) >= 4.5, "{theme:?}: digit on cap");
+        }
+        // High contrast has no tints: the row colour, the border carries it.
+        assert_eq!(
+            keycap_fill(Theme::HighContrast, HC_WHITE.window, HC_WHITE.window_text),
+            HC_WHITE.window
+        );
+    }
+
+    #[test]
     fn rgb_packs_as_bbggrr() {
         assert_eq!(rgb(0x11, 0x22, 0x33), 0x0033_2211);
     }
@@ -617,8 +830,10 @@ mod tests {
     }
 
     /// Every (foreground, background) text pair a theme defines.
-    fn text_pairs(t: &Tokens) -> [(&'static str, u32, u32); 5] {
+    fn text_pairs(t: &Tokens) -> [(&'static str, u32, u32); 7] {
         [
+            ("text on a text box", t.text, t.control_fill),
+            ("text_dim on a text box", t.text_dim, t.control_fill),
             ("text", t.text, t.surface),
             ("text_dim", t.text_dim, t.surface),
             ("text_faint", t.text_faint, t.surface),
@@ -652,7 +867,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 20, "the test must look at every pair");
+        assert_eq!(checked, 28, "the test must look at every pair");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "wingman"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 build = "build.rs"
@@ -21,6 +21,12 @@ serde = { version = "1.0", features = ["derive"] }
 # arithmetic and contradicts itself. Do not remove this feature.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 toml = "1.1"
+# Comment-preserving config writes (#870, src/config_writer.rs): Settings changes one
+# field and keeps every comment, unknown key and hand edit in config.toml. (MIT
+# OR Apache-2.0, re-verified 2026-10-16.) It shares toml_parser,
+# toml_datetime and winnow with `toml` 1.1, so there is no second parser in the
+# exe.
+toml_edit = "0.25"
 base64 = "0.23"
 anyhow = "1.0"
 # Pinned exactly: src/inputs/web_page.rs connects only to addresses it already
@@ -35,12 +41,21 @@ ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "js
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3.6"
+# Grapheme-cluster boundaries for the options card ellipsis (#1023). (MIT OR
+# Apache-2.0), no dependencies of its own.
+unicode-segmentation = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 # QR decoding (#313): pure Rust, no model, no network. (MIT OR Apache-2.0) AND
 # ISC (the ISC part is its port of the quirc detector), re-verified at adoption
 # 2026-10-15; its dependency chain is MIT/Apache/Zlib. Default features off:
 # the `img` feature only adds a second `image` coupling we do not use.
 rqrr = { version = "0.11", default-features = false }
+
+# card_uia.rs (#654): the `#[implement]` macro the windows crate re-exports
+# expands to paths in `windows_core`, so it must be a direct dependency. Same
+# version and licence (MIT OR Apache-2.0) as the copy `windows` already pulls in,
+# so no new code is built.
+windows-core = "0.62"
 
 [dependencies.windows]
 version = "0.62"
@@ -70,6 +85,9 @@ features = [
   # encryption at rest.
   "Win32_Security_Cryptography",
   "Win32_Storage_Packaging_Appx",
+  # #81: the knowledge folder watcher (ReadDirectoryChangesW, overlapped).
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
   # speech.rs (#77): ISpVoice, the system text-to-speech voice (SAPI).
   "Win32_Media_Speech",
   "Win32_System_Com",

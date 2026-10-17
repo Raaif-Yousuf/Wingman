@@ -71,6 +71,66 @@ pub(crate) fn with_send_authorized<R>(authorized: SendAuthorized, f: impl FnOnce
     f()
 }
 
+// ---------------------------------------------------------------------
+// Call deadline (#843)
+//
+// The router chain stops starting calls at its wall clock, but a call
+// already in flight used to run to its own 90 s or 180 s HTTP timeout, and
+// could be billed after the palette gave up. `Chain` now scopes a deadline
+// around each provider attempt; the completion entry points (`post_json_with`
+// and `post_json_with_connect_timeout`) cap their timeout to what is left of
+// it. The model download, model list and GET helpers are not part of a chain
+// attempt and are deliberately uncapped. A thread-local (like `SEND_AUTHORIZED`) keeps
+// `Request` and every provider unchanged: the attempt runs on one thread,
+// blocking, and nothing here starts a timer or a thread.
+// ---------------------------------------------------------------------
+
+thread_local! {
+    static CALL_DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// Restores the previous deadline when dropped, panic-unwind included.
+pub(crate) struct CallDeadlineScope(Option<std::time::Instant>);
+
+impl Drop for CallDeadlineScope {
+    fn drop(&mut self) {
+        CALL_DEADLINE.with(|c| c.set(self.0));
+    }
+}
+
+/// Puts `deadline` (if any) in force for this thread until the returned guard
+/// drops. A nested scope never loosens an outer one: the earlier deadline wins.
+pub(crate) fn scope_call_deadline(deadline: Option<std::time::Instant>) -> CallDeadlineScope {
+    let previous = CALL_DEADLINE.with(Cell::get);
+    let effective = match (previous, deadline) {
+        (Some(p), Some(d)) => Some(p.min(d)),
+        (p, d) => p.or(d),
+    };
+    CALL_DEADLINE.with(|c| c.set(effective));
+    CallDeadlineScope(previous)
+}
+
+/// `timeout`, capped to what is left of this thread's call deadline. `None`
+/// means the deadline has passed, so nothing may be sent (fail closed: a
+/// request nobody waits for is never started or billed).
+fn cap_to_call_deadline(timeout: Duration) -> Option<Duration> {
+    match CALL_DEADLINE.with(Cell::get) {
+        None => Some(timeout),
+        Some(d) => {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            (!left.is_zero()).then(|| timeout.min(left))
+        }
+    }
+}
+
+fn call_deadline_passed() -> bool {
+    cap_to_call_deadline(Duration::MAX).is_none()
+}
+
+fn call_deadline_error(tag: &str) -> anyhow::Error {
+    anyhow!("{tag}: the time limit for this request passed, so it was not sent")
+}
+
 /// #105: refuses to proceed when `config::egress_preview_enabled()` is on
 /// and this thread has no live [`with_send_authorized`] scope. No em dash
 /// (rule 11) -- this text reaches the result card verbatim.
@@ -137,6 +197,22 @@ pub(crate) enum TransportError {
     /// fresh attempt -- it surfaces immediately, naming the status that was
     /// received, so the card is honest about what's known to have happened.
     BodyReadFailed { status: u16, error: String },
+    /// #727: the request timed out somewhere after the connection was made,
+    /// so the vendor may have received it and may already have billed it.
+    /// Never retried: a second send could be a second charge.
+    TimedOut(String),
+}
+
+/// #727: true when this send failure proves nothing reached the vendor, so a
+/// retry cannot bill twice. Only a DNS or connect timeout qualifies; any
+/// other timeout (global, send, waiting for the response) may have come
+/// after the request was delivered. Non-timeout failures (refused, TLS,
+/// unknown host) happen before the body is sent and stay retryable.
+fn is_provably_unsent(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Timeout(t) => matches!(t, ureq::Timeout::Resolve | ureq::Timeout::Connect),
+        _ => true,
+    }
 }
 
 pub(crate) trait Transport {
@@ -177,7 +253,13 @@ impl Transport for UreqTransport {
             .timeout_global(Some(timeout))
             .build()
             .send_json(body)
-            .map_err(|e| TransportError::NoResponse(e.to_string()))?;
+            .map_err(|e| {
+                if is_provably_unsent(&e) {
+                    TransportError::NoResponse(e.to_string())
+                } else {
+                    TransportError::TimedOut(e.to_string())
+                }
+            })?;
 
         // A status was received from here on -- any further failure is
         // `BodyReadFailed`, never folded back into `NoResponse` (#187).
@@ -426,12 +508,90 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The error codes a vendor uses to say it declined the content itself:
+/// OpenAI's `content_policy_violation` and `invalid_prompt`, and the
+/// `content_filter` that Azure-style endpoints send.
+const POLICY_DECLINE_CODES: [&str; 3] = [
+    "content_policy_violation",
+    "invalid_prompt",
+    "content_filter",
+];
+
+/// Azure's own name for the same thing, found one level down in
+/// `error.innererror.code`.
+const AZURE_POLICY_CODE: &str = "ResponsibleAIPolicyViolation";
+
+/// #920: the policy-decline code in an error body, if it carries one. Only
+/// the structured `error.code`, `error.type` and `error.innererror.code`
+/// count: a body that is not JSON, or that only mentions a filter in prose,
+/// is an ordinary failure. Pure.
+fn content_policy_code(body: &str) -> Option<&'static str> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let inner = error.get("innererror").and_then(|i| i.get("code"));
+    for field in [error.get("code"), error.get("type"), inner] {
+        let Some(text) = field.and_then(Value::as_str) else {
+            continue;
+        };
+        if text == AZURE_POLICY_CODE {
+            return Some(AZURE_POLICY_CODE);
+        }
+        if let Some(code) = POLICY_DECLINE_CODES.iter().copied().find(|c| *c == text) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// #1020: the failure kinds Settings can fix that a vendor reports only in the
+/// body of a status shared with other failures. They go into the error text as
+/// `HTTP {status} ({kind})`, which `app::setup_failure` reads.
+pub(crate) const KIND_NO_CREDIT: &str = "no_credit";
+pub(crate) const KIND_KEY_INVALID: &str = "key_invalid";
+
+/// #1020: the credit or key kind an error body carries, from its structured
+/// fields only (never the status alone, so an ordinary 429 stays a rate limit):
+/// OpenAI's 429 `insufficient_quota`, Anthropic's 400 "credit balance is too
+/// low", Gemini's 400 `API_KEY_INVALID`. Pure.
+pub(crate) fn failure_kind(status: u16, body: &str) -> Option<&'static str> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error")?;
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+    let message = text(error.get("message"));
+    match status {
+        429 => ["code", "type"]
+            .iter()
+            .any(|f| text(error.get(*f)) == "insufficient_quota")
+            .then_some(KIND_NO_CREDIT),
+        400 | 402 if message.contains("credit balance") => Some(KIND_NO_CREDIT),
+        400 | 403 => {
+            let reason = error
+                .get("details")
+                .and_then(Value::as_array)
+                .is_some_and(|d| d.iter().any(|e| text(e.get("reason")) == "api_key_invalid"));
+            (reason || message.contains("api key not valid")).then_some(KIND_KEY_INVALID)
+        }
+        _ => None,
+    }
+}
+
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
-fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
+pub(crate) fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
+    // #920: a 400 that says the content was declined is a decline (it stops
+    // the chain), not a failure to retry on the next vendor. Read from the
+    // raw body: the redaction below rewrites these underscore words.
+    if status == 400 {
+        if let Some(code) = content_policy_code(body) {
+            return super::blocked_error(tag, code);
+        }
+    }
     let truncated = redact_and_truncate(body);
-    anyhow!("{tag}: HTTP {status}: {truncated}")
+    match failure_kind(status, body) {
+        Some(kind) => anyhow!("{tag}: HTTP {status} ({kind}): {truncated}"),
+        None => anyhow!("{tag}: HTTP {status}: {truncated}"),
+    }
 }
 
 /// #253: the one place network-derived text becomes user-facing text.
@@ -560,6 +720,10 @@ pub(crate) fn post_json_with(
         // timeout (the default policy's is), but a second or third attempt
         // only gets whatever remains.
         let attempt_timeout = timeout.min(wall_clock_remaining());
+        // #843: and by the chain's call deadline, if it set one.
+        let Some(attempt_timeout) = cap_to_call_deadline(attempt_timeout) else {
+            return Err(call_deadline_error(tag));
+        };
         // #106: this attempt is a retry iff an earlier attempt in THIS call
         // already failed and asked for another try (a transport/5xx retry
         // bumps `retries`, a 429 retry-after sets `retried_429`) -- read
@@ -582,11 +746,20 @@ pub(crate) fn post_json_with(
                     redact_detail(&error)
                 ));
             }
+            // #727: the request may have arrived and been billed; a second
+            // send could charge again, so this surfaces as a card at once.
+            Err(TransportError::TimedOut(e)) => {
+                return Err(anyhow!(
+                    "{tag}: the request timed out and was not sent again, in case it was already processed: {}",
+                    redact_detail(&e)
+                ));
+            }
             Err(TransportError::NoResponse(transport_err)) => {
                 let backoff_remaining = policy.max_total_backoff.saturating_sub(backoff_spent);
                 if retries < policy.max_retries
                     && !backoff_remaining.is_zero()
                     && wall_clock_remaining() > policy.retry_floor
+                    && !call_deadline_passed()
                 {
                     let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                     env.sleeper.sleep(delay);
@@ -605,8 +778,16 @@ pub(crate) fn post_json_with(
                 }
 
                 if resp.status == 429 {
+                    // #1020: out of credit, not a rate limit: no retry, and the
+                    // text says so.
+                    if failure_kind(429, &resp.body).is_some() {
+                        return Err(http_error(tag, 429, &resp.body));
+                    }
                     let retry_after = parse_retry_after(&resp.headers, env.clock);
-                    if !retried_429 && wall_clock_remaining() > policy.retry_floor {
+                    if !retried_429
+                        && wall_clock_remaining() > policy.retry_floor
+                        && !call_deadline_passed()
+                    {
                         if let Some(delay) = retry_after {
                             if delay <= policy.max_retry_after {
                                 env.sleeper.sleep(delay);
@@ -623,6 +804,7 @@ pub(crate) fn post_json_with(
                     if retries < policy.max_retries
                         && !backoff_remaining.is_zero()
                         && wall_clock_remaining() > policy.retry_floor
+                        && !call_deadline_passed()
                     {
                         let delay = jittered_backoff(retries, policy.base_delay, backoff_remaining);
                         env.sleeper.sleep(delay);
@@ -690,6 +872,16 @@ fn log_attempt(
             0,
             egress::Outcome::Failure,
             Some(&format!("transport error: {e}")),
+        ),
+        Err(TransportError::TimedOut(e)) => egress::build_entry(
+            tag,
+            url,
+            body,
+            is_retry,
+            bytes_sent,
+            0,
+            egress::Outcome::Failure,
+            Some(&format!("timed out: {e}")),
         ),
         Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
             tag,
@@ -855,8 +1047,7 @@ pub(crate) fn get_text_with_timeout(url: &str, timeout: Duration, tag: &str) -> 
         .with_context(|| format!("{tag}: failed to read response body"))?;
 
     if !status.is_success() {
-        let truncated = redact_and_truncate(&body_text);
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status.as_u16(), &body_text));
     }
 
     Ok(body_text)
@@ -903,8 +1094,7 @@ pub(crate) fn get_json_with_headers(
     // `e` was redacted by `get_with_headers_raw` already.
     let resp = result.map_err(|e| anyhow!("{tag}: transport error: {}", e))?;
     if !(200..300).contains(&resp.status) {
-        let truncated = redact_and_truncate(&resp.body);
-        return Err(anyhow!("{tag}: HTTP {}: {truncated}", resp.status));
+        return Err(http_error(tag, resp.status, &resp.body));
     }
     Ok(resp.body)
 }
@@ -1064,8 +1254,7 @@ pub(crate) fn post_json_read_body<T>(
     if !(200..300).contains(&status) {
         let mut text = Vec::new();
         let _ = (&mut body_reader).take(4096).read_to_end(&mut text);
-        let truncated = redact_and_truncate(&String::from_utf8_lossy(&text));
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status, &String::from_utf8_lossy(&text)));
     }
     read(&mut body_reader)
 }
@@ -1132,8 +1321,7 @@ fn post_json_read_body_ureq<T>(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.body_mut().read_to_string().unwrap_or_default();
-        let truncated = redact_and_truncate(&body_text);
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status.as_u16(), &body_text));
     }
 
     let mut reader = response.body_mut().as_reader();
@@ -1255,6 +1443,14 @@ pub(crate) fn post_json_with_connect_timeout(
     // an attempt logged from this function is never a retry.
     let bytes_sent = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
 
+    // #843: both phases are capped to the chain's call deadline, if any.
+    let (Some(connect_timeout), Some(total_timeout)) = (
+        cap_to_call_deadline(connect_timeout),
+        cap_to_call_deadline(total_timeout),
+    ) else {
+        return Err(call_deadline_error(tag));
+    };
+
     let mut builder = ureq::post(url);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
@@ -1327,7 +1523,7 @@ pub(crate) fn post_json_with_connect_timeout(
             ),
             &redactions,
         );
-        return Err(anyhow!("{tag}: HTTP {status}: {truncated}"));
+        return Err(http_error(tag, status.as_u16(), &body_text));
     }
 
     record_entry(
@@ -1456,6 +1652,37 @@ mod tests {
         }
     }
 
+    // -- #1020: credit and key failures, read from the structured body --------
+
+    #[test]
+    fn a_429_for_no_credit_is_told_apart_from_a_rate_limit() {
+        let quota = r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        assert_eq!(failure_kind(429, quota), Some(KIND_NO_CREDIT));
+        let text = http_error("openai", 429, quota).to_string();
+        assert!(text.starts_with("openai: HTTP 429 (no_credit): "), "{text}");
+        // An ordinary rate limit, or a body that is not JSON, is not credit.
+        let rate = r#"{"error":{"message":"Rate limit reached","type":"requests","code":"rate_limit_exceeded"}}"#;
+        assert_eq!(failure_kind(429, rate), None);
+        assert_eq!(failure_kind(429, "insufficient_quota"), None);
+        assert_eq!(failure_kind(500, quota), None);
+    }
+
+    #[test]
+    fn anthropic_low_credit_and_gemini_bad_key_are_read_from_the_body() {
+        let low = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#;
+        assert_eq!(failure_kind(400, low), Some(KIND_NO_CREDIT));
+        let other = r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens must be positive"}}"#;
+        assert_eq!(failure_kind(400, other), None);
+        let key = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"x","reason":"API_KEY_INVALID"}]}}"#;
+        assert_eq!(failure_kind(400, key), Some(KIND_KEY_INVALID));
+        let text = http_error("gemini", 400, key).to_string();
+        assert!(
+            text.starts_with("gemini: HTTP 400 (key_invalid): "),
+            "{text}"
+        );
+        let plain = r#"{"error":{"code":400,"message":"Bad field","status":"INVALID_ARGUMENT"}}"#;
+        assert_eq!(failure_kind(400, plain), None);
+    }
     #[test]
     fn wire_schema_removes_editable_everywhere_and_keeps_every_other_key_in_order() {
         let kinds = crate::actions::schema::PROPOSAL_KINDS;
@@ -1584,6 +1811,12 @@ mod tests {
                 .collect(),
             body: body.to_string(),
         })
+    }
+
+    /// A scripted #727 failure: the request timed out after it may have
+    /// reached the vendor.
+    fn timed_out(msg: &str) -> std::result::Result<RawResponse, TransportError> {
+        Err(TransportError::TimedOut(msg.to_string()))
     }
 
     /// A scripted #187 failure: a status was received, then reading the
@@ -2095,6 +2328,52 @@ mod tests {
         assert_eq!(transport.call_count(), 1);
         assert!(sleeper.recorded().is_empty());
         assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    fn a_timeout_is_never_retried_because_the_vendor_may_have_billed_it() {
+        let _g = network_guard();
+        // #727: a timeout does not prove the request never arrived, so a
+        // second send could be a second billed completion.
+        let transport = ScriptedTransport::new(vec![timed_out("timeout: global"), ok("done")]);
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+
+        let err = run(&transport, &sleeper, &clock).unwrap_err();
+
+        assert_eq!(transport.call_count(), 1);
+        assert!(sleeper.recorded().is_empty());
+        let text = err.to_string();
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    #[test]
+    fn the_real_transport_reports_a_silent_server_as_timed_out() {
+        // The wiring check for #727: a server that accepts and never answers
+        // must come back as `TimedOut` from the real `ureq` transport, not
+        // `NoResponse`, or the retry loop would send the request again.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_millis(300));
+        drop(listener);
+        assert!(matches!(result, Err(TransportError::TimedOut(_))));
+    }
+
+    #[test]
+    fn only_a_resolve_or_connect_timeout_counts_as_provably_unsent() {
+        use ureq::Timeout;
+        assert!(is_provably_unsent(&ureq::Error::Timeout(Timeout::Resolve)));
+        assert!(is_provably_unsent(&ureq::Error::Timeout(Timeout::Connect)));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(Timeout::Global)));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(
+            Timeout::RecvResponse
+        )));
+        assert!(!is_provably_unsent(&ureq::Error::Timeout(
+            Timeout::SendBody
+        )));
+        // Any non-timeout failure keeps the existing behaviour (retryable).
+        assert!(is_provably_unsent(&ureq::Error::HostNotFound));
     }
 
     #[test]
@@ -3093,6 +3372,60 @@ mod tests {
         assert_eq!(msg, "anthropic: HTTP 400: {\"error\": \"model not found\"}");
     }
 
+    /// #920: a 400 whose error code says the content was declined is a
+    /// decline, not a plain failure, so the chain stops instead of sending
+    /// the same screenshot to the next vendor. Covers OpenAI's two codes and
+    /// the Azure-style one, in the places each puts them.
+    #[test]
+    fn an_http_400_content_policy_code_is_a_decline() {
+        let bodies = [
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"content_policy_violation"}}"#,
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"invalid_prompt"}}"#,
+            r#"{"error":{"message":"m","type":"invalid_request_error","param":"prompt","code":"content_filter"}}"#,
+            r#"{"error":{"message":"m","type":"content_filter"}}"#,
+            r#"{"error":{"code":"BadRequest","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#,
+        ];
+        for body in bodies {
+            let _g = network_guard();
+            let transport = ScriptedTransport::new(vec![status(400, vec![], body)]);
+            let err = run(&transport, &RecordingSleeper::new(), &FixedClock(0)).unwrap_err();
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_some(),
+                "{body}: {err:#}"
+            );
+            assert_eq!(
+                transport.call_count(),
+                1,
+                "{body}: a decline is never retried"
+            );
+        }
+    }
+
+    /// #920: only a code decides. Other 400s, a prose mention of a filter, a
+    /// body that is not JSON and a non-400 status stay plain failures.
+    #[test]
+    fn other_http_errors_are_not_declines() {
+        let cases = [
+            (400, r#"{"error":{"code":"invalid_api_key"}}"#),
+            (
+                400,
+                r#"{"error":{"message":"the content_filter setting is off"}}"#,
+            ),
+            (400, "content_policy_violation"),
+            (400, ""),
+            (401, r#"{"error":{"code":"content_filter"}}"#),
+        ];
+        for (code, body) in cases {
+            let _g = network_guard();
+            let transport = ScriptedTransport::new(vec![status(code, vec![], body)]);
+            let err = run(&transport, &RecordingSleeper::new(), &FixedClock(0)).unwrap_err();
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_none(),
+                "{code} {body}: {err:#}"
+            );
+        }
+    }
+
     /// A transport error's text is network-derived too: it carries the URL,
     /// and `openai_compat` points at whatever base URL the user configured
     /// (#16's list includes proxies that take a key as a query parameter).
@@ -3137,7 +3470,7 @@ mod tests {
         // #281: without this, a rename of the local would empty the
         // haystack and the test would pass by checking nothing.
         assert!(
-            candidates.len() >= 4,
+            candidates.len() >= 2,
             "the scanner found only {} `let truncated` bindings; the naming must have changed and this test is no longer checking anything",
             candidates.len()
         );
@@ -3279,16 +3612,22 @@ mod tests {
 
     /// Sets the budget and the spend `usage::check_budget` sees, and puts both
     /// back on drop (also when an assertion panics), so no other test in the
-    /// binary ever sees them. Callers hold `network_guard()` for the whole test.
-    struct BudgetScope;
+    /// binary ever sees them. Callers hold `network_guard()` for the whole test
+    /// (egress lock first), and this takes the usage test lock after it, the
+    /// order `usage::USAGE_TEST_LOCK` documents (#990). The lock is released
+    /// after `drop` has reset the budget.
+    struct BudgetScope {
+        _usage: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl BudgetScope {
         fn new(limit_usd: f64, spent: f64) -> Self {
+            let usage = crate::usage::lock_usage_test();
             crate::usage::set_daily_budget(limit_usd, 80);
             *crate::usage::SPENT_OVERRIDE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(spent);
-            BudgetScope
+            BudgetScope { _usage: usage }
         }
     }
 
@@ -3430,6 +3769,273 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Daily budget"), "{err}");
+    }
+
+    // -- #843: a call deadline reaches the HTTP timeout ---------------------
+
+    /// Records the timeout each attempt was given and optionally sleeps, then
+    /// answers with a scripted pre-response failure.
+    struct TimeoutProbe {
+        seen: Mutex<Vec<Duration>>,
+        sleep: Duration,
+    }
+
+    impl Transport for TimeoutProbe {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &Value,
+            timeout: Duration,
+        ) -> std::result::Result<RawResponse, TransportError> {
+            self.seen.lock().unwrap().push(timeout);
+            std::thread::sleep(self.sleep);
+            no_response("connection reset")
+        }
+    }
+
+    fn probe_call(
+        probe: &TimeoutProbe,
+        sleeper: &RecordingSleeper,
+        timeout: Duration,
+    ) -> Result<String> {
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport: probe,
+            sleeper,
+            clock: &FixedClock(0),
+            policy: &policy,
+        };
+        post_json_with(
+            &env,
+            "https://example.invalid/",
+            &[],
+            json!({}),
+            timeout,
+            "anthropic",
+        )
+    }
+
+    #[test]
+    fn a_call_deadline_caps_the_attempt_timeout() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::ZERO,
+        };
+        let _scope =
+            scope_call_deadline(Some(std::time::Instant::now() + Duration::from_millis(400)));
+        let _ = probe_call(&probe, &RecordingSleeper::new(), Duration::from_secs(90));
+        let first = probe.seen.lock().unwrap()[0];
+        assert!(first <= Duration::from_millis(400), "got {first:?}");
+    }
+
+    #[test]
+    fn without_a_call_deadline_the_requested_timeout_is_used() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::ZERO,
+        };
+        let _ = probe_call(&probe, &RecordingSleeper::new(), Duration::from_secs(1));
+        assert_eq!(probe.seen.lock().unwrap()[0], Duration::from_secs(1));
+    }
+
+    #[test]
+    fn no_retry_starts_after_the_call_deadline() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::from_millis(80),
+        };
+        let sleeper = RecordingSleeper::new();
+        let _scope =
+            scope_call_deadline(Some(std::time::Instant::now() + Duration::from_millis(30)));
+        let result = probe_call(&probe, &sleeper, Duration::from_secs(90));
+        assert!(result.is_err());
+        assert_eq!(probe.seen.lock().unwrap().len(), 1, "no second attempt");
+        assert!(sleeper.recorded().is_empty(), "no backoff sleep either");
+    }
+
+    #[test]
+    fn a_call_deadline_already_past_sends_nothing() {
+        let _g = network_guard();
+        let probe = TimeoutProbe {
+            seen: Mutex::new(vec![]),
+            sleep: Duration::ZERO,
+        };
+        let past = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("clock is past 5 ms");
+        let _scope = scope_call_deadline(Some(past));
+        let err =
+            probe_call(&probe, &RecordingSleeper::new(), Duration::from_secs(90)).unwrap_err();
+        assert!(probe.seen.lock().unwrap().is_empty());
+        assert!(format!("{err:#}").contains("time limit"), "{err:#}");
+    }
+
+    #[test]
+    fn the_scope_restores_the_previous_deadline_and_keeps_the_earlier_one() {
+        let now = std::time::Instant::now();
+        let outer = now + Duration::from_secs(5);
+        {
+            let _a = scope_call_deadline(Some(outer));
+            {
+                let _b = scope_call_deadline(Some(now + Duration::from_secs(60)));
+                assert_eq!(
+                    CALL_DEADLINE.with(Cell::get),
+                    Some(outer),
+                    "later one never loosens"
+                );
+            }
+            assert_eq!(CALL_DEADLINE.with(Cell::get), Some(outer));
+        }
+        assert_eq!(CALL_DEADLINE.with(Cell::get), None);
+    }
+
+    /// The real thing: a server that accepts and never answers. With a 300 ms
+    /// call deadline the Ollama-style call (30 s total timeout) is abandoned
+    /// at about that time instead of at its own timeout.
+    #[test]
+    fn a_silent_server_is_abandoned_at_the_call_deadline() {
+        let _g = network_guard();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let held = listener.accept();
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let result = {
+            let _scope = scope_call_deadline(Some(started + Duration::from_millis(300)));
+            post_json_with_connect_timeout(
+                &format!("http://127.0.0.1:{port}/api/chat"),
+                &[],
+                json!({}),
+                Duration::from_secs(3),
+                Duration::from_secs(30),
+                "ollama",
+            )
+        };
+        let took = started.elapsed();
+        let _ = stop_tx.send(());
+        let _ = server.join();
+        assert!(result.is_err());
+        assert!(took < Duration::from_secs(3), "took {took:?}");
+    }
+
+    // -- #941 / #942: one shared HTTP error builder -------------------------
+
+    const POLICY_BODY: &str = r#"{"error":{"message":"m","type":"invalid_request_error","param":null,"code":"content_policy_violation"}}"#;
+
+    /// A loopback server that reads one request up to the blank line (and a
+    /// `}` body end, when a body follows) and answers `status` with `body`.
+    fn status_server(status: u16, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n")
+                    || (req.starts_with(b"POST") && !req.ends_with(b"}"))
+                {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes());
+                let _ = s.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/x")
+    }
+
+    /// #942: every send and read helper treats a content-policy 400 as a
+    /// decline, so it stops the chain and the card shows the vendor's reason.
+    #[test]
+    fn every_http_helper_recognises_a_content_policy_decline() {
+        let _g = network_guard();
+        let t = Duration::from_secs(3);
+        let results = [
+            (
+                "post_json_read_body",
+                post_json_read_body(
+                    &status_server(400, POLICY_BODY),
+                    &json!({"model": "m"}),
+                    t,
+                    "test",
+                    &std::sync::atomic::AtomicBool::new(false),
+                    t,
+                    |_| Ok(()),
+                )
+                .map(|()| String::new()),
+            ),
+            (
+                "post_json_with_connect_timeout",
+                post_json_with_connect_timeout(
+                    &status_server(400, POLICY_BODY),
+                    &[],
+                    json!({"model": "m"}),
+                    t,
+                    t,
+                    "test",
+                ),
+            ),
+            (
+                "get_text_with_timeout",
+                get_text_with_timeout(&status_server(400, POLICY_BODY), t, "test"),
+            ),
+            (
+                "get_json_with_headers",
+                get_json_with_headers(&status_server(400, POLICY_BODY), &[], t, "test"),
+            ),
+        ];
+        for (name, result) in results {
+            let err = result.expect_err(name);
+            assert!(
+                err.downcast_ref::<super::super::Declined>().is_some(),
+                "{name}: {err:#}"
+            );
+        }
+    }
+
+    /// #941: the vendor's own error type and code survive redaction on the
+    /// card, and a key echoed next to them does not.
+    #[test]
+    fn vendor_error_type_and_code_survive_redaction() {
+        // A key with short word-like segments is not on the vendor list.
+        let word_key = "tok_prod_abcdefghijkl";
+        let body = format!(
+            r#"{{"error":{{"message":"Incorrect key {FAKE_KEY} or {word_key}","type":"invalid_request_error","code":"model_not_found"}}}}"#
+        );
+        let msg = http_error("openai", 404, &body).to_string();
+        assert!(msg.contains("invalid_request_error"), "{msg}");
+        assert!(msg.contains("model_not_found"), "{msg}");
+        assert!(!msg.contains(FAKE_KEY), "{msg}");
+        assert!(!msg.contains(word_key), "{msg}");
+    }
+
+    /// #942: the `HTTP {status}: {body}` text is built in exactly one place.
+    #[test]
+    fn the_http_status_error_text_is_built_in_one_place() {
+        let src = include_str!("common.rs").replace('\r', "");
+        let calls = anyhow_invocations(&src);
+        let builders: Vec<&String> = calls
+            .iter()
+            .filter(|c| {
+                c.contains("HTTP {status}: {truncated}") || c.contains("HTTP {}: {truncated}")
+            })
+            .collect();
+        assert_eq!(builders.len(), 1, "{builders:?}");
     }
 
     // -- post_json_read_body over its own socket (#635) --------------------

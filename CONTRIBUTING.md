@@ -26,14 +26,18 @@ a real `actions.toml` entry against the shipped framework end to end.
 Contributions that work against the app as it exists today (the hotkey
 path, capture, the settings window, the card, the tray, provider code, or a
 new catalogue action) are welcome right now. See the
-[good first issue list](https://github.com/Raaif-Yousuf/Wingman/labels/good%20first%20issue)
-for a place to start.
+[Start here issue (#318)](https://github.com/Raaif-Yousuf/Wingman/issues/318)
+for a short list of small issues, or the
+[good first issue label](https://github.com/Raaif-Yousuf/Wingman/labels/good%20first%20issue).
 
 ## Prerequisites
 
 - Rust 1.80 or newer (`rust-version` in `Cargo.toml`), stable toolchain.
 - Windows 11. This is a Win32 application; it will not build meaningfully on
   another OS, though `cargo check` may get partway on one.
+- The MSVC build tools (to link) and the Windows SDK (`makeappx.exe` and
+  `signtool.exe`, only needed to run `install.ps1`): the Visual Studio
+  Installer's "Desktop development with C++" workload covers both.
 - An OpenAI or Anthropic API key to exercise the running app end to end.
   Not required to build or run the unit tests.
 - Optional: [Ollama](https://ollama.com) running locally on `127.0.0.1:11434`

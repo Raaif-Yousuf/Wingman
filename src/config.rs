@@ -5,6 +5,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hotkey::Chord;
+
+/// The start of the load problem when the copilot-ask settings could not be
+/// copied forward (#1018). The card wording keys off it (#1037).
+pub const COPY_FAILED_PREFIX: &str = "Your copilot-ask settings could not be copied";
 use crate::mode::Mode;
 use crate::provider::openai_compat::{CompatAuth, Structured};
 use crate::provider::{
@@ -176,6 +180,21 @@ pub struct Config {
     pub egress_preview: EgressPreview,
     /// #101 daily cost budget. Default off.
     pub budget: Budget,
+    /// #81 the knowledge folder (`[knowledge]`). Default off.
+    pub knowledge: Knowledge,
+}
+
+/// #81: the knowledge folder (spec 2026-10-16-knowledge-and-memory-design).
+/// Until Settings can add folders, this one setting is how a folder is turned
+/// on. Empty (the default) means Knowledge is off: no thread starts and no file
+/// is read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Knowledge {
+    /// Absolute path of a folder whose text files (.txt, .md, .html, .csv, .json)
+    /// Wingman indexes, and then watches, so they can be searched. The text stays on this PC. Wingman
+    /// never creates the folder. Empty: off.
+    pub folder: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -198,7 +217,7 @@ pub struct Hotkeys {
     /// alt = false
     /// win = false
     /// ```
-    /// The tray's "Set pause key" item (issue #202) learns and saves it, so
+    /// Settings, General (Change beside Pause shortcut) learns and saves it, so
     /// hand-editing is optional. `hotkey::HotkeyHook::set_pause_chord`
     /// is how the hook learns about it; see that method's doc comment for
     /// the lock-free packed-chord path.
@@ -225,6 +244,56 @@ pub struct Hotkeys {
     /// state rather than `pause`'s lock-free atomic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub palette: Option<Chord>,
+    /// #308: what one press of the Wingman key does. `"options"` (the
+    /// default) shows the options card; an action id (`"check-my-work"` for
+    /// the old one-press flow) runs that action at once, with no router call.
+    /// An id that is not in the catalogue shows one card naming this setting
+    /// and the id the first time the key is pressed; later presses show the
+    /// options card. See [`Hotkeys::primary_target`].
+    pub primary_action: String,
+    /// #393: what the key does when a card is showing: `"dynamic"` (the
+    /// default: picks an option if there is one, otherwise closes the card),
+    /// `"pick"` or `"close"`. Anything else is the default. See
+    /// [`crate::keypress::KeyMode`].
+    pub key_mode: String,
+    /// #393: how long, in milliseconds, a second press counts as a double
+    /// press (default 300, clamped to 150 to 600). `0` turns double press
+    /// off, so the first press always acts at once. See
+    /// [`crate::keypress::double_press_window_ms`].
+    pub double_press_ms: u32,
+}
+
+/// What a press of the Wingman key runs, from `hotkeys.primary_action`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimaryAction {
+    /// The options card.
+    Options,
+    /// This action id, straight away.
+    Action(String),
+}
+
+impl Hotkeys {
+    /// `key_mode` read as a mode; an unknown value is the default.
+    pub fn key_mode_value(&self) -> crate::keypress::KeyMode {
+        crate::keypress::KeyMode::parse(&self.key_mode)
+    }
+
+    /// The double-press window in milliseconds, or `None` when it is off.
+    pub fn double_press_window_ms(&self) -> Option<u32> {
+        crate::keypress::double_press_window_ms(self.double_press_ms)
+    }
+
+    /// `primary_action` read as a target. An empty value (or only spaces) is
+    /// the default, `Options`, and the word is matched without regard to case
+    /// or surrounding spaces; anything else is an action id, kept as typed.
+    pub fn primary_target(&self) -> PrimaryAction {
+        let t = self.primary_action.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("options") {
+            PrimaryAction::Options
+        } else {
+            PrimaryAction::Action(t.to_string())
+        }
+    }
 }
 
 impl Default for Hotkeys {
@@ -246,6 +315,9 @@ impl Default for Hotkeys {
             },
             pause: None,
             palette: None,
+            primary_action: "options".to_string(),
+            key_mode: "dynamic".to_string(),
+            double_press_ms: 300,
         }
     }
 }
@@ -727,17 +799,21 @@ pub struct Forms {
     pub require_tick_for: RequireTickFor,
 }
 
-/// #24: settings for the Quick Ask palette's intent router.
+/// #24: settings for the intent router's confidence bar.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Palette {
-    /// Minimum `RouterOption::confidence` (0.0..=1.0) for the router's
-    /// suggestion to pre-select a row -- see `router::should_apply`, the one
-    /// place this value is actually consulted (`app.rs` reads it from
-    /// `Config` and passes it through). Kept as a plain `f64` rather than a
-    /// clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never
-    /// clears (or always clears) the threshold, which is a safe degradation,
-    /// not a crash.
+    /// INERT: nothing reads this at runtime, so changing it has no effect.
+    /// The palette no longer asks the router (#805), and the options card's
+    /// key never runs a clipboard-writing option on the model's confidence
+    /// (#859: text on the screen can claim any confidence), so there is no bar
+    /// left for it to set. It is kept so existing configs keep parsing and a
+    /// signal the screen cannot set can use it later.
+    ///
+    /// Minimum `RouterOption::confidence` (0.0..=1.0) a router option would
+    /// need to be picked by a bare key press. Kept as a plain
+    /// `f64` rather than a clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never clears (or always clears) the
+    /// threshold, which is a safe degradation, not a crash.
     pub router_threshold: f64,
 }
 
@@ -761,6 +837,15 @@ pub struct Options {
     /// `palette.router_threshold`: the card exists to show alternatives, so
     /// it needs a lower bar than the palette's pre-select.
     pub min_confidence: f64,
+    /// #307: seconds the options card stays up before it closes by itself
+    /// (default 20). Also bounds how long the digit and Esc claim lasts.
+    /// Clamped to 5..=120 where it is used ([`Options::card_dismiss_secs`]).
+    pub auto_dismiss_secs: u32,
+    /// #307: whether the keyboard hook claims keys 1 to 4 and Esc while the
+    /// options card shows (default true). Off for someone who types digits
+    /// while the card is up, or whose IME uses digits to pick a candidate:
+    /// the options are then picked by click.
+    pub claim_keys: bool,
 }
 
 impl Default for Options {
@@ -768,11 +853,23 @@ impl Default for Options {
         Self {
             max_options: crate::router::DEFAULT_MAX_OPTIONS,
             min_confidence: crate::router::DEFAULT_MIN_CONFIDENCE,
+            auto_dismiss_secs: DEFAULT_OPTIONS_DISMISS_SECS,
+            claim_keys: true,
         }
     }
 }
 
+/// #307: how long the options card stays up by default.
+const DEFAULT_OPTIONS_DISMISS_SECS: u32 = 20;
+
 impl Options {
+    /// The auto-dismiss, clamped to 5..=120 seconds: a hand-edited `0` must
+    /// not mean "never" (the claim is bounded by it) and a huge value must not
+    /// leave the card up for hours.
+    pub fn card_dismiss_secs(&self) -> u32 {
+        self.auto_dismiss_secs.clamp(5, 120)
+    }
+
     /// The clamped limits the router validates a shortlist with.
     pub fn router_limits(&self) -> crate::router::RouterLimits {
         crate::router::RouterLimits::new(self.min_confidence, self.max_options)
@@ -825,7 +922,7 @@ impl OverlayConfig {
 // and cannot leak into a concurrently-running test.
 #[cfg(test)]
 thread_local! {
-    static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FORCE_ACL_FAILURE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// #711: the modified time of each config file as this process last read or
@@ -835,7 +932,7 @@ thread_local! {
 static SEEN_MTIMES: std::sync::Mutex<Vec<(PathBuf, std::time::SystemTime)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+pub(crate) fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
@@ -844,7 +941,31 @@ fn seen_mtime(path: &Path) -> Option<std::time::SystemTime> {
     seen.iter().find(|(p, _)| p == path).map(|(_, t)| *t)
 }
 
-fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
+/// Runs `load` (a `Config::load` that notes the file as read) without leaving
+/// that note behind, and returns the mtime it noted. The field writer's thread
+/// loads the file for the UI thread; until the UI thread swaps the result in,
+/// its in-memory config is still the stale one, so a whole-file save must stay
+/// refused. The UI thread calls [`note_mtime`] with the returned value when it
+/// adopts the load.
+pub(crate) fn load_deferring_mtime<T>(
+    path: &Path,
+    load: impl FnOnce() -> T,
+) -> (T, Option<std::time::SystemTime>) {
+    let before = seen_mtime(path);
+    let out = load();
+    let noted = seen_mtime(path);
+    let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
+    match before {
+        Some(t) => match seen.iter_mut().find(|(p, _)| p == path) {
+            Some(entry) => entry.1 = t,
+            None => seen.push((path.to_path_buf(), t)),
+        },
+        None => seen.retain(|(p, _)| p != path),
+    }
+    (out, noted)
+}
+
+pub(crate) fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
     let Some(mtime) = mtime else { return };
     let mut seen = SEEN_MTIMES.lock().unwrap_or_else(|e| e.into_inner());
     match seen.iter_mut().find(|(p, _)| p == path) {
@@ -858,6 +979,8 @@ fn note_mtime(path: &Path, mtime: Option<std::time::SystemTime>) {
 /// copy rather than an intermediate one.
 static BACKED_UP: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 /// A backup that could not be made, for the next card. See [`take_backup_warning`].
+/// Held for the whole of [`write_file_atomically`].
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static BACKUP_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 fn lock_ignoring_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -952,6 +1075,100 @@ fn backup_without_keys(path: &Path) -> Result<()> {
     made
 }
 
+/// "config.toml has an error at line L, column C", from a parse error's byte
+/// span. Never includes any file text: a value could be an API key. Shared with
+/// the field-level writer (`config_writer`), whose `toml_edit` errors would
+/// otherwise print the offending line.
+pub(crate) fn describe_error_span(contents: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(span) = span else {
+        return "config.toml could not be parsed".to_string();
+    };
+    let before = &contents.as_bytes()[..span.start.min(contents.len())];
+    let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
+    let line_start = before
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    let column = String::from_utf8_lossy(&before[line_start..])
+        .chars()
+        .count()
+        + 1;
+    format!("config.toml has an error at line {line}, column {column}")
+}
+
+/// The one atomic write of `config.toml`, shared by [`Config::save_to`] and the
+/// field-level writer (`config_writer`, #870): temp file, owner-only ACL on the
+/// temp file, one-generation backup, rename, then note the new mtime.
+///
+/// `note_new_mtime` says whether the new file counts as "read by this process".
+/// [`Config::save_to`] writes what the process holds, so yes. The field-level
+/// writer patches the file as it is on disk, which the in-memory config has not
+/// read, so no: the mtime stays unseen until `Config::load` reads the file, and
+/// a whole-file save in between is refused instead of overwriting a hand edit
+/// that the patch carried along.
+pub(crate) fn write_file_atomically(path: &Path, text: &str, note_new_mtime: bool) -> Result<()> {
+    let _one_writer = lock_writes();
+    write_file_atomically_held(path, text, note_new_mtime)
+}
+
+/// The UI thread's whole-file save and the writer thread share one temp file
+/// name; two writes at once would trip over it. The field writer holds this
+/// across its "did the file change" check and its write.
+pub(crate) fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+    lock_ignoring_poison(&WRITE_LOCK)
+}
+
+/// [`write_file_atomically`] for a caller that already holds [`lock_writes`].
+pub(crate) fn write_file_atomically_held(
+    path: &Path,
+    text: &str,
+    note_new_mtime: bool,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create config directory")?;
+    }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    fs::write(&tmp_path, text).context("failed to write config temp file")?;
+
+    // #257: restrict the ACL on the TEMP file, before it is ever visible
+    // under the real name, and never rename an unrestricted file into
+    // place. The old order (rename, then restrict) left a window where
+    // the finally-named file existed, held a live key, and had whatever
+    // ACL the rename happened to produce; it also swallowed a failure
+    // there and let the write stand regardless. Now a failure aborts
+    // the write entirely instead.
+    #[cfg(windows)]
+    if let Err(e) = Config::restrict_acl(&tmp_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).context(
+            "failed to restrict the config file's permissions to the current \
+             user; the write was aborted rather than leave an API key in an \
+             unprotected file",
+        );
+    }
+
+    // #711: one generation of backup, taken on the first save after each
+    // load (so the hand-edited original survives the load's own repair or
+    // key-import rewrites). It never holds an API key. A backup that cannot
+    // be made only warns: the atomic write below still goes ahead.
+    if path.exists() && mark_backed_up(path) {
+        if let Err(e) = backup_without_keys(path) {
+            *lock_ignoring_poison(&BACKUP_WARNING) = Some(format!(
+                "Wingman could not keep a backup copy of config.toml ({e:#}). Your settings were saved."
+            ));
+        }
+    }
+
+    fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
+    if note_new_mtime {
+        note_mtime(path, file_mtime(path));
+    }
+
+    Ok(())
+}
+
 impl Config {
     /// `%APPDATA%\Wingman\config.toml`.
     pub fn path() -> Result<PathBuf> {
@@ -1032,7 +1249,12 @@ impl Config {
     /// credentials (rule 9).
     pub fn load() -> Result<Config> {
         let path = Self::path()?;
-        let mut config = Self::load_from_file(&path)?;
+        // #1018: the copilot-ask copy runs here, not in `app::run`, so a
+        // Reload settings retries it too.
+        let mut config = match Self::old_path() {
+            Ok(old) => Self::load_file_after_migration(&old, &path)?,
+            Err(_) => Self::load_from_file(&path)?,
+        };
 
         let store = CredManagerStore;
         if config.import_secrets_and_blank(&store) {
@@ -1043,6 +1265,30 @@ impl Config {
         config.hydrate_secrets(&store);
         config.apply_env_overrides();
         Ok(config)
+    }
+
+    /// #1018: runs the copilot-ask migration, then the file load. A failed
+    /// migration must not fall through to `load_from_file`, which would write a
+    /// default file and stop the migration from ever running again. It returns
+    /// "not loaded" defaults (Offline, never saved over anything) naming the
+    /// cause, and the next load tries the copy again.
+    fn load_file_after_migration(old_path: &Path, path: &Path) -> Result<Config> {
+        if let Err(e) = Self::migrate_from(old_path, path) {
+            // #1036: when the copy can never work, the user needs a way out
+            // that does not depend on guessing. Renaming the old file makes
+            // the next load see no old settings and write a default config;
+            // the old settings stay on disk. Nothing is copied or deleted
+            // for them, so no key moves anywhere.
+            let folder = old_path.parent().unwrap_or(old_path);
+            return Ok(Self::not_loaded(format!(
+                "{COPY_FAILED_PREFIX} to the Wingman folder ({}). \
+                 They are still in {} (to start fresh instead, rename config.toml there to \
+                 config.toml.old)",
+                format!("{e:#}").chars().take(200).collect::<String>(),
+                folder.display()
+            )));
+        }
+        Self::load_from_file(path)
     }
 
     /// Same as [`Config::load`] but against an arbitrary path, and without
@@ -1106,6 +1352,24 @@ impl Config {
         }
     }
 
+    /// #924: the config used for a session when [`Config::load`] failed (the
+    /// first-run file could not be created). Default settings, so Mode is Auto,
+    /// but with the stored keys and the env keys read the way `load` reads
+    /// them: without them a later save would see empty key fields and delete
+    /// the user's stored credentials.
+    pub fn defaults_after_failed_load() -> Config {
+        Self::defaults_after_failed_load_with(&CredManagerStore, &|name| std::env::var(name).ok())
+    }
+
+    fn defaults_after_failed_load_with(
+        store: &dyn SecretStore,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Config {
+        let mut config = Config::default();
+        config.hydrate_secrets(store);
+        config.apply_overrides_from(lookup);
+        config
+    }
     /// Moves any non-empty `api_key` out of `self` and into `store` (target
     /// `Wingman/<provider>`), blanking the field here in memory. Returns
     /// whether anything was blanked, so the caller knows whether the file
@@ -1248,11 +1512,30 @@ impl Config {
     ///
     /// `env_is_set` is injected (rather than calling `std::env::var`
     /// directly) so tests exercise this without touching real process env.
+    #[cfg(test)]
     fn push_secrets_to_store(
         &mut self,
         store: &dyn SecretStore,
         env_is_set: &dyn Fn(&str) -> bool,
     ) -> Result<()> {
+        self.push_secrets_logged(store, env_is_set, &mut Vec::new())
+    }
+
+    /// [`Config::push_secrets_to_store`] that also records each credential's
+    /// previous value before touching it (#890), so a failed save can put the
+    /// store back. A credential that cannot be read is not recorded: it is
+    /// overwritten as before rather than blocking a retyped key.
+    fn push_secrets_logged(
+        &mut self,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+        undo: &mut Vec<(String, Option<String>)>,
+    ) -> Result<()> {
+        let mut remember = |target: &str| {
+            if let Ok(previous) = store.get(target) {
+                undo.push((target.to_string(), previous));
+            }
+        };
         for (provider, key) in [
             ("openai", &mut self.providers.openai.api_key),
             ("anthropic", &mut self.providers.anthropic.api_key),
@@ -1271,10 +1554,12 @@ impl Config {
                 continue;
             }
             if key.is_empty() {
+                remember(&target);
                 store
                     .delete(&target)
                     .with_context(|| format!("failed to delete {target} from the secret store"))?;
             } else {
+                remember(&target);
                 store
                     .set(&target, key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
@@ -1292,10 +1577,12 @@ impl Config {
                 continue;
             }
             if entry.api_key.is_empty() {
+                remember(&target);
                 store
                     .delete(&target)
                     .with_context(|| format!("failed to delete {target} from the secret store"))?;
             } else {
+                remember(&target);
                 store
                     .set(&target, &entry.api_key)
                     .with_context(|| format!("failed to save {target} to the secret store"))?;
@@ -1331,20 +1618,7 @@ impl Config {
     /// "config.toml has an error at line L, column C", from the parse error's
     /// byte span. Never includes any file text: a value could be an API key.
     fn describe_parse_error(contents: &str, err: &toml::de::Error) -> String {
-        let Some(span) = err.span() else {
-            return "config.toml could not be parsed".to_string();
-        };
-        let before = &contents.as_bytes()[..span.start.min(contents.len())];
-        let line = before.iter().filter(|&&b| b == b'\n').count() + 1;
-        let line_start = before
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |i| i + 1);
-        let column = String::from_utf8_lossy(&before[line_start..])
-            .chars()
-            .count()
-            + 1;
-        format!("config.toml has an error at line {line}, column {column}")
+        describe_error_span(contents, err.span())
     }
 
     /// Defaults, marked "not loaded" so nothing saves them over the file.
@@ -1517,12 +1791,108 @@ impl Config {
     /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
+        self.save_with_store(&path, &CredManagerStore, &|name| {
+            std::env::var(name).is_ok()
+        })
+    }
+
+    /// [`Config::save`] with the path and secret store injected. The store is
+    /// written before the file (the file must not hold a key the store never
+    /// got), so when the file write fails the store is put back: a failed
+    /// save changes neither (#890).
+    fn save_with_store(
+        &self,
+        path: &Path,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
         // #711: checked before the secret store is touched, so a refused save
         // writes nothing anywhere.
-        self.check_save_allowed(&path)?;
+        self.check_save_allowed(path)?;
         let mut on_disk = self.clone();
-        on_disk.push_secrets_to_store(&CredManagerStore, &|name| std::env::var(name).is_ok())?;
-        on_disk.save_to(&path)
+        let mut undo = Vec::new();
+        let result = on_disk
+            .push_secrets_logged(store, env_is_set, &mut undo)
+            .and_then(|()| on_disk.save_to(path));
+        if result.is_err() {
+            for (target, previous) in undo.into_iter().rev() {
+                // Best effort: the save error is the one worth reporting.
+                let _ = match previous {
+                    Some(secret) => store.set(&target, &secret),
+                    None => store.delete(&target),
+                };
+            }
+        }
+        result
+    }
+
+    /// Stores the keys the user changed between `original` (what the Settings
+    /// window opened with) and `edited` (what it saved) in Credential Manager,
+    /// and removes the credential of a key that was cleared. A key that is the
+    /// same in both is left alone, so a stale copy held by an open window can
+    /// never overwrite a key changed elsewhere meanwhile. It never writes a file:
+    /// the field-level writer (`config_writer`, #870) keeps keys out of
+    /// `config.toml`, and runs this only after the file write has succeeded.
+    pub(crate) fn push_changed_secrets(original: &Config, edited: &Config) -> Result<()> {
+        Self::push_changed_secrets_with(original, edited, &CredManagerStore, &|name| {
+            std::env::var(name).is_ok()
+        })
+    }
+
+    fn push_changed_secrets_with(
+        original: &Config,
+        edited: &Config,
+        store: &dyn SecretStore,
+        env_is_set: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        let mut changed = Self::only_changed_secrets(original, edited);
+        let mut undo = Vec::new();
+        let result = changed.push_secrets_logged(store, env_is_set, &mut undo);
+        if result.is_err() {
+            // Best effort: the store error is the one worth reporting.
+            for (target, previous) in undo.into_iter().rev() {
+                let _ = match previous {
+                    Some(secret) => store.set(&target, &secret),
+                    None => store.delete(&target),
+                };
+            }
+        }
+        result
+    }
+
+    /// `edited` with every key that did not change marked as "leave the store
+    /// alone" (the same marker an unreadable credential carries, which
+    /// `push_secrets_logged` skips).
+    fn only_changed_secrets(original: &Config, edited: &Config) -> Config {
+        let mut out = edited.clone();
+        let keep = |was: &str, now: &mut String| {
+            if was == now.as_str() {
+                *now = UNREADABLE_KEY_MARKER.to_string();
+            }
+        };
+        keep(
+            &original.providers.openai.api_key,
+            &mut out.providers.openai.api_key,
+        );
+        keep(
+            &original.providers.anthropic.api_key,
+            &mut out.providers.anthropic.api_key,
+        );
+        keep(
+            &original.providers.gemini.api_key,
+            &mut out.providers.gemini.api_key,
+        );
+        for entry in &mut out.providers.compat {
+            if let Some(was) = original
+                .providers
+                .compat
+                .iter()
+                .find(|o| o.name == entry.name)
+            {
+                keep(&was.api_key, &mut entry.api_key);
+            }
+        }
+        out
     }
 
     /// #711: refuses a save that would clobber the user's file.
@@ -1531,7 +1901,7 @@ impl Config {
         if let Some(problem) = &self.load_problem {
             anyhow::bail!(
                 "{problem}, so Wingman did not save over it. Fix the file, then choose \
-                 Reload settings from the tray menu"
+                 Reload settings (tray menu, Help and diagnostics)"
             );
         }
         // A hand edit made after this config was read is not clobbered.
@@ -1539,7 +1909,7 @@ impl Config {
             if seen != now {
                 anyhow::bail!(
                     "config.toml changed on disk since Wingman read it, so it was not saved. \
-                     Choose Reload settings from the tray menu, then try again"
+                     Choose Reload settings (tray menu, Help and diagnostics), then try again"
                 );
             }
         }
@@ -1552,52 +1922,12 @@ impl Config {
     /// so a reader never observes a half-written file.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         self.check_save_allowed(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("failed to create config directory")?;
-        }
         let toml_str = toml::to_string_pretty(self).context("failed to serialize config")?;
-
-        let mut tmp_name = path.as_os_str().to_os_string();
-        tmp_name.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_name);
-        fs::write(&tmp_path, &toml_str).context("failed to write config temp file")?;
-
-        // #257: restrict the ACL on the TEMP file, before it is ever visible
-        // under the real name, and never rename an unrestricted file into
-        // place. The old order (rename, then restrict) left a window where
-        // the finally-named file existed, held a live key, and had whatever
-        // ACL the rename happened to produce; it also swallowed a failure
-        // there and let the write stand regardless. Now a failure aborts
-        // the write entirely instead.
-        #[cfg(windows)]
-        if let Err(e) = Self::restrict_acl(&tmp_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e).context(
-                "failed to restrict the config file's permissions to the current \
-                 user; the write was aborted rather than leave an API key in an \
-                 unprotected file",
-            );
-        }
-
-        // #711: one generation of backup, taken on the first save after each
-        // load (so the hand-edited original survives the load's own repair or
-        // key-import rewrites). It never holds an API key. A backup that cannot
-        // be made only warns: the atomic write below still goes ahead.
-        if path.exists() && mark_backed_up(path) {
-            if let Err(e) = backup_without_keys(path) {
-                *lock_ignoring_poison(&BACKUP_WARNING) = Some(format!(
-                    "Wingman could not keep a backup copy of config.toml ({e:#}). Your settings were saved."
-                ));
-            }
-        }
-
-        fs::rename(&tmp_path, path).context("failed to move config temp file into place")?;
-        note_mtime(path, file_mtime(path));
-
-        Ok(())
+        write_file_atomically(path, &toml_str, true)
     }
 
-    /// Restricts a file's ACL to the current user only, via `icacls`.
+    /// Restricts a file's ACL to the current user only, via `icacls`: no
+    /// inherited entries, and no SYSTEM or Administrators entry either (#966).
     /// Returns an error rather than swallowing one (#257): a caller that
     /// cannot show a card itself (this module never does, per rule 7) must
     /// propagate this so whichever caller CAN show one does.
@@ -1622,24 +1952,8 @@ impl Config {
         // the system folder. `icacls_command` also sets CREATE_NO_WINDOW:
         // Wingman has no console, so without it every `save()` would flash
         // one.
-        let account = crate::owner_acl::grant_account()
-            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?;
-        let output = crate::owner_acl::icacls_command()
-            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))?
-            .arg(path)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(format!("{account}:F"))
-            .output()
-            .context("failed to run icacls to restrict the config file's permissions")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "icacls exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+        crate::owner_acl::restrict_to_owner(path, false)
+            .map_err(|e| anyhow::anyhow!("{e}; cannot restrict the config file"))
     }
 
     /// Builds the provider fallback chain per `providers.order`, ignoring
@@ -1767,7 +2081,7 @@ impl Providers {
     /// router's own cheaper picked model instead of the configured one. A
     /// provider kind added to this match without a matching arm in that
     /// hand-copy silently made the router skip it forever, with no error
-    /// card by design (see `App::maybe_start_router`'s doc comment) --
+    /// card by design (see `App::show_options_card`'s doc comment) --
     /// exactly the `wired-to-nothing` skill's "hard-coded list" row. Now
     /// `app.rs`'s `provider_for_router` is a one-line call into this
     /// function with `model: Some(&target.model)`, so there is nowhere else
@@ -1902,7 +2216,7 @@ impl Providers {
     /// [`Providers::build_chain`]'s own behavior. The list
     /// `diagnostics::provider_rows` iterates (issue #201).
     pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
-        self.order
+        self.effective_order()
             .iter()
             .filter_map(|name| self.describe(name))
             .collect()
@@ -1915,13 +2229,37 @@ impl Providers {
     /// `hotkeys`/`capture`/`ui` along for no reason.
     pub fn build_chain(&self) -> Chain {
         let providers: Vec<Box<dyn Provider>> = self
-            .order
+            .effective_order()
             .iter()
             .filter_map(|name| self.provider_for(name))
             .collect();
         Chain::new(providers)
     }
 
+    /// #923: `order` as it is used at runtime. Gemini is not in the stock
+    /// order, and #780 stops an untouched Save from adding it, so a Gemini key
+    /// pasted on its own would never be used. When `order` is still the stock
+    /// pair (in either order, so choosing Anthropic as Active keeps this) and
+    /// Gemini is the only cloud provider with a key, it is appended here, in
+    /// memory only: the file is not rewritten. If OpenAI or Anthropic has a
+    /// key too, nothing is added, so a `GEMINI_API_KEY` set for another tool
+    /// never becomes a silent extra fallback that gets screenshots. An edited
+    /// order is a choice and is returned unchanged.
+    fn effective_order(&self) -> Vec<String> {
+        let mut order = self.order.clone();
+        let stock_pair = order.len() == 2
+            && order.iter().any(|n| n == "openai")
+            && order.iter().any(|n| n == "anthropic");
+        let keyed = |key: &str| !unreadable_as_empty(key).is_empty();
+        if stock_pair
+            && keyed(&self.gemini.api_key)
+            && !keyed(&self.openai.api_key)
+            && !keyed(&self.anthropic.api_key)
+        {
+            order.push("gemini".to_string());
+        }
+        order
+    }
     /// #133: whether a first press with no model ready may look for a local
     /// Ollama and adopt it. Only for a setup the user has not shaped: Cloud
     /// mode is a choice to use the cloud, an `order` that already names
@@ -1986,7 +2324,12 @@ impl Providers {
     /// requests through. Kept as the one place both callers share so they
     /// can never disagree about which providers `mode` allows.
     pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
-        crate::mode::select_providers(mode, &self.order, ollama_ready, &self.local_compat_names())
+        crate::mode::select_providers(
+            mode,
+            &self.effective_order(),
+            ollama_ready,
+            &self.local_compat_names(),
+        )
     }
 
     /// #16: a compat endpoint's locality is decided by its configured
@@ -2188,6 +2531,127 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.overlay, cfg.overlay);
+    }
+
+    // -- hotkeys.primary_action (issue #308) ----------------------------------
+
+    #[test]
+    fn a_bare_key_press_shows_the_options_card_by_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.hotkeys.primary_action, "options");
+        assert_eq!(cfg.hotkeys.primary_target(), PrimaryAction::Options);
+    }
+
+    #[test]
+    fn primary_action_options_is_matched_loosely_and_anything_else_is_an_id() {
+        let target = |s: &str| {
+            Hotkeys {
+                primary_action: s.to_string(),
+                ..Hotkeys::default()
+            }
+            .primary_target()
+        };
+        for s in ["options", "Options", "  OPTIONS ", ""] {
+            assert_eq!(target(s), PrimaryAction::Options, "{s:?}");
+        }
+        assert_eq!(
+            target(" check-my-work "),
+            PrimaryAction::Action("check-my-work".to_string())
+        );
+    }
+
+    #[test]
+    fn an_existing_config_without_primary_action_loads_with_the_default() {
+        let cfg: Config = toml::from_str("[hotkeys]\n").unwrap();
+        assert_eq!(cfg.hotkeys.primary_target(), PrimaryAction::Options);
+        let pinned: Config =
+            toml::from_str("[hotkeys]\nprimary_action = \"check-my-work\"\n").unwrap();
+        assert_eq!(
+            pinned.hotkeys.primary_target(),
+            PrimaryAction::Action("check-my-work".to_string())
+        );
+    }
+
+    // -- hotkeys.key_mode and double_press_ms (issue #393) --------------------
+
+    #[test]
+    fn the_key_defaults_are_dynamic_with_a_300_ms_double_press_window() {
+        let h = Config::default().hotkeys;
+        assert_eq!(h.key_mode_value(), crate::keypress::KeyMode::Dynamic);
+        assert_eq!(h.double_press_window_ms(), Some(300));
+    }
+
+    #[test]
+    fn key_mode_and_double_press_ms_load_from_toml_and_bad_values_fall_back() {
+        let cfg: Config = toml::from_str(
+            "[hotkeys]
+key_mode = \"pick\"
+double_press_ms = 0
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.hotkeys.key_mode_value(), crate::keypress::KeyMode::Pick);
+        assert_eq!(cfg.hotkeys.double_press_window_ms(), None);
+        let bad: Config = toml::from_str(
+            "[hotkeys]
+key_mode = \"nope\"
+double_press_ms = 5000
+",
+        )
+        .unwrap();
+        assert_eq!(
+            bad.hotkeys.key_mode_value(),
+            crate::keypress::KeyMode::Dynamic
+        );
+        assert_eq!(bad.hotkeys.double_press_window_ms(), Some(600));
+        // An older config.toml has neither key.
+        let old: Config = toml::from_str(
+            "[hotkeys]
+",
+        )
+        .unwrap();
+        assert_eq!(old.hotkeys.double_press_window_ms(), Some(300));
+    }
+
+    // -- options.auto_dismiss_secs and claim_keys (issue #307) ----------------
+
+    #[test]
+    fn options_card_defaults_match_the_spec() {
+        let o = Config::default().options;
+        assert_eq!(o.auto_dismiss_secs, 20);
+        assert!(o.claim_keys, "the digit and Esc claim is on by default");
+        assert_eq!(o.card_dismiss_secs(), 20);
+    }
+
+    #[test]
+    fn options_card_auto_dismiss_is_clamped_to_5_through_120() {
+        for (set, want) in [
+            (0u32, 5u32),
+            (1, 5),
+            (5, 5),
+            (20, 20),
+            (120, 120),
+            (9_999, 120),
+        ] {
+            let o = Options {
+                auto_dismiss_secs: set,
+                ..Options::default()
+            };
+            assert_eq!(o.card_dismiss_secs(), want, "auto_dismiss_secs = {set}");
+        }
+    }
+
+    #[test]
+    fn options_card_keys_can_be_switched_off_in_the_file() {
+        let cfg: Config =
+            toml::from_str("[options]\nclaim_keys = false\nauto_dismiss_secs = 30\n").unwrap();
+        assert!(!cfg.options.claim_keys);
+        assert_eq!(cfg.options.card_dismiss_secs(), 30);
+        // The older keys keep their defaults in a partial table.
+        assert_eq!(cfg.options.max_options, 4);
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.options, cfg.options);
     }
 
     // -- palette.router_threshold (issue #24) --------------------------------
@@ -2834,6 +3298,91 @@ model = "gpt-5.5"
         }
     }
 
+    /// #923: a Gemini key on a stock order is reachable without anyone
+    /// editing `providers.order` (#780 keeps an untouched Save from adding it).
+    #[test]
+    fn a_gemini_key_on_the_stock_order_is_reachable_in_every_cloud_path() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        assert_eq!(p.order, Providers::default().order, "the file is untouched");
+        assert_eq!(
+            p.build_chain_for_mode(Mode::Cloud, false).provider_names(),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Auto, false),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.build_chain().ready_provider_names(),
+            vec!["gemini"],
+            "the mode-agnostic chain sees it too"
+        );
+        assert_eq!(p.order, Providers::default().order, "never rewritten");
+    }
+
+    #[test]
+    fn a_gemini_entry_without_a_key_is_not_added_to_the_stock_order() {
+        let p = Config::default().providers;
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+        let mut unreadable = Config::default().providers;
+        unreadable.gemini.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert_eq!(
+            unreadable.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+    }
+
+    /// A Gemini key set globally for another tool must not become a silent
+    /// extra fallback: Gemini is added only when no other cloud provider has a
+    /// key, in either order of the stock pair (choosing Anthropic as Active
+    /// makes it anthropic, openai).
+    #[test]
+    fn gemini_is_added_only_when_it_is_the_only_keyed_cloud_provider() {
+        for order in [["openai", "anthropic"], ["anthropic", "openai"]] {
+            let mut p = Config::default().providers;
+            p.order = order.iter().map(|s| s.to_string()).collect();
+            p.gemini.api_key = "g-key".to_string();
+            let mut expected: Vec<String> = p.order.clone();
+            expected.push("gemini".to_string());
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), expected);
+            p.openai.api_key = "o-key".to_string();
+            assert_eq!(
+                p.selected_order_for_mode(Mode::Cloud, false),
+                order,
+                "another keyed provider: no gemini"
+            );
+            p.openai.api_key.clear();
+            p.anthropic.api_key = "a-key".to_string();
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), order);
+        }
+    }
+    /// A hand-edited order is a choice: a keyed vendor the user left out
+    /// stays out, so a screenshot never goes to a vendor they removed.
+    #[test]
+    fn a_hand_edited_order_is_never_widened_by_a_gemini_key() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        p.order = vec!["anthropic".to_string()];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["anthropic"]
+        );
+        p.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+        ];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic", "gemini"],
+            "no duplicate when it is already listed"
+        );
+    }
+
     #[test]
     fn build_chain_for_mode_cloud_excludes_ollama() {
         let mut config = Config::default();
@@ -3229,6 +3778,52 @@ structured = "prompt"
             .contains(&"compat:openrouter".to_string()));
     }
 
+    /// #890: a save that fails after the secret store was written puts the
+    /// store back, so nothing is half-applied.
+    #[test]
+    fn a_save_that_fails_on_the_file_leaves_the_secret_store_as_it_was() {
+        let blocker = std::env::temp_dir().join(format!(
+            "wingman-test-890-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&blocker, "not a directory").unwrap();
+        // A parent that is a file: create_dir_all, so save_to, must fail.
+        let path = blocker.join("config.toml");
+
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-new".into();
+        config.providers.anthropic.api_key = String::new();
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-old").unwrap();
+        store.set("Wingman/anthropic", "sk-ant-old").unwrap();
+
+        let err = config.save_with_store(&path, &store, &|_| false);
+        let _ = std::fs::remove_file(&blocker);
+        assert!(err.is_err());
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-old")
+        );
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-ant-old"),
+            "a delete must be undone too"
+        );
+        // A key that was new is removed again.
+        let fresh = crate::secrets::InMemoryStore::default();
+        let blocker2 = std::env::temp_dir().join(format!(
+            "wingman-test-890b-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&blocker2, "x").unwrap();
+        let err = config.save_with_store(&blocker2.join("config.toml"), &fresh, &|_| false);
+        let _ = std::fs::remove_file(&blocker2);
+        assert!(err.is_err());
+        assert_eq!(fresh.get("Wingman/openai").unwrap(), None);
+    }
+
     #[test]
     fn push_secrets_to_store_saves_a_live_compat_key() {
         let mut config = Config::default();
@@ -3243,6 +3838,31 @@ structured = "prompt"
         );
     }
 
+    /// #924: the defaults used after a failed first-run load carry the stored
+    /// keys, and saving them never deletes a stored credential.
+    #[test]
+    fn defaults_after_a_failed_load_keep_stored_keys_and_a_save_never_deletes_them() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-stored").unwrap();
+        let config = Config::defaults_after_failed_load_with(&store, &|_| None);
+        assert_eq!(config.providers.openai.api_key, "sk-stored");
+        assert_eq!(config.mode, Mode::Auto);
+
+        let path = scratch_path("924-failed-load-save");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Whether this save is allowed or refused, the credential must stay.
+        let _ = config.save_with_store(&path, &store, &|_| false);
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-stored")
+        );
+        cleanup(&path);
+
+        let env = Config::defaults_after_failed_load_with(&store, &|n| {
+            (n == "ANTHROPIC_API_KEY").then(|| "sk-env".to_string())
+        });
+        assert_eq!(env.providers.anthropic.api_key, "sk-env");
+    }
     #[test]
     fn push_secrets_to_store_deletes_the_compat_credential_when_the_field_is_cleared() {
         let mut config = Config::default();
@@ -3253,6 +3873,98 @@ structured = "prompt"
 
         config.push_secrets_to_store(&store, &|_| false).unwrap();
         assert_eq!(store.get("Wingman/compat:openrouter").unwrap(), None);
+    }
+
+    // -- the keys a Settings save changed (#871) ------------------------------
+
+    fn with_keys(openai: &str, anthropic: &str) -> Config {
+        let mut c = Config::default();
+        c.providers.openai.api_key = openai.into();
+        c.providers.anthropic.api_key = anthropic.into();
+        c
+    }
+
+    #[test]
+    fn a_changed_key_is_stored_and_an_unchanged_one_is_left_alone() {
+        // The window opened with both keys. Meanwhile the Anthropic key was
+        // changed elsewhere (the store holds a newer one). Saving the window must
+        // store the OpenAI key it changed and must not put the stale Anthropic
+        // key back.
+        let store = crate::secrets::InMemoryStore::default();
+        store
+            .set("Wingman/anthropic", "sk-newer-elsewhere")
+            .unwrap();
+        let original = with_keys("sk-old-openai", "sk-old-anthropic");
+        let edited = with_keys("sk-typed", "sk-old-anthropic");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-typed")
+        );
+        assert_eq!(
+            store.get("Wingman/anthropic").unwrap().as_deref(),
+            Some("sk-newer-elsewhere"),
+            "an unchanged key must not be written back"
+        );
+    }
+
+    #[test]
+    fn a_cleared_key_is_removed_and_one_never_set_stays_absent() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-old-openai").unwrap();
+        let original = with_keys("sk-old-openai", "");
+        let edited = with_keys("", "");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(store.get("Wingman/openai").unwrap(), None);
+        assert_eq!(store.get("Wingman/anthropic").unwrap(), None);
+    }
+
+    #[test]
+    fn an_untouched_save_changes_nothing_in_the_store() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-newer").unwrap();
+        let same = with_keys("sk-old", "");
+        Config::push_changed_secrets_with(&same, &same, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-newer")
+        );
+    }
+
+    #[test]
+    fn a_compat_key_is_matched_by_name_and_only_a_changed_one_is_stored() {
+        let store = crate::secrets::InMemoryStore::default();
+        let mut original = Config::default();
+        original.providers.compat = vec![
+            compat_entry("kept", "https://a.example/v1"),
+            compat_entry("changed", "https://b.example/v1"),
+        ];
+        let mut edited = original.clone();
+        edited.providers.compat[1].api_key = "sk-new-compat".into();
+        store
+            .set("Wingman/compat:kept", "sk-newer-elsewhere")
+            .unwrap();
+        Config::push_changed_secrets_with(&original, &edited, &store, &|_| false).unwrap();
+        assert_eq!(
+            store.get("Wingman/compat:changed").unwrap().as_deref(),
+            Some("sk-new-compat")
+        );
+        assert_eq!(
+            store.get("Wingman/compat:kept").unwrap().as_deref(),
+            Some("sk-newer-elsewhere")
+        );
+    }
+
+    #[test]
+    fn a_key_set_by_an_env_var_is_not_stored_from_a_save() {
+        let store = crate::secrets::InMemoryStore::default();
+        let original = with_keys("", "");
+        let edited = with_keys("sk-from-env", "");
+        Config::push_changed_secrets_with(&original, &edited, &store, &|name| {
+            name == "OPENAI_API_KEY"
+        })
+        .unwrap();
+        assert_eq!(store.get("Wingman/openai").unwrap(), None);
     }
 
     #[test]
@@ -3811,6 +4523,46 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
 
     #[test]
     #[cfg(windows)]
+    fn restrict_acl_leaves_the_current_user_as_the_only_entry() {
+        // #966: a file made by an elevated process carries explicit allow
+        // entries for SYSTEM and Administrators (the token's default DACL).
+        // `/inheritance:r` does not touch explicit entries, so they survived.
+        // Plant them the same way, restrict, then read the DACL back.
+        let path = scratch_path("acl-owner-only");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        for sid in ["*S-1-5-18", "*S-1-5-32-544"] {
+            let planted = crate::owner_acl::icacls_command()
+                .unwrap()
+                .arg(&path)
+                .arg("/grant")
+                .arg(format!("{sid}:F"))
+                .output()
+                .expect("icacls should run");
+            assert!(planted.status.success(), "could not plant {sid}");
+        }
+
+        Config::restrict_acl(&path).expect("restrict_acl should succeed");
+
+        // Read the DACL back by SID (not icacls's localized text).
+        let me = crate::owner_acl::current_user_sid().unwrap();
+        let (_, aces) = crate::owner_acl::dacl::read(&path);
+        cleanup(&path);
+        assert!(
+            aces.iter().any(|a| a.sid == me),
+            "the current user lost access"
+        );
+        assert!(
+            !aces.iter().any(|a| a.sid == "S-1-5-18"),
+            "SYSTEM still has an entry"
+        );
+        assert!(
+            !aces.iter().any(|a| a.sid == "S-1-5-32-544"),
+            "Administrators still has an entry"
+        );
+    }
+    #[test]
+    #[cfg(windows)]
     fn migrate_from_aborts_and_reports_when_acl_restriction_fails() {
         let root = scratch_dir("acl-failure-migrate");
         let old_path = root.join("old").join("config.toml");
@@ -3837,6 +4589,121 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
              ACL step failed"
         );
 
+        cleanup(&root.join("dummy"));
+    }
+
+    // #1018: a failed migration used to be dropped, and the next load wrote a
+    // default file that stopped the migration from ever running again.
+    #[test]
+    fn failed_migration_leaves_no_config_and_reports_it() {
+        let root = scratch_dir("migrate-fail-load");
+        let old_path = root.join("old").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "mode = \"offline\"\n").unwrap();
+        // The new folder cannot be created: its parent is a plain file.
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let new_path = blocker.join("Wingman").join("config.toml");
+
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        let problem = config
+            .load_problem
+            .clone()
+            .expect("the failure must be reported");
+        assert!(problem.contains("copilot-ask"), "{problem}");
+        assert_eq!(config.mode, Mode::Offline, "fail safe until it is copied");
+        assert!(!new_path.exists(), "no default file may be written");
+        assert!(old_path.exists(), "the old file is left alone");
+        assert!(config.check_save_allowed(&new_path).is_err());
+        cleanup(&root.join("dummy"));
+    }
+
+    // #1036: a copy that can never work must not strand the user. The card
+    // names the exact old folder and the one step that starts fresh, and that
+    // step really does end the problem without touching the old settings.
+    #[test]
+    fn failed_migration_names_the_old_folder_and_the_way_to_start_fresh() {
+        let root = scratch_dir("migrate-fail-fresh");
+        let old_dir = root.join("old");
+        let old_path = old_dir.join("config.toml");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(&old_path, "mode = \"offline\"\n").unwrap();
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let blocked = blocker.join("Wingman").join("config.toml");
+
+        let problem = Config::load_file_after_migration(&old_path, &blocked)
+            .unwrap()
+            .load_problem
+            .expect("the failure must be reported");
+        assert!(
+            problem.contains(&old_dir.display().to_string()),
+            "{problem}"
+        );
+        assert!(problem.contains("start fresh"), "{problem}");
+        assert!(problem.contains("config.toml.old"), "{problem}");
+        assert!(!problem.contains('\u{2014}'), "{problem}");
+
+        // Doing what the card says: rename the old file, then load again.
+        let renamed = old_dir.join("config.toml.old");
+        fs::rename(&old_path, &renamed).unwrap();
+        let new_path = root.join("new").join("config.toml");
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+        assert!(config.load_problem.is_none(), "the way out must work");
+        assert!(new_path.exists(), "a default config is written");
+        assert!(renamed.exists(), "the old settings are kept, never deleted");
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn failed_migration_retries_on_the_next_load() {
+        let root = scratch_dir("migrate-retry-load");
+        let old_path = root.join("old").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "[ui]\ntext_scale = 1.5\n").unwrap();
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let blocked = blocker.join("Wingman").join("config.toml");
+        assert!(Config::load_file_after_migration(&old_path, &blocked)
+            .unwrap()
+            .load_problem
+            .is_some());
+
+        let new_path = root.join("new").join("config.toml");
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        assert!(config.load_problem.is_none());
+        assert!((config.ui.text_scale - 1.5).abs() < f32::EPSILON);
+        assert!(new_path.exists());
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn successful_migration_loads_the_old_settings() {
+        let root = scratch_dir("migrate-ok-load");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "[ui]\ntext_scale = 1.25\n").unwrap();
+
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        assert!(config.load_problem.is_none());
+        assert!((config.ui.text_scale - 1.25).abs() < f32::EPSILON);
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn no_old_file_still_creates_defaults() {
+        let root = scratch_dir("migrate-none-load");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        assert!(config.load_problem.is_none());
+        assert!(new_path.exists());
         cleanup(&root.join("dummy"));
     }
 
@@ -5324,5 +6191,23 @@ mod egress_preview_tests {
         let mut o = order(&["ollama", "openai"]);
         assert!(!ActiveProvider::Ollama.move_to_front(&mut o));
         assert_eq!(o, order(&["ollama", "openai"]));
+    }
+}
+
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+
+    #[test]
+    fn the_knowledge_folder_is_off_by_default() {
+        assert_eq!(Config::default().knowledge.folder, "");
+    }
+
+    #[test]
+    fn a_knowledge_table_in_config_toml_is_read() {
+        let c: Config = toml::from_str("[knowledge]\nfolder = 'C:\\Notes'\n").unwrap();
+        assert_eq!(c.knowledge.folder, "C:\\Notes");
+        let none: Config = toml::from_str("mode = \"auto\"\n").unwrap();
+        assert_eq!(none.knowledge, Knowledge::default());
     }
 }

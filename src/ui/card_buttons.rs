@@ -12,10 +12,9 @@
 use crate::ui::theme::{accent_fill, read_accent_shades, Theme};
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetStockObject, GetSysColor,
-    RoundRect, SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT,
-    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT,
-    HGDIOBJ, NULL_BRUSH, PS_SOLID, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, FillRect, GetSysColor, SelectObject, SetBkMode, SetTextColor,
+    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_CENTER,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
@@ -81,6 +80,9 @@ pub(crate) struct Look {
     pub text: u32,
     /// The ring drawn inside the button while it has keyboard focus.
     pub focus: u32,
+    /// Anti-aliased corners. Off in high contrast: a blended pixel is not a
+    /// system colour.
+    pub smooth: bool,
 }
 
 fn channels(c: u32) -> (f32, f32, f32) {
@@ -176,6 +178,7 @@ pub(crate) fn look(
                 border: fill,
                 text,
                 focus: readable_on(fill),
+                smooth: true,
             }
         }
         Role::Secondary => {
@@ -194,6 +197,7 @@ pub(crate) fn look(
                 border: surface.border,
                 text,
                 focus: surface.text,
+                smooth: true,
             }
         }
     }
@@ -224,6 +228,7 @@ fn high_contrast_look(role: Role, state: State, hc: &HighContrast) -> Look {
             text
         },
         focus: text,
+        smooth: false,
     }
 }
 
@@ -264,7 +269,9 @@ pub(crate) fn system_high_contrast() -> Option<HighContrast> {
 }
 
 /// Paints one owner-drawn button into the `DC` of a `WM_DRAWITEM`.
-/// `corner` and `ring` are in pixels (the caller scales them for DPI).
+/// `corner` and `ring` are in pixels (the caller scales them for DPI). The
+/// corners are anti-aliased unless `look.smooth` is false (high contrast, so
+/// every pixel stays a system colour).
 ///
 /// # Safety
 /// `dis` must be the `DRAWITEMSTRUCT` Windows passed with the message, so
@@ -286,55 +293,48 @@ pub(crate) unsafe fn draw(
     FillRect(hdc, &rc, bg);
     let _ = DeleteObject(HGDIOBJ(bg.0));
 
-    let brush = CreateSolidBrush(COLORREF(look.fill));
-    let pen = CreatePen(PS_SOLID, 1, COLORREF(look.border));
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
-    let _ = RoundRect(
+    // Smoothed corners: `RoundRect` has no anti-aliasing (#989).
+    crate::ui::round_rect::paint(
         hdc,
-        rc.left,
-        rc.top,
-        rc.right,
-        rc.bottom,
-        corner * 2,
-        corner * 2,
+        rc,
+        corner,
+        Some(look.fill),
+        Some((look.border, 1)),
+        look.smooth,
     );
 
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(look.text));
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    let mut text_rc = rc;
-    DrawTextW(
+    // Through the shared guard: `DrawTextW` with an empty buffer crashes the
+    // process (see `ui::text`), and the options card (#307) draws its own
+    // label and passes no text here.
+    crate::ui::text::draw_text_line(
         hdc,
-        &mut wide,
-        &mut text_rc,
+        text,
+        rc,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
 
     if dis.itemState.0 & ODS_FOCUS != 0 && dis.itemState.0 & ODS_NOFOCUSRECT == 0 {
-        let focus_pen = CreatePen(PS_SOLID, ring.max(1), COLORREF(look.focus));
-        SelectObject(hdc, HGDIOBJ(focus_pen.0));
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
         let inset = ring + 2;
-        let _ = RoundRect(
+        let ring_rect = RECT {
+            left: rc.left + inset,
+            top: rc.top + inset,
+            right: rc.right - inset,
+            bottom: rc.bottom - inset,
+        };
+        crate::ui::round_rect::paint(
             hdc,
-            rc.left + inset,
-            rc.top + inset,
-            rc.right - inset,
-            rc.bottom - inset,
-            corner.max(2),
-            corner.max(2),
+            ring_rect,
+            corner.max(2) / 2,
+            None,
+            Some((look.focus, ring.max(1))),
+            look.smooth,
         );
-        SelectObject(hdc, HGDIOBJ(pen.0));
-        let _ = DeleteObject(HGDIOBJ(focus_pen.0));
     }
 
     SelectObject(hdc, old_font);
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(HGDIOBJ(brush.0));
-    let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
 /// Maps a `DRAWITEMSTRUCT` to the state to draw, given the hover flag.
@@ -479,6 +479,91 @@ mod tests {
         assert_eq!((hover.fill, hover.text), (3, 4));
         let off = look(Role::Primary, State::Disabled, &SURFACE, ACCENT, Some(&hc));
         assert_eq!((off.text, off.border), (5, 5));
+        assert!(!primary.smooth, "high contrast takes plain corners");
+        let normal = look(Role::Primary, State::Normal, &SURFACE, ACCENT, None);
+        assert!(normal.smooth);
+    }
+
+    /// #989: in high contrast the corner pixels are exactly the card colour,
+    /// the fill or the border, never a blend that is no system colour.
+    #[test]
+    fn high_contrast_corners_hold_only_system_colours() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        let hc = HighContrast {
+            face: 0x0000_0000,
+            text: 0x00FF_FFFF,
+            highlight: 0x00FF_FF00,
+            highlight_text: 0x0000_0000,
+            gray_text: 0x0080_8080,
+        };
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 60,
+            bottom: 24,
+        };
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 60, 24);
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let dis = DRAWITEMSTRUCT {
+                hDC: dc,
+                rcItem: rc,
+                ..Default::default()
+            };
+            let look = look(Role::Primary, State::Normal, &SURFACE, ACCENT, Some(&hc));
+            draw(&dis, "", HFONT(std::ptr::null_mut()), &look, BG, 8, 1);
+            for y in 0..8 {
+                for x in 0..8 {
+                    let p = GetPixel(dc, x, y).0;
+                    assert!(
+                        p == BG || p == look.fill || p == look.border,
+                        "({x},{y}) = {p:06X}"
+                    );
+                }
+            }
+            assert_eq!(GetPixel(dc, 0, 0).0, BG, "the very corner is the card");
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+        }
+    }
+
+    /// A button drawn with no text must not crash: `DrawTextW` with an empty
+    /// buffer is an access violation (see `ui::text`), and the options card
+    /// (#307) paints its own label over a text-less button.
+    #[test]
+    fn a_button_with_no_text_draws_without_crashing() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, ReleaseDC,
+        };
+        let rc = RECT {
+            left: 0,
+            top: 0,
+            right: 60,
+            bottom: 24,
+        };
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, 60, 24);
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            let dis = DRAWITEMSTRUCT {
+                hDC: dc,
+                rcItem: rc,
+                ..Default::default()
+            };
+            let look = look(Role::Secondary, State::Normal, &SURFACE, ACCENT, None);
+            draw(&dis, "", HFONT(std::ptr::null_mut()), &look, BG, 4, 1);
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+        }
     }
 
     #[test]

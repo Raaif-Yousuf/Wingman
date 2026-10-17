@@ -11,6 +11,7 @@ mod capture;
 mod config;
 #[cfg(test)]
 mod config_example;
+mod config_writer;
 mod connectors;
 mod crash_note;
 mod diagnostics;
@@ -21,10 +22,15 @@ mod executors;
 mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
+mod keypress;
+// Called by the ingest worker in a later slice; until then only tests use it.
+#[cfg_attr(not(test), expect(dead_code))]
+mod knowledge;
 mod known_folder;
 mod machine;
 mod mode;
 mod ocr;
+mod options_keys;
 mod overlay;
 mod owner_acl;
 mod password_managers;
@@ -34,6 +40,8 @@ mod portable;
 mod profile;
 mod provider;
 mod redact;
+mod remote_ollama;
+mod report_problem;
 mod router;
 mod secrets;
 mod single_instance;
@@ -69,6 +77,9 @@ fn main() {
     }
 
     if let Err(e) = app::run() {
+        // #1019: no console in a release build, so leave a note the next
+        // start shows as a card.
+        crash_note::record_startup_failure(&format!("{e:#}"));
         eprintln!("Wingman: {e:#}");
         std::process::exit(1);
     }

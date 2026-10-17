@@ -197,7 +197,7 @@ impl OpenAiCompat {
             .and_then(Value::as_str)
         {
             if !refusal.is_empty() {
-                return Err(anyhow!("openai-compat: model refused to answer"));
+                return Err(super::refused_error("openai-compat"));
             }
         }
 

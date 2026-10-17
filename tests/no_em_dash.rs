@@ -339,6 +339,64 @@ fn deliberate_exemption_matches_its_named_line_only() {
     ));
 }
 
+/// User-facing text that lives outside `src/` (issue #783): the README and
+/// policy docs, the installer scripts (their output is printed to the user),
+/// the manifest's display names, the resource script and the example configs
+/// users copy. Paths are relative to the crate root.
+const NON_RUST_USER_FACING_FILES: &[&str] = &[
+    "README.md",
+    "PRIVACY.md",
+    "PROMISES.md",
+    "install.ps1",
+    "uninstall.ps1",
+    "config.example.toml",
+    "actions.example.toml",
+    "assets/app.rc",
+    "packaging/AppxManifest.xml.in",
+];
+
+/// 1-based line numbers of every U+2014 in `text`, CRLF-normalised first so a
+/// Windows checkout and a Linux one report the same lines.
+fn em_dash_lines(text: &str) -> Vec<usize> {
+    text.replace('\r', "")
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains('\u{2014}'))
+        .map(|(n, _)| n + 1)
+        .collect()
+}
+
+#[test]
+fn em_dash_lines_finds_a_dash_in_crlf_text() {
+    assert_eq!(
+        em_dash_lines("fine\r\nbad \u{2014} here\r\nfine\r\n"),
+        vec![2]
+    );
+    assert!(em_dash_lines("a - b\r\nan en dash \u{2013}\r\n").is_empty());
+}
+
+#[test]
+fn no_em_dash_in_non_rust_user_facing_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut scanned = 0usize;
+    let mut msg = String::new();
+    for rel in NON_RUST_USER_FACING_FILES {
+        let path = root.join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"));
+        scanned += 1;
+        for line in em_dash_lines(&text) {
+            msg.push_str(&format!("  {rel}:{line}\n"));
+        }
+    }
+    assert!(scanned > 0, "candidate set of non-Rust files was empty");
+    assert!(
+        msg.is_empty(),
+        "found U+2014 (em dash) in user-facing text outside src/ (AGENTS.md rule 11 -- \
+         use a full stop, colon, or the word the dash was hiding):\n{msg}"
+    );
+}
+
 #[test]
 fn no_em_dash_in_user_facing_string_literals() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

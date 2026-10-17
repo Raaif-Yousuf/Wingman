@@ -491,6 +491,21 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Held by every test that touches this module's process-wide state (the
+/// budget, the notice, the in-memory totals, the store-down switches) or
+/// records into the real store, for the whole test (#990).
+///
+/// Lock order, to avoid deadlock: `EGRESS_PREVIEW_TEST_LOCK` (what
+/// `network_guard` in `provider::common` takes first), then this one. Never
+/// take the egress lock while holding this.
+#[cfg(test)]
+static USAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn lock_usage_test() -> std::sync::MutexGuard<'static, ()> {
+    USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Publishes `[budget]` for the request path. A limit that is not a positive
 /// number turns the budget off. Called at startup and on every config reload.
 pub fn set_daily_budget(daily_usd: f64, warn_percent: u8) {
@@ -761,11 +776,12 @@ pub fn tally(
     result
 }
 
-/// The tooltip fragment for today, read from the store.
+/// The tooltip fragment for today, read from the store. Runs on the UI
+/// thread, so it never opens the store (#1010): before the start-up open has
+/// finished there is no spend part, and the next refresh shows it.
 pub fn tooltip_part() -> Option<String> {
-    let day = crate::store::global()
-        .and_then(|s| s.day_total(&local_date_today()))
-        .ok()??;
+    let store = crate::store::global_if_ready()?.ok()?;
+    let day = store.day_total(&local_date_today()).ok()??;
     format_tooltip_part(&day)
 }
 
@@ -970,10 +986,8 @@ mod tests {
 
     /// Held by every test that records into the real store (or flips the
     /// store-down switch), so a before/after difference is exact.
-    static TALLY_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn tally_lock() -> std::sync::MutexGuard<'static, ()> {
-        TALLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        lock_usage_test()
     }
 
     fn day_total_today(today: &str) -> DayTotal {
@@ -1052,7 +1066,7 @@ mod tests {
     /// the in-memory total the budget falls back to.
     #[test]
     fn with_the_store_down_an_error_reply_still_counts_toward_the_budget() {
-        let (_scope, _guard) = down_scope(0.01);
+        let _scope = down_scope(0.01);
         assert!(check_budget().is_ok());
         for _ in 0..2 {
             let _ = tally(
@@ -1190,7 +1204,10 @@ mod tests {
     }
 
     /// Puts every global this test touches back, also when an assertion panics.
-    struct DownScope;
+    struct DownScope {
+        /// Released only after `drop` has put every global back.
+        _locks: DownGuards,
+    }
     impl Drop for DownScope {
         fn drop(&mut self) {
             set_daily_budget(0.0, 80);
@@ -1210,25 +1227,25 @@ mod tests {
         std::sync::MutexGuard<'static, ()>,
     );
 
-    fn down_scope(limit: f64) -> (DownScope, DownGuards) {
-        // The tally lock first: no recording test may run while the store is
-        // switched off.
+    fn down_scope(limit: f64) -> DownScope {
+        // Egress lock first, then the usage lock (see `USAGE_TEST_LOCK`): no
+        // recording test may run while the store is switched off.
         let guard = (
-            tally_lock(),
             crate::config::EGRESS_PREVIEW_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
+            tally_lock(),
         );
-        let scope = DownScope;
+        let scope = DownScope { _locks: guard };
         set_daily_budget(limit, 80);
         STORE_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         *lock(&MEM_SPEND) = None;
-        (scope, guard)
+        scope
     }
 
     #[test]
     fn with_the_store_down_record_and_check_budget_still_stop_the_second_request() {
-        let (_scope, _guard) = down_scope(0.01);
+        let _scope = down_scope(0.01);
         // About $0.006 each.
         assert!(check_budget().is_ok());
         record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
@@ -1244,7 +1261,7 @@ mod tests {
     fn with_writes_failing_but_reads_fine_the_budget_still_trips() {
         // #794: the saved total stays put when writes fail; this run's own
         // spend must still count toward the cap.
-        let (_scope, _guard) = down_scope(0.01);
+        let _scope = down_scope(0.01);
         STORE_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
         WRITES_FAIL.store(true, std::sync::atomic::Ordering::SeqCst);
         // The path under test needs a store that opens and reads; without
@@ -1271,7 +1288,7 @@ mod tests {
 
     #[test]
     fn an_unpriced_cloud_response_still_counts_in_the_fallback_total() {
-        let (_scope, _guard) = down_scope(0.015);
+        let _scope = down_scope(0.015);
         // No usage block: unpriced, counted at the flat guess.
         record("anthropic", "model-with-no-price", false, None);
         assert!(check_budget().is_ok());
@@ -1281,7 +1298,7 @@ mod tests {
 
     #[test]
     fn a_notice_already_waiting_is_joined_not_overwritten() {
-        let (_scope, _guard) = down_scope(0.0);
+        let _scope = down_scope(0.0);
         let _ = take_budget_notice();
         push_notice("first".to_string());
         push_notice("second".to_string());

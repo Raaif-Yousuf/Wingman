@@ -1,4 +1,4 @@
-//! "Table to CSV" (#69): read a table off the screen and put it on the
+//! "Table to spreadsheet rows" (#69): read a table off the screen and put it on the
 //! clipboard as tab-separated text, which a spreadsheet pastes into columns (#708).
 //!
 //! The model fills `columns` (the header names) and then `rows` (each row a
@@ -10,7 +10,7 @@
 //! Decision (#708): tab-separated text only, in the one text format on the
 //! clipboard. Excel and Sheets split pasted text on tabs, so CSV landed in one
 //! column. A second CSV clipboard format would need raw clipboard code for a
-//! rarer target; the action keeps its name and id.
+//! rarer target; the id stays `table-to-csv` so configs keep working; the name changed (#802).
 //!
 //! [`Table`] and its [`tsv`](Table::tsv) are the shared piece: a receipt or a
 //! chart read into the same `table` proposal (#70, #114) gets the same quoting
@@ -52,7 +52,7 @@ pub const BASE_PROMPT: &str = "You are shown a table (as text, or as a screensho
 pub fn builtin_action() -> Action {
     Action {
         id: ACTION_ID.to_string(),
-        name: "Table to CSV".to_string(),
+        name: "Table to spreadsheet rows".to_string(),
         group: Some("Work".to_string()),
         inputs: vec![InputKind::Selection, InputKind::Screen],
         proposal: PROPOSAL_KIND.to_string(),
@@ -228,6 +228,15 @@ pub fn is_unreadable(proposal_kind: &str, proposal: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #802: the action copies tab-separated text, so its name says rows, not CSV;
+    /// the id stays so existing configs keep working.
+    #[test]
+    fn the_name_says_spreadsheet_rows_and_the_id_is_unchanged() {
+        let a = builtin_action();
+        assert_eq!(a.id, "table-to-csv");
+        assert_eq!(a.name, "Table to spreadsheet rows");
+    }
 
     fn table(columns: &[&str], rows: &[&[&str]]) -> Table {
         Table {

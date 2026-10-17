@@ -307,7 +307,12 @@ guarantees the card never ends up empty or a single dead end:
   model is ready, then **Copy text from screen** (#41, model-free).
 - With no model ready (no key, or Offline with no local model), the router
   does not run at all. The card is the static list: the catalogue's
-  model-free actions in a fixed order (#132), capped at 4. Zero network.
+  model-free actions in a fixed order (#132), capped at 3, then a last row,
+  **Set up a model**, that opens Settings (#1017). It is the one row that is not
+  an action: it runs nothing and bills nothing. From the key or the tray, the
+  press first looks for a local Ollama (#133) on a worker thread, adopts a
+  model that can read images, and lands on this card when it finds none. Zero
+  model requests.
 
 The fallback labels are the catalogue names, not model text.
 

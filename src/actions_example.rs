@@ -13,6 +13,12 @@
 mod tests {
     use crate::actions::{builtin_actions, ActionsFile};
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// #956: with UPDATE_EXAMPLES=1 one test rewrites the example file, so every
+    /// test that touches the file holds this lock; otherwise a reader can see it
+    /// half written.
+    static EXAMPLE_FILE: Mutex<()> = Mutex::new(());
 
     fn example_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("actions.example.toml")
@@ -27,6 +33,7 @@ mod tests {
 
     #[test]
     fn actions_example_matches_builtin_actions() {
+        let _lock = EXAMPLE_FILE.lock().unwrap_or_else(|e| e.into_inner());
         let expected =
             toml::to_string_pretty(&example_file()).expect("ActionsFile must serialize to TOML");
 
@@ -59,6 +66,7 @@ mod tests {
 
     #[test]
     fn actions_example_round_trips_through_the_real_parser() {
+        let _lock = EXAMPLE_FILE.lock().unwrap_or_else(|e| e.into_inner());
         // The example must actually be a valid actions.toml, parsed the
         // same way a user's own file is -- not merely valid TOML.
         let committed = std::fs::read_to_string(example_path())

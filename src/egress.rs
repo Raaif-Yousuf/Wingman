@@ -48,9 +48,15 @@
 //!
 //! # Knowledge snippets (#85+)
 //!
-//! [`EgressEntry::snippets`] is always empty today: the knowledge/retrieval
-//! system it would describe is unbuilt Phase 3b work (issue #85 onwards).
-//! The column exists now so #85 only has to populate it, not add it.
+//! A request that attaches excerpts from the user's documents (#92) records
+//! one label per excerpt in [`EgressEntry::snippets`], in the spec's form
+//! `file#chunk 12:ab12cd34` (file name, chunk number, first 8 hex characters
+//! of the chunk hash), never the text, and one [`AttachmentKind::Knowledge`]
+//! attachment with the excerpt bytes. The worker names its excerpts with
+//! [`KnowledgeScope::new`] before it sends; the scope clears them when it is
+//! dropped, the way the trigger is named
+//! ([`crate::activation::set_worker_trigger`]). [`build_entry`] reads them on
+//! that same thread. A request that attached none leaves the field empty.
 //!
 //! # Cost (#21)
 //!
@@ -73,6 +79,9 @@ use crate::store::{Store, StoreError};
 pub enum AttachmentKind {
     Image,
     Text,
+    /// Excerpts from the user's documents (#92), a subset of the request's
+    /// text. `size_bytes` is the excerpt text.
+    Knowledge,
 }
 
 /// One attached input's kind and size -- never its content. `width`/`height`
@@ -105,7 +114,8 @@ pub struct EgressEntry {
     /// `provider::common::post_json_with`). `false` for the first attempt.
     pub retried: bool,
     pub attachments: Vec<Attachment>,
-    /// Always empty; see this module's doc comment on knowledge snippets.
+    /// One label per document excerpt in the request, empty when it carried
+    /// none; see this module's doc comment on knowledge snippets.
     pub snippets: Vec<String>,
     pub bytes_sent: usize,
     pub bytes_received: usize,
@@ -118,7 +128,7 @@ pub struct EgressEntry {
     /// usage (shown as "unknown"), and on failures and non-model requests.
     pub cost: Option<f64>,
     /// What started the ask this request belongs to (`hotkey`, `activation`,
-    /// `tray`, `palette`, see `activation::Trigger`), so "forty of these were
+    /// `tray`, `palette`, `options`, see `activation::Trigger`), so "forty of these were
     /// activations" can be told apart from key presses (#236). `None` for
     /// requests not started by an ask, and for rows written before this
     /// field existed.
@@ -488,7 +498,10 @@ fn token_spans(run: &str) -> Vec<std::ops::Range<usize>> {
     if let Some(b) = start {
         spans.push(b..run.len());
     }
-    spans.retain(|r| run[r.clone()].chars().count() >= MIN_TOKEN_CHARS);
+    spans.retain(|r| {
+        let part = &run[r.clone()];
+        part.chars().count() >= MIN_TOKEN_CHARS && !KNOWN_VENDOR_CODES.contains(&part)
+    });
     spans.extend(hex_chain_spans(run));
     spans.sort_by_key(|r| r.start);
 
@@ -502,6 +515,25 @@ fn token_spans(run: &str) -> Vec<std::ops::Range<usize>> {
     }
     merged
 }
+
+/// #941: the error `type` and `code` words the vendors publish that are long
+/// enough to look key-shaped. A narrow fragment equal to one of these, whole,
+/// is kept, so the card still says why a request failed. It is a fixed list,
+/// not a shape rule: anything else, however word-like, is still scrubbed.
+const KNOWN_VENDOR_CODES: [&str; 12] = [
+    "invalid_request_error",
+    "authentication_error",
+    "content_policy_violation",
+    "image_content_policy_violation",
+    "context_length_exceeded",
+    "invalid_organization",
+    "string_above_max_length",
+    "unsupported_country_region_territory",
+    "invalid_request_parameters",
+    "request_too_large",
+    "permission_denied_error",
+    "insufficient_permissions",
+];
 
 /// #273: a same-case hex secret split by `/ + = . - _` is a row of short
 /// fragments, none long enough for the narrow rule and none mixed-case
@@ -595,6 +627,41 @@ fn run_spans(s: &str, run: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>
         .collect()
 }
 
+/// The excerpts the current worker thread is about to send: their labels and
+/// the bytes of their text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkerKnowledge {
+    labels: Vec<String>,
+    bytes: usize,
+}
+
+thread_local! {
+    static WORKER_KNOWLEDGE: std::cell::RefCell<WorkerKnowledge> =
+        const { std::cell::RefCell::new(WorkerKnowledge { labels: Vec::new(), bytes: 0 }) };
+}
+
+/// The labels set on this thread, for the send preview.
+pub fn worker_knowledge_labels() -> Vec<String> {
+    WORKER_KNOWLEDGE.with(|k| k.borrow().labels.clone())
+}
+
+/// Names the excerpts this thread's requests attach (see the module doc) and
+/// forgets them when dropped, on every exit path.
+pub struct KnowledgeScope;
+
+impl KnowledgeScope {
+    pub fn new(labels: Vec<String>, bytes: usize) -> Self {
+        WORKER_KNOWLEDGE.with(|k| *k.borrow_mut() = WorkerKnowledge { labels, bytes });
+        Self
+    }
+}
+
+impl Drop for KnowledgeScope {
+    fn drop(&mut self) {
+        WORKER_KNOWLEDGE.with(|k| *k.borrow_mut() = WorkerKnowledge::default());
+    }
+}
+
 /// Builds the row [`record`] will persist for one HTTP attempt. `provider`
 /// is the same short tag every provider file already passes to
 /// `post_json`/`post_json_with_connect_timeout` (e.g. `"anthropic"`,
@@ -612,7 +679,16 @@ pub fn build_entry(
     outcome: Outcome,
     error: Option<&str>,
 ) -> EgressEntry {
-    let attachments = attachments_from_body(body);
+    let mut attachments = attachments_from_body(body);
+    let knowledge = WORKER_KNOWLEDGE.with(|k| k.borrow().clone());
+    if !knowledge.labels.is_empty() {
+        attachments.push(Attachment {
+            kind: AttachmentKind::Knowledge,
+            size_bytes: knowledge.bytes,
+            width: None,
+            height: None,
+        });
+    }
     // The painted counts describe the screenshot, so they only belong on a
     // request that carries one.
     let redactions = if attachments.iter().any(|a| a.kind == AttachmentKind::Image) {
@@ -626,7 +702,7 @@ pub fn build_entry(
         model: model_from(url, body),
         retried,
         attachments,
-        snippets: Vec::new(),
+        snippets: knowledge.labels,
         bytes_sent,
         bytes_received,
         outcome,
@@ -811,6 +887,7 @@ pub fn render_human(entry: &EgressEntry) -> String {
         let kind = match a.kind {
             AttachmentKind::Image => "image",
             AttachmentKind::Text => "text",
+            AttachmentKind::Knowledge => "knowledge",
         };
         match (a.width, a.height) {
             (Some(w), Some(h)) => {
@@ -824,7 +901,7 @@ pub fn render_human(entry: &EgressEntry) -> String {
         if entry.snippets.is_empty() {
             "none".to_string()
         } else {
-            entry.snippets.len().to_string()
+            entry.snippets.join("; ")
         }
     ));
     parts.push(format!(
@@ -1055,6 +1132,25 @@ mod tests {
     }
 
     // -- redact_opaque_tokens: the single most important test here --------
+
+    /// #941: a vendor's published error type and code stay readable; word-like
+    /// text that is not on the list (a key with short segments, a passphrase)
+    /// is still scrubbed.
+    #[test]
+    fn redact_opaque_tokens_keeps_known_vendor_codes_only() {
+        let body = r#"{"type":"invalid_request_error","code":"content_policy_violation"}"#;
+        assert_eq!(redact_opaque_tokens(body), body);
+
+        for other in [
+            "tok_prod_abcdefghijkl",
+            "correct_horse_battery",
+            "invalid_request_error_x",
+            "xinvalid_request_error",
+        ] {
+            let out = redact_opaque_tokens(&format!("key {other} bad"));
+            assert!(!out.contains(other), "{out}");
+        }
+    }
 
     #[test]
     fn redact_opaque_tokens_scrubs_a_long_key_shaped_token() {
@@ -1325,6 +1421,48 @@ mod tests {
         assert!(!serialized.contains(fake_key), "{serialized}");
         let human = render_human(&entry);
         assert!(!human.contains(fake_key), "{human}");
+    }
+
+    // -- knowledge excerpts (#92) ----------------------------------------------
+
+    #[test]
+    fn a_request_with_excerpts_records_their_labels_and_never_their_text() {
+        let body = json!({"model": "gpt-5.5", "input": "secret excerpt words"});
+        let send = || {
+            build_entry(
+                "openai",
+                "https://api.openai.com/v1/responses",
+                &body,
+                false,
+                10,
+                20,
+                Outcome::Success,
+                None,
+            )
+        };
+        assert!(send().snippets.is_empty());
+        let labels = vec!["cv.md#chunk 3:ab12cd34".to_string()];
+        let entry = {
+            let _scope = KnowledgeScope::new(labels.clone(), 20);
+            assert_eq!(worker_knowledge_labels(), labels);
+            send()
+        };
+        assert_eq!(entry.snippets, labels);
+        let k = entry
+            .attachments
+            .iter()
+            .find(|a| a.kind == AttachmentKind::Knowledge)
+            .expect("a knowledge attachment");
+        assert_eq!(k.size_bytes, 20);
+        let human = render_human(&entry);
+        assert!(human.contains("cv.md#chunk 3:ab12cd34"), "{human}");
+        assert!(human.contains("knowledge:"), "{human}");
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("secret excerpt"));
+        // The scope is gone: the next request on this thread carries none.
+        assert!(send().snippets.is_empty());
+        assert!(worker_knowledge_labels().is_empty());
     }
 
     // -- trigger (#236) ------------------------------------------------------

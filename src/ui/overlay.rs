@@ -69,7 +69,7 @@ pub const WM_APP_OVERLAY_INPUT: u32 = WM_APP + 30;
 
 /// `SetTimer`'s id for the overlay's one-shot age timer. It is killed the
 /// moment it fires and by every hide path, so it never repeats (rule 5).
-pub const OVERLAY_TIMER_ID: usize = 5;
+pub const OVERLAY_TIMER_ID: usize = 6;
 
 const CLASS_NAME: &str = "Wingman.Overlay.5b1d9c42";
 #[cfg(test)]

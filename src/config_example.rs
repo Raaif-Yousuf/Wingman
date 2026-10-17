@@ -16,15 +16,37 @@
 mod tests {
     use crate::config::Config;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// #956: with UPDATE_EXAMPLES=1 one test rewrites the example file, so every
+    /// test that touches the file holds this lock; otherwise a reader can see it
+    /// half written.
+    static EXAMPLE_FILE: Mutex<()> = Mutex::new(());
 
     fn example_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
     }
 
+    /// The serialiser writes no comments, so notes that belong in the example
+    /// are added here, after the section header they describe.
+    fn with_notes(generated: &str) -> String {
+        const HEADER: &str = "[palette]\n";
+        const NOTE: &str = "# Not used yet: the key never runs a clipboard option on the model's\n\
+                            # confidence alone (#859). Changing it has no effect today.\n";
+        assert!(
+            generated.contains(HEADER),
+            "the [palette] section moved; update with_notes"
+        );
+        generated.replacen(HEADER, &format!("{HEADER}{NOTE}"), 1)
+    }
+
     #[test]
     fn config_example_matches_defaults() {
-        let expected = toml::to_string_pretty(&Config::default())
-            .expect("Config::default() must serialize to TOML");
+        let _lock = EXAMPLE_FILE.lock().unwrap_or_else(|e| e.into_inner());
+        let expected = with_notes(
+            &toml::to_string_pretty(&Config::default())
+                .expect("Config::default() must serialize to TOML"),
+        );
 
         let path = example_path();
 
@@ -54,6 +76,7 @@ mod tests {
 
     #[test]
     fn config_example_never_ships_a_nonempty_api_key() {
+        let _lock = EXAMPLE_FILE.lock().unwrap_or_else(|e| e.into_inner());
         // Config::default()'s api_key fields are empty strings. Guard the
         // committed file against ever carrying a real-looking key, even if
         // someone hand-edits it after a regeneration.

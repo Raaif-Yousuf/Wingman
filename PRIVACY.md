@@ -81,6 +81,34 @@ refused in Offline and Local mode, is one row in the egress log (the site
 name and the bytes received, never the path, the query or the page), and
 lives in `src/inputs/web_page.rs`.
 
+## Your documents folder
+
+If you set a folder under `[knowledge]` in the config file, Wingman reads the
+text files in it and keeps a searchable copy in its local store. Nothing is
+sent anywhere to do that: reading and indexing make no network request.
+
+A file's text leaves your computer in one case only: you type a question in
+the palette and choose **Ask my documents**. Wingman then looks up the few
+excerpts that match your question and puts them in that one request to your
+model, marked as untrusted data. Email addresses, card numbers, IBANs and
+key-like tokens in the excerpts are replaced with markers first, whatever the
+screenshot-redaction setting says. A password written as plain words next to a
+label (`password: hunter2`) is not recognised and would be sent, so keep such
+files out of the folder. Nothing else in the folder is sent, and nothing is
+sent without your question.
+
+- Where it goes: to the provider that answers, like any other request. With a
+  local model (Ollama on this computer) it stays on this computer.
+- **Offline** blocks it like every cloud request. Local mode sends it only to
+  a local model.
+- The egress log records every such request. It lists one label per excerpt,
+  such as `resume.pdf#chunk 12:ab12cd34` (file name, chunk number and the start
+  of the chunk's hash), and never the excerpt text. A file name can be
+  sensitive in itself, and the log shows it so you can see what was attached.
+  The send preview, when it is on, shows the same labels.
+- The answer card shows the quotes it relied on and the file each came from.
+  Wingman checks every quote against the excerpt before showing it.
+
 ## Modes and the Offline guard
 
 The tray's **Mode** submenu is Cloud / Local / Auto (default) / Offline.
@@ -124,6 +152,17 @@ packet capture, is in [`docs/offline.md`](docs/offline.md).
   the Wingman folder instead). Wingman deletes files at least an hour old when
   it starts and the next time you add an event, and the undo button deletes it
   at once.
+- **Knowledge folder (off unless you set it).** If `[knowledge] folder` in
+  `config.toml` names a folder, Wingman reads the .txt and .md files in it once,
+  when it starts, and keeps their text in the local store (`store\wingman.db`)
+  so it can be searched. Card, bank-account (IBAN) and national-id numbers are
+  replaced with a marker such as `[card number]` before the text is saved. The
+  text is saved as plain text in the store folder, which only your Windows
+  account can open, like the files themselves. Nothing is sent anywhere: this
+  makes no network request. Delete a file and its text is removed at the next
+  start. Change the setting to another folder, or clear it, and the saved text
+  of the old folder is deleted at the next start. Leave the setting empty and
+  Wingman reads no folder and keeps no text from one.
 - Nothing else. No screenshot is written to disk. No history, log or cache of
   past answers persists across a restart.
 
@@ -207,7 +246,8 @@ Remove-Item "$env:LOCALAPPDATA\Wingman" -Recurse -Force
   only be opened by your Windows account on this PC. Rows are kept for 90 days, at
   most 10 000. After an upgrade it also holds the old `spend.json.migrated`
   and `egress.log.migrated`. The `store` folder is readable only by your
-  Windows account.
+  Windows account. If you turned on the knowledge folder, it also holds the
+  text of those files.
 
 Deleting `config.toml` removes a key that was stored in it, but rotate any
 exposed key with your provider regardless; deleting the file does not

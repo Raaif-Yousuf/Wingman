@@ -75,6 +75,17 @@ merely restricted to loopback -- neither connectors nor an update checker
 exist in this crate yet, so there is nothing to disable today; see "What it
 cannot guarantee" below for what this means in practice.
 
+### A config file that does not parse
+
+If `config.toml` cannot be read as valid TOML when Wingman starts or when you
+choose **Reload settings**, the run is Offline until it parses, whatever
+`mode` was before. A hand edit with a typo therefore cannot send a screenshot
+to a cloud provider by accident. Wingman shows a card naming the problem and
+refuses to save over the file while it is broken or has changed on disk since
+it was read, so your edit is never overwritten. Before a save does replace the
+file, one copy is kept as `config.toml.bak`, with API keys blanked. Fix the
+file, then choose **Reload settings** (in **Help and diagnostics** in the tray menu).
+
 ## What the guard blocks, and where
 
 Every function in `src/provider/common.rs` that actually opens a socket

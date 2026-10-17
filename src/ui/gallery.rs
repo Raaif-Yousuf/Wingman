@@ -24,6 +24,10 @@ pub struct GalleryArgs {
     /// `--matrix`: with `--screenshot <dir>`, render every state under every
     /// theme and scale in [`MATRIX_THEMES`] and [`MATRIX_SCALES`].
     pub matrix: bool,
+    /// `--only <prefix>`: draw only the states whose name starts with this
+    /// (`tray-menu`, `card-options`), so one surface can be looked at without
+    /// rendering the whole gallery.
+    pub only: Option<String>,
 }
 
 /// The themes `--matrix` renders, by their `--theme` names.
@@ -60,24 +64,61 @@ pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> Stri
 }
 
 /// Whether a state can be drawn under a simulated theme and DPI. The card
-/// states and the region overlay can. The palette reads the live theme and
-/// the window's own DPI, so `--matrix` draws it once, as
-/// `<state>--system--<percent>.png` at the DPI the window really has.
-/// Settings follows the DPI only (see [`follows_dpi_only`]).
+/// states, the palette, the region overlay and the tray menu can. Settings
+/// follows the DPI only (see [`follows_dpi_only`]).
 #[cfg(any(test, debug_assertions))]
 pub fn follows_variants(state: GalleryState) -> bool {
     use GalleryState::*;
     !matches!(
         state,
+        SettingsGeneral
+            | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen
+    )
+}
+
+/// Whether a state is captured by sending `WM_PRINT` instead of calling
+/// `PrintWindow`. The palette draws with a Direct2D window render target,
+/// which `PrintWindow` cannot read, so its pictures were a black page (#626).
+/// `WM_PRINT` gets the GDI paint.
+/// The card and Settings paint with GDI and `PrintWindow` is exact for them.
+#[cfg(any(test, debug_assertions))]
+pub fn prints_with_wm_print(state: GalleryState) -> bool {
+    use GalleryState::*;
+    matches!(
+        state,
         PaletteDefault
-            | PaletteRouterSuggestion
             | PaletteNoMatches
             | PaletteNoModel
-            | SettingsTop
-            | SettingsBottom
-            | SettingsAdvancedTop
-            | SettingsAdvancedBottom
+            | PaletteHover
+            | PaletteLong
+            | PaletteLongScrolled
+            | PaletteLongThumbHot
+            | PaletteLongName
     )
+}
+
+/// Whether a state also gets a Direct2D picture. The palette draws with a
+/// Direct2D window render target that a screen capture and `PrintWindow` cannot
+/// read (#987), so its `WM_PRINT` picture is the GDI paint. The gallery
+/// therefore paints it a second time through the real Direct2D code into an
+/// off-screen target, saved next to the GDI one (see [`d2d_filename`]).
+#[cfg(any(test, debug_assertions))]
+pub fn draws_with_direct2d(state: GalleryState) -> bool {
+    prints_with_wm_print(state)
+}
+
+/// The Direct2D picture's file for the GDI picture at `gdi`:
+/// `palette-default--dark--150.png` becomes `palette-default--dark--150--d2d.png`.
+#[cfg(any(test, debug_assertions))]
+pub fn d2d_filename(gdi: &std::path::Path) -> PathBuf {
+    let stem = gdi.file_stem().unwrap_or_default().to_string_lossy();
+    gdi.with_file_name(format!("{stem}--d2d.png"))
 }
 
 /// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
@@ -88,7 +129,14 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
-        SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom
+        SettingsGeneral
+            | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen
     )
 }
 
@@ -119,6 +167,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
     let mut theme = None;
     let mut dpi = None;
     let mut matrix = false;
+    let mut only = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a == "--screenshot" {
@@ -135,6 +184,10 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
             }
         } else if a == "--matrix" {
             matrix = true;
+        } else if a == "--only" {
+            if let Some(prefix) = iter.next() {
+                only = Some(prefix.clone());
+            }
         }
     }
     Some(GalleryArgs {
@@ -142,6 +195,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
         theme,
         dpi,
         matrix,
+        only,
     })
 }
 
@@ -159,6 +213,8 @@ pub enum GalleryState {
     /// The same with the Tab focus rectangle on the first link (#606).
     CardAnswerFocused,
     CardError,
+    /// #831: the first-launch welcome card (a click-to-open-Settings card).
+    CardWelcome,
     /// Issue #354. Replaces the old single glyph-only `CardPending` state:
     /// the pending card now always carries a status line, so each sub-stage
     /// gets its own gallery entry instead of one generic "pending" shot.
@@ -179,17 +235,48 @@ pub enum GalleryState {
     /// The preview's title line replaced by an error message, drawn in the
     /// error colour (a number field holding text).
     CardPreviewError,
+    /// Issue #307: the options card while the router works: the summary
+    /// placeholder, no buttons yet.
+    CardOptionsLooking,
+    /// Issue #307: three options, the router's answer.
+    CardOptionsReady,
+    /// Issue #307: four options with long labels and a long summary, and
+    /// option 1 drawn as the default (the key runs it).
+    CardOptionsDefaultLong,
+    /// Issue #307: no model is set up, so the static list of actions that
+    /// need none.
+    CardOptionsNoModel,
+    /// #885: the setup cards a new user sees, which show their detail line.
+    CardSetupNoModel,
+    CardSetupOllamaDown,
+    /// #1020: the first failure a new user meets, as a plain setup card.
+    CardSetupKeyRejected,
     PaletteDefault,
-    PaletteRouterSuggestion,
     PaletteNoMatches,
     PaletteNoModel,
-    /// Issue #560: the Settings window from a default config, Advanced
-    /// collapsed, scrolled to the top / bottom.
-    SettingsTop,
-    SettingsBottom,
-    /// Issue #560: the same with Advanced expanded.
-    SettingsAdvancedTop,
-    SettingsAdvancedBottom,
+    /// #883: more actions than fit, at the top: a scroll thumb at the top.
+    PaletteLong,
+    /// #883: the same list scrolled to the end: the thumb at the bottom.
+    PaletteLongScrolled,
+    /// The scroll thumb widened, as with the pointer over its strip (#988).
+    PaletteLongThumbHot,
+    /// #1000: an action name and a footer line far wider than the row: both
+    /// end in an ellipsis, clear of the scroll thumb.
+    PaletteLongName,
+    /// #882: the mouse over a row other than the selected one.
+    PaletteHover,
+    /// Issue #560, #872: the Settings window from a default config, one state
+    /// per page of the rail.
+    SettingsGeneral,
+    SettingsModels,
+    SettingsModelsClaude,
+    SettingsModelsMoreProviders,
+    SettingsPrivacy,
+    SettingsActions,
+    /// The Advanced page with the Check my work prompt folded away.
+    SettingsAdvanced,
+    /// The same with the prompt open.
+    SettingsAdvancedPromptOpen,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -197,6 +284,10 @@ pub enum GalleryState {
     /// them flipped below its text and one spanning a line break. Drawn
     /// straight to a PNG (no window), so a screenshot run only.
     OverlayNotes,
+    /// #825: the real tray menu, drawn from fixture data.
+    TrayMenu,
+    /// #825: the same with a row selected and its submenu open.
+    TrayMenuSubmenu,
 }
 
 /// The full ordered list of states the gallery steps through. Order is the
@@ -213,6 +304,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardAnswerExpanded,
         CardAnswerFocused,
         CardError,
+        CardWelcome,
         CardPendingReadingSelection,
         CardPendingAskingModelShort,
         CardPendingAskingModelLong,
@@ -220,16 +312,33 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardPreviewCalendar,
         CardPreviewFormLongLabels,
         CardPreviewError,
+        CardOptionsLooking,
+        CardOptionsReady,
+        CardOptionsDefaultLong,
+        CardOptionsNoModel,
+        CardSetupNoModel,
+        CardSetupOllamaDown,
+        CardSetupKeyRejected,
         PaletteDefault,
-        PaletteRouterSuggestion,
         PaletteNoMatches,
         PaletteNoModel,
-        SettingsTop,
-        SettingsBottom,
-        SettingsAdvancedTop,
-        SettingsAdvancedBottom,
+        PaletteLong,
+        PaletteLongScrolled,
+        PaletteLongThumbHot,
+        PaletteLongName,
+        PaletteHover,
+        SettingsGeneral,
+        SettingsModels,
+        SettingsModelsClaude,
+        SettingsModelsMoreProviders,
+        SettingsPrivacy,
+        SettingsActions,
+        SettingsAdvanced,
+        SettingsAdvancedPromptOpen,
         RegionOverlay,
         OverlayNotes,
+        TrayMenu,
+        TrayMenuSubmenu,
     ]
 }
 
@@ -248,6 +357,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardAnswerExpanded => "card-answer-expanded",
         CardAnswerFocused => "card-answer-focused",
         CardError => "card-error",
+        CardWelcome => "card-welcome",
         CardPendingReadingSelection => "card-pending-reading-selection",
         CardPendingAskingModelShort => "card-pending-asking-model-short",
         CardPendingAskingModelLong => "card-pending-asking-model-long",
@@ -255,16 +365,33 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardPreviewCalendar => "card-preview-calendar",
         CardPreviewFormLongLabels => "card-preview-form-long-labels",
         CardPreviewError => "card-preview-error",
+        CardOptionsLooking => "card-options-looking",
+        CardOptionsReady => "card-options-ready",
+        CardOptionsDefaultLong => "card-options-default-long",
+        CardOptionsNoModel => "card-options-no-model",
+        CardSetupNoModel => "card-setup-no-model",
+        CardSetupOllamaDown => "card-setup-ollama-down",
+        CardSetupKeyRejected => "card-setup-key-rejected",
         PaletteDefault => "palette-default",
-        PaletteRouterSuggestion => "palette-router-suggestion",
         PaletteNoMatches => "palette-no-matches",
         PaletteNoModel => "palette-no-model",
-        SettingsTop => "settings-top",
-        SettingsBottom => "settings-bottom",
-        SettingsAdvancedTop => "settings-advanced-top",
-        SettingsAdvancedBottom => "settings-advanced-bottom",
+        PaletteLong => "palette-long",
+        PaletteLongScrolled => "palette-long-scrolled",
+        PaletteLongThumbHot => "palette-long-thumb-hot",
+        PaletteLongName => "palette-long-name",
+        PaletteHover => "palette-hover",
+        SettingsGeneral => "settings-general",
+        SettingsModels => "settings-models",
+        SettingsModelsClaude => "settings-models-claude",
+        SettingsModelsMoreProviders => "settings-models-more-providers",
+        SettingsPrivacy => "settings-privacy",
+        SettingsActions => "settings-actions",
+        SettingsAdvanced => "settings-advanced",
+        SettingsAdvancedPromptOpen => "settings-advanced-prompt-open",
         RegionOverlay => "region-overlay",
         OverlayNotes => "overlay-notes",
+        TrayMenu => "tray-menu",
+        TrayMenuSubmenu => "tray-menu-submenu",
     }
 }
 
@@ -286,9 +413,10 @@ pub fn screenshot_filename(state_name: &str) -> String {
 // named in the PR: `wingman --ui-gallery --screenshot <dir>` must produce
 // one non-trivial PNG per state in `gallery_states()`, with no hotkey
 // registered, no tray icon created and no `single_instance` mutex touched
-// (verified by code inspection: this module never imports `hotkey`, `tray`
-// or `single_instance`, and never constructs anything from `provider::`
-// that would make a real HTTP call -- every value handed to `show_answer`/
+// (verified by code inspection: this module never imports `hotkey` or
+// `single_instance`, and it uses `tray` only through `Tray::for_gallery`,
+// which builds the menu on a tray that never adds a shell icon), and never
+// constructs anything from `provider::` that would make a real HTTP call -- every value handed to `show_answer`/
 // `show_error`/`show_preview` below is a literal or a fixture
 // `serde_json::Value`).
 #[cfg(debug_assertions)]
@@ -299,18 +427,18 @@ mod driver {
     use crate::ui::palette::Palette;
     use crate::ui::palette_model::PaletteAction;
     use crate::ui::region::Overlay;
-    use crate::ui::settings::GalleryWindow;
+    use crate::ui::settings::{GalleryWindow, Page};
     use std::time::Duration;
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
         SelectObject, HBITMAP, HDC,
     };
     use windows::Win32::Storage::Xps::{PrintWindow, PW_CLIENTONLY};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_LEFT, VK_RIGHT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetClientRect, GetMessageW, PeekMessageW, TranslateMessage, MSG,
-        PM_REMOVE, WM_KEYDOWN,
+        DispatchMessageW, GetClientRect, GetMessageW, PeekMessageW, SendMessageW, TranslateMessage,
+        MSG, PM_REMOVE, WM_KEYDOWN, WM_PRINT,
     };
 
     /// Runs the gallery. With `args.screenshot_dir` set, drives every state
@@ -330,9 +458,15 @@ mod driver {
 
         let mut card = Card::new_for_test(instance)?;
         let mut palette = Palette::new_for_test(instance)?;
+        palette.keep_open_for_gallery();
+        palette.ignore_mouse_for_test();
         let mut settings: Option<GalleryWindow> = None;
         let mut region: Option<Overlay> = None;
-        let states = gallery_states();
+        let mut states = gallery_states();
+        if let Some(prefix) = &args.only {
+            states.retain(|s| state_name(*s).starts_with(prefix.as_str()));
+            anyhow::ensure!(!states.is_empty(), "--only {prefix:?} matches no state");
+        }
 
         if args.matrix {
             if args.theme.is_some() || args.dpi.is_some() {
@@ -381,15 +515,16 @@ mod driver {
                         )?;
                     }
                 } else {
-                    // Live theme, the window's own DPI: named for the DPI it
-                    // really had, found out once the window exists.
+                    // Tray menus and the like: once, at the monitor's own DPI,
+                    // named for the DPI the window really had.
+                    let variant = Variant::default();
                     let path = dir.join("pending.png");
                     let named = shoot(
                         &mut card,
                         &mut palette,
                         &mut settings,
                         &mut region,
-                        Variant::default(),
+                        variant,
                         *state,
                         &path,
                     )
@@ -441,7 +576,7 @@ mod driver {
         }
 
         let mut idx = 0usize;
-        apply_variant(&mut card, variant);
+        apply_variant(&mut card, &mut palette, variant);
         let hwnd0 = show_state(
             &mut card,
             &mut palette,
@@ -494,12 +629,14 @@ mod driver {
         dpi: Option<u32>,
     }
 
-    fn apply_variant(card: &mut Card, variant: Variant) {
+    fn apply_variant(card: &mut Card, palette: &mut Palette, variant: Variant) {
         if let Some(theme) = variant.theme {
             card.force_theme_for_gallery(theme);
+            palette.force_theme_for_gallery(theme);
         }
         if let Some(dpi) = variant.dpi {
             card.force_dpi_for_gallery(dpi);
+            palette.force_dpi_for_gallery(dpi);
         }
     }
 
@@ -513,18 +650,36 @@ mod driver {
         state: GalleryState,
         path: &std::path::Path,
     ) -> anyhow::Result<HWND> {
-        apply_variant(card, variant);
+        apply_variant(card, palette, variant);
         if state == GalleryState::OverlayNotes {
             // No window: the overlay is a layered window, which `PrintWindow`
             // renders black (#626). Its picture is the frame it would show.
             card.hide();
             palette.hide();
             crate::ui::overlay::gallery_png(variant.theme, variant.dpi.unwrap_or(96), path)?;
+        } else if matches!(
+            state,
+            GalleryState::TrayMenu | GalleryState::TrayMenuSubmenu
+        ) {
+            // A real menu in its own modal loop, captured from the screen.
+            // The card window only names the DPI the picture was drawn at.
+            card.hide();
+            palette.hide();
+            tray_menu_shot(variant, state, Some(path))?;
             return Ok(card.hwnd());
         }
         let hwnd = show_state(card, palette, settings, region, variant, state)?;
         pump_and_wait(Duration::from_millis(120));
-        print_window_png(hwnd, path)?;
+        if state == GalleryState::PaletteHover {
+            // Windows sends a mouse move when a window appears under the
+            // cursor, which clears the hover set above: set it again so the
+            // picture does not depend on where the cursor happens to be.
+            palette.set_hover_for_test(Some(2));
+        }
+        print_window_png(hwnd, path, prints_with_wm_print(state))?;
+        if draws_with_direct2d(state) {
+            direct2d_png(palette, &d2d_filename(path))?;
+        }
         Ok(hwnd)
     }
 
@@ -585,6 +740,81 @@ mod driver {
         crate::actions::fill_form::build_preview_schema_and_value(&proposal)
     }
 
+    /// More actions than the palette shows at once, so it draws a scroll thumb.
+    fn long_palette_catalogue() -> Vec<PaletteAction> {
+        [
+            "Check my work",
+            "Summarize this",
+            "Explain this",
+            "Translate this",
+            "Rewrite more simply",
+            "Fix the grammar",
+            "Copy text from screen",
+            "Copy region to clipboard",
+            "Calculate selection",
+            "Convert units",
+            "Convert times",
+            "Add to calendar",
+            "Fill this form",
+            "Read a QR code",
+            "Define this word",
+            "Find similar images",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| PaletteAction {
+            id: format!("long-{i}"),
+            name: (*name).to_string(),
+            group: None,
+            requires_model: false,
+            effect: crate::ui::palette_model::Effect::None,
+            takes_text: false,
+        })
+        .collect()
+    }
+
+    /// One action whose name is about 90 characters, among short ones (#1000).
+    fn long_name_palette_catalogue() -> Vec<PaletteAction> {
+        [
+            "Check my work",
+            "Copy every table on this page into a spreadsheet and keep the column headings as they are",
+            "Summarize this",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| PaletteAction {
+            id: format!("long-name-{i}"),
+            name: (*name).to_string(),
+            group: None,
+            requires_model: false,
+            effect: crate::ui::palette_model::Effect::None,
+            takes_text: false,
+        })
+        .collect()
+    }
+
+    /// The options card's rows from `(id, label)` pairs.
+    fn option_rows(rows: &[(&str, &str)]) -> Vec<crate::ui::card::OptionRow> {
+        rows.iter()
+            .map(|(id, label)| crate::ui::card::OptionRow {
+                id: (*id).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect()
+    }
+
+    /// The options card as the app shows it: the longest dismiss time (so the
+    /// interactive gallery does not lose it) and the key claim on, so the
+    /// hint line reads as it does in use.
+    fn options_behavior(key_runs_first: bool) -> crate::ui::card::OptionsBehavior {
+        crate::ui::card::OptionsBehavior {
+            dismiss_secs: 120,
+            claim_keys: true,
+            key_runs_first,
+            foreground: 0,
+        }
+    }
+
     fn free_palette_catalogue() -> Vec<PaletteAction> {
         vec![
             PaletteAction {
@@ -593,6 +823,7 @@ mod driver {
                 group: Some("Answer".to_string()),
                 requires_model: true,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: "summarize".to_string(),
@@ -600,6 +831,7 @@ mod driver {
                 group: Some("Answer".to_string()),
                 requires_model: true,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: crate::ui::palette_model::CALCULATE_SELECTION_ACTION_ID.to_string(),
@@ -607,6 +839,7 @@ mod driver {
                 group: Some("Utilities".to_string()),
                 requires_model: false,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: crate::ui::palette_model::COPY_REGION_ACTION_ID.to_string(),
@@ -614,8 +847,24 @@ mod driver {
                 group: Some("Utilities".to_string()),
                 requires_model: false,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
         ]
+    }
+
+    /// The Settings page a gallery state shows.
+    fn settings_page(state: GalleryState) -> Page {
+        match state {
+            GalleryState::SettingsModels
+            | GalleryState::SettingsModelsClaude
+            | GalleryState::SettingsModelsMoreProviders => Page::Models,
+            GalleryState::SettingsPrivacy => Page::Privacy,
+            GalleryState::SettingsActions => Page::Actions,
+            GalleryState::SettingsAdvanced | GalleryState::SettingsAdvancedPromptOpen => {
+                Page::Advanced
+            }
+            _ => Page::General,
+        }
     }
 
     fn show_state(
@@ -697,10 +946,45 @@ mod driver {
             CardError => {
                 card.hide();
                 palette.hide();
-                card.show_error(
+                // Expanded and tracked, so the footer shows "Copy details"
+                // and "Report a problem" (#373).
+                card.show_error_with_details(
                     "Couldn't reach the model",
                     "The request timed out. Check your connection and try again.",
                 );
+                card.expand_for_gallery();
+            }
+            CardSetupNoModel | CardSetupOllamaDown => {
+                card.hide();
+                palette.hide();
+                let mut providers = crate::config::Providers {
+                    order: vec!["openai".to_string()],
+                    ..Default::default()
+                };
+                if state == CardSetupOllamaDown {
+                    providers.order = vec!["ollama".to_string()];
+                    providers.ollama.base_url = "http://127.0.0.1:11434".to_string();
+                }
+                let (headline, detail) = crate::app::empty_chain_card(
+                    crate::mode::Mode::Auto,
+                    &providers,
+                    "config.toml",
+                    None,
+                );
+                card.show_settings_needed(&headline, &detail);
+            }
+            CardSetupKeyRejected => {
+                card.hide();
+                palette.hide();
+                let raw = "anthropic: HTTP 401: invalid x-api-key";
+                let (headline, detail) = crate::app::setup_failure(raw).unwrap_or_default();
+                card.show_settings_needed(&headline, &detail);
+            }
+            CardWelcome => {
+                card.hide();
+                palette.hide();
+                let (headline, detail) = crate::app::welcome_card("Ctrl+Shift+/");
+                card.show_settings_needed(&headline, &detail);
             }
             CardPendingReadingSelection => {
                 card.hide();
@@ -755,33 +1039,129 @@ mod driver {
             PaletteDefault => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
             }
-            PaletteRouterSuggestion => {
+            CardOptionsLooking => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
-                let generation = palette.router_generation();
-                let result = crate::router::RouterResult {
-                    summary: "Check my work".to_string(),
-                    options: vec![crate::router::RouterOption {
-                        intent: "check-work".to_string(),
-                        label: "Check my work".to_string(),
-                        confidence: 0.92,
-                    }],
-                };
-                palette.apply_router_suggestion(generation, &result, 0.5);
+                card.show_options(
+                    1,
+                    crate::router::LOOKING_SUMMARY,
+                    &[],
+                    options_behavior(false),
+                );
+            }
+            CardOptionsReady => {
+                card.hide();
+                palette.hide();
+                card.show_options(
+                    1,
+                    "Compose window to Dana, \"Q3 numbers\"",
+                    &option_rows(&[
+                        ("review-this-email", "Review this email to Dana"),
+                        ("rewrite-tone", "Make it sound friendlier"),
+                        ("translate", "Translate to Spanish"),
+                    ]),
+                    options_behavior(false),
+                );
+            }
+            CardOptionsDefaultLong => {
+                card.hide();
+                palette.hide();
+                card.show_options(
+                    1,
+                    "A long thread about the quarterly numbers, with a table of figures and two attachments",
+                    &option_rows(&[
+                        (
+                            "review-this-email",
+                            "Review this email to Dana about the quarterly numbers",
+                        ),
+                        ("explain-screen", "Explain what is on screen"),
+                        ("chart-table", "Turn the table into a chart"),
+                        ("extract-text", "Copy text from screen"),
+                    ]),
+                    options_behavior(true),
+                );
+            }
+            CardOptionsNoModel => {
+                card.hide();
+                palette.hide();
+                card.show_options(
+                    1,
+                    crate::router::NO_MODEL_SUMMARY,
+                    &option_rows(&[
+                        ("extract-text", "Copy text from screen"),
+                        ("read-qr", "Read QR code from screen"),
+                        ("calculate-selection", "Calculate selection"),
+                        (
+                            crate::router::SETUP_MODEL_ID,
+                            crate::router::SETUP_MODEL_LABEL,
+                        ),
+                    ]),
+                    options_behavior(false),
+                );
             }
             PaletteNoMatches => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
                 palette.set_query_for_test("zzzzznomatch");
             }
             PaletteNoModel => {
                 card.hide();
                 palette.hide();
-                palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
+                palette.show(
+                    free_palette_catalogue(),
+                    false,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
+            }
+            PaletteLong | PaletteLongScrolled | PaletteLongThumbHot => {
+                card.hide();
+                palette.hide();
+                palette.show(
+                    long_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
+                if state == PaletteLongScrolled {
+                    palette.scroll_for_test(i32::MAX);
+                }
+                if state == PaletteLongThumbHot {
+                    palette.set_thumb_hot_for_test(true);
+                }
+            }
+            PaletteLongName => {
+                card.hide();
+                palette.hide();
+                palette.show(
+                    long_name_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line(
+                        "Auto",
+                        Some("openai:a-model-with-a-name-far-too-long-for-the-footer-line-to-hold-and-then-some-more-and-a-good-deal-more-after-that"),
+                    ),
+                );
+            }
+            PaletteHover => {
+                card.hide();
+                palette.hide();
+                palette.show(
+                    free_palette_catalogue(),
+                    true,
+                    crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
+                );
+                // Row 0 is the "Answer" header, row 1 the selected action:
+                // the hovered one is the action under it.
+                palette.set_hover_for_test(Some(2));
             }
             RegionOverlay => {
                 card.hide();
@@ -798,28 +1178,51 @@ mod driver {
                 card.hide();
                 palette.hide();
             }
-            SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
+            TrayMenu | TrayMenuSubmenu => {
+                card.hide();
+                palette.hide();
+                // Interactive: the menu opens and stays until it is closed.
+                tray_menu_shot(variant, state, None)?;
+            }
+            SettingsGeneral
+            | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen => {
                 card.hide();
                 palette.hide();
                 let mut w = GalleryWindow::open(instance, variant.dpi)
                     .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
-                w.set_advanced(matches!(
-                    state,
-                    SettingsAdvancedTop | SettingsAdvancedBottom
-                ));
-                w.scroll_to_end(matches!(state, SettingsBottom | SettingsAdvancedBottom));
+                w.show_page(settings_page(state));
+                w.set_advanced(matches!(state, SettingsAdvancedPromptOpen));
+                match state {
+                    SettingsModelsClaude => {
+                        w.pick_provider(crate::config::ActiveProvider::Anthropic)
+                    }
+                    SettingsModelsMoreProviders => w.reveal_providers(),
+                    _ => {}
+                }
                 *settings = Some(w);
             }
         }
         Ok(match state {
-            PaletteDefault | PaletteRouterSuggestion | PaletteNoMatches | PaletteNoModel => {
-                palette.hwnd()
-            }
+            PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover | PaletteLong
+            | PaletteLongScrolled | PaletteLongThumbHot | PaletteLongName => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
                 .map(|o| o.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no region overlay"))?,
-            SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => settings
+            SettingsGeneral
+            | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen => settings
                 .as_ref()
                 .map(|w| w.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
@@ -827,11 +1230,318 @@ mod driver {
         })
     }
 
-    /// Captures `hwnd`'s client area via `PrintWindow` and saves it as a PNG
-    /// at `path`. A specific application window, never the monitor (rule:
-    /// this must never call anything from `capture.rs`, which grabs the
-    /// screen for the real ask flow).
-    fn print_window_png(hwnd: HWND, path: &std::path::Path) -> anyhow::Result<()> {
+    /// Shows the real tray menu, built from fixture data on a tray with no
+    /// shell icon, and, with `path`, saves a picture of it and closes it
+    /// (#825). The menu runs its own modal loop, so a timer on the host
+    /// window drives it: it presses the keys the state needs, then captures
+    /// the menu windows from the screen. The process DPI is the monitor's, so
+    /// the file is named for that scale.
+    fn tray_menu_shot(
+        variant: Variant,
+        state: GalleryState,
+        path: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        use windows::core::w;
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW, WS_POPUP,
+        };
+        let instance = unsafe {
+            windows::Win32::Foundation::HINSTANCE(
+                windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?.0,
+            )
+        };
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(menu_host_proc),
+            hInstance: instance,
+            lpszClassName: w!("WingmanGalleryMenuHost"),
+            ..Default::default()
+        };
+        // Registering twice (a matrix run) fails harmlessly with "exists".
+        unsafe { RegisterClassW(&wc) };
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("WingmanGalleryMenuHost"),
+                w!("Wingman gallery menu host"),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }?;
+        let tray = crate::ui::tray::Tray::for_gallery(hwnd, instance);
+        let theme = variant.theme.unwrap_or_else(crate::ui::theme::detect_theme);
+        let sys = if theme == crate::ui::theme::Theme::HighContrast {
+            crate::ui::theme::HC_BLACK
+        } else {
+            crate::ui::theme::SysColors::read()
+        };
+        let menu = tray
+            .prepare_menu_at(POINT { x: 80, y: 80 }, theme, sys, variant.dpi)
+            .ok_or_else(|| anyhow::anyhow!("could not build the tray menu"))?;
+        MENU_SHOT.with(|s| {
+            *s.borrow_mut() = Some(MenuShot {
+                path: path.map(|p| p.to_path_buf()),
+                keys: if state == GalleryState::TrayMenuSubmenu {
+                    // Down to "Mode" (the first press lands on the version line), then Right.
+                    vec![VK_DOWN.0; 6].into_iter().chain([VK_RIGHT.0]).collect()
+                } else {
+                    Vec::new()
+                },
+                step: 0,
+                error: None,
+            })
+        });
+        if path.is_some() {
+            unsafe { windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 400, None) };
+        }
+        let _ = menu.track();
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        drop(tray);
+        let shot = MENU_SHOT.with(|s| s.borrow_mut().take());
+        match shot.and_then(|s| s.error) {
+            Some(e) => Err(anyhow::anyhow!(e)),
+            None => Ok(()),
+        }
+    }
+
+    struct MenuShot {
+        path: Option<std::path::PathBuf>,
+        keys: Vec<u16>,
+        step: u32,
+        error: Option<String>,
+    }
+
+    thread_local! {
+        static MENU_SHOT: std::cell::RefCell<Option<MenuShot>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The owner of the gallery's menu: answers the menu's owner-draw messages
+    /// and runs the capture timer.
+    unsafe extern "system" fn menu_host_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DefWindowProcW, EndMenu, KillTimer, SetTimer, WM_TIMER,
+        };
+        if let Some(answer) = crate::ui::tray_menu::handle_message(msg, wparam, lparam) {
+            return answer;
+        }
+        if msg == WM_TIMER {
+            let _ = KillTimer(Some(hwnd), 1);
+            let (step, keys, path) = MENU_SHOT.with(|s| {
+                let mut s = s.borrow_mut();
+                match s.as_mut() {
+                    Some(shot) => {
+                        shot.step += 1;
+                        (shot.step, shot.keys.clone(), shot.path.clone())
+                    }
+                    None => (0, Vec::new(), None),
+                }
+            });
+            if step == 1 && !keys.is_empty() {
+                for vk in keys {
+                    press_key(vk);
+                }
+                SetTimer(Some(hwnd), 1, 400, None);
+            } else {
+                if let Some(path) = path {
+                    if let Err(e) = capture_menus_png(&path) {
+                        MENU_SHOT.with(|s| {
+                            if let Some(shot) = s.borrow_mut().as_mut() {
+                                shot.error = Some(e.to_string());
+                            }
+                        });
+                    }
+                }
+                let _ = EndMenu();
+            }
+            return windows::Win32::Foundation::LRESULT(0);
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    fn press_key(vk: u16) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+            KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        };
+        let key = |flags: KEYBD_EVENT_FLAGS| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    dwFlags: flags,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            SendInput(
+                &[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)],
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    /// Saves the screen area every open menu window covers as a PNG.
+    fn capture_menus_png(path: &std::path::Path) -> anyhow::Result<()> {
+        use windows::core::w;
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, SRCCOPY};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowExW, GetWindowRect, IsWindowVisible,
+        };
+        let mut union: Option<RECT> = None;
+        let mut prev: Option<HWND> = None;
+        unsafe {
+            while let Ok(menu) = FindWindowExW(None, prev, w!("#32768"), None) {
+                prev = Some(menu);
+                if !IsWindowVisible(menu).as_bool() {
+                    continue;
+                }
+                let mut r = RECT::default();
+                if GetWindowRect(menu, &mut r).is_err() {
+                    continue;
+                }
+                union = Some(match union {
+                    None => r,
+                    Some(u) => RECT {
+                        left: u.left.min(r.left),
+                        top: u.top.min(r.top),
+                        right: u.right.max(r.right),
+                        bottom: u.bottom.max(r.bottom),
+                    },
+                });
+            }
+        }
+        let r = union.ok_or_else(|| anyhow::anyhow!("no menu window was on screen"))?;
+        // A little margin so the shadow edge and corners can be seen.
+        let (x, y) = (r.left - 8, r.top - 8);
+        let (width, height) = (r.right - r.left + 16, r.bottom - r.top + 16);
+        unsafe {
+            let screen_dc: HDC = GetDC(None);
+            let mem_dc = CreateCompatibleDC(Some(screen_dc));
+            let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
+            let old = SelectObject(mem_dc, bitmap.into());
+            let blit = BitBlt(
+                mem_dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                x,
+                y,
+                SRCCOPY | CAPTUREBLT,
+            );
+            let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
+            let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
+                bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>()
+                        as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let lines = windows::Win32::Graphics::Gdi::GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                height as u32,
+                Some(buf.as_mut_ptr().cast()),
+                &mut bmi,
+                windows::Win32::Graphics::Gdi::DIB_RGB_COLORS,
+            );
+            SelectObject(mem_dc, old);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
+            blit?;
+            // GetDIBits returns the scan lines it copied; fewer than asked
+            // for means the buffer is still zeroed and the PNG would be black.
+            if lines != height {
+                anyhow::bail!("GetDIBits copied {lines} of {height} lines for {path:?}");
+            }
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2);
+                px[3] = 255;
+            }
+            let img: image::RgbaImage =
+                image::ImageBuffer::from_raw(width as u32, height as u32, buf)
+                    .ok_or_else(|| anyhow::anyhow!("bad capture buffer for {path:?}"))?;
+            img.save(path)
+                .map_err(|e| anyhow::anyhow!("failed to save {path:?}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Captures `hwnd`'s client area and saves it as a PNG at `path`, with
+    /// `PrintWindow` or, for `wm_print`, by sending `WM_PRINT` (see
+    /// [`prints_with_wm_print`]). A specific application window, never the
+    /// monitor (rule: this must never call anything from `capture.rs`, which
+    /// grabs the screen for the real ask flow).
+    fn print_window_png(hwnd: HWND, path: &std::path::Path, wm_print: bool) -> anyhow::Result<()> {
+        if wm_print
+            && !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) }.as_bool()
+        {
+            // A palette that hid itself (it hides when focus leaves it)
+            // would print as a black page: fail loudly instead.
+            anyhow::bail!("the window is hidden, so {path:?} would be a black page");
+        }
+        capture_client_png(hwnd, path, |dc| {
+            if wm_print {
+                // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_PRINT,
+                        Some(WPARAM(dc.0 as usize)),
+                        Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+                    );
+                }
+                Ok(())
+            } else if unsafe { PrintWindow(hwnd, dc, PW_CLIENTONLY) }.as_bool() {
+                Ok(())
+            } else {
+                anyhow::bail!("PrintWindow failed for {path:?}")
+            }
+        })
+    }
+
+    /// Saves the palette as painted by the real Direct2D code (#987): the
+    /// paint list goes through `paint_ops_d2d` into a bitmap, with the query
+    /// box printed on top (see `paint_d2d_into_for_gallery`).
+    fn direct2d_png(palette: &mut Palette, path: &std::path::Path) -> anyhow::Result<()> {
+        let hwnd = palette.hwnd();
+        capture_client_png(hwnd, path, |dc| palette.paint_d2d_into_for_gallery(dc))
+    }
+
+    /// Makes a bitmap the size of `hwnd`'s client area, lets `fill` draw into
+    /// its device context, and saves the result as a PNG at `path`.
+    fn capture_client_png(
+        hwnd: HWND,
+        path: &std::path::Path,
+        fill: impl FnOnce(HDC) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         unsafe {
             let mut rect = windows::Win32::Foundation::RECT::default();
             GetClientRect(hwnd, &mut rect)?;
@@ -843,7 +1553,7 @@ mod driver {
             let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
             let old = SelectObject(mem_dc, bitmap.into());
 
-            let ok = PrintWindow(hwnd, mem_dc, PW_CLIENTONLY);
+            let filled = fill(mem_dc);
 
             let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
             let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
@@ -874,9 +1584,7 @@ mod driver {
             let _ = DeleteDC(mem_dc);
             ReleaseDC(None, screen_dc);
 
-            if !ok.as_bool() {
-                anyhow::bail!("PrintWindow failed for {path:?}");
-            }
+            filled?;
 
             // BGRA -> RGBA for the `image` crate.
             for px in buf.chunks_exact_mut(4) {
@@ -921,6 +1629,22 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn only_names_a_state_prefix() {
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only", "tray-menu"]))
+            .expect("--ui-gallery is present");
+        assert_eq!(parsed.only.as_deref(), Some("tray-menu"));
+        let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("tray-menu")).count(),
+            2,
+            "the prefix finds the two tray menu states"
+        );
+        // A dangling --only is ignored, like a dangling --screenshot.
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only"])).unwrap();
+        assert_eq!(parsed.only, None);
     }
 
     #[test]
@@ -982,19 +1706,61 @@ mod tests {
     }
 
     #[test]
-    fn only_the_palette_and_settings_states_ignore_variants() {
+    fn only_the_settings_states_ignore_variants() {
         assert!(follows_variants(GalleryState::CardError));
         assert!(follows_variants(GalleryState::RegionOverlay));
-        assert!(!follows_variants(GalleryState::PaletteDefault));
-        assert!(!follows_variants(GalleryState::SettingsTop));
+        assert!(follows_variants(GalleryState::TrayMenu));
+        assert!(follows_variants(GalleryState::TrayMenuSubmenu));
+        assert!(!follows_variants(GalleryState::SettingsGeneral));
+        for state in gallery_states() {
+            let n = state_name(state);
+            assert_eq!(follows_variants(state), !n.starts_with("settings-"), "{n}");
+        }
+    }
+
+    /// #1007: the palette is drawn at every matrix theme and scale, so its
+    /// 100 and 150 percent pictures exist.
+    #[test]
+    fn the_palette_states_follow_theme_and_scale() {
+        let mut palette_states = 0;
+        for state in gallery_states() {
+            let n = state_name(state);
+            if n.starts_with("palette-") {
+                assert!(follows_variants(state) && !follows_dpi_only(state), "{n}");
+                palette_states += 1;
+            }
+        }
+        assert_eq!(palette_states, 8, "the test must see every palette state");
+    }
+
+    /// #987: the Direct2D picture sits next to the GDI one, same name plus
+    /// `--d2d`, so the two can be compared file by file.
+    #[test]
+    fn the_direct2d_picture_is_named_after_the_gdi_one() {
+        let gdi = matrix_filename("palette-default", "dark", 150);
+        assert_eq!(gdi, "palette-default--dark--150.png");
+        assert_eq!(
+            d2d_filename(std::path::Path::new("out").join(&gdi).as_path()),
+            std::path::Path::new("out").join("palette-default--dark--150--d2d.png")
+        );
+        assert!(draws_with_direct2d(GalleryState::PaletteHover));
+        assert!(!draws_with_direct2d(GalleryState::CardError));
+        assert!(!draws_with_direct2d(GalleryState::SettingsGeneral));
+    }
+
+    #[test]
+    fn only_the_palette_states_are_printed_with_wm_print() {
+        let mut palette_states = 0;
         for state in gallery_states() {
             let n = state_name(state);
             assert_eq!(
-                follows_variants(state),
-                !(n.starts_with("palette-") || n.starts_with("settings-")),
+                prints_with_wm_print(state),
+                n.starts_with("palette-"),
                 "{n}"
             );
+            palette_states += usize::from(n.starts_with("palette-"));
         }
+        assert_eq!(palette_states, 8, "the test must see every palette state");
     }
 
     #[test]
@@ -1071,9 +1837,16 @@ mod tests {
         // 5 card-answer variants (short + 4 difficulty badges) + error + 4
         // pending sub-stages (#354) + 3 previews (calendar, long labels,
         // the error title) + the expanded answer, with and without link
-        // focus = 15 card states, + 4 palette states + 4 settings states
-        // (#560) + the region overlay (#580) + the in-place overlay (#809) = 25.
-        assert_eq!(states.len(), 25);
+        // focus = 15 card states, + 4 options card states (#307) + 3 palette
+        // states + 4 settings states (#560) + the region overlay (#580) + the
+        // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
+        // two long palettes (#883) = 33, + the tray menu with and without an
+        // open submenu (#825) = 35, + the long action name (#1000) = 36, + the
+        // key-rejected setup card (#1020) = 37, + the Settings states going
+        // from four to one per page and the prompt open (#872) = 39, + the
+        // Models page with Claude active and with every provider shown (#874)
+        // = 41, + the palette with a widened thumb (#988) = 42.
+        assert_eq!(states.len(), 43);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1084,16 +1857,43 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_states_are_listed_in_scroll_and_advanced_pairs() {
+    fn the_options_card_states_are_listed_and_follow_themes_and_scales() {
         let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
         for want in [
-            "settings-top",
-            "settings-bottom",
-            "settings-advanced-top",
-            "settings-advanced-bottom",
+            "card-options-looking",
+            "card-options-ready",
+            "card-options-default-long",
+            "card-options-no-model",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
+        assert!(follows_variants(GalleryState::CardOptionsReady));
+        assert!(follows_variants(GalleryState::CardOptionsDefaultLong));
+        assert!(
+            !names.iter().any(|n| n.contains("router-suggestion")),
+            "the palette no longer shows a router suggestion (#805)"
+        );
+    }
+
+    #[test]
+    fn every_settings_page_has_a_gallery_state() {
+        let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
+        for want in [
+            "settings-general",
+            "settings-models",
+            "settings-privacy",
+            "settings-actions",
+            "settings-advanced",
+            "settings-advanced-prompt-open",
+        ] {
+            assert!(names.contains(&want), "missing {want}");
+        }
+        // One state per page of the rail: a page added there needs a picture.
+        assert_eq!(
+            crate::ui::settings::page_labels().len(),
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 3,
+            "the Advanced page has two states (prompt closed and open) and the Models page three (#874)"
+        );
     }
 
     #[test]
