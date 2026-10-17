@@ -356,19 +356,6 @@ pub fn model_from(url: &str, body: &Value) -> Option<String> {
 /// already happening, never creates one in text that would otherwise be
 /// left alone.
 pub fn redact_opaque_tokens(s: &str) -> String {
-    redact_tokens(s, false)
-}
-
-/// #941: [`redact_opaque_tokens`] for a vendor's error body, which keeps a
-/// snake_case identifier such as `invalid_request_error` or
-/// `content_policy_violation` (see [`is_plain_identifier`]). Every key pattern
-/// is still scrubbed, and the log and the screenshot painter keep the strict
-/// rule.
-pub fn redact_error_body(s: &str) -> String {
-    redact_tokens(s, true)
-}
-
-fn redact_tokens(s: &str, keep_identifiers: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut run = String::new();
     let mut chars = s.chars().peekable();
@@ -396,11 +383,11 @@ fn redact_tokens(s: &str, keep_identifiers: bool) -> String {
             // line break exactly as if it had not been there.
             continue;
         } else {
-            flush_run(&mut run, &mut out, keep_identifiers);
+            flush_run(&mut run, &mut out);
             out.push(c);
         }
     }
-    flush_run(&mut run, &mut out, keep_identifiers);
+    flush_run(&mut run, &mut out);
     out
 }
 
@@ -452,9 +439,9 @@ fn looks_like_a_credential(run: &str) -> bool {
 
 /// Scrub one maximal wide run: every span [`token_spans`] finds becomes
 /// `[redacted]`, the rest is copied through.
-fn flush_run(run: &mut String, out: &mut String, keep_identifiers: bool) {
+fn flush_run(run: &mut String, out: &mut String) {
     let mut at = 0;
-    for span in token_spans(run, keep_identifiers) {
+    for span in token_spans(run) {
         out.push_str(&run[at..span.start]);
         out.push_str("[redacted]");
         at = span.end;
@@ -482,7 +469,7 @@ const MIN_HEX_CHAIN_DIGITS: usize = 32;
 ///
 /// Shared by [`redact_opaque_tokens`] and [`find_opaque_tokens`] so the log
 /// and the screenshot painter can never disagree about what a secret is.
-fn token_spans(run: &str, keep_identifiers: bool) -> Vec<std::ops::Range<usize>> {
+fn token_spans(run: &str) -> Vec<std::ops::Range<usize>> {
     if run.chars().count() >= MIN_TOKEN_CHARS && looks_like_a_credential(run) {
         return std::iter::once(0..run.len()).collect();
     }
@@ -503,7 +490,7 @@ fn token_spans(run: &str, keep_identifiers: bool) -> Vec<std::ops::Range<usize>>
     }
     spans.retain(|r| {
         let part = &run[r.clone()];
-        part.chars().count() >= MIN_TOKEN_CHARS && !(keep_identifiers && is_plain_identifier(part))
+        part.chars().count() >= MIN_TOKEN_CHARS && !KNOWN_VENDOR_CODES.contains(&part)
     });
     spans.extend(hex_chain_spans(run));
     spans.sort_by_key(|r| r.start);
@@ -519,29 +506,24 @@ fn token_spans(run: &str, keep_identifiers: bool) -> Vec<std::ops::Range<usize>>
     merged
 }
 
-/// #941: a snake_case word such as `invalid_request_error`: two or more
-/// non-empty lower-case letter segments joined by single underscores, none
-/// longer than [`MAX_IDENTIFIER_SEGMENT`]. A vendor's error `type` and `code`
-/// look like this and are the reason the user needs to read. A key is not
-/// shaped like it: it carries digits or capitals, or a segment too long to be
-/// a word (`prefix_abcdefghijklmnopqrstu`). When unsure this says no, so the text
-/// is redacted.
-fn is_plain_identifier(part: &str) -> bool {
-    let mut segments = 0;
-    for seg in part.split('_') {
-        if seg.is_empty()
-            || seg.len() > MAX_IDENTIFIER_SEGMENT
-            || !seg.bytes().all(|b| b.is_ascii_lowercase())
-        {
-            return false;
-        }
-        segments += 1;
-    }
-    segments >= 2
-}
-
-/// The longest word an identifier segment may be (`unsupported` is 11).
-const MAX_IDENTIFIER_SEGMENT: usize = 12;
+/// #941: the error `type` and `code` words the vendors publish that are long
+/// enough to look key-shaped. A narrow fragment equal to one of these, whole,
+/// is kept, so the card still says why a request failed. It is a fixed list,
+/// not a shape rule: anything else, however word-like, is still scrubbed.
+const KNOWN_VENDOR_CODES: [&str; 12] = [
+    "invalid_request_error",
+    "authentication_error",
+    "content_policy_violation",
+    "image_content_policy_violation",
+    "context_length_exceeded",
+    "invalid_organization",
+    "string_above_max_length",
+    "unsupported_country_region_territory",
+    "invalid_request_parameters",
+    "request_too_large",
+    "permission_denied_error",
+    "insufficient_permissions",
+];
 
 /// #273: a same-case hex secret split by `/ + = . - _` is a row of short
 /// fragments, none long enough for the narrow rule and none mixed-case
@@ -629,7 +611,7 @@ pub(crate) fn find_opaque_tokens(s: &str) -> Vec<std::ops::Range<usize>> {
 }
 
 fn run_spans(s: &str, run: std::ops::Range<usize>) -> Vec<std::ops::Range<usize>> {
-    token_spans(&s[run.clone()], false)
+    token_spans(&s[run.clone()])
         .into_iter()
         .map(|r| run.start + r.start..run.start + r.end)
         .collect()
@@ -1096,23 +1078,22 @@ mod tests {
 
     // -- redact_opaque_tokens: the single most important test here --------
 
-    /// #941: a vendor's error type and code are plain snake_case words and
-    /// stay readable in an error body; the log's strict rule is unchanged.
+    /// #941: a vendor's published error type and code stay readable; word-like
+    /// text that is not on the list (a key with short segments, a passphrase)
+    /// is still scrubbed.
     #[test]
-    fn redact_error_body_keeps_snake_case_identifiers_but_not_keys() {
+    fn redact_opaque_tokens_keeps_known_vendor_codes_only() {
         let body = r#"{"type":"invalid_request_error","code":"content_policy_violation"}"#;
-        assert_eq!(redact_error_body(body), body);
-        assert!(redact_opaque_tokens(body).contains("[redacted]"));
+        assert_eq!(redact_opaque_tokens(body), body);
 
-        for key in [
-            concat!("sk_", "test_abcdefghijklmnopqrst"),
-            "abcdefghijklmnopqrstuvwxyz",
-            concat!("sk_", "live_a1B2c3D4e5F6g7H8"),
-            "abcdefghijklmnopqrstuvwxyz_",
-            "_abcdefghijkl_mnopqrstuvwxyz",
+        for other in [
+            "tok_prod_abcdefghijkl",
+            "correct_horse_battery",
+            "invalid_request_error_x",
+            "xinvalid_request_error",
         ] {
-            let out = redact_error_body(&format!("key {key} bad"));
-            assert!(!out.contains(key), "{out}");
+            let out = redact_opaque_tokens(&format!("key {other} bad"));
+            assert!(!out.contains(other), "{out}");
         }
     }
 

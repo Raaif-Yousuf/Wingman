@@ -486,7 +486,7 @@ fn content_policy_code(body: &str) -> Option<&'static str> {
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
-fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
+pub(crate) fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
     // #920: a 400 that says the content was declined is a decline (it stops
     // the chain), not a failure to retry on the next vendor. Read from the
     // raw body: the redaction below rewrites these underscore words.
@@ -515,7 +515,10 @@ fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
 /// a token below the 20-character threshold that identifies it, so the tail
 /// of a key would survive as ordinary-looking text.
 fn redact_and_truncate(body: &str) -> String {
-    egress::redact_error_body(body).chars().take(300).collect()
+    egress::redact_opaque_tokens(body)
+        .chars()
+        .take(300)
+        .collect()
 }
 
 /// The same defense for a transport or body-read failure's text, which is
@@ -3700,13 +3703,16 @@ mod tests {
     /// card, and a key echoed next to them does not.
     #[test]
     fn vendor_error_type_and_code_survive_redaction() {
+        // A key with short word-like segments is not on the vendor list.
+        let word_key = "tok_prod_abcdefghijkl";
         let body = format!(
-            r#"{{"error":{{"message":"Incorrect key {FAKE_KEY}","type":"invalid_request_error","code":"model_not_found"}}}}"#
+            r#"{{"error":{{"message":"Incorrect key {FAKE_KEY} or {word_key}","type":"invalid_request_error","code":"model_not_found"}}}}"#
         );
         let msg = http_error("openai", 404, &body).to_string();
         assert!(msg.contains("invalid_request_error"), "{msg}");
         assert!(msg.contains("model_not_found"), "{msg}");
         assert!(!msg.contains(FAKE_KEY), "{msg}");
+        assert!(!msg.contains(word_key), "{msg}");
     }
 
     /// #942: the `HTTP {status}: {body}` text is built in exactly one place.
