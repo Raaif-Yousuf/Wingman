@@ -100,6 +100,13 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 
 ## Gemini
 
+- **Reachable with just a key:** Gemini is not in the stock
+  `providers.order` (`openai`, `anthropic`). If Gemini is the only cloud
+  provider with a key (Settings or `GEMINI_API_KEY`) and the list is still
+  those two, in either order, Gemini is added to the end in memory and the file
+  is not rewritten. With an OpenAI or Anthropic key as well, or once you have
+  edited `providers.order` yourself, the list is used exactly as written: add
+  `"gemini"` to it, or pick Gemini as the Active provider.
 - **Endpoint:**
   `POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
   (`src/provider/gemini.rs`, issue #17).
