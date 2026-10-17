@@ -491,29 +491,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Test seam (#990): the thread whose test currently owns the process-wide
-/// budget state. While one is set, every other test thread's calls into this
-/// module leave that state alone, so a provider test that records or checks
-/// the budget mid-way cannot shift the totals or steal the notice.
+/// Held by every test that touches this module's process-wide state (the
+/// budget, the notice, the in-memory totals, the store-down switches) or
+/// records into the real store, for the whole test (#990).
+///
+/// Lock order, to avoid deadlock: `EGRESS_PREVIEW_TEST_LOCK` (what
+/// `network_guard` in `provider::common` takes first), then this one. Never
+/// take the egress lock while holding this.
 #[cfg(test)]
-static TEST_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+static USAGE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
-fn foreign_to_test_owner() -> bool {
-    matches!(*lock(&TEST_OWNER), Some(id) if id != std::thread::current().id())
-}
-
-#[cfg(not(test))]
-fn foreign_to_test_owner() -> bool {
-    false
+pub(crate) fn lock_usage_test() -> std::sync::MutexGuard<'static, ()> {
+    USAGE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Publishes `[budget]` for the request path. A limit that is not a positive
 /// number turns the budget off. Called at startup and on every config reload.
 pub fn set_daily_budget(daily_usd: f64, warn_percent: u8) {
-    if foreign_to_test_owner() {
-        return;
-    }
     *lock(&BUDGET) = budget_from(daily_usd, warn_percent);
 }
 
@@ -563,9 +558,6 @@ pub fn check_budget_with(b: &Budget, spent: f64) -> Result<(), String> {
 /// used; when the store cannot be read, the total counted in memory for this
 /// run is used instead (#713), so the limit never switches itself off.
 pub fn check_budget() -> Result<(), String> {
-    if foreign_to_test_owner() {
-        return Ok(());
-    }
     let Some(b) = *lock(&BUDGET) else {
         return Ok(());
     };
@@ -687,9 +679,6 @@ fn budget_notice_for(
 
 /// Takes the pending budget notice, if any. `app.rs` adds it to the next card.
 pub fn take_budget_notice() -> Option<String> {
-    if foreign_to_test_owner() {
-        return None;
-    }
     lock(&BUDGET_NOTICE).take()
 }
 
@@ -717,9 +706,6 @@ pub fn record(provider: &str, model: &str, local: bool, usage: Option<Usage>) {
     let date = local_date_today();
     let cost = request_cost(provider, model, &date, local, usage.as_ref());
     note_run_cost(cost);
-    if foreign_to_test_owner() {
-        return;
-    }
     // Always counted, so the budget has a total when the store is down. An
     // unpriced cloud response still costs something: count the last known
     // price for this model, else a flat guess, so the fallback never undercounts to zero.
@@ -999,10 +985,8 @@ mod tests {
 
     /// Held by every test that records into the real store (or flips the
     /// store-down switch), so a before/after difference is exact.
-    static TALLY_TEST_LOCK: Mutex<()> = Mutex::new(());
-
     fn tally_lock() -> std::sync::MutexGuard<'static, ()> {
-        TALLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        lock_usage_test()
     }
 
     fn day_total_today(today: &str) -> DayTotal {
@@ -1234,7 +1218,6 @@ mod tests {
             APPROX_NOTICED.store(false, std::sync::atomic::Ordering::SeqCst);
             *lock(&NOTIFIED) = None;
             let _ = take_budget_notice();
-            *lock(&TEST_OWNER) = None;
         }
     }
 
@@ -1244,16 +1227,15 @@ mod tests {
     );
 
     fn down_scope(limit: f64) -> DownScope {
-        // The tally lock first: no recording test may run while the store is
-        // switched off.
+        // Egress lock first, then the usage lock (see `USAGE_TEST_LOCK`): no
+        // recording test may run while the store is switched off.
         let guard = (
-            tally_lock(),
             crate::config::EGRESS_PREVIEW_TEST_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
+            tally_lock(),
         );
         let scope = DownScope { _locks: guard };
-        *lock(&TEST_OWNER) = Some(std::thread::current().id());
         set_daily_budget(limit, 80);
         STORE_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
         *lock(&MEM_SPEND) = None;
@@ -1301,28 +1283,6 @@ mod tests {
         assert!(err.contains("Daily budget"), "{err}");
         let notice = take_budget_notice().unwrap_or_default();
         assert!(notice.contains("approximate"), "{notice}");
-    }
-
-    /// #990: another test thread's record, budget check, budget change or
-    /// notice take must not reach the state a scoped test is checking.
-    #[test]
-    fn another_thread_cannot_touch_the_state_a_scoped_test_owns() {
-        let _scope = down_scope(0.01);
-        let before = spent_today(&local_date_today()).0;
-        std::thread::spawn(|| {
-            record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
-            record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
-            assert!(check_budget().is_ok(), "a foreign check never refuses");
-            set_daily_budget(0.0, 80);
-            assert!(take_budget_notice().is_none());
-        })
-        .join()
-        .unwrap();
-        assert!(close(spent_today(&local_date_today()).0, before));
-        assert!(lock(&BUDGET).is_some(), "the owner's budget survives");
-        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
-        record("anthropic", "claude-opus-5", false, Some(usage(900, 60)));
-        assert!(check_budget().is_err(), "the owner's own calls still count");
     }
 
     #[test]

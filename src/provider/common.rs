@@ -3468,16 +3468,22 @@ mod tests {
 
     /// Sets the budget and the spend `usage::check_budget` sees, and puts both
     /// back on drop (also when an assertion panics), so no other test in the
-    /// binary ever sees them. Callers hold `network_guard()` for the whole test.
-    struct BudgetScope;
+    /// binary ever sees them. Callers hold `network_guard()` for the whole test
+    /// (egress lock first), and this takes the usage test lock after it, the
+    /// order `usage::USAGE_TEST_LOCK` documents (#990). The lock is released
+    /// after `drop` has reset the budget.
+    struct BudgetScope {
+        _usage: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl BudgetScope {
         fn new(limit_usd: f64, spent: f64) -> Self {
+            let usage = crate::usage::lock_usage_test();
             crate::usage::set_daily_budget(limit_usd, 80);
             *crate::usage::SPENT_OVERRIDE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(spent);
-            BudgetScope
+            BudgetScope { _usage: usage }
         }
     }
 
