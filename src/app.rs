@@ -3168,6 +3168,14 @@ impl App {
             }
         };
 
+        // The selector pumped its own message loop: a hotkey or tray command
+        // may have started another action meanwhile. Check again, or two runs
+        // would overlap. The picked region is dropped, as on a busy press.
+        if self.busy_now() {
+            self.show_busy_card();
+            return;
+        }
+
         // #772: the clipboard write can wait on another app that holds the
         // clipboard, and this thread also runs the keyboard hook, so it runs
         // on the executor worker. A missing executor is an error card here.
@@ -12734,6 +12742,25 @@ mod tests {
         let body = &rest[..rest.find("\n    fn ").expect("end of copy_region")];
         assert!(body.contains("spawn_executor("), "{body}");
         assert!(!body.contains(".execute("), "{body}");
+    }
+
+    /// #772: the region selector pumps its own message loop, so another
+    /// action can start while it is open. `copy_region` must check busy
+    /// again after the selector returns and before it spawns the worker.
+    #[test]
+    fn copy_region_rechecks_busy_after_the_selector() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src.split("\nmod tests {").next().expect("production part");
+        let start = production
+            .find("    fn copy_region(")
+            .expect("copy_region exists");
+        let rest = &production[start + 1..];
+        let body = &rest[..rest.find("\n    fn ").expect("end of copy_region")];
+        let select = body.find("select_region(").expect("opens the selector");
+        let spawn = body.find("spawn_executor(").expect("spawns the worker");
+        let between = &body[select..spawn];
+        assert!(between.contains("busy_now()"), "{between}");
+        assert!(between.contains("show_busy_card()"), "{between}");
     }
 
     #[test]
