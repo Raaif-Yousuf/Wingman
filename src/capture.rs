@@ -463,6 +463,74 @@ pub fn grab_raw_for(
     lookup_window: LookupWindow,
     extra_managers: &[String],
 ) -> Result<RawShot> {
+    Ok(grab_full_size_for(
+        monitor_mode,
+        max_long_edge,
+        max_pixels,
+        lookup_window,
+        extra_managers,
+    )?
+    .finish())
+}
+
+/// A capture that has been grabbed but not yet shrunk for the model (#1200).
+/// MEASURED 2026-10-17 (release, `bench_grab_resize`): the Lanczos3 downscale
+/// takes ~220 ms from a 3840x2160 frame and ~95 ms from 1920x1080, a large
+/// share of the whole grab, and the grab runs on the thread that also hosts
+/// the keyboard hook. So the grab keeps only what must happen at press time
+/// (the pixels, the window scan, the password lookup) and the caller calls
+/// [`PendingShot::finish`] on its worker thread.
+pub struct PendingShot {
+    image: image::RgbaImage,
+    max_long_edge: u32,
+    max_pixels: u64,
+    origin_x: i32,
+    origin_y: i32,
+    lookup: Option<crate::inputs::uia::PasswordLookup>,
+    managers: Result<Vec<ScreenRect>, String>,
+}
+
+impl PendingShot {
+    /// Shrinks the capture to fit the model limits and maps it onto the
+    /// screen. Pure image work: any thread. Nothing leaves the process here;
+    /// redaction runs later on the shrunk pixels (`encode_for_chain`).
+    pub fn finish(self) -> RawShot {
+        let (w, h) = (self.image.width(), self.image.height());
+        let (nw, nh) = fit_for_model(w, h, self.max_long_edge, self.max_pixels);
+        let resized = if (nw, nh) == (w, h) {
+            self.image
+        } else {
+            imageops::resize(&self.image, nw, nh, FilterType::Lanczos3)
+        };
+        let (final_w, final_h) = (resized.width(), resized.height());
+        let mut screen = ScreenMap::for_capture(
+            self.origin_x,
+            self.origin_y,
+            w,
+            h,
+            final_w,
+            final_h,
+            self.lookup,
+        );
+        screen.manager_windows = self.managers;
+        RawShot {
+            rgba: resized.into_raw(),
+            width: final_w,
+            height: final_h,
+            screen: Some(screen),
+        }
+    }
+}
+
+/// [`grab_raw_for`] without the downscale (#1200): see [`PendingShot`]. The
+/// lookup thread starts here, before the monitor is grabbed, as it always did.
+pub fn grab_full_size_for(
+    monitor_mode: &str,
+    max_long_edge: u32,
+    max_pixels: u64,
+    lookup_window: LookupWindow,
+    extra_managers: &[String],
+) -> Result<PendingShot> {
     let lookup = lookup_window
         .resolve()
         .map(crate::inputs::uia::PasswordLookup::start);
@@ -507,22 +575,14 @@ pub fn grab_raw_for(
             extra_managers,
         )
     };
-    let (nw, nh) = fit_for_model(w, h, max_long_edge, max_pixels);
-
-    let resized = if (nw, nh) == (w, h) {
-        image
-    } else {
-        imageops::resize(&image, nw, nh, FilterType::Lanczos3)
-    };
-
-    let (final_w, final_h) = (resized.width(), resized.height());
-    let mut screen = ScreenMap::for_capture(origin_x, origin_y, w, h, final_w, final_h, lookup);
-    screen.manager_windows = managers;
-    Ok(RawShot {
-        rgba: resized.into_raw(),
-        width: final_w,
-        height: final_h,
-        screen: Some(screen),
+    Ok(PendingShot {
+        image,
+        max_long_edge,
+        max_pixels,
+        origin_x,
+        origin_y,
+        lookup,
+        managers,
     })
 }
 
@@ -1508,6 +1568,154 @@ mod tests {
                     bytes as f64 / 1024.0
                 );
             }
+        }
+    }
+
+    /// Run manually in release, once (#1200): times the Lanczos3 downscale
+    /// that used to run inside the press-time grab (it now runs in
+    /// `PendingShot::finish`, on a worker), on synthetic 4K and 1080p frames,
+    /// and the whole live `grab_raw_for` (grab plus finish) on this machine's
+    /// active monitor. The live number is the old UI-thread total, not the
+    /// UI-thread time today.
+    /// ```text
+    /// cargo test --release capture::tests::bench_grab_resize -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "release-only timing benchmark; run manually, see this test's doc comment"]
+    fn bench_grab_resize() {
+        for (w, h) in [(3840u32, 2160u32), (1920u32, 1080u32)] {
+            let rgba = synthetic_ui_image(w, h);
+            let img = image::RgbaImage::from_raw(w, h, rgba).expect("buffer size");
+            let (nw, nh) = super::fit_for_model(
+                w,
+                h,
+                super::ANTHROPIC_STANDARD_MAX_LONG_EDGE,
+                super::ANTHROPIC_STANDARD_MAX_PIXELS,
+            );
+            let mut ms = Vec::new();
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let out =
+                    image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
+                ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(out.width(), nw);
+            }
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "MEASURED 2026-10-17: Lanczos3 {w}x{h} -> {nw}x{nh}: median {:.1} ms (min {:.1}, max {:.1})",
+                ms[2], ms[0], ms[4]
+            );
+        }
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let raw = super::grab_raw(
+                "active",
+                super::ANTHROPIC_STANDARD_MAX_LONG_EDGE,
+                super::ANTHROPIC_STANDARD_MAX_PIXELS,
+            );
+            let took = start.elapsed().as_secs_f64() * 1000.0;
+            match raw {
+                Ok(r) => println!(
+                    "MEASURED 2026-10-17: live grab_raw (capture, scan, resize) -> {}x{}: {took:.1} ms",
+                    r.width, r.height
+                ),
+                Err(e) => println!("live grab_raw failed: {e}"),
+            }
+        }
+    }
+
+    // -- PendingShot (#1200) -----------------------------------------------
+
+    fn pending(w: u32, h: u32, max_edge: u32) -> super::PendingShot {
+        super::PendingShot {
+            image: image::RgbaImage::from_pixel(w, h, image::Rgba([10, 20, 30, 255])),
+            max_long_edge: max_edge,
+            max_pixels: u64::MAX,
+            origin_x: -1920,
+            origin_y: 40,
+            lookup: None,
+            managers: Err("list failed".to_string()),
+        }
+    }
+
+    #[test]
+    fn finishing_a_pending_shot_shrinks_it_and_maps_it_onto_the_screen() {
+        let raw = pending(400, 200, 100).finish();
+        assert_eq!((raw.width, raw.height), (100, 50));
+        assert_eq!(raw.rgba.len(), 100 * 50 * 4);
+        let screen = raw.screen.expect("a capture carries its map");
+        assert_eq!((screen.origin_x, screen.origin_y), (-1920.0, 40.0));
+        assert_eq!((screen.scale_x, screen.scale_y), (4.0, 4.0));
+        // The window list (or the reason it failed) survives the split, so
+        // redaction still fails closed.
+        assert_eq!(screen.manager_windows, Err("list failed".to_string()));
+    }
+
+    #[test]
+    fn finishing_a_small_pending_shot_keeps_its_pixels() {
+        let raw = pending(64, 32, 1568).finish();
+        assert_eq!((raw.width, raw.height), (64, 32));
+        assert_eq!(&raw.rgba[..4], &[10, 20, 30, 255]);
+        assert_eq!(raw.screen.expect("map").scale_x, 1.0);
+    }
+
+    #[test]
+    fn the_press_time_grab_does_not_resize_and_the_model_flows_finish_on_their_worker() {
+        // Wiring (#1200): the downscale must not creep back onto the thread
+        // that hosts the keyboard hook, and every caller of the press-time
+        // grab must finish the shot, or a full-size frame would be sent.
+        let norm = |s: &str| s.replace('\r', "");
+        let capture = norm(include_str!("capture.rs"));
+        let at = capture
+            .find("pub fn grab_full_size_for(")
+            .expect("grab exists");
+        let body = &capture[at..at
+            + capture[at..]
+                .find(
+                    "
+}
+",
+                )
+                .unwrap()];
+        assert!(!body.contains("resize("), "{body}");
+        assert!(!body.contains("fit_for_model("), "{body}");
+        let app = norm(include_str!("app.rs"));
+        for f in ["fn begin_action<T>(", "fn show_options_card("] {
+            let at = app.find(f).unwrap_or_else(|| panic!("{f}"));
+            let body = &app[at..at
+                + app[at..]
+                    .find(
+                        "
+    }
+",
+                    )
+                    .unwrap()];
+            assert!(body.contains("grab_full_size_for("), "{f}");
+            assert!(!body.contains("grab_raw_for("), "{f}");
+        }
+        // Each flow that takes the shot finishes it itself, on its worker.
+        for f in [
+            "fn ask_inner(",
+            "fn start_options_router(",
+            "fn add_event_from_screen(",
+            "fn run_generic_action_with(",
+            "fn review_this_email(",
+            "fn fill_form_from_screen(",
+        ] {
+            let at = app.find(f).unwrap_or_else(|| panic!("{f}"));
+            let body = &app[at..at
+                + app[at..]
+                    .find(
+                        "
+    }
+",
+                    )
+                    .unwrap()];
+            assert!(
+                body.contains("pending.finish()")
+                    || body.contains("pending.map(capture::PendingShot::finish)"),
+                "{f} must finish the shot on its worker"
+            );
         }
     }
 

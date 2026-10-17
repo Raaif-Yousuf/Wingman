@@ -2247,7 +2247,7 @@ impl App {
     fn begin_model_action<T>(
         &mut self,
         extra: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<(capture::RawShot, isize, T)> {
+    ) -> Option<(capture::PendingShot, isize, T)> {
         let (raw, foreground_hwnd, value) = self.begin_action(BeginPlan::MODEL, extra)?;
         Some((raw?, foreground_hwnd, value))
     }
@@ -2260,7 +2260,7 @@ impl App {
         &mut self,
         plan: BeginPlan,
         extra: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<(Option<capture::RawShot>, isize, T)> {
+    ) -> Option<(Option<capture::PendingShot>, isize, T)> {
         // #871: never on settings that are about to change, and never over the
         // window being typed in.
         if self.refuse_for_settings() {
@@ -2326,9 +2326,11 @@ impl App {
 
         let extra_value = extra(self)?;
 
-        // Capture (grab the pixels and downscale) runs here, on the main
-        // thread, and must happen before the pending card is shown --
-        // otherwise the card is in its own screenshot. Encoding those pixels
+        // Capture (grab the pixels) runs here, on the main thread, and must
+        // happen before the pending card is shown -- otherwise the card is in
+        // its own screenshot. The downscale does NOT happen here (#1200,
+        // MEASURED 2026-10-17: ~220 ms from 4K in release): the caller's
+        // worker calls `PendingShot::finish`. Encoding those pixels
         // to PNG does NOT happen here: issue #177 measured
         // `CompressionType::Best` PNG encoding at up to ~1s in a release
         // build on a 1402x876 image, which froze the message loop for that
@@ -2363,7 +2365,7 @@ impl App {
                 ),
                 capture::LookupWindow::Foreground,
             );
-            match capture::grab_raw_for(
+            match capture::grab_full_size_for(
                 &self.config.capture.monitor,
                 max_long_edge,
                 max_pixels,
@@ -2452,7 +2454,7 @@ impl App {
     }
 
     fn ask_inner(&mut self, trigger: Trigger) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
         };
@@ -2481,6 +2483,8 @@ impl App {
             crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 (|| -> Result<Answer> {
+                    // #1200: the downscale runs here, not on the hook's thread.
+                    let mut raw = pending.finish();
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     worker(
                         &providers,
@@ -2703,7 +2707,7 @@ impl App {
         // A heavily downscaled capture, see `router::ROUTER_IMAGE_LONG_EDGE`.
         // Grabbed on the main thread (Win32 capture must not run on a worker);
         // the PNG encode happens on the worker.
-        let raw = match capture::grab_raw_for(
+        let pending = match capture::grab_full_size_for(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
@@ -2734,7 +2738,7 @@ impl App {
         self.card
             .show_options(generation, router::LOOKING_SUMMARY, &[], behavior);
         self.set_watch(true);
-        self.start_options_router(raw, candidates, generation, trigger);
+        self.start_options_router(pending, candidates, generation, trigger);
     }
 
     /// Starts the router for the options card showing `generation`. The call
@@ -2744,7 +2748,7 @@ impl App {
     /// `WM_APP_ROUTER_RESULT`, a failure included.
     fn start_options_router(
         &mut self,
-        mut raw: capture::RawShot,
+        pending: capture::PendingShot,
         candidates: Vec<router::RouterCandidate>,
         generation: u32,
         trigger: Trigger,
@@ -2762,6 +2766,8 @@ impl App {
                 crate::activation::set_worker_trigger(trigger);
                 let result: std::result::Result<router::RouterResult, String> =
                     catch_worker(|| {
+                        // #1200: the downscale runs here, not on the hook's thread.
+                        let mut raw = pending.finish();
                         router_worker(&providers, mode, &mut raw, redact, &candidates, limits)
                             .map_err(|e| {
                                 let chain_text = worker_error_chain_text(&e);
@@ -3533,7 +3539,7 @@ impl App {
     /// that helper's `extra` closure so it still runs exactly where it did
     /// before -- after the readiness gate, before capture.
     fn add_event_from_screen(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, (today, offset_minutes))) = self
+        let Some((pending, foreground_hwnd_isize, (today, offset_minutes))) = self
             .begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -3558,6 +3564,7 @@ impl App {
             crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
+                    let mut raw = pending.finish();
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     calendar_worker(
                         &providers,
@@ -3783,7 +3790,7 @@ impl App {
                 && actions::generic_inputs::screen_may_be_needed(&action.inputs),
             ..BeginPlan::MODEL
         };
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
         else {
             return;
         };
@@ -3840,6 +3847,8 @@ impl App {
             crate::activation::set_worker_trigger_opt(trigger);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
+                    // #1200: the downscale runs here, not on the hook's thread.
+                    let mut raw = pending.map(capture::PendingShot::finish);
                     // #127 step 1: find the link, check it, and hand it back for
                     // confirmation. Nothing is fetched and no model is asked.
                     if link_step == actions::link_summary::Step::Confirm {
@@ -4485,7 +4494,7 @@ impl App {
     /// `begin_model_action`, exactly like `add_event_from_screen`'s already
     /// does.
     fn review_this_email(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
         };
@@ -4502,6 +4511,7 @@ impl App {
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
+                        let mut raw = pending.finish();
                         let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                         review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                     })()
@@ -4683,7 +4693,7 @@ impl App {
                 .unwrap_or_default(),
         )
         .is_none();
-        let Some((raw, foreground_hwnd_isize, ())) =
+        let Some((pending, foreground_hwnd_isize, ())) =
             self.begin_action(BeginPlan::for_fill_form(use_model), |_| Some(()))
         else {
             return;
@@ -4699,8 +4709,9 @@ impl App {
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
             crate::activation::set_worker_trigger_opt(trigger);
-            let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
+                // #1200: the downscale runs here, not on the hook's thread.
+                let mut raw = pending.map(capture::PendingShot::finish);
                 form_fill_worker(
                     &providers,
                     mode,
@@ -12726,7 +12737,7 @@ mod tests {
                     "refuse_for_settings()",
                     "model_action_gate(",
                     "refuse_if_password_manager()",
-                    "grab_raw_for(",
+                    "grab_full_size_for(",
                 ],
             ),
             (
@@ -17479,7 +17490,9 @@ mod tests {
         let notice = body
             .find("show_remote_ollama_notice()")
             .expect("begin_action must call the notice");
-        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let capture = body
+            .find("capture::grab_full_size_for")
+            .expect("capture call");
         assert!(notice < capture, "the notice must come before the capture");
         assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
     }
@@ -17499,7 +17512,9 @@ mod tests {
         let notice = body
             .find("show_remote_ollama_notice()")
             .expect("the router must call the notice");
-        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let capture = body
+            .find("capture::grab_full_size_for")
+            .expect("capture call");
         // The worker that sends is started by a later fn, after the capture.
         assert!(notice < capture, "the notice must come before the capture");
     }
