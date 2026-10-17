@@ -41,9 +41,9 @@ use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
-    apply_learned, chord_to_string, pause_binding_label, slot_name, Chord, HotkeyHook,
-    LearnedVerdict, HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
-    WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
+    apply_learned, chord_to_string, slot_name, Chord, HotkeyHook, LearnedVerdict, HK_PAUSE,
+    HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE,
+    WM_APP_PAUSE_TOGGLE,
 };
 use crate::keypress;
 use crate::mode::{self, Mode};
@@ -185,6 +185,12 @@ pub const WM_APP_SETTINGS_LEFT: u32 = WM_APP + 26;
 /// every tray change takes (`App::persist_changes_with`), so the count of writes
 /// in flight, the reload and the cards are all kept in one place. `WM_APP + 27`.
 pub const WM_APP_SETTINGS_SAVE: u32 = WM_APP + 27;
+
+/// #873: posted by the Settings window when the Mode row or the Pause or Resume
+/// button is used. `wparam` is a [`SettingsCommand`] code. The handler runs the
+/// tray's own `set_mode`, `pause_for` and `resume`, so the window and the tray
+/// menu share one path. `WM_APP + 28`.
+pub const WM_APP_SETTINGS_COMMAND: u32 = WM_APP + 28;
 
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
@@ -4969,7 +4975,10 @@ impl App {
                 "Couldn't open settings",
                 "Windows would not create the settings window. Try again, or open config.toml (tray menu, Help and diagnostics, Open config.toml).",
             );
+            return;
         }
+        // The window builds with the mode in `config` and no pause time.
+        self.sync_settings_window();
     }
 
     /// Settings lost the foreground or closed (#871): show what waited for it,
@@ -5106,6 +5115,7 @@ impl App {
                 DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
                 DeferredMessage::SettingsLeft => self.on_settings_left(),
                 DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
+                DeferredMessage::SettingsCommand(command) => self.on_settings_command(command),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
@@ -5217,6 +5227,7 @@ impl App {
             hook.set_palette_chord(self.config.hotkeys.palette);
         }
         self.refresh_tray_labels();
+        self.sync_settings_window();
     }
 
     /// #174: `edit_settings` only needs to save when the file did not exist
@@ -5371,6 +5382,7 @@ impl App {
                 config_problem_card(self.config.load_problem.as_deref().unwrap_or_default());
             self.card.show_error(&headline, &detail);
             self.tray.set_mode(self.config.mode);
+            self.sync_settings_window();
             self.set_watch(true);
             return;
         }
@@ -5378,8 +5390,35 @@ impl App {
         mode::set_current(mode);
         self.tray.set_mode(mode);
         self.update_tooltip();
+        self.sync_settings_window();
         self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
         self.set_watch(true);
+    }
+
+    /// The Settings window's Mode row and Pause or Resume button (#873). Each
+    /// runs the handler the tray menu item runs, so there is one path.
+    fn on_settings_command(&mut self, command: SettingsCommand) {
+        match command {
+            SettingsCommand::Mode(mode) => self.set_mode(mode),
+            SettingsCommand::Pause(choice) => self.pause_for(choice),
+            SettingsCommand::Resume => self.resume(),
+        }
+    }
+
+    /// Shows the current mode and pause state in an open Settings window (#873),
+    /// so it follows a change made from the tray, the pause key, an expired
+    /// pause or a reload. A no-op when no window is open.
+    fn sync_settings_window(&self) {
+        if !settings::is_open() {
+            return;
+        }
+        let paused = match self.pause {
+            PauseState::Paused { choice, until } if self.pause.is_paused(SystemTime::now()) => {
+                Some(pause::tooltip_text(choice, until.and_then(local_hour_min)))
+            }
+            _ => None,
+        };
+        settings::sync_live(self.config.mode, paused.as_deref());
     }
 
     /// Hands one field change to the writer thread. `label` names it in the
@@ -5607,8 +5646,6 @@ impl App {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
         self.tray.set_key_bindings(&primary, &secondary);
-        self.tray
-            .set_pause_binding(&pause_binding_label(self.config.hotkeys.pause.as_ref()));
 
         let p = &self.config.providers;
         self.tray
@@ -5703,6 +5740,7 @@ impl App {
         self.hide_card();
         self.set_watch(false);
         self.update_tooltip();
+        self.sync_settings_window();
     }
 
     /// Leave Pause (issue #20), whether from the "Resume" menu item or
@@ -5716,6 +5754,7 @@ impl App {
         }
         self.tray.set_paused(false);
         self.update_tooltip();
+        self.sync_settings_window();
     }
 
     /// #181: flips Pause on a pause-toggle-chord press -- resume if
@@ -7591,6 +7630,10 @@ enum DeferredMessage {
     /// `WM_APP_SETTINGS_SAVE` (#871), when it arrives during a tray menu or a
     /// file dialog: the save is handed to the writer once that loop has ended.
     SettingsSave(Box<SettingsSave>),
+    /// `WM_APP_SETTINGS_COMMAND` (#873), when it arrives during a tray menu or a
+    /// file dialog: run once that loop has ended, so the tray's own handler never
+    /// runs under a menu.
+    SettingsCommand(SettingsCommand),
     /// `WM_APP_PAUSE_TOGGLE` pressed while Settings is in front: applied when it
     /// is not, so no "Paused" card lands on the window being typed in. Nothing
     /// can start a request meanwhile (`settings_hold_card`).
@@ -7924,7 +7967,8 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_EXECUTOR_DONE
         | WM_APP_CONFIG_WRITTEN
         | WM_APP_SETTINGS_LEFT
-        | WM_APP_SETTINGS_SAVE => SettingsReentrancy::Defer,
+        | WM_APP_SETTINGS_SAVE
+        | WM_APP_SETTINGS_COMMAND => SettingsReentrancy::Defer,
         WM_APP_HOTKEY
         | WM_APP_ACTIVATE
         | WM_APP_TRAY
@@ -8046,6 +8090,61 @@ pub(crate) fn post_settings_save(owner: isize, save: SettingsSave) -> Result<(),
     Ok(())
 }
 
+/// What the Settings window asks of the app (#873): the same three things the
+/// tray menu offers, so each runs through the tray's own handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsCommand {
+    Mode(Mode),
+    Pause(PauseChoice),
+    Resume,
+}
+
+impl SettingsCommand {
+    /// The code that travels in `wparam`.
+    pub(crate) fn to_wparam(self) -> usize {
+        match self {
+            SettingsCommand::Mode(Mode::Cloud) => 0,
+            SettingsCommand::Mode(Mode::Local) => 1,
+            SettingsCommand::Mode(Mode::Auto) => 2,
+            SettingsCommand::Mode(Mode::Offline) => 3,
+            SettingsCommand::Pause(PauseChoice::OneHour) => 10,
+            SettingsCommand::Pause(PauseChoice::UntilTomorrow) => 11,
+            SettingsCommand::Pause(PauseChoice::UntilResumed) => 12,
+            SettingsCommand::Resume => 20,
+        }
+    }
+
+    /// The command for a code; `None` for a number nobody sends, so a stray
+    /// message is dropped instead of acted on.
+    pub(crate) fn from_wparam(code: usize) -> Option<SettingsCommand> {
+        Some(match code {
+            0 => SettingsCommand::Mode(Mode::Cloud),
+            1 => SettingsCommand::Mode(Mode::Local),
+            2 => SettingsCommand::Mode(Mode::Auto),
+            3 => SettingsCommand::Mode(Mode::Offline),
+            10 => SettingsCommand::Pause(PauseChoice::OneHour),
+            11 => SettingsCommand::Pause(PauseChoice::UntilTomorrow),
+            12 => SettingsCommand::Pause(PauseChoice::UntilResumed),
+            20 => SettingsCommand::Resume,
+            _ => return None,
+        })
+    }
+}
+
+/// Posts `command` to the owner window `owner`. Never waits. `false` when the
+/// owner is gone, which the caller says on the window's own status line.
+pub(crate) fn post_settings_command(owner: isize, command: SettingsCommand) -> bool {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(owner as *mut _)),
+            WM_APP_SETTINGS_COMMAND,
+            WPARAM(command.to_wparam()),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
 /// Takes ownership of the payload a deferrable message carries and returns it
 /// as a [`DeferredMessage`]. `None` for an id that cannot be deferred, whose
 /// payload (if any) the caller frees: never a panic, this runs in the window
@@ -8097,6 +8196,9 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_SETTINGS_LEFT => DeferredMessage::SettingsLeft,
         WM_APP_SETTINGS_SAVE => {
             DeferredMessage::SettingsSave(unsafe { Box::from_raw(lparam.0 as *mut SettingsSave) })
+        }
+        WM_APP_SETTINGS_COMMAND => {
+            DeferredMessage::SettingsCommand(SettingsCommand::from_wparam(wparam.0)?)
         }
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
         // #1011: tray menu only; see `tray_menu_policy`.
@@ -8336,9 +8438,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     // would silently swallow the next key pressed anywhere.
     if !matches!(
         decode(id),
-        MenuChoice::Command(cmd::SET_PRIMARY)
-            | MenuChoice::Command(cmd::SET_SECONDARY)
-            | MenuChoice::Command(cmd::SET_PAUSE)
+        MenuChoice::Command(cmd::SET_PRIMARY) | MenuChoice::Command(cmd::SET_SECONDARY)
     ) {
         if let Some(h) = &app.hook {
             h.cancel_learning();
@@ -8364,7 +8464,6 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
         MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
         MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
-        MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
         MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
         MenuChoice::Command(cmd::RELOAD) => app.reload(),
         MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
@@ -8760,6 +8859,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_settings_save(save);
             LRESULT(0)
         }
+        WM_APP_SETTINGS_COMMAND => {
+            if let Some(command) = SettingsCommand::from_wparam(wparam.0) {
+                app.on_settings_command(command);
+            }
+            LRESULT(0)
+        }
         WM_APP_MACHINE_CHECK_RESULT => {
             let facts = unsafe { *Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts) };
             app.on_machine_check_result(&facts);
@@ -8998,7 +9103,9 @@ mod tests {
     };
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
-    use super::{SettingsSave, WM_APP_SETTINGS_LEFT, WM_APP_SETTINGS_SAVE};
+    use super::{
+        SettingsSave, WM_APP_SETTINGS_COMMAND, WM_APP_SETTINGS_LEFT, WM_APP_SETTINGS_SAVE,
+    };
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
@@ -9014,6 +9121,7 @@ mod tests {
     };
     use crate::mode::Mode;
     use crate::options_keys::WM_APP_OPTIONS_CHOICE;
+    use crate::pause::PauseChoice;
     use crate::provider::ollama_admin::FirstRun;
     use crate::provider::Provider;
     use crate::router;
@@ -9148,6 +9256,7 @@ mod tests {
             WM_APP_CONFIG_WRITTEN,
             WM_APP_SETTINGS_LEFT,
             WM_APP_SETTINGS_SAVE,
+            WM_APP_SETTINGS_COMMAND,
             WM_APP_TRAY,
             WM_CLOSE,
             WM_DESTROY,
@@ -9623,6 +9732,71 @@ mod tests {
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_LEFT => {"));
         assert!(proc_src.contains("WM_APP_SETTINGS_SAVE => {"));
+    }
+
+    /// #873: the Mode and Pause controls in Settings send one of these; each
+    /// code must come back as the same command, and a stray number as nothing.
+    #[test]
+    fn a_settings_command_round_trips_and_a_stray_code_is_refused() {
+        use super::SettingsCommand as C;
+        let all = [
+            C::Mode(Mode::Cloud),
+            C::Mode(Mode::Local),
+            C::Mode(Mode::Auto),
+            C::Mode(Mode::Offline),
+            C::Pause(PauseChoice::OneHour),
+            C::Pause(PauseChoice::UntilTomorrow),
+            C::Pause(PauseChoice::UntilResumed),
+            C::Resume,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for c in all {
+            assert_eq!(C::from_wparam(c.to_wparam()), Some(c), "{c:?}");
+            assert!(seen.insert(c.to_wparam()), "{c:?} shares a code");
+        }
+        assert_eq!(C::from_wparam(999), None);
+        assert_eq!(C::from_wparam(usize::MAX), None);
+    }
+
+    /// #873: the command can wait for a nested loop, and keeps what it carries.
+    #[test]
+    fn a_settings_command_can_be_held_for_a_nested_loop() {
+        use super::{take_deferred, DeferredMessage, SettingsCommand as C};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        let cmd = C::Mode(Mode::Offline);
+        match take_deferred(WM_APP_SETTINGS_COMMAND, WPARAM(cmd.to_wparam()), LPARAM(0)) {
+            Some(DeferredMessage::SettingsCommand(got)) => assert_eq!(got, cmd),
+            _ => panic!("a held command lost its payload"),
+        }
+        // A stray code is not a command: never a panic in the window procedure.
+        assert!(take_deferred(WM_APP_SETTINGS_COMMAND, WPARAM(999), LPARAM(0)).is_none());
+    }
+
+    /// #873 wired-to-nothing: the owner window has an arm for the message, the
+    /// arm calls the tray's own handlers (one path, not a copy), and every place
+    /// the mode or the pause state changes tells an open Settings window.
+    #[test]
+    fn a_settings_command_runs_the_trays_handlers_and_every_change_tells_settings() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        assert!(proc_src.contains("WM_APP_SETTINGS_COMMAND => {"), "no arm");
+        let run = body_between(&src, "    fn on_settings_command(", "\n    }\n");
+        for call in ["self.set_mode(", "self.pause_for(", "self.resume()"] {
+            assert!(run.contains(call), "{call} is not the tray's path:\n{run}");
+        }
+        for head in [
+            "    fn set_mode(&mut self, mode: Mode) {",
+            "    fn pause_for(&mut self, choice: PauseChoice) {",
+            "    fn resume(&mut self) {",
+            "    fn apply_config(&mut self) {",
+            "    fn open_settings(&mut self) {",
+        ] {
+            let body = body_between(&src, head, "\n    }\n");
+            assert!(
+                body.contains("self.sync_settings_window()"),
+                "{head} leaves an open Settings window showing the old state"
+            );
+        }
     }
 
     // -- readiness_gate (issue #192) ---------------------------------------
@@ -11777,6 +11951,7 @@ mod tests {
         ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
         ("WM_APP_SETTINGS_LEFT", WM_APP_SETTINGS_LEFT),
         ("WM_APP_SETTINGS_SAVE", WM_APP_SETTINGS_SAVE),
+        ("WM_APP_SETTINGS_COMMAND", WM_APP_SETTINGS_COMMAND),
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
     ];
 
@@ -12705,6 +12880,11 @@ mod tests {
         (
             "WM_APP_SETTINGS_SAVE",
             WM_APP_SETTINGS_SAVE,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_SETTINGS_COMMAND",
+            WM_APP_SETTINGS_COMMAND,
             SettingsReentrancy::Defer,
         ),
     ];

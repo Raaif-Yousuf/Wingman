@@ -198,9 +198,7 @@ pub mod cmd {
     /// needs to be unique among menu items.
     pub const VERSION_LABEL: u32 = 1029;
 
-    /// Issue #202: "Set pause key" learn-mode item, the third sibling of
-    /// `SET_PRIMARY`/`SET_SECONDARY`. See `App::start_learning` in `app.rs`.
-    pub const SET_PAUSE: u32 = 1030;
+    // 1030 was "Set pause key", which moved to Settings, General (#873).
 
     /// Issue #124: builds a plain-text diagnostics report and copies it to
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
@@ -353,9 +351,6 @@ pub struct Tray {
     /// parenthetical suffix is simply omitted.
     primary_label: String,
     secondary_label: String,
-    /// Display string for the pause-toggle binding (issue #202), or "not
-    /// set". Set via [`Tray::set_pause_binding`].
-    pause_label: String,
     /// Model lists and current-selection index for the two submenus. Set
     /// via [`Tray::set_models`]; empty until then, in which case the
     /// submenu shows a single greyed-out "none configured" entry.
@@ -435,7 +430,6 @@ impl Tray {
             instance,
             primary_label: String::new(),
             secondary_label: String::new(),
-            pause_label: String::new(),
             active_provider: Some(ActiveProvider::OpenAi),
             openai_models: Vec::new(),
             openai_current: None,
@@ -465,7 +459,6 @@ impl Tray {
     pub(crate) fn for_gallery(hwnd: HWND, instance: HINSTANCE) -> Self {
         let mut tray = Self::with_icon(hwnd, instance, HICON::default());
         tray.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K");
-        tray.set_pause_binding("Not set");
         tray.set_models(
             &["gpt-5".to_string(), "gpt-5-mini".to_string()],
             "gpt-5",
@@ -610,12 +603,6 @@ impl Tray {
     pub fn set_key_bindings(&mut self, primary: &str, secondary: &str) {
         self.primary_label = primary.to_string();
         self.secondary_label = secondary.to_string();
-    }
-
-    /// Display string for the "Set pause key" label (issue #202), e.g.
-    /// `hotkey::pause_binding_label(config.hotkeys.pause.as_ref())`.
-    pub fn set_pause_binding(&mut self, pause: &str) {
-        self.pause_label = pause.to_string();
     }
 
     /// Populates the two model submenus. `*_current` marks which entry gets
@@ -919,14 +906,6 @@ impl Tray {
             cmd::SET_SECONDARY,
             "Set secondary key…",
             &self.secondary_label,
-            None,
-            !self.paused,
-        )?;
-        append_item_with(
-            setup,
-            cmd::SET_PAUSE,
-            "Set pause key…",
-            &self.pause_label,
             None,
             !self.paused,
         )?;
@@ -1847,10 +1826,6 @@ mod tests {
             !item_is_greyed(hmenu_running, cmd::SET_SECONDARY),
             "SET_SECONDARY must not be greyed while running"
         );
-        assert!(
-            !item_is_greyed(hmenu_running, cmd::SET_PAUSE),
-            "SET_PAUSE must not be greyed while running"
-        );
         let _ = unsafe { DestroyMenu(hmenu_running) };
 
         tray.set_paused(true);
@@ -1864,10 +1839,6 @@ mod tests {
         assert!(
             item_is_greyed(hmenu_paused, cmd::SET_SECONDARY),
             "SET_SECONDARY must be greyed while paused"
-        );
-        assert!(
-            item_is_greyed(hmenu_paused, cmd::SET_PAUSE),
-            "SET_PAUSE must be greyed while paused"
         );
         let _ = unsafe { DestroyMenu(hmenu_paused) };
 
@@ -2084,10 +2055,7 @@ mod tests {
         assert_eq!(help, want);
 
         let setup = find_sub(&tree, "Providers and keys");
-        assert_eq!(
-            direct_ids(setup),
-            [cmd::SET_PRIMARY, cmd::SET_SECONDARY, cmd::SET_PAUSE]
-        );
+        assert_eq!(direct_ids(setup), [cmd::SET_PRIMARY, cmd::SET_SECONDARY]);
         let mut providers = Vec::new();
         ids_under(find_sub(setup, "Provider"), &mut providers);
         assert_eq!(providers.len(), ActiveProvider::ALL.len());
@@ -2365,7 +2333,6 @@ mod tests {
         assert!(!checked(&running, cmd::MODE_CLOUD));
         assert!(checked(&running, cmd::USE_GEMINI));
         assert!(!checked(&running, cmd::USE_OPENAI));
-        assert!(!grey(&running, cmd::SET_PAUSE));
         assert!(!grey(&running, cmd::QUICK_ASK));
         assert!(!grey(&running, cmd::WHAT_CAN_I_DO));
 
@@ -2373,7 +2340,6 @@ mod tests {
         for id in [
             cmd::SET_PRIMARY,
             cmd::SET_SECONDARY,
-            cmd::SET_PAUSE,
             cmd::QUICK_ASK,
             cmd::WHAT_CAN_I_DO,
             cmd::CALCULATE_SELECTION,
@@ -2729,7 +2695,6 @@ mod tests {
         ("COPY_LAST", cmd::COPY_LAST),
         ("SET_PRIMARY", cmd::SET_PRIMARY),
         ("SET_SECONDARY", cmd::SET_SECONDARY),
-        ("SET_PAUSE", cmd::SET_PAUSE),
         ("EDIT_SETTINGS", cmd::EDIT_SETTINGS),
         ("RELOAD", cmd::RELOAD),
         ("QUIT", cmd::QUIT),
