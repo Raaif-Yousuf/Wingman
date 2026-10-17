@@ -972,10 +972,13 @@ pub fn run() -> Result<()> {
             .as_ref()
             .map(|(folder, error)| (folder.as_str(), error.as_str())),
         merge_cards(
-            degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
-            knowledge_start_card(
-                knowledge_setting_problem.as_deref(),
-                knowledge_spawn_problem.as_deref(),
+            plaintext_keys_card(&config.keys_left_in_file),
+            merge_cards(
+                degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
+                knowledge_start_card(
+                    knowledge_setting_problem.as_deref(),
+                    knowledge_spawn_problem.as_deref(),
+                ),
             ),
         ),
     ) {
@@ -1150,6 +1153,34 @@ fn unreadable_secrets_card(providers: &[String]) -> (String, String) {
         format!(
             "Could not read the saved key for: {list}. It was not deleted. Retype it in Settings to replace it."
         ),
+    )
+}
+
+/// #899: the card for API keys that are still written in config.toml after a
+/// load, because Credential Manager refused them or the file could not be
+/// rewritten. The keys still work; the card says where they are and what to do.
+/// `None` when there are none. Names only, never a key. No em dash (rule 11).
+fn plaintext_keys_card(providers: &[String]) -> Option<(String, String)> {
+    if providers.is_empty() {
+        return None;
+    }
+    Some((
+        "API key still in config.toml".to_string(),
+        format!(
+            "Wingman could not move the key for {} out of config.toml, so it is still there as plain text. \
+             Choose Reload settings (tray menu, Help and diagnostics) to try again, or retype it in Settings.",
+            providers.join(", ")
+        ),
+    ))
+}
+
+/// The one card for what a load found about keys: stored keys it could not read
+/// (#175) and keys it left in config.toml (#899), joined so neither hides the
+/// other. `None` when there is nothing to say. Pure.
+fn load_notice_card(unreadable: &[String], left_in_file: &[String]) -> Option<(String, String)> {
+    merge_cards(
+        (!unreadable.is_empty()).then(|| unreadable_secrets_card(unreadable)),
+        plaintext_keys_card(left_in_file),
     )
 }
 
@@ -6000,20 +6031,22 @@ impl App {
                             // must not be re-applied over it later.
                             self.unsaved.clear();
                         }
-                        // #175: read before the config is moved. A reload that
-                        // was superseded hands its card on to this reply.
+                        // #175, #899: read before the config is moved. A reload
+                        // that was superseded hands its card on to this reply.
+                        // Keys a load left in the file are said after any job,
+                        // a Settings save included.
                         let unreadable = secrets_to_announce(
                             outcome.from_reload || carried.is_some(),
                             &config.unreadable_secrets,
                             carried.as_deref().map(|c| c.unreadable_secrets.as_slice()),
                         )
                         .to_vec();
+                        let notice = load_notice_card(&unreadable, &config.keys_left_in_file);
                         if let Some(config) = final_config(Some(config), carried, &self.unsaved) {
                             self.config = config;
                         }
                         self.apply_config();
-                        if !unreadable.is_empty() {
-                            let (headline, mut detail) = unreadable_secrets_card(&unreadable);
+                        if let Some((headline, mut detail)) = notice {
                             if let Some(why) = &key_error {
                                 // The key note must not be lost behind this card.
                                 let human = self.track_error(KEY_NOT_STORED_HEADLINE, why);
@@ -6087,8 +6120,9 @@ impl App {
                     // The reloaded values are live now, so the note must not
                     // say the old settings are still in use.
                     note = format!("{}\n\n{human}", carried_fail_note(kept));
-                    if !carried.unreadable_secrets.is_empty() {
-                        let (_, detail) = unreadable_secrets_card(&carried.unreadable_secrets);
+                    if let Some((_, detail)) =
+                        load_notice_card(&carried.unreadable_secrets, &carried.keys_left_in_file)
+                    {
                         note = format!("{note}\n\n{detail}");
                     }
                 }
@@ -9893,6 +9927,54 @@ mod tests {
     }
 
     #[test]
+    fn the_load_notice_joins_unreadable_and_left_in_file_keys() {
+        use super::load_notice_card;
+        let one = vec!["openai".to_string()];
+        let two = vec!["lab".to_string()];
+        assert!(load_notice_card(&[], &[]).is_none());
+        let (h, d) = load_notice_card(&one, &[]).unwrap();
+        assert_eq!(h, "Stored API key unreadable");
+        assert!(d.contains("openai"));
+        let (h, d) = load_notice_card(&[], &two).unwrap();
+        assert_eq!(h, "API key still in config.toml");
+        assert!(d.contains("lab"));
+        let (_, d) = load_notice_card(&one, &two).unwrap();
+        assert!(d.contains("openai") && d.contains("lab"), "{d}");
+    }
+
+    /// #899: the write handler says what a load left in the file, on the last
+    /// reply of any job (a Settings save too), and the failure path as well.
+    #[test]
+    fn the_write_handler_reads_keys_left_in_the_file_before_the_move() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let notice = handler
+            .find("load_notice_card(")
+            .expect("the handler never builds the notice");
+        let moved = handler.find("final_config(Some(config)").unwrap();
+        assert!(notice < moved, "{handler}");
+        assert!(
+            handler[notice..].contains("config.keys_left_in_file"),
+            "{handler}"
+        );
+        // Not only for a reload.
+        let before = &handler[..notice];
+        assert!(!before.ends_with("if outcome.from_reload {\n"), "{handler}");
+        let err = handler.find("Err(reason) =>").unwrap();
+        assert!(handler[err..].contains("keys_left_in_file"), "{handler}");
+    }
+
+    #[test]
+    fn plaintext_keys_card_names_the_providers_and_is_absent_when_none() {
+        use super::plaintext_keys_card;
+        assert!(plaintext_keys_card(&[]).is_none());
+        let (headline, detail) =
+            plaintext_keys_card(&["openai".to_string(), "lab".to_string()]).unwrap();
+        assert!(detail.contains("openai, lab"), "{detail}");
+        assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
+    }
+
+    #[test]
     fn unreadable_secrets_card_has_no_em_dash() {
         // AGENTS.md rule 11: no em dashes in user-facing strings.
         let (headline, detail) = unreadable_secrets_card(&["openai".to_string()]);
@@ -10495,9 +10577,7 @@ mod tests {
         assert!(!text.contains('\u{2014}'));
         let src = lf(include_str!("app.rs"));
         let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
-        let at = handler
-            .find("unreadable_secrets_card(&unreadable)")
-            .unwrap();
+        let at = handler.find("= notice {").unwrap();
         let show = handler[at..].find("return;").unwrap();
         assert!(
             handler[at..at + show].contains("with_key_failure_note("),
