@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -311,6 +311,10 @@ const PAUSE_TIMER_ID: usize = 1;
 /// #723: one-shot, armed only while a run is in flight (rule 5), fires when
 /// the run has outlasted `provider::worst_case_run_secs` for its chain.
 const STUCK_TIMER_ID: usize = 4;
+/// #393: one-shot, armed only by a first press that has to wait to tell a
+/// single press from a double (rule 5: never while idle), killed when it
+/// fires or a second press arrives.
+const KEY_WINDOW_TIMER_ID: usize = 5;
 
 /// #307: the options card on screen, as the app side knows it. The card holds
 /// the buttons; this holds what each one runs. Its `generation` must equal the
@@ -335,14 +339,40 @@ fn key_phase_of(session: Option<&OptionsSession>, card_generation: Option<u32>) 
     match (session, card_generation) {
         (Some(s), Some(g)) if s.generation == g => {
             if s.ids.is_empty() {
-                keypress::Phase::Looking
+                keypress::Phase::Looking { early: false }
             } else {
+                let pick = |i: usize| i < s.ids.len() && s.key_pickable.get(i) == Some(&true);
                 keypress::Phase::Options {
-                    first_key_pickable: s.key_pickable.first().copied().unwrap_or(false),
+                    count: s.ids.len(),
+                    pickable: [pick(0), pick(1)],
                 }
             }
         }
         _ => keypress::Phase::Other,
+    }
+}
+
+/// #393: `phase` with what only the card and the clock know filled in. A
+/// press inside the window of the one that started a Look is the second tap
+/// of a double (`early`), and an answer, error or info card is `Answer`.
+/// Pure, so the table over every state is tested.
+fn refine_key_phase(
+    phase: keypress::Phase,
+    card_state: crate::ui::card::CardState,
+    since_look_press: Option<Duration>,
+    window: Option<Duration>,
+) -> keypress::Phase {
+    use crate::ui::card::CardState;
+    match phase {
+        keypress::Phase::Looking { .. } => keypress::Phase::Looking {
+            early: matches!((since_look_press, window), (Some(d), Some(w)) if d < w),
+        },
+        keypress::Phase::Other
+            if matches!(card_state, CardState::Collapsed | CardState::Expanded) =>
+        {
+            keypress::Phase::Answer
+        }
+        other => other,
     }
 }
 
@@ -552,6 +582,16 @@ struct App {
     /// #308: the bad `hotkeys.primary_action` id already shown on a card, so
     /// the mistake is shown once and later presses fall back to the options card.
     primary_action_reported: Option<String>,
+    /// #393: a first press waiting out the double-press window: the options
+    /// card it was made on and when. Only an options card with two buttons
+    /// the key may run ever waits (`keypress::needs_window`).
+    key_pending: Option<(u32, Instant)>,
+    /// #393: presses are ignored until then. Set when the key closes or
+    /// cancels something, so the second tap of a double does not start a new
+    /// Look on the card the first tap just closed.
+    key_quiet_until: Option<Instant>,
+    /// #393: when the press that started the current Look was made.
+    look_pressed_at: Option<Instant>,
     chain: Arc<Chain>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
@@ -833,6 +873,9 @@ pub fn run() -> Result<()> {
         options: None,
         options_generation: 0,
         primary_action_reported: None,
+        key_pending: None,
+        key_quiet_until: None,
+        look_pressed_at: None,
         busy: false,
         last: None,
         pause: PauseState::Running,
@@ -1520,7 +1563,7 @@ impl App {
         ) else {
             let pending = matches!(self.card.state(), crate::ui::card::CardState::Pending);
             if should_hide_after_first_run(pending, self.busy) {
-                self.card.hide();
+                self.hide_card();
             }
             return;
         };
@@ -1663,7 +1706,7 @@ impl App {
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
@@ -2002,7 +2045,7 @@ impl App {
         };
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             self.set_watch(false);
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
@@ -2231,24 +2274,125 @@ impl App {
         self.dispatch_palette_action(id);
     }
 
-    /// #308: one press of the Wingman key. What it does follows the options
-    /// card ([`keypress::on_key`]): while the router works it cancels, on the
-    /// card it runs option 1 when the key may, otherwise it closes the card.
-    /// With no options card it does the primary action: show the options card
-    /// (the default), or run the action `hotkeys.primary_action` names, with
-    /// no router call (`"check-my-work"` is the old one-press flow).
+    /// #308, #393: one press of the Wingman key. What it does follows what is
+    /// on screen and `hotkeys.key_mode` ([`keypress::on_key`]): while the
+    /// router works it cancels, on the options card it runs option 1 (a
+    /// double press option 2) when the key may, otherwise it closes the card,
+    /// and an answer card is dismissed. With no card up it does the primary
+    /// action: show the options card (the default), or run the action
+    /// `hotkeys.primary_action` names, with no router call.
+    ///
+    /// The hook stays dumb; the timing lives here. Where a single and a
+    /// double would differ (an options card with two buttons) the first press
+    /// arms a one-shot timer ([`KEY_WINDOW_TIMER_ID`]) and waits: a second
+    /// press inside the window is a double, the timer firing is a single.
+    /// Everywhere else the press acts at once.
     fn on_primary_key(&mut self, trigger: Trigger) {
-        let phase = key_phase_of(self.options.as_ref(), self.card.options_generation());
-        match keypress::on_key(phase) {
-            keypress::KeyAction::Close => self.close_options_card(),
-            keypress::KeyAction::RunFirst => {
-                let first = self.options.as_ref().and_then(|s| s.ids.first().cloned());
-                match first {
+        let now = Instant::now();
+        if self.key_quiet_until.is_some_and(|t| now < t) {
+            return;
+        }
+        if KEY_WINDOW_STALE.with(|c| c.replace(false)) {
+            self.disarm_key_window();
+        }
+        let window = self.key_window();
+        let mode = self.config.hotkeys.key_mode_value();
+        let phase = self.current_key_phase(now, window);
+        let step = key_press_step(
+            self.key_pending.take(),
+            self.card.options_generation(),
+            window,
+            keypress::needs_window(phase, mode),
+            now,
+        );
+        // A stale wait (its card is gone) leaves nothing armed.
+        self.disarm_key_window();
+        match step {
+            KeyStep::Double => {
+                let action = keypress::on_key(phase, mode, keypress::Press::Double);
+                self.apply_key_action(action, trigger, window, now);
+            }
+            KeyStep::Wait(generation, w) => {
+                self.key_pending = Some((generation, now));
+                let hwnd = self.hwnd();
+                unsafe {
+                    let _ = SetTimer(Some(hwnd), KEY_WINDOW_TIMER_ID, w.as_millis() as u32, None);
+                }
+            }
+            KeyStep::Single => {
+                let action = keypress::on_key(phase, mode, keypress::Press::Single);
+                self.apply_key_action(action, trigger, window, now);
+            }
+        }
+    }
+
+    /// The double-press window from the config, or `None` when it is off.
+    fn key_window(&self) -> Option<Duration> {
+        self.config
+            .hotkeys
+            .double_press_window_ms()
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+    }
+
+    /// #393: the double-press window ran out with no second press: the first
+    /// press was a single. Dropped when its card is gone.
+    fn on_key_window_expired(&mut self) {
+        let pending = self.key_pending.take();
+        self.disarm_key_window();
+        if !key_wait_is_live(pending, self.card.options_generation()) {
+            return;
+        }
+        let now = Instant::now();
+        let window = self.key_window();
+        let phase = self.current_key_phase(now, window);
+        let mode = self.config.hotkeys.key_mode_value();
+        let action = keypress::on_key(phase, mode, keypress::Press::Single);
+        self.apply_key_action(action, Trigger::Hotkey, window, now);
+    }
+
+    /// The one place the double-press wait is cancelled: forgets the pending
+    /// first press and kills the one-shot timer.
+    fn disarm_key_window(&mut self) {
+        self.key_pending = None;
+        let hwnd = self.hwnd();
+        unsafe {
+            let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
+        }
+    }
+
+    fn current_key_phase(&self, now: Instant, window: Option<Duration>) -> keypress::Phase {
+        refine_key_phase(
+            key_phase_of(self.options.as_ref(), self.card.options_generation()),
+            self.card.state(),
+            self.look_pressed_at.map(|t| now.duration_since(t)),
+            window,
+        )
+    }
+
+    fn apply_key_action(
+        &mut self,
+        action: keypress::KeyAction,
+        trigger: Trigger,
+        window: Option<Duration>,
+        now: Instant,
+    ) {
+        match action {
+            keypress::KeyAction::Close => {
+                self.close_options_card();
+                self.key_quiet_until = window.map(|w| now + w);
+            }
+            keypress::KeyAction::RunOption(i) => {
+                let id = self.options.as_ref().and_then(|s| s.ids.get(i).cloned());
+                match id {
                     Some(id) => self.run_option(&id),
                     None => self.close_options_card(),
                 }
             }
-            keypress::KeyAction::Proceed => self.run_primary_action(trigger),
+            keypress::KeyAction::Absorb => {}
+            keypress::KeyAction::Proceed => {
+                self.look_pressed_at = Some(now);
+                self.run_primary_action(trigger);
+            }
         }
     }
 
@@ -2290,8 +2434,15 @@ impl App {
     /// key claim and the auto-dismiss.
     fn close_options_card(&mut self) {
         self.options = None;
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
+    }
+
+    /// Every path that hides the card goes through here, so the double-press
+    /// wait never outlives the card it was waiting on (#393).
+    fn hide_card(&mut self) {
+        self.disarm_key_window();
+        self.card.hide();
     }
 
     /// `"<name>:<model>"` for the first entry `self.config.mode` would
@@ -2431,7 +2582,7 @@ impl App {
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
@@ -2504,7 +2655,7 @@ impl App {
         }
 
         if !matches!(self.card.state(), crate::ui::card::CardState::Hidden) {
-            self.card.hide();
+            self.hide_card();
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
@@ -3283,7 +3434,7 @@ impl App {
         if !take_send_slot(&mut self.pending_preview) {
             return false;
         }
-        self.card.hide();
+        self.hide_card();
         true
     }
 
@@ -3294,7 +3445,7 @@ impl App {
         if !is_send_cancelled(packed) {
             return false;
         }
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         true
     }
@@ -4645,7 +4796,7 @@ impl App {
     fn open_settings_inner(&mut self) {
         // The card would sit on top of the settings window, and a click in
         // that window would dismiss it anyway.
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
 
         SETTINGS_OPEN.with(|c| c.set(true));
@@ -5263,7 +5414,7 @@ impl App {
         }
 
         self.tray.set_paused(true);
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         self.update_tooltip();
     }
@@ -5393,7 +5544,7 @@ impl App {
         if self.point_in_card(x, y) {
             return;
         }
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
     }
 
@@ -5428,7 +5579,7 @@ impl App {
     fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
         // Like `open_settings`: no card timers or click watcher while the
         // nested loop runs.
-        self.card.hide();
+        self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
         let out = dialog();
@@ -7159,6 +7310,11 @@ thread_local! {
     /// #723: the in-flight run outlasted its bound; the next press abandons
     /// it. Thread-local for the same reason as `SETTINGS_OPEN`.
     static BUSY_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// #393: the double-press timer fired while Settings was open. `App`
+    /// cannot be touched there (see `SETTINGS_OPEN`), so the wait is
+    /// forgotten by the next press, through `disarm_key_window`.
+    static KEY_WINDOW_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 use std::os::windows::ffi::OsStrExt;
@@ -7682,6 +7838,47 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     LRESULT(0)
 }
 
+/// What a press of the Wingman key does with the double-press wait (#393).
+#[derive(Debug, PartialEq, Eq)]
+enum KeyStep {
+    /// A second press inside the window, for the card that is still up.
+    Double,
+    /// Start waiting for a second press (card generation, window).
+    Wait(u32, Duration),
+    /// Act now as a single press.
+    Single,
+}
+
+/// Whether a timer expiry still belongs to the card up now: the generation
+/// it waited on must be the one showing. Anything else is stale and runs
+/// nothing.
+fn key_wait_is_live(pending: Option<(u32, Instant)>, generation: Option<u32>) -> bool {
+    pending.is_some_and(|(g, _)| generation == Some(g))
+}
+
+/// The pure state machine behind `App::on_primary_key`: `pending` is the
+/// first press still waiting (its card generation and time), `generation`
+/// the card up now. A wait whose card is gone (a different generation, or
+/// none) is stale and the press is a fresh one.
+fn key_press_step(
+    pending: Option<(u32, Instant)>,
+    generation: Option<u32>,
+    window: Option<Duration>,
+    needs_window: bool,
+    now: Instant,
+) -> KeyStep {
+    if let Some((g, at)) = pending {
+        let inside = window.is_some_and(|w| now.duration_since(at) < w);
+        if inside && generation == Some(g) {
+            return KeyStep::Double;
+        }
+    }
+    match (window, needs_window, generation) {
+        (Some(w), true, Some(g)) => KeyStep::Wait(g, w),
+        _ => KeyStep::Single,
+    }
+}
+
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         OWNER_HWND.with(|h| h.set(hwnd.0 as isize));
@@ -7714,6 +7911,15 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 let _ = KillTimer(Some(hwnd), PAUSE_TIMER_ID);
             }
             PAUSE_REEVALUATE_PENDING.with(|c| c.set(true));
+            return LRESULT(0);
+        }
+        if msg == WM_TIMER && wparam.0 == KEY_WINDOW_TIMER_ID {
+            // A one-shot: killed at once so it cannot repeat behind the modal,
+            // and the wait is forgotten so the next press is a fresh press.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), KEY_WINDOW_TIMER_ID);
+            }
+            KEY_WINDOW_STALE.with(|c| c.set(true));
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
@@ -8036,6 +8242,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 app.on_pause_timer(hwnd);
             } else if wparam.0 == STUCK_TIMER_ID {
                 app.on_busy_stuck();
+            } else if wparam.0 == KEY_WINDOW_TIMER_ID {
+                app.on_key_window_expired();
             }
             LRESULT(0)
         }
@@ -8536,7 +8744,7 @@ mod tests {
     fn an_option_runs_through_the_one_palette_dispatch() {
         // A click, a digit and the key all run an option through `run_option`.
         assert!(app_method_body("on_options_choice").contains("self.run_option("));
-        assert!(app_method_body("on_primary_key").contains("self.run_option("));
+        assert!(app_method_body("apply_key_action").contains("self.run_option("));
         let body = app_method_body("run_option");
         assert!(body.contains("self.dispatch_palette_action("), "{body}");
         for second in [
@@ -8752,26 +8960,206 @@ mod tests {
         use crate::keypress::Phase;
         let mut s = session(4, &[]);
         // Looking: a shell with no buttons.
-        assert_eq!(super::key_phase_of(Some(&s), Some(4)), Phase::Looking);
+        assert_eq!(
+            super::key_phase_of(Some(&s), Some(4)),
+            Phase::Looking { early: false }
+        );
         s = session(4, &["a", "b"]);
         s.key_pickable = vec![true, false];
         assert_eq!(
             super::key_phase_of(Some(&s), Some(4)),
             Phase::Options {
-                first_key_pickable: true
+                count: 2,
+                pickable: [true, false]
             }
         );
         s.key_pickable = vec![false, true];
         assert_eq!(
             super::key_phase_of(Some(&s), Some(4)),
             Phase::Options {
-                first_key_pickable: false
+                count: 2,
+                pickable: [false, true]
+            }
+        );
+        // A flag past the last button never counts.
+        s = session(4, &["a"]);
+        s.key_pickable = vec![true, true];
+        assert_eq!(
+            super::key_phase_of(Some(&s), Some(4)),
+            Phase::Options {
+                count: 1,
+                pickable: [true, false]
             }
         );
         // A card that is not this session's, or no card: not an options card.
         assert_eq!(super::key_phase_of(Some(&s), Some(5)), Phase::Other);
         assert_eq!(super::key_phase_of(Some(&s), None), Phase::Other);
         assert_eq!(super::key_phase_of(None, Some(4)), Phase::Other);
+    }
+
+    /// #393: what only the card and the clock know.
+    #[test]
+    fn the_key_phase_is_refined_by_the_card_state_and_the_clock() {
+        use crate::keypress::Phase;
+        use crate::ui::card::CardState;
+        let ms = |n| Some(std::time::Duration::from_millis(n));
+        let looking = Phase::Looking { early: false };
+        // Inside the window of the press that started the Look: a second tap.
+        assert_eq!(
+            super::refine_key_phase(looking, CardState::Options, ms(100), ms(300)),
+            Phase::Looking { early: true }
+        );
+        // Outside it, or with double press off, or no press recorded: a cancel.
+        for (since, win) in [(ms(300), ms(300)), (ms(100), None), (None, ms(300))] {
+            assert_eq!(
+                super::refine_key_phase(looking, CardState::Options, since, win),
+                Phase::Looking { early: false }
+            );
+        }
+        // An answer, error or info card is an Answer; nothing else is.
+        for st in [CardState::Collapsed, CardState::Expanded] {
+            assert_eq!(
+                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                Phase::Answer
+            );
+        }
+        for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
+            assert_eq!(
+                super::refine_key_phase(Phase::Other, st, None, ms(300)),
+                Phase::Other
+            );
+        }
+        let opts = Phase::Options {
+            count: 2,
+            pickable: [true, true],
+        };
+        assert_eq!(
+            super::refine_key_phase(opts, CardState::Options, None, ms(300)),
+            opts
+        );
+    }
+
+    /// Wired-to-nothing guard (#393): the window timer is armed by the press
+    /// and its `WM_TIMER` reaches the handler, both in the live window
+    /// procedure and in the Settings-open branch that must kill it.
+    #[test]
+    fn the_double_press_window_is_a_one_shot_that_is_armed_and_handled() {
+        let src = lf(include_str!("app.rs"));
+        let key = src
+            .split("fn on_primary_key(")
+            .nth(1)
+            .expect("no on_primary_key");
+        let key = &key[..key.find("\n    }\n").unwrap()];
+        let squashed = |t: &str| t.split_whitespace().collect::<String>();
+        let key_sq = squashed(key);
+        assert!(key_sq.contains("SetTimer("), "{key}");
+        assert!(key_sq.contains("KEY_WINDOW_TIMER_ID"), "{key}");
+        assert!(key.contains("needs_window("), "{key}");
+        let proc_src = wnd_proc_body(&src);
+        assert!(
+            proc_src.contains("app.on_key_window_expired()"),
+            "WM_TIMER must reach the window-expiry handler"
+        );
+        let kills = squashed(proc_src)
+            .matches("KillTimer(Some(hwnd),KEY_WINDOW_TIMER_ID)")
+            .count();
+        assert!(kills >= 1, "the Settings branch must kill the one-shot");
+        // Armed in exactly one place, after a press, never at startup.
+        let live = src.split("\n#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            squashed(live)
+                .matches("SetTimer(Some(hwnd),KEY_WINDOW_TIMER_ID,")
+                .count(),
+            1
+        );
+    }
+
+    /// #393: every hide path ends the double-press wait through
+    /// `disarm_key_window`, so none can leave a timer armed.
+    #[test]
+    fn every_card_hide_goes_through_the_helper_that_disarms_the_key_window() {
+        let src = lf(include_str!("app.rs"));
+        let live = src
+            .split(
+                "
+#[cfg(test)]",
+            )
+            .next()
+            .unwrap();
+        let helper = live
+            .split("fn hide_card(&mut self)")
+            .nth(1)
+            .expect("no hide_card");
+        let helper = &helper[..helper
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+        assert!(helper.contains("self.disarm_key_window()"), "{helper}");
+        let disarm = live
+            .split("fn disarm_key_window(&mut self)")
+            .nth(1)
+            .expect("no disarm_key_window");
+        let disarm = &disarm[..disarm
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+        assert!(disarm.contains("self.key_pending = None"), "{disarm}");
+        assert!(disarm.contains("KillTimer("), "{disarm}");
+        let direct = live.matches("self.card.hide()").count();
+        assert_eq!(direct, 1, "only hide_card may call card.hide() directly");
+        let routed = live.matches("self.hide_card()").count();
+        assert!(
+            routed >= 10,
+            "expected the hide sites to be routed: {routed}"
+        );
+    }
+
+    /// #393: the press state machine. A second press inside the window for
+    /// the same card is a double; a stale or late one is a fresh press.
+    #[test]
+    fn key_press_step_pending_stale_and_quiet_cases() {
+        use super::{key_press_step as step, key_wait_is_live, KeyStep};
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let w = Some(ms(300));
+        let later = |m| t0 + ms(m);
+        // The expiry guard: a stale timer never runs an option.
+        assert!(key_wait_is_live(Some((4, t0)), Some(4)));
+        assert!(!key_wait_is_live(Some((4, t0)), Some(5)));
+        assert!(!key_wait_is_live(Some((4, t0)), None));
+        assert!(!key_wait_is_live(None, Some(4)));
+        // No wait pending, the options card needs the window: wait.
+        assert_eq!(step(None, Some(4), w, true, t0), KeyStep::Wait(4, ms(300)));
+        // The window is off: act at once.
+        assert_eq!(step(None, Some(4), None, true, t0), KeyStep::Single);
+        // Nothing to wait for (no options card): single.
+        assert_eq!(step(None, None, w, false, t0), KeyStep::Single);
+        // Second press inside the window, same card: double.
+        assert_eq!(
+            step(Some((4, t0)), Some(4), w, true, later(100)),
+            KeyStep::Double
+        );
+        // Second press after the window: a fresh wait, not a double.
+        assert_eq!(
+            step(Some((4, t0)), Some(4), w, true, later(400)),
+            KeyStep::Wait(4, ms(300))
+        );
+        // A stale expiry never runs an option: another card is up.
+        assert_eq!(
+            step(Some((4, t0)), Some(5), w, true, later(100)),
+            KeyStep::Wait(5, ms(300))
+        );
+        // The card is gone: single.
+        assert_eq!(
+            step(Some((4, t0)), None, w, false, later(100)),
+            KeyStep::Single
+        );
     }
 
     /// Wired-to-nothing guard: the hook's message reaches the key table, and a
@@ -8806,7 +9194,12 @@ mod tests {
             .expect("no on_primary_key");
         let key = &key[..key.find("\n    }\n").unwrap()];
         assert!(key.contains("keypress::on_key("), "{key}");
-        assert!(key.contains("self.run_primary_action("), "{key}");
+        let apply = src
+            .split("fn apply_key_action(")
+            .nth(1)
+            .expect("no apply_key_action");
+        let apply = &apply[..apply.find("\n    }\n").unwrap()];
+        assert!(apply.contains("self.run_primary_action("), "{apply}");
         // The decision itself is unit tested (`primary_dispatch`); this only
         // checks the method acts on it.
         let run = src
