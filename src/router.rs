@@ -736,7 +736,9 @@ mod tests {
             }
             fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                // Longer than the 400 ms of deadline the second chain has left,
+                // so the deadline always passes during this call.
+                std::thread::sleep(std::time::Duration::from_millis(450));
                 Ok(Completion {
                     text: "not json".to_string(),
                     usage: None,
@@ -766,7 +768,9 @@ mod tests {
             "past the deadline: no call at all"
         );
 
-        let nearly = ROUTER_WALL_CLOCK - std::time::Duration::from_millis(20);
+        // 400 ms of deadline left, far more than a loaded machine stalls
+        // between here and the first check, and less than the slow call.
+        let nearly = ROUTER_WALL_CLOCK - std::time::Duration::from_millis(400);
         let chain = router_chain(
             Box::new(SlowBadAnswer(calls.clone())),
             std::time::Instant::now()

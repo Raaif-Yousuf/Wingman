@@ -833,6 +833,29 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_reads_html_csv_and_json_files_into_searchable_text() {
+        let dir = scratch("readers");
+        fs::write(
+            dir.join("page.html"),
+            "<html><title>Trip</title><script>hiddenscript()</script><p>Flight lands at gate zebra7.</p></html>",
+        )
+        .unwrap();
+        fs::write(dir.join("people.csv"), "Name,City\nJane,Lisbonxyz\n").unwrap();
+        fs::write(dir.join("data.json"), r#"{"pet":{"kind":"axolotlq"}}"#).unwrap();
+        let store = Store::in_memory();
+        let summary = scan_folder(&store, &dir, FUT).unwrap();
+        assert_eq!(summary.indexed, 3, "{summary:?}");
+        assert_eq!(store.fts_hits("zebra7").unwrap(), 1);
+        assert_eq!(store.fts_hits("Lisbonxyz").unwrap(), 1);
+        assert_eq!(store.fts_hits("axolotlq").unwrap(), 1);
+        assert_eq!(
+            store.fts_hits("hiddenscript").unwrap(),
+            0,
+            "script text is not indexed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn a_scan_indexes_text_and_markdown_and_ignores_the_rest() {
         let dir = scratch("basic");
         fs::write(dir.join("a.md"), "# Title\nfrobnicate the widget\n").unwrap();

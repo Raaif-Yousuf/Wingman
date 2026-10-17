@@ -10,6 +10,7 @@
 
 pub mod chunk;
 pub mod diff;
+pub mod flatten;
 pub mod hash;
 pub mod ingest;
 pub mod mask;
