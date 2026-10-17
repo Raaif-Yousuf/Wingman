@@ -1572,8 +1572,11 @@ mod tests {
     }
 
     /// Run manually in release, once (#1200): times the Lanczos3 downscale
-    /// `grab_raw_for` does on the UI thread, on synthetic 4K and 1080p frames,
-    /// and the whole live `grab_raw_for` on this machine's active monitor.
+    /// that used to run inside the press-time grab (it now runs in
+    /// `PendingShot::finish`, on a worker), on synthetic 4K and 1080p frames,
+    /// and the whole live `grab_raw_for` (grab plus finish) on this machine's
+    /// active monitor. The live number is the old UI-thread total, not the
+    /// UI-thread time today.
     /// ```text
     /// cargo test --release capture::tests::bench_grab_resize -- --ignored --nocapture
     /// ```
@@ -1690,10 +1693,30 @@ mod tests {
             assert!(body.contains("grab_full_size_for("), "{f}");
             assert!(!body.contains("grab_raw_for("), "{f}");
         }
-        assert!(
-            app.matches(".finish()").count() >= 5,
-            "workers finish the shot"
-        );
+        // Each flow that takes the shot finishes it itself, on its worker.
+        for f in [
+            "fn ask_inner(",
+            "fn start_options_router(",
+            "fn add_event_from_screen(",
+            "fn run_generic_action_with(",
+            "fn review_this_email(",
+            "fn fill_form_from_screen(",
+        ] {
+            let at = app.find(f).unwrap_or_else(|| panic!("{f}"));
+            let body = &app[at..at
+                + app[at..]
+                    .find(
+                        "
+    }
+",
+                    )
+                    .unwrap()];
+            assert!(
+                body.contains("pending.finish()")
+                    || body.contains("pending.map(capture::PendingShot::finish)"),
+                "{f} must finish the shot on its worker"
+            );
+        }
     }
 
     // -- ScreenMap (#506) --------------------------------------------------

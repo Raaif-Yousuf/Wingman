@@ -2298,9 +2298,11 @@ impl App {
 
         let extra_value = extra(self)?;
 
-        // Capture (grab the pixels and downscale) runs here, on the main
-        // thread, and must happen before the pending card is shown --
-        // otherwise the card is in its own screenshot. Encoding those pixels
+        // Capture (grab the pixels) runs here, on the main thread, and must
+        // happen before the pending card is shown -- otherwise the card is in
+        // its own screenshot. The downscale does NOT happen here (#1200,
+        // MEASURED 2026-10-17: ~220 ms from 4K in release): the caller's
+        // worker calls `PendingShot::finish`. Encoding those pixels
         // to PNG does NOT happen here: issue #177 measured
         // `CompressionType::Best` PNG encoding at up to ~1s in a release
         // build on a 1402x876 image, which froze the message loop for that
