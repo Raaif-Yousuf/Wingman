@@ -174,6 +174,10 @@ pub(crate) struct Tokens {
     pub(crate) link: u32,
     /// Error text.
     pub(crate) danger: u32,
+    /// The fill of a text box, one step off the surface it sits on (Windows 11
+    /// `ControlFillColorDefault`). High contrast has no tints: the window
+    /// colour, with the border carrying the shape.
+    pub(crate) control_fill: u32,
 }
 
 /// Neither pure black nor pure white, per the card spec.
@@ -185,6 +189,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text_faint: rgb(112, 112, 112),
     link: rgb(112, 112, 112),
     danger: rgb(200, 50, 50),
+    control_fill: rgb(255, 255, 255),
 };
 
 pub(crate) const DARK: Tokens = Tokens {
@@ -195,6 +200,7 @@ pub(crate) const DARK: Tokens = Tokens {
     text_faint: rgb(140, 140, 140),
     link: rgb(140, 140, 140),
     danger: rgb(240, 100, 100),
+    control_fill: rgb(45, 45, 45),
 };
 
 /// The Windows system colours that matter in high contrast, read again on
@@ -246,6 +252,7 @@ impl Tokens {
                 text_faint: sys.window_text,
                 link: sys.hotlight,
                 danger: sys.window_text,
+                control_fill: sys.window,
             },
         }
     }
@@ -471,6 +478,27 @@ pub(crate) const PADDING_DP: i32 = SPACE_LG_DP;
 pub(crate) const GAP_DP: i32 = SPACE_SM_DP;
 /// Corner radius of owner-drawn controls, in dp.
 pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
+/// The icon font on Windows 11, and the one it replaced, which Windows 10
+/// still has. Use [`icon_font_face`] to pick one.
+pub(crate) const FLUENT_ICON_FONT_FACE: &str = "Segoe Fluent Icons";
+pub(crate) const MDL2_ICON_FONT_FACE: &str = "Segoe MDL2 Assets";
+/// The magnifier glyph, the same code point in both icon fonts.
+pub(crate) const GLYPH_SEARCH: char = '\u{E721}';
+/// Side of the square an icon glyph is drawn in, in dp.
+pub(crate) const ICON_BOX_DP: i32 = 16;
+/// Font size of an icon glyph in a text box or list row, in dp.
+pub(crate) const ICON_FONT_DP: i32 = 14;
+
+/// The icon font to draw glyphs in: Segoe Fluent Icons when it is installed,
+/// otherwise Segoe MDL2 Assets (Windows 10).
+pub(crate) fn icon_font_face(fluent_installed: bool) -> &'static str {
+    if fluent_installed {
+        FLUENT_ICON_FONT_FACE
+    } else {
+        MDL2_ICON_FONT_FACE
+    }
+}
+
 /// Corner radius of a top-level window, in dp (what `DWMWCP_ROUND` draws).
 #[allow(dead_code)] // ramp token for surfaces not yet moved onto it
 pub(crate) const WINDOW_RADIUS_DP: i32 = 8;
@@ -493,6 +521,8 @@ mod tests {
         assert_eq!(LIGHT.text_dim, rgb(90, 90, 90));
         assert_eq!(LIGHT.text_faint, rgb(112, 112, 112));
         assert_eq!(LIGHT.danger, rgb(200, 50, 50));
+        assert_eq!(LIGHT.control_fill, rgb(255, 255, 255));
+        assert_eq!(DARK.control_fill, rgb(45, 45, 45));
         assert_eq!(LIGHT.link, LIGHT.text_faint);
         assert_eq!(DARK.link, DARK.text_faint);
         assert_eq!(DARK.surface, rgb(32, 32, 32));
@@ -592,6 +622,21 @@ mod tests {
     }
 
     #[test]
+    fn the_icon_font_falls_back_to_mdl2_when_fluent_is_missing() {
+        assert_eq!(icon_font_face(true), "Segoe Fluent Icons");
+        assert_eq!(icon_font_face(false), "Segoe MDL2 Assets");
+        assert_eq!(GLYPH_SEARCH as u32, 0xE721);
+    }
+
+    #[test]
+    fn a_text_box_is_a_step_off_the_surface_except_in_high_contrast() {
+        assert_ne!(LIGHT.control_fill, LIGHT.surface);
+        assert_ne!(DARK.control_fill, DARK.surface);
+        let hc = Tokens::for_theme(Theme::HighContrast, &HC_WHITE);
+        assert_eq!(hc.control_fill, HC_WHITE.window);
+    }
+
+    #[test]
     fn rgb_packs_as_bbggrr() {
         assert_eq!(rgb(0x11, 0x22, 0x33), 0x0033_2211);
     }
@@ -603,8 +648,10 @@ mod tests {
     }
 
     /// Every (foreground, background) text pair a theme defines.
-    fn text_pairs(t: &Tokens) -> [(&'static str, u32, u32); 5] {
+    fn text_pairs(t: &Tokens) -> [(&'static str, u32, u32); 7] {
         [
+            ("text on a text box", t.text, t.control_fill),
+            ("text_dim on a text box", t.text_dim, t.control_fill),
             ("text", t.text, t.surface),
             ("text_dim", t.text_dim, t.surface),
             ("text_faint", t.text_faint, t.surface),
@@ -638,7 +685,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, 20, "the test must look at every pair");
+        assert_eq!(checked, 28, "the test must look at every pair");
     }
 
     #[test]

@@ -97,9 +97,13 @@
 use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
+use crate::ui::palette_paint::{
+    build_ops, palette_colors, query_edit_rect, row_at, window_height, Face, Op, PaintInput,
+    PaletteColors, WINDOW_WIDTH,
+};
 use crate::ui::theme::{
-    detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
-    Theme, Tokens, SPACE_SM_DP,
+    detect_theme, icon_font_face, setting_change_affects_theme, setting_change_name, SysColors,
+    Theme, Tokens, FLUENT_ICON_FONT_FACE, ICON_FONT_DP, TYPE_CAPTION_PX,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -112,12 +116,13 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, D2D1_DRAW_TEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
@@ -191,21 +196,8 @@ const PALETTE_SUBCLASS_ID: usize = 1;
 /// adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163).
 pub const WM_APP_PALETTE_RUN: u32 = WM_APP + 11;
 
-// Logical (96 DPI) layout constants, scaled by `scale()` at paint/layout
-// time.
-const WINDOW_WIDTH: i32 = 560;
-const EDIT_HEIGHT: i32 = 30;
-const ROW_HEIGHT: i32 = 26;
-const FOOTER_HEIGHT: i32 = 22;
-const PADDING: i32 = 8;
-/// Space between the selection bar and an action's text, so the bar is not drawn
-/// over the first letter.
-const ROW_TEXT_INSET: i32 = 12;
-/// How far the query box's hairline sits outside the edit control.
-const QUERY_BORDER_OUTSET: i32 = 3;
-/// Space between the query box's left and right edges and its text (#881), on
-/// top of the padding the box sits in.
-const QUERY_TEXT_INSET: i32 = SPACE_SM_DP;
+// The layout lives in `palette_paint`: every size there is in dp and scaled by
+// `scale()` (`px`) at paint and layout time.
 /// The placeholder in an empty query box (#881). No em dash (rule 11).
 const QUERY_CUE: &str = "Type to filter";
 /// Private message the query edit's subclass sends its parent to have the
@@ -218,34 +210,10 @@ const EM_GETMARGINS: u32 = 0x00D4;
 /// reachable by scrolling (keyboard: Up/Down/PageUp/PageDown drag the
 /// viewport via `PaletteState::offset`; mouse: `WM_MOUSEWHEEL` below) rather
 /// than being truncated -- that constant is the single source of truth for
-/// both the window's fixed height here and the palette-side viewport math in
+/// both the window's fixed height and the palette-side viewport math in
 /// `palette_model.rs`.
-/// #883: the scroll thumb is this wide, this far from the window's right edge
-/// and never shorter than this, in logical pixels.
-const SCROLL_THUMB_WIDTH: i32 = 3;
-const SCROLL_THUMB_EDGE: i32 = 2;
-const SCROLL_THUMB_MIN: i32 = 24;
 fn scale(v: i32, dpi: u32) -> i32 {
-    v * dpi as i32 / 96
-}
-
-/// Where the query `EDIT` goes, in client pixels (#881). A single-line EDIT
-/// draws its text from the top of its client area and cannot be told to centre
-/// it, so the control is exactly one text line high (`text_h`, from the font
-/// it uses) and sits in the middle of the box, inset from the box's left and
-/// right edges.
-fn query_edit_rect(window_w: i32, dpi: u32, text_h: i32) -> RECT {
-    let pad = scale(PADDING, dpi);
-    let inset = scale(QUERY_TEXT_INSET, dpi);
-    let box_h = scale(EDIT_HEIGHT, dpi);
-    let h = text_h.clamp(1, box_h.max(1));
-    let top = pad + (box_h - h) / 2;
-    RECT {
-        left: pad + inset,
-        top,
-        right: window_w - pad - inset,
-        bottom: top + h,
-    }
+    crate::ui::palette_paint::px(v, dpi)
 }
 
 /// The height in pixels of one line of text in `font`, or the body line
@@ -267,78 +235,6 @@ fn font_text_height(font: HFONT, dpi: u32) -> i32 {
         } else {
             fallback
         }
-    }
-}
-
-fn window_height(dpi: u32) -> i32 {
-    scale(PADDING * 2 + EDIT_HEIGHT, dpi)
-        + scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32
-        + scale(FOOTER_HEIGHT, dpi)
-}
-
-/// #357: pure hit-test -- given a client-area `y` in physical pixels (as
-/// `WM_MOUSEMOVE`/`WM_LBUTTONUP` deliver it), the current viewport `offset`
-/// and the real row count, returns the real row index (into
-/// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
-/// under that `y`, or `None` when `y` is above the list (still over the
-/// query box/padding), below the last real row, or below
-/// the whole painted viewport. Mirrors `on_paint`'s row-geometry math
-/// exactly (same constants, same order of additions) so a click always lands
-/// on the row it visually looks like it landed on -- see that function's `y`
-/// math, which this must never drift from.
-fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
-    let pad = scale(PADDING, dpi);
-    let list_top = pad + scale(EDIT_HEIGHT, dpi) + pad;
-    let row_h = scale(ROW_HEIGHT, dpi);
-    if row_h <= 0 || y < list_top {
-        return None;
-    }
-    let visible_pos = ((y - list_top) / row_h) as usize;
-    if visible_pos >= crate::ui::palette_model::MAX_VISIBLE_ROWS {
-        return None;
-    }
-    let idx = offset + visible_pos;
-    if idx < row_count {
-        Some(idx)
-    } else {
-        None
-    }
-}
-
-/// Where the scroll thumb is drawn (#883), in client pixels at `dpi`, for a
-/// list of `row_count` rows scrolled to `offset`. `None` when every row fits.
-/// It sits in the padding to the right of the rows, so it never covers a row's
-/// fill or text.
-fn thumb_rect(dpi: u32, offset: usize, row_count: usize) -> Option<RECT> {
-    let list_top = scale(PADDING, dpi) + scale(EDIT_HEIGHT, dpi) + scale(PADDING, dpi);
-    let track = scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32;
-    let (top, len) = crate::ui::palette_model::scroll_thumb(
-        offset,
-        row_count,
-        crate::ui::palette_model::MAX_VISIBLE_ROWS,
-        track,
-        scale(SCROLL_THUMB_MIN, dpi),
-    )?;
-    let right = scale(WINDOW_WIDTH, dpi) - scale(SCROLL_THUMB_EDGE, dpi);
-    Some(RECT {
-        left: right - scale(SCROLL_THUMB_WIDTH, dpi).max(2),
-        top: list_top + top,
-        right,
-        bottom: list_top + top + len,
-    })
-}
-
-/// The path of the query box's 1 px hairline in logical pixels, for Direct2D
-/// (#886). A stroke is centred on its path, so the path sits half a pixel in
-/// from the box's outer edge: the line then covers whole pixels at 100% scale
-/// instead of blurring across two rows, and lands where the GDI path's fills do.
-fn query_border_rect() -> D2D_RECT_F {
-    let (pad, o) = (PADDING as f32, QUERY_BORDER_OUTSET as f32);
-    D2D_RECT_F {
-        left: pad - o + 0.5,
-        top: pad - o + 0.5,
-        right: WINDOW_WIDTH as f32 - pad + o - 0.5,
-        bottom: pad + EDIT_HEIGHT as f32 + o - 0.5,
     }
 }
 
@@ -714,7 +610,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn create_query_edit(parent: HWND, instance: HINSTANCE, font: HFONT, dpi: u32) -> HWND {
     let class_w = wide_z(WC_EDIT);
     let text_w = wide_z("");
-    let rect = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, font_text_height(font, dpi));
+    let rect = query_edit_rect(dpi, font_text_height(font, dpi));
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -846,6 +742,10 @@ struct PaletteRenderer {
     dwrite_factory: IDWriteFactory,
     target: Option<ID2D1HwndRenderTarget>,
     text_format: Option<IDWriteTextFormat>,
+    /// The footer's caption size, and the icon font. Without either, the
+    /// body format draws in its place.
+    caption_format: Option<IDWriteTextFormat>,
+    icon_format: Option<IDWriteTextFormat>,
 }
 
 impl PaletteRenderer {
@@ -863,6 +763,8 @@ impl PaletteRenderer {
             dwrite_factory,
             target: None,
             text_format: None,
+            caption_format: None,
+            icon_format: None,
         })
     }
 
@@ -899,22 +801,41 @@ impl PaletteRenderer {
             .ok();
         }
         if self.target.is_some() && self.text_format.is_none() {
-            self.text_format = self.build_text_format(DWRITE_FONT_WEIGHT_NORMAL);
+            self.text_format = self.build_text_format(
+                D2D_FONT_FAMILY,
+                D2D_FONT_SIZE_DIP,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+            );
+            self.caption_format = self.build_text_format(
+                D2D_FONT_FAMILY,
+                TYPE_CAPTION_PX as f32,
+                DWRITE_TEXT_ALIGNMENT_LEADING,
+            );
+            self.icon_format = self.build_text_format(
+                icon_face(),
+                ICON_FONT_DP as f32,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            );
         }
         self.target.is_some() && self.text_format.is_some()
     }
 
-    fn build_text_format(&self, weight: DWRITE_FONT_WEIGHT) -> Option<IDWriteTextFormat> {
-        let family = wide_z(D2D_FONT_FAMILY);
+    fn build_text_format(
+        &self,
+        face: &str,
+        size_dip: f32,
+        align: DWRITE_TEXT_ALIGNMENT,
+    ) -> Option<IDWriteTextFormat> {
+        let family = wide_z(face);
         let locale = wide_z(D2D_LOCALE);
         let format = unsafe {
             self.dwrite_factory.CreateTextFormat(
                 PCWSTR(family.as_ptr()),
                 None,
-                weight,
+                DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                D2D_FONT_SIZE_DIP,
+                size_dip,
                 PCWSTR(locale.as_ptr()),
             )
         }
@@ -923,7 +844,7 @@ impl PaletteRenderer {
             // DT_LEFT | DT_VCENTER | DT_SINGLELINE's DirectWrite equivalent:
             // leading (left) horizontal alignment, centered vertically
             // within the layout box, no wrapping (every row is one line).
-            let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            let _ = format.SetTextAlignment(align);
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
@@ -969,6 +890,8 @@ impl PaletteRenderer {
     fn drop_target(&mut self) {
         self.target = None;
         self.text_format = None;
+        self.caption_format = None;
+        self.icon_format = None;
     }
 }
 
@@ -987,101 +910,61 @@ fn colorref_to_d2d(c: COLORREF) -> D2D1_COLOR_F {
     }
 }
 
-/// Every colour the palette draws, for one theme (#579). Built from the shared
-/// tokens in `theme.rs`, so there are no literal colours in this file and the
-/// palette follows light, dark and high contrast like the card does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PaletteColors {
-    background: u32,
-    /// The hairline around the query box.
-    border: u32,
-    /// Action row text.
-    text: u32,
-    /// Group headers.
-    header: u32,
-    /// The "no matching actions" hint.
-    hint: u32,
-    footer: u32,
-    /// The scroll thumb shown when there are more rows than fit (#883).
-    thumb: u32,
-    /// The placeholder in an empty query box. High contrast uses GrayText,
-    /// which Windows keeps readable on Window.
-    cue: u32,
-    /// The fill of a row the mouse is over: quieter than the selection's.
-    /// High contrast has no tints, so there it is the background and the row
-    /// gets `hover_outline` instead.
-    hover_fill: u32,
-    hover_outline: Option<u32>,
-    /// The fill of the selected row.
-    selected_fill: u32,
-    selected_text: u32,
-    /// The 3 px bar on the selected row.
-    bar: u32,
-}
-
 /// The user's accent for the selection bar in `theme`, kept at 3:1 against the
 /// theme's surface (the same shade and fit the primary button uses). Read live,
 /// so call it when the theme or the accent changes, never per paint.
 fn live_accent(theme: Theme, sys: &SysColors) -> u32 {
     crate::ui::card_buttons::system_accent(theme, Tokens::for_theme(theme, sys).surface)
 }
-/// The palette's colours in `theme`. High contrast uses the system colours
-/// only: the selected row is the system highlight, as in a Windows list.
-fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
-    use crate::ui::card_buttons::blend;
-    let t = Tokens::for_theme(theme, sys);
-    if theme == Theme::HighContrast {
-        return PaletteColors {
-            background: t.surface,
-            border: t.border,
-            text: t.text,
-            header: t.text,
-            hint: t.text,
-            footer: t.text,
-            cue: sys.gray_text,
-            thumb: t.text,
-            hover_fill: t.surface,
-            hover_outline: Some(t.text),
-            selected_fill: sys.highlight,
-            selected_text: sys.highlight_text,
-            // The whole row is the highlight, so the bar is the same colour.
-            bar: sys.highlight,
-        };
-    }
-    // An accent from live_accent already clears 3:1; this keeps any other
-    // caller honest too.
-    let bar = ensure_contrast(accent, t.surface, 3.0);
-    PaletteColors {
-        background: t.surface,
-        border: t.border,
-        text: t.text,
-        header: t.text_dim,
-        hint: t.text_faint,
-        footer: t.text_faint,
-        cue: t.text_faint,
-        thumb: t.text_faint,
-        hover_fill: blend(t.surface, bar, 8),
-        hover_outline: None,
-        selected_fill: blend(t.surface, bar, 16),
-        selected_text: t.text,
-        bar,
-    }
-}
-
 /// The palette's GDI font: Segoe UI, `D2D_FONT_SIZE_DIP` tall at `dpi`, in
 /// `weight`. The caller frees it with `DeleteObject`.
 fn gdi_font(dpi: u32, weight: i32) -> HFONT {
+    gdi_font_face(D2D_FONT_FAMILY, D2D_FONT_SIZE_DIP as i32, dpi, weight)
+}
+
+/// A GDI font in `face`, `size_dp` tall at `dpi`. The caller frees it with
+/// `DeleteObject`.
+fn gdi_font_face(face: &str, size_dp: i32, dpi: u32, weight: i32) -> HFONT {
     let mut lf = LOGFONTW {
-        lfHeight: -scale(D2D_FONT_SIZE_DIP as i32, dpi),
+        lfHeight: -scale(size_dp, dpi),
         lfWeight: weight,
         lfCharSet: DEFAULT_CHARSET,
         lfQuality: CLEARTYPE_QUALITY,
         ..Default::default()
     };
-    for (slot, unit) in lf.lfFaceName.iter_mut().zip(D2D_FONT_FAMILY.encode_utf16()) {
+    for (slot, unit) in lf.lfFaceName.iter_mut().zip(face.encode_utf16()) {
         *slot = unit;
     }
     unsafe { CreateFontIndirectW(&lf) }
+}
+
+/// Whether Segoe Fluent Icons is installed (Windows 11), asked of DirectWrite
+/// once. A failure to ask counts as not installed, which picks the older icon
+/// font: the glyph is drawn either way.
+fn fluent_icons_installed() -> bool {
+    use windows::Win32::Graphics::DirectWrite::IDWriteFontCollection;
+    let Ok(factory) =
+        (unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) })
+    else {
+        return false;
+    };
+    let mut collection: Option<IDWriteFontCollection> = None;
+    if unsafe { factory.GetSystemFontCollection(&mut collection, false) }.is_err() {
+        return false;
+    }
+    let Some(collection) = collection else {
+        return false;
+    };
+    let name = wide_z(FLUENT_ICON_FONT_FACE);
+    let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+    unsafe { collection.FindFamilyName(PCWSTR(name.as_ptr()), &mut index, &mut exists) }.is_ok()
+        && exists.as_bool()
+}
+
+/// The font the palette draws icon glyphs in.
+fn icon_face() -> &'static str {
+    static FLUENT: OnceLock<bool> = OnceLock::new();
+    icon_font_face(*FLUENT.get_or_init(fluent_icons_installed))
 }
 
 /// D2D/DirectWrite equivalent of `draw_text_line` (imported from
@@ -1116,6 +999,188 @@ fn draw_text_line_d2d(
             D2D1_DRAW_TEXT_OPTIONS_NONE,
             DWRITE_MEASURING_MODE_NATURAL,
         );
+    }
+}
+
+/// A rectangle in dp (or pixels) as Direct2D wants it.
+fn rect_f(r: &RECT) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left: r.left as f32,
+        top: r.top as f32,
+        right: r.right as f32,
+        bottom: r.bottom as f32,
+    }
+}
+
+/// Draws a paint list with Direct2D. `formats` are the body, caption and icon
+/// text formats. A brush that cannot be made leaves that one shape out, so a
+/// single failure never blanks the window.
+fn paint_ops_d2d(target: &ID2D1HwndRenderTarget, formats: [&IDWriteTextFormat; 3], ops: &[Op]) {
+    for op in ops {
+        let color = match op {
+            Op::Clear { color }
+            | Op::FillRound { color, .. }
+            | Op::StrokeRound { color, .. }
+            | Op::Text { color, .. } => *color,
+        };
+        match op {
+            Op::Clear { .. } => {
+                unsafe {
+                    target.Clear(Some(&colorref_to_d2d(COLORREF(color)) as *const _));
+                }
+                continue;
+            }
+            Op::Text {
+                rect, text, face, ..
+            } => {
+                let format = match face {
+                    Face::Body => formats[0],
+                    Face::Caption => formats[1],
+                    Face::Icon => formats[2],
+                };
+                draw_text_line_d2d(target, format, text, rect_f(rect), COLORREF(color));
+                continue;
+            }
+            _ => {}
+        }
+        let Ok(brush) =
+            (unsafe { target.CreateSolidColorBrush(&colorref_to_d2d(COLORREF(color)), None) })
+        else {
+            continue;
+        };
+        match op {
+            Op::Clear { .. } | Op::Text { .. } => {}
+            Op::FillRound { rect, radius, .. } => {
+                let shape = D2D1_ROUNDED_RECT {
+                    rect: rect_f(rect),
+                    radiusX: *radius as f32,
+                    radiusY: *radius as f32,
+                };
+                unsafe { target.FillRoundedRectangle(&shape as *const _, &brush) };
+            }
+            Op::StrokeRound {
+                rect,
+                radius,
+                width,
+                ..
+            } => {
+                // A stroke is centred on its path: half a stroke in from the
+                // edge keeps the whole line inside `rect`, on whole pixels.
+                let half = *width as f32 / 2.0;
+                let r = rect_f(rect);
+                let shape = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: r.left + half,
+                        top: r.top + half,
+                        right: r.right - half,
+                        bottom: r.bottom - half,
+                    },
+                    radiusX: (*radius as f32 - half).max(0.0),
+                    radiusY: (*radius as f32 - half).max(0.0),
+                };
+                unsafe {
+                    target.DrawRoundedRectangle(&shape as *const _, &brush, *width as f32, None)
+                };
+            }
+        }
+    }
+}
+
+/// Draws a paint list with GDI into `hdc`, whose client area is `client`:
+/// the `WM_PRINTCLIENT` picture, and the fallback when Direct2D is missing.
+/// Corners are GDI's `RoundRect`, as everywhere else in the app.
+fn paint_ops_gdi(hdc: HDC, dpi: u32, client: RECT, ops: &[Op]) {
+    use windows::Win32::Graphics::Gdi::{
+        CreatePen, GetStockObject, RoundRect, DT_CENTER, NULL_BRUSH, PS_INSIDEFRAME,
+    };
+    unsafe {
+        SetBkMode(hdc, TRANSPARENT);
+        let body = gdi_font(dpi, FW_NORMAL.0 as i32);
+        let caption = gdi_font_face(D2D_FONT_FAMILY, TYPE_CAPTION_PX, dpi, FW_NORMAL.0 as i32);
+        let icon = gdi_font_face(icon_face(), ICON_FONT_DP, dpi, FW_NORMAL.0 as i32);
+        let old_font = SelectObject(hdc, HGDIOBJ(body.0));
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        for op in ops {
+            match op {
+                Op::Clear { color } => {
+                    let brush = CreateSolidBrush(COLORREF(*color));
+                    FillRect(hdc, &client, brush);
+                    let _ = DeleteObject(brush.into());
+                }
+                Op::FillRound {
+                    rect,
+                    radius,
+                    color,
+                } => {
+                    // The pen is the fill's own colour, drawn inside the
+                    // rectangle, so the shape is exactly `rect`.
+                    let brush = CreateSolidBrush(COLORREF(*color));
+                    let pen = CreatePen(PS_INSIDEFRAME, 1, COLORREF(*color));
+                    let (ob, op_) = (
+                        SelectObject(hdc, HGDIOBJ(brush.0)),
+                        SelectObject(hdc, HGDIOBJ(pen.0)),
+                    );
+                    let _ = RoundRect(
+                        hdc,
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom,
+                        radius * 2,
+                        radius * 2,
+                    );
+                    SelectObject(hdc, ob);
+                    SelectObject(hdc, op_);
+                    let _ = DeleteObject(pen.into());
+                    let _ = DeleteObject(brush.into());
+                }
+                Op::StrokeRound {
+                    rect,
+                    radius,
+                    width,
+                    color,
+                } => {
+                    let pen = CreatePen(PS_INSIDEFRAME, *width, COLORREF(*color));
+                    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+                    let _ = RoundRect(
+                        hdc,
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom,
+                        radius * 2,
+                        radius * 2,
+                    );
+                    SelectObject(hdc, old_pen);
+                    let _ = DeleteObject(pen.into());
+                }
+                Op::Text {
+                    rect,
+                    text,
+                    color,
+                    face,
+                } => {
+                    let (font, align) = match face {
+                        Face::Body => (body, DT_LEFT),
+                        Face::Caption => (caption, DT_LEFT),
+                        Face::Icon => (icon, DT_CENTER),
+                    };
+                    SelectObject(hdc, HGDIOBJ(font.0));
+                    SetTextColor(hdc, COLORREF(*color));
+                    draw_text_line(
+                        hdc,
+                        text,
+                        *rect,
+                        align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                }
+            }
+        }
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_font);
+        for font in [body, caption, icon] {
+            let _ = DeleteObject(font.into());
+        }
     }
 }
 
@@ -1280,7 +1345,7 @@ impl PaletteInner {
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
         }
-        self.layout_edit_control(w);
+        self.layout_edit_control();
         // #216: the render target's pixel buffer must match the window's
         // real physical size -- resized here (never recreated) alongside
         // every window resize, mirroring the window/edit-control resize
@@ -1290,13 +1355,12 @@ impl PaletteInner {
         }
     }
 
-    /// Positions the query `EDIT` control within a window of logical width
-    /// `w` (physical pixels, already DPI-scaled by the caller) -- factored
+    /// Positions the query `EDIT` control in the window -- factored
     /// out of [`PaletteInner::reposition_centered`] so `WM_DPICHANGED`'s
     /// handler can re-run the same layout after a DPI change without
     /// re-centering the window on the active monitor too.
-    fn layout_edit_control(&self, w: i32) {
-        let r = query_edit_rect(w, self.dpi, font_text_height(self.font, self.dpi));
+    fn layout_edit_control(&self) {
+        let r = query_edit_rect(self.dpi, font_text_height(self.font, self.dpi));
         unsafe {
             let _ = SetWindowPos(
                 self.edit_hwnd,
@@ -1507,168 +1571,28 @@ impl PaletteInner {
             .clone()
             .expect("ensure_target just confirmed Some");
 
-        let pad = PADDING as f32;
-        let row_h = ROW_HEIGHT as f32;
-        let content_w = WINDOW_WIDTH as f32;
-        let content_h = window_height(96) as f32; // logical/DIP total height -- see the module doc comment
-        let y = pad + EDIT_HEIGHT as f32 + pad;
-
+        let body = format;
+        let caption = renderer
+            .caption_format
+            .clone()
+            .unwrap_or_else(|| body.clone());
+        let icon = renderer.icon_format.clone().unwrap_or_else(|| body.clone());
+        // Dp-sized geometry: the render target scales it to the window's DPI.
+        let ops = build_ops(
+            96,
+            &PaintInput {
+                rows: &self.state.rows,
+                offset: self.state.offset,
+                selected: self.state.selected,
+                hover: self.hover,
+                footer: &self.footer_text,
+                colors: &colors,
+            },
+        );
         unsafe {
             target.BeginDraw();
-            target.Clear(Some(
-                &colorref_to_d2d(COLORREF(colors.background)) as *const _
-            ));
-            if let Ok(brush) = target
-                .CreateSolidColorBrush(&colorref_to_d2d(COLORREF(colors.border)) as *const _, None)
-            {
-                let rect = query_border_rect();
-                target.DrawRectangle(&rect as *const _, &brush, 1.0, None);
-            }
         }
-
-        // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS) are
-        // painted; `i` stays the row's real index into `state.rows` (what
-        // `state.selected` compares against for the highlight), while
-        // `visible_pos` (i - offset) is what actually places it vertically.
-        for (i, row) in self
-            .state
-            .rows
-            .iter()
-            .enumerate()
-            .skip(self.state.offset)
-            .take(crate::ui::palette_model::MAX_VISIBLE_ROWS)
-        {
-            let visible_pos = (i - self.state.offset) as f32;
-            let row_rect = D2D_RECT_F {
-                left: pad,
-                top: y + row_h * visible_pos,
-                right: content_w - pad,
-                bottom: y + row_h * (visible_pos + 1.0),
-            };
-            match row {
-                crate::ui::palette_model::Row::Header(name) => {
-                    draw_text_line_d2d(&target, &format, name, row_rect, COLORREF(colors.header));
-                }
-                crate::ui::palette_model::Row::Hint(text) => {
-                    draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
-                }
-                crate::ui::palette_model::Row::Action { name, .. } => {
-                    // The selected row has the strong fill and the bar; a row
-                    // only hovered gets a quiet fill (an outline in high
-                    // contrast), so the two never look alike.
-                    if i == self.state.selected {
-                        if let Ok(hl) = unsafe {
-                            target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(colors.selected_fill)) as *const _,
-                                None,
-                            )
-                        } {
-                            unsafe {
-                                target.FillRectangle(&row_rect as *const _, &hl);
-                            }
-                        }
-                    } else if self.hover == Some(i) {
-                        if let Ok(fill) = unsafe {
-                            target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(colors.hover_fill)) as *const _,
-                                None,
-                            )
-                        } {
-                            unsafe {
-                                target.FillRectangle(&row_rect as *const _, &fill);
-                            }
-                        }
-                        if let Some(ink) = colors.hover_outline {
-                            if let Ok(outline) = unsafe {
-                                target.CreateSolidColorBrush(
-                                    &colorref_to_d2d(COLORREF(ink)) as *const _,
-                                    None,
-                                )
-                            } {
-                                let inset = D2D_RECT_F {
-                                    left: row_rect.left + 0.5,
-                                    top: row_rect.top + 0.5,
-                                    right: row_rect.right - 0.5,
-                                    bottom: row_rect.bottom - 0.5,
-                                };
-                                unsafe {
-                                    target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
-                                }
-                            }
-                        }
-                    }
-                    if i == self.state.selected {
-                        let accent_rect = D2D_RECT_F {
-                            left: row_rect.left,
-                            top: row_rect.top,
-                            right: row_rect.left + 3.0,
-                            bottom: row_rect.bottom,
-                        };
-
-                        if let Ok(accent) = unsafe {
-                            target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
-                                None,
-                            )
-                        } {
-                            unsafe {
-                                target.FillRectangle(&accent_rect as *const _, &accent);
-                            }
-                        }
-                    }
-                    let text_rect = D2D_RECT_F {
-                        left: row_rect.left + ROW_TEXT_INSET as f32,
-                        ..row_rect
-                    };
-                    draw_text_line_d2d(
-                        &target,
-                        &format,
-                        name,
-                        text_rect,
-                        COLORREF(if i == self.state.selected {
-                            colors.selected_text
-                        } else {
-                            colors.text
-                        }),
-                    );
-                }
-            }
-        }
-
-        // #883: more rows than fit, so say where the viewport is. Drawn at 96
-        // DPI: the render target scales logical pixels itself.
-        if let Some(t) = thumb_rect(96, self.state.offset, self.state.rows.len()) {
-            if let Ok(brush) = unsafe {
-                target.CreateSolidColorBrush(
-                    &colorref_to_d2d(COLORREF(colors.thumb)) as *const _,
-                    None,
-                )
-            } {
-                let rect = D2D_RECT_F {
-                    left: t.left as f32,
-                    top: t.top as f32,
-                    right: t.right as f32,
-                    bottom: t.bottom as f32,
-                };
-                unsafe {
-                    target.FillRectangle(&rect as *const _, &brush);
-                }
-            }
-        }
-
-        let footer_rect = D2D_RECT_F {
-            left: pad,
-            top: content_h - FOOTER_HEIGHT as f32,
-            right: content_w - pad,
-            bottom: content_h,
-        };
-        draw_text_line_d2d(
-            &target,
-            &format,
-            &self.footer_text,
-            footer_rect,
-            COLORREF(colors.footer),
-        );
+        paint_ops_d2d(&target, [&body, &caption, &icon], &ops);
 
         if let Err(e) = unsafe { target.EndDraw(None, None) } {
             if e.code() == D2DERR_RECREATE_TARGET {
@@ -1689,196 +1613,22 @@ impl PaletteInner {
     /// tested as the path it replaces, not a second, thinner
     /// implementation.
     fn paint_gdi(&self, hdc: windows::Win32::Graphics::Gdi::HDC) {
-        let colors = self.colors;
+        let mut rc = RECT::default();
         unsafe {
-            let mut rc = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rc);
-
-            let bg = CreateSolidBrush(COLORREF(colors.background));
-            FillRect(hdc, &rc, bg);
-            let _ = DeleteObject(bg.into());
-
-            SetBkMode(hdc, TRANSPARENT);
-            // Segoe UI at this window's DPI, like the DirectWrite path (the stock
-            // GUI font is neither Segoe nor scaled), freed below.
-            let normal = gdi_font(self.dpi, FW_NORMAL.0 as i32);
-            let old_font = SelectObject(hdc, HGDIOBJ(normal.0));
-
-            let pad = scale(PADDING, self.dpi);
-
-            // The query box's hairline: four thin fills round the edit.
-            let line = scale(1, self.dpi).max(1);
-            let o = scale(QUERY_BORDER_OUTSET, self.dpi);
-            let (l, t, r, b) = (
-                pad - o,
-                pad - o,
-                rc.right - pad + o,
-                pad + scale(EDIT_HEIGHT, self.dpi) + o,
-            );
-            let border = CreateSolidBrush(COLORREF(colors.border));
-            for edge in [
-                RECT {
-                    left: l,
-                    top: t,
-                    right: r,
-                    bottom: t + line,
-                },
-                RECT {
-                    left: l,
-                    top: b - line,
-                    right: r,
-                    bottom: b,
-                },
-                RECT {
-                    left: l,
-                    top: t,
-                    right: l + line,
-                    bottom: b,
-                },
-                RECT {
-                    left: r - line,
-                    top: t,
-                    right: r,
-                    bottom: b,
-                },
-            ] {
-                FillRect(hdc, &edge, border);
-            }
-            let _ = DeleteObject(border.into());
-            let row_h = scale(ROW_HEIGHT, self.dpi);
-            let y = pad + scale(EDIT_HEIGHT, self.dpi) + pad;
-
-            // #217: only the rows inside [offset, offset + MAX_VISIBLE_ROWS)
-            // are painted; `i` stays the row's real index into `state.rows`
-            // (what `state.selected` compares against for the highlight),
-            // while `visible_pos` (i - offset) is what actually places it
-            // vertically.
-            for (i, row) in self
-                .state
-                .rows
-                .iter()
-                .enumerate()
-                .skip(self.state.offset)
-                .take(crate::ui::palette_model::MAX_VISIBLE_ROWS)
-            {
-                let visible_pos = (i - self.state.offset) as i32;
-                let row_rect = RECT {
-                    left: pad,
-                    top: y + row_h * visible_pos,
-                    right: rc.right - pad,
-                    bottom: y + row_h * (visible_pos + 1),
-                };
-                match row {
-                    crate::ui::palette_model::Row::Header(name) => {
-                        SetTextColor(hdc, COLORREF(colors.header));
-                        draw_text_line(
-                            hdc,
-                            name,
-                            row_rect,
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                        );
-                    }
-                    crate::ui::palette_model::Row::Hint(text) => {
-                        SetTextColor(hdc, COLORREF(colors.hint));
-                        draw_text_line(
-                            hdc,
-                            text,
-                            row_rect,
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                        );
-                    }
-                    crate::ui::palette_model::Row::Action { name, .. } => {
-                        if i == self.state.selected {
-                            let hl = CreateSolidBrush(COLORREF(colors.selected_fill));
-                            FillRect(hdc, &row_rect, hl);
-                            let _ = DeleteObject(hl.into());
-                        } else if self.hover == Some(i) {
-                            let fill = CreateSolidBrush(COLORREF(colors.hover_fill));
-                            FillRect(hdc, &row_rect, fill);
-                            let _ = DeleteObject(fill.into());
-                            if let Some(ink) = colors.hover_outline {
-                                let outline = CreateSolidBrush(COLORREF(ink));
-                                let line = scale(1, self.dpi).max(1);
-                                for edge in [
-                                    RECT {
-                                        bottom: row_rect.top + line,
-                                        ..row_rect
-                                    },
-                                    RECT {
-                                        top: row_rect.bottom - line,
-                                        ..row_rect
-                                    },
-                                    RECT {
-                                        right: row_rect.left + line,
-                                        ..row_rect
-                                    },
-                                    RECT {
-                                        left: row_rect.right - line,
-                                        ..row_rect
-                                    },
-                                ] {
-                                    FillRect(hdc, &edge, outline);
-                                }
-                                let _ = DeleteObject(outline.into());
-                            }
-                        }
-                        if i == self.state.selected {
-                            let accent = CreateSolidBrush(COLORREF(colors.bar));
-                            let accent_rect = RECT {
-                                left: row_rect.left,
-                                top: row_rect.top,
-                                right: row_rect.left + scale(3, self.dpi),
-                                bottom: row_rect.bottom,
-                            };
-                            FillRect(hdc, &accent_rect, accent);
-                            let _ = DeleteObject(accent.into());
-                        }
-                        SetTextColor(
-                            hdc,
-                            COLORREF(if i == self.state.selected {
-                                colors.selected_text
-                            } else {
-                                colors.text
-                            }),
-                        );
-                        let text_rect = RECT {
-                            left: row_rect.left + scale(ROW_TEXT_INSET, self.dpi),
-                            ..row_rect
-                        };
-                        draw_text_line(
-                            hdc,
-                            name,
-                            text_rect,
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                        );
-                    }
-                }
-            }
-
-            // #883: more rows than fit, so say where the viewport is.
-            if let Some(t) = thumb_rect(self.dpi, self.state.offset, self.state.rows.len()) {
-                let brush = CreateSolidBrush(COLORREF(colors.thumb));
-                FillRect(hdc, &t, brush);
-                let _ = DeleteObject(brush.into());
-            }
-
-            let footer_rect = RECT {
-                left: pad,
-                top: rc.bottom - scale(FOOTER_HEIGHT, self.dpi),
-                right: rc.right - pad,
-                bottom: rc.bottom,
-            };
-            SetTextColor(hdc, COLORREF(colors.footer));
-            draw_text_line(
-                hdc,
-                &self.footer_text,
-                footer_rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
-
-            SelectObject(hdc, old_font);
-            let _ = DeleteObject(normal.into());
         }
+        let ops = build_ops(
+            self.dpi,
+            &PaintInput {
+                rows: &self.state.rows,
+                offset: self.state.offset,
+                selected: self.state.selected,
+                hover: self.hover,
+                footer: &self.footer_text,
+                colors: &self.colors,
+            },
+        );
+        paint_ops_gdi(hdc, self.dpi, rc, &ops);
     }
 
     fn handle_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
@@ -1907,9 +1657,9 @@ impl PaletteInner {
                 let hdc = HDC(wparam.0 as *mut c_void);
                 unsafe {
                     SetTextColor(hdc, COLORREF(self.colors.text));
-                    SetBkColor(hdc, COLORREF(self.colors.background));
+                    SetBkColor(hdc, COLORREF(self.colors.box_fill));
                     if self.edit_brush.0.is_null() {
-                        self.edit_brush = CreateSolidBrush(COLORREF(self.colors.background));
+                        self.edit_brush = CreateSolidBrush(COLORREF(self.colors.box_fill));
                     }
                 }
                 Some(LRESULT(self.edit_brush.0 as isize))
@@ -2086,7 +1836,7 @@ impl PaletteInner {
                     );
                 }
                 self.rebuild_font();
-                self.layout_edit_control(w);
+                self.layout_edit_control();
                 if let Some(renderer) = &mut self.d2d {
                     renderer.set_dpi(self.dpi);
                     renderer.resize(w as u32, h as u32);
@@ -2130,6 +1880,7 @@ use crate::ui::text::draw_text_line;
 mod tests {
     use super::*;
     use crate::ui::palette_model::PaletteAction;
+    use crate::ui::palette_paint::{box_rect, glyph_rect, row_fill, row_slot, thumb_rect};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -2271,9 +2022,10 @@ mod tests {
                 // In high contrast the whole row is the system highlight and
                 // the bar is that colour: the row itself must stand out.
                 let (bar, under) = if theme == Theme::HighContrast {
+                    assert_eq!(c.bar, None, "{name}: no decorative bar in high contrast");
                     (c.selected_fill, c.background)
                 } else {
-                    (c.bar, c.background)
+                    (c.bar.expect("a bar"), c.background)
                 };
                 let r = ratio(bar, under);
                 assert!(r >= 3.0, "{name}: the selection is {r:.2}:1");
@@ -2442,64 +2194,10 @@ mod tests {
                 ReleaseDC(None, screen);
             }
             assert_ne!(result.0, 0, "WM_CTLCOLOREDIT must return a brush");
-            assert_eq!(bk.0, colors.background);
+            assert_eq!(bk.0, colors.box_fill, "the edit sits on the box fill");
             assert_eq!(text.0, colors.text);
         }
     }
-    // #886: a 1 px stroke is centred on its path, so a path on whole pixels
-    // blurs across two rows of pixels.
-    #[test]
-    fn the_query_border_path_sits_on_half_pixels_inside_the_outer_edge() {
-        let r = query_border_rect();
-        for v in [r.left, r.top, r.right, r.bottom] {
-            assert_eq!(v.fract(), 0.5, "{v}");
-        }
-        // The stroke fills the outermost pixel, like the GDI path's four fills.
-        let pad = PADDING as f32;
-        let o = QUERY_BORDER_OUTSET as f32;
-        assert_eq!(r.left - 0.5, pad - o);
-        assert_eq!(r.top - 0.5, pad - o);
-        assert_eq!(r.right + 0.5, WINDOW_WIDTH as f32 - pad + o);
-        assert_eq!(r.bottom + 0.5, pad + EDIT_HEIGHT as f32 + o);
-    }
-
-    // #881: the query box centres its text and shows a placeholder.
-    mod query_box_tests {
-        use super::super::{
-            query_edit_rect, scale, EDIT_HEIGHT, PADDING, QUERY_TEXT_INSET, WINDOW_WIDTH,
-        };
-
-        #[test]
-        fn the_text_line_is_centred_in_the_box_at_every_scale() {
-            for dpi in [96u32, 120, 144, 192, 240] {
-                let text_h = scale(20, dpi);
-                let r = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, text_h);
-                let box_top = scale(PADDING, dpi);
-                let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
-                assert_eq!(r.bottom - r.top, text_h, "dpi {dpi}");
-                let (above, below) = (r.top - box_top, box_bottom - r.bottom);
-                assert!(above > 0 && (above - below).abs() <= 1, "dpi {dpi}");
-                // The text clears the box edge by the inset on both sides.
-                assert_eq!(r.left, scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi));
-                assert_eq!(
-                    scale(WINDOW_WIDTH, dpi) - r.right,
-                    scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi)
-                );
-            }
-        }
-
-        #[test]
-        fn a_font_taller_than_the_box_is_clamped_to_the_box() {
-            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 500);
-            assert_eq!(r.bottom - r.top, scale(EDIT_HEIGHT, 96));
-            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 0);
-            assert!(
-                r.bottom > r.top,
-                "a zero-height font still leaves a control"
-            );
-        }
-    }
-
     // The placeholder is painted into the EDIT by the palette (a plain EDIT
     // has no cue banner in the palette's colours), so these print the real
     // control and look at its pixels.
@@ -2521,7 +2219,7 @@ mod tests {
                 let dc = CreateCompatibleDC(Some(screen));
                 let bmp = CreateCompatibleBitmap(screen, rc.right, rc.bottom);
                 let old = SelectObject(dc, HGDIOBJ(bmp.0));
-                let bg = CreateSolidBrush(COLORREF(p.inner.colors.background));
+                let bg = CreateSolidBrush(COLORREF(p.inner.colors.box_fill));
                 FillRect(dc, &rc, bg);
                 let _ = DeleteObject(bg.into());
                 // PRF_CLIENT
@@ -2534,7 +2232,7 @@ mod tests {
                 let mut n = 0;
                 for y in 0..rc.bottom {
                     for x in from_x..rc.right {
-                        if GetPixel(dc, x, y).0 != p.inner.colors.background {
+                        if GetPixel(dc, x, y).0 != p.inner.colors.box_fill {
                             n += 1;
                         }
                     }
@@ -2580,65 +2278,13 @@ mod tests {
                 let _ = GetWindowRect(p.edit_hwnd(), &mut er);
                 let _ = GetWindowRect(p.hwnd(), &mut pr);
             }
-            let dpi = p.inner.dpi;
-            let box_top = scale(PADDING, dpi);
-            let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+            let b = box_rect(p.inner.dpi);
             let (top, bottom) = (er.top - pr.top, er.bottom - pr.top);
-            assert!(bottom - top < scale(EDIT_HEIGHT, dpi), "{top}..{bottom}");
-            assert!(((top - box_top) - (box_bottom - bottom)).abs() <= 1);
-        }
-    }
-
-    mod row_at_tests {
-        use super::super::row_at;
-
-        const DPI: u32 = 96;
-        // list_top = PADDING + EDIT_HEIGHT + PADDING = 8 + 30 + 8 = 46
-        const LIST_TOP: i32 = 46;
-        const ROW_H: i32 = 26;
-
-        #[test]
-        fn y_in_the_header_padding_above_the_list_is_none() {
-            assert_eq!(row_at(0, DPI, 0, 10), None);
-            assert_eq!(row_at(LIST_TOP - 1, DPI, 0, 10), None);
-        }
-
-        #[test]
-        fn y_at_the_top_of_the_first_row_is_row_zero() {
-            assert_eq!(row_at(LIST_TOP, DPI, 0, 10), Some(0));
-        }
-
-        #[test]
-        fn y_between_rows_lands_on_the_row_it_falls_in() {
-            // Middle of row 2 (index 2): list_top + 2*ROW_H + ROW_H/2.
-            let y = LIST_TOP + 2 * ROW_H + ROW_H / 2;
-            assert_eq!(row_at(y, DPI, 0, 10), Some(2));
-            // Exactly on the boundary between row 2 and row 3 -> row 3.
-            let boundary = LIST_TOP + 3 * ROW_H;
-            assert_eq!(row_at(boundary, DPI, 0, 10), Some(3));
-        }
-
-        #[test]
-        fn y_below_the_last_real_row_is_none() {
-            // Only 2 rows exist; the geometric slot for row 2 is still inside
-            // the painted viewport but there is no such row.
-            let y = LIST_TOP + 2 * ROW_H + 1;
-            assert_eq!(row_at(y, DPI, 0, 2), None);
-        }
-
-        #[test]
-        fn y_below_the_whole_viewport_is_none() {
-            let y = LIST_TOP + ROW_H * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32 + 5;
-            assert_eq!(row_at(y, DPI, 0, 100), None);
-        }
-
-        #[test]
-        fn scrolled_offset_shifts_the_returned_index() {
-            // With offset 5, the row painted at visible position 0 is real
-            // index 5.
-            assert_eq!(row_at(LIST_TOP, DPI, 5, 20), Some(5));
-            let y = LIST_TOP + 2 * ROW_H + 1;
-            assert_eq!(row_at(y, DPI, 5, 20), Some(7));
+            assert!(bottom - top < b.bottom - b.top, "{top}..{bottom}");
+            assert!(((top - b.top) - (b.bottom - bottom)).abs() <= 1);
+            // After the glyph, inside the box.
+            let left = er.left - pr.left;
+            assert!(left > glyph_rect(p.inner.dpi).right && left < b.right);
         }
     }
 
@@ -2676,10 +2322,11 @@ mod tests {
         let pixel = |x: i32, y: i32| unsafe { GetPixel(mem as HDC, x, y) };
         // Rows start below the edit; the first action
         // row (after the group header) is the selected one.
-        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING, dpi);
-        let selected_y = list_top + scale(ROW_HEIGHT, dpi) + scale(ROW_HEIGHT, dpi) / 2;
-        let selected = pixel(w - scale(PADDING, dpi) - 4, selected_y);
-        let empty = pixel(w / 2, h - scale(FOOTER_HEIGHT, dpi) - 4);
+        let fill = row_fill(dpi, 1);
+        let selected = pixel(fill.right - scale(8, dpi), (fill.top + fill.bottom) / 2);
+        let empty_slot = row_slot(dpi, 8);
+        let empty = pixel(w / 2, (empty_slot.top + empty_slot.bottom) / 2);
+        assert!(h > empty_slot.bottom);
         unsafe {
             let _ = DeleteDC(mem);
             ReleaseDC(None, screen);
@@ -2753,28 +2400,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_thumb_rect_sits_in_the_padding_beside_the_rows_at_every_scale() {
-        for dpi in [96u32, 120, 144, 192, 240] {
-            let w = scale(WINDOW_WIDTH, dpi);
-            // Each term is scaled on its own, as the rows are laid out.
-            let list_top = scale(PADDING, dpi) + scale(EDIT_HEIGHT, dpi) + scale(PADDING, dpi);
-            let track = scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32;
-            assert_eq!(thumb_rect(dpi, 0, 12), None, "12 rows fit");
-            let r = thumb_rect(dpi, 0, 40).unwrap();
-            assert!(
-                r.left >= w - scale(PADDING, dpi),
-                "dpi {dpi}: overlaps the rows"
-            );
-            assert!(r.right < w, "dpi {dpi}: leaves the window");
-            assert!(
-                r.top >= list_top && r.bottom <= list_top + track,
-                "dpi {dpi}"
-            );
-            assert!(r.right - r.left >= 2, "dpi {dpi}: too thin to see");
-        }
-    }
-
     /// #882: a row the mouse is over is filled lighter than the selected row,
     /// so two rows never look selected. Prints the window and reads the
     /// pixels of the hovered row and of the selected one.
@@ -2805,9 +2430,11 @@ mod tests {
                 Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
             );
         }
-        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING, dpi);
-        let row_y = |pos: i32| list_top + scale(ROW_HEIGHT, dpi) * pos + scale(ROW_HEIGHT, dpi) / 2;
-        let x = w - scale(PADDING, dpi) - 4;
+        let row_y = |pos: i32| {
+            let f = row_fill(dpi, pos);
+            (f.top + f.bottom) / 2
+        };
+        let x = row_fill(dpi, 1).right - scale(8, dpi);
         let (selected, hovered) = unsafe {
             (
                 GetPixel(mem as HDC, x, row_y(1)).0,
@@ -2980,11 +2607,10 @@ mod tests {
         p.show(free_actions(), true, "mode: Auto".to_string());
         pump_pending(p.hwnd());
 
-        // list_top (96 DPI) = PADDING + EDIT_HEIGHT + PADDING = 8 + 30 + 8 =
-        // 46; row 1's midpoint is list_top + ROW_HEIGHT + ROW_HEIGHT/2 =
-        // 46 + 26 + 13 = 85.
+        // Row 1's midpoint, at the window's own scale.
+        let slot = row_slot(p.inner.dpi, 1);
         let x: i16 = 50;
-        let y: i16 = 85;
+        let y: i16 = ((slot.top + slot.bottom) / 2) as i16;
         let lparam = LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize);
 
         unsafe {
