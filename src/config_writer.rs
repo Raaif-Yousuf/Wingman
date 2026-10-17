@@ -1007,7 +1007,7 @@ x = 1
         assert!(!o.fail_note.contains("revert"), "{}", o.fail_note);
         assert!(!o.fail_headline.contains('\u{2014}') && !o.fail_note.contains('\u{2014}'));
         assert!(!Outcome::simple("x").from_reload);
-        assert!(!Outcome::settings_save().from_reload);
+        assert!(!Outcome::settings_field("x").from_reload);
     }
 
     fn crlf(s: &str) -> String {
