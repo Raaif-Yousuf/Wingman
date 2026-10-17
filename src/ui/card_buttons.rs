@@ -145,6 +145,11 @@ pub(crate) fn state_from(item_state: u32, hovered: bool) -> State {
     }
 }
 
+/// How far a secondary button's fill moves toward its text colour when hot and
+/// when pressed, in percent. Settings' combo arrow button shares them.
+pub(crate) const SECONDARY_HOVER_PCT: u32 = 8;
+pub(crate) const SECONDARY_PRESSED_PCT: u32 = 16;
+
 /// The pure decision: colors for a role in a state on a surface, honoring
 /// the system accent, and the system colors outright in high contrast mode.
 pub(crate) fn look(
@@ -185,8 +190,8 @@ pub(crate) fn look(
         Role::Secondary => {
             let fill = match state {
                 State::Normal | State::Disabled => surface.bg,
-                State::Hover => blend(surface.bg, surface.text, 8),
-                State::Pressed => blend(surface.bg, surface.text, 16),
+                State::Hover => blend(surface.bg, surface.text, SECONDARY_HOVER_PCT),
+                State::Pressed => blend(surface.bg, surface.text, SECONDARY_PRESSED_PCT),
             };
             let text = if state == State::Disabled {
                 surface.hint
