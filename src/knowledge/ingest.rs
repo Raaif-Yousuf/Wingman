@@ -31,6 +31,11 @@ const MAX_DEPTH: usize = 32;
 const ATTR_OFFLINE: u32 = 0x0000_1000;
 const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
+/// Tests that go through the process-wide store (and the process-wide notice
+/// queue) take turns on this, here and in the watcher's tests.
+#[cfg(test)]
+pub(super) static GLOBAL_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What one scan did, for the notice and the tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ScanSummary {
@@ -118,7 +123,7 @@ fn spawn_failed_notice(error: &str) -> String {
 /// release profile is `panic = "abort"`, where nothing can be caught and the
 /// crash note (`crash_note.rs`) shows a card at the next start instead. The
 /// panic text is never shown (it can come from file contents).
-fn guarded(work: impl FnOnce()) {
+pub(super) fn guarded(work: impl FnOnce()) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
         notice::report(
             "Indexing your knowledge folder stopped unexpectedly. Wingman keeps running; it will try again at the next start.",
@@ -148,7 +153,7 @@ fn open_failure(e: &std::io::Error) -> OpenFailure {
 }
 
 /// The one sentence a finished scan leaves for the next card, if any.
-fn summary_notice(summary: &ScanSummary) -> Option<String> {
+pub(super) fn summary_notice(summary: &ScanSummary) -> Option<String> {
     let unreadable = summary.failed + summary.pending;
     if unreadable > 0 {
         Some(format!(
@@ -205,7 +210,7 @@ fn run_scan(setting: Setting) {
 
 /// Background mode lowers CPU, disk and memory priority for this thread.
 /// Best effort: a refusal only means the scan runs at normal priority.
-fn lower_thread_priority() {
+pub(super) fn lower_thread_priority() {
     use windows::Win32::System::Threading::{
         GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
     };
@@ -215,7 +220,7 @@ fn lower_thread_priority() {
     }
 }
 
-fn now_unix() -> i64 {
+pub(super) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -224,7 +229,7 @@ fn now_unix() -> i64 {
 
 /// The folder as an absolute path without the `\\?\` prefix. The folder is
 /// never created here (it is made on first use, spec question 1).
-fn canonical_root(folder: &Path) -> Result<PathBuf, String> {
+pub(super) fn canonical_root(folder: &Path) -> Result<PathBuf, String> {
     let canon = std::fs::canonicalize(folder).map_err(|_| {
         format!(
             "The knowledge folder {} was not found, so nothing was indexed.",
@@ -244,8 +249,8 @@ fn canonical_root(folder: &Path) -> Result<PathBuf, String> {
     }
 }
 
-struct FoundFile {
-    rel: String,
+pub(super) struct FoundFile {
+    pub(super) rel: String,
     path: PathBuf,
     size: u64,
     mtime: Option<i64>,
@@ -326,37 +331,112 @@ fn walk(root: &Path) -> (Vec<FoundFile>, bool) {
                 }
                 continue;
             }
-            if !kind.is_file() || is_ignored_file(&name) {
+            if !kind.is_file() || is_ignored_file(&name) || parser_for(&name).is_none() {
                 continue;
             }
-            let Some(parser) = parser_for(&name) else {
-                continue;
-            };
             let Ok(meta) = entry.metadata() else {
                 incomplete = true;
                 continue;
             };
-            let path = entry.path();
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            files.push(FoundFile {
-                rel: rel_key(rel),
-                size: meta.len(),
-                mtime: meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64),
-                attributes: attributes(&meta),
-                parser,
-                path,
-            });
+            if let Some(file) = file_candidate(root, entry.path(), &meta) {
+                files.push(file);
+            }
         }
     }
     files.sort_by(|a, b| a.rel.cmp(&b.rel));
     files.truncate(MAX_FILES_PER_ROOT);
     (files, incomplete)
+}
+
+/// The indexable file at `path` under `root`, or `None` for one that is
+/// ignored, has no parser, or is not under `root`. The one place a
+/// [`FoundFile`] is built, for the scan's walk and the watcher's single paths.
+fn file_candidate(root: &Path, path: PathBuf, meta: &std::fs::Metadata) -> Option<FoundFile> {
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    if is_ignored_file(&name) {
+        return None;
+    }
+    let parser = parser_for(&name)?;
+    let rel = path.strip_prefix(root).ok()?;
+    Some(FoundFile {
+        rel: rel_key(rel),
+        size: meta.len(),
+        mtime: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64),
+        attributes: attributes(meta),
+        parser,
+        path,
+    })
+}
+
+/// What is at one path under a root right now (the watcher's view of a change).
+pub(super) enum Probe {
+    /// Nothing there: deleted, or renamed away.
+    Gone,
+    /// A folder that is walked (not a dot-folder, not a link).
+    Dir,
+    /// A link, a dot-folder, a lock or temp file, or a type with no parser.
+    Ignored,
+    /// Could not be looked at (in use, no access): try again shortly.
+    Unreadable,
+    File(FoundFile),
+}
+
+/// True for a relative path the scan would never index: anything inside a
+/// dot-folder, a `~$` Office lock file, a `.tmp` file. Pure.
+pub(super) fn is_ignored_rel(rel: &str) -> bool {
+    let mut parts = rel.split('/').filter(|p| !p.is_empty()).peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_some() {
+            if part.starts_with('.') {
+                return true;
+            }
+        } else {
+            return is_ignored_file(part);
+        }
+    }
+    true
+}
+
+/// Looks at `rel` under `root` without following links.
+pub(super) fn probe(root: &Path, rel: &str) -> Probe {
+    if is_ignored_rel(rel) {
+        return Probe::Ignored;
+    }
+    let path = root.join(rel);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probe::Gone,
+        Err(_) => return Probe::Unreadable,
+    };
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Probe::Ignored
+    } else if kind.is_dir() {
+        let dotted = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'));
+        if dotted {
+            Probe::Ignored
+        } else {
+            Probe::Dir
+        }
+    } else if kind.is_file() {
+        file_candidate(root, path, &meta).map_or(Probe::Ignored, Probe::File)
+    } else {
+        Probe::Ignored
+    }
+}
+
+/// The folder the watcher should watch for this setting, if it is a usable one.
+pub(super) fn watch_target(folder: &str) -> Option<PathBuf> {
+    match read_setting(folder) {
+        Setting::Folder(path) => Some(path),
+        Setting::Off | Setting::Invalid(_) => None,
+    }
 }
 
 fn is_ignored_file(name: &str) -> bool {
@@ -376,7 +456,7 @@ fn attributes(meta: &std::fs::Metadata) -> u32 {
     meta.file_attributes()
 }
 
-enum Outcome {
+pub(super) enum Outcome {
     Indexed,
     Unchanged,
     Skipped,
@@ -384,7 +464,7 @@ enum Outcome {
     Pending,
 }
 
-fn index_file(
+pub(super) fn index_file(
     store: &Store,
     root_id: i64,
     file: &FoundFile,
@@ -580,7 +660,7 @@ mod tests {
 
     /// `start_scan` works on the one process-wide store and retires the roots
     /// it was not given, so the tests that go through it take turns.
-    static GLOBAL_STORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::GLOBAL_STORE_LOCK as GLOBAL_STORE;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

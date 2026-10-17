@@ -131,6 +131,48 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// One document of a root, by its relative path.
+    pub fn document_row(
+        &self,
+        root_id: i64,
+        rel_path: &str,
+    ) -> Result<Option<DocumentRow>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, rel_path, size, mtime_unix, content_hash, parser_ver, status, ingested_unix
+                 FROM document WHERE root_id = ?1 AND rel_path = ?2",
+                params![root_id, rel_path],
+                |r| {
+                    Ok(DocumentRow {
+                        id: r.get(0)?,
+                        rel_path: r.get(1)?,
+                        size: r.get(2)?,
+                        mtime_unix: r.get(3)?,
+                        content_hash: r.get(4)?,
+                        parser_ver: r.get(5)?,
+                        status: r.get(6)?,
+                        ingested_unix: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Moves a document to a new relative path in place: same row, same
+    /// chunks. `false` when there is no row at `from`, or one already at `to`
+    /// (nothing is changed then).
+    pub fn rename_document(&self, root_id: i64, from: &str, to: &str) -> Result<bool, StoreError> {
+        let changed = self.lock().execute(
+            "UPDATE document SET rel_path = ?3
+             WHERE root_id = ?1 AND rel_path = ?2
+               AND NOT EXISTS (SELECT 1 FROM document WHERE root_id = ?1 AND rel_path = ?3)",
+            params![root_id, from, to],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Creates or finds the document row for `rel_path` and sets its status
     /// and the fields in `u`. A field left `None` keeps its stored value, so a
     /// failed re-read does not forget the hash its older chunks belong to.

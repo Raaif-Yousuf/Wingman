@@ -616,6 +616,11 @@ struct App {
     /// #393: when the press that started the current Look was made.
     look_pressed_at: Option<Instant>,
     chain: Arc<Chain>,
+    /// #81: the knowledge folder watcher, while a usable folder is set and the
+    /// watch is alive. Dropping it asks its thread to stop.
+    knowledge_watch: Option<crate::knowledge::watch::Watcher>,
+    /// The `[knowledge] folder` text the scan and watcher were last started for.
+    knowledge_folder: String,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
     /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
@@ -844,8 +849,7 @@ pub fn run() -> Result<()> {
     // is only known on the scan thread and waits in its own notice queue.
     let knowledge_setting_problem =
         crate::knowledge::ingest::startup_problem(&config.knowledge.folder);
-    let knowledge_spawn_problem =
-        crate::knowledge::ingest::start_scan(&config.knowledge.folder).err();
+    let (knowledge_watch, knowledge_spawn_problem) = start_knowledge(&config.knowledge.folder);
     let chain = Arc::new(config.build_chain());
 
     // #105: every `Chain` built from here on asks the owner window to show
@@ -922,9 +926,12 @@ pub fn run() -> Result<()> {
         card.show_error(&headline, &detail);
     }
 
+    let knowledge_folder = config.knowledge.folder.clone();
     let mut app = Box::new(App {
         instance,
         taskbar_created_msg,
+        knowledge_watch,
+        knowledge_folder,
         config,
         unsaved: Vec::new(),
         pending_writes: Arc::default(),
@@ -1116,6 +1123,33 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #81: whether a Reload or Settings save must start the knowledge scan and
+/// watch again: the folder text changed, or the watch ended on its own (its
+/// folder went away) and Reload is the retry. Pure.
+fn knowledge_needs_restart(started_for: &str, wanted: &str, watch_ended: bool) -> bool {
+    started_for != wanted || watch_ended
+}
+
+/// #81: starts watching the knowledge folder, then the start-up scan. The
+/// watch is armed first (`watch::start` waits for that, bounded), so a file
+/// changed while the scan walks is still seen. Returns the watcher, if one is
+/// running, and a plain sentence for whatever could not be started.
+fn start_knowledge(folder: &str) -> (Option<crate::knowledge::watch::Watcher>, Option<String>) {
+    let mut problems = Vec::new();
+    let watch = match crate::knowledge::watch::start(folder) {
+        Ok(watch) => watch,
+        Err(e) => {
+            problems.push(e);
+            None
+        }
+    };
+    if let Err(e) = crate::knowledge::ingest::start_scan(folder) {
+        problems.push(e);
+    }
+    let problem = (!problems.is_empty()).then(|| problems.join("\n\n"));
+    (watch, problem)
 }
 
 /// #1054: the start-up card for a knowledge folder that will not be indexed
@@ -5260,6 +5294,7 @@ impl App {
         self.card.set_text_scale(self.config.ui.text_scale);
         self.card
             .set_placement(self.config.ui.card_corner, &self.config.ui.card_monitor);
+        self.restart_knowledge_if_needed();
         if let Some(hook) = &self.hook {
             hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
             // #181: a Reload/Settings-save always re-syncs the pause chord
@@ -5274,6 +5309,34 @@ impl App {
             hook.set_palette_chord(self.config.hotkeys.palette);
         }
         self.refresh_tray_labels();
+    }
+
+    /// #81: after a Reload or a Settings save, watch and scan the folder now in
+    /// the settings, or start again after a watch that ended (its folder was
+    /// deleted or renamed). Unchanged settings with a live watch do nothing.
+    /// Problems have no start-up card to ride, so they wait for the next
+    /// result card like the scan's own notices.
+    fn restart_knowledge_if_needed(&mut self) {
+        let folder = self.config.knowledge.folder.clone();
+        let watch_ended = self
+            .knowledge_watch
+            .as_ref()
+            .is_some_and(|w| !w.is_running());
+        if !knowledge_needs_restart(&self.knowledge_folder, &folder, watch_ended) {
+            return;
+        }
+        // Stop the old watch first, so it cannot apply a batch to a root the
+        // new scan is about to retire.
+        self.knowledge_watch = None;
+        self.knowledge_folder = folder.clone();
+        let (watch, problem) = start_knowledge(&folder);
+        self.knowledge_watch = watch;
+        for text in [crate::knowledge::ingest::startup_problem(&folder), problem]
+            .into_iter()
+            .flatten()
+        {
+            crate::knowledge::notice::report(&text);
+        }
     }
 
     /// #174: `edit_settings` only needs to save when the file did not exist
@@ -12248,6 +12311,44 @@ mod tests {
     /// its loopback check entirely and a non-loopback-configured Ollama (or
     /// any `compat:` provider pointed off-box) keeps sending while the user
     /// believes Offline is on.
+    /// #81: a changed folder, or a watch that ended, restarts the knowledge
+    /// watch; nothing else does. The reload path and start-up both go through
+    /// `start_knowledge` (watch armed before the scan).
+    #[test]
+    fn a_reload_restarts_the_knowledge_watch_only_when_needed() {
+        assert!(!super::knowledge_needs_restart(
+            r"C:\Notes",
+            r"C:\Notes",
+            false
+        ));
+        assert!(super::knowledge_needs_restart(
+            r"C:\Notes",
+            r"C:\Other",
+            false
+        ));
+        assert!(super::knowledge_needs_restart("", r"C:\Notes", false));
+        assert!(super::knowledge_needs_restart(r"C:\Notes", "", false));
+        assert!(super::knowledge_needs_restart(
+            r"C:\Notes",
+            r"C:\Notes",
+            true
+        ));
+        let app_src = lf(include_str!("app.rs"));
+        assert!(
+            apply_config_body(&app_src).contains("restart_knowledge_if_needed()"),
+            "apply_config must restart the knowledge watch (#81)"
+        );
+        let run = app_src
+            .split("fn start_knowledge(")
+            .nth(1)
+            .and_then(|b| b.split("\n}\n").next())
+            .expect("start_knowledge exists");
+        let watch_at = run.find("watch::start(").expect("starts the watch");
+        let scan_at = run.find("start_scan(").expect("starts the scan");
+        assert!(watch_at < scan_at, "the watch is armed before the scan");
+        assert!(app_src.contains("start_knowledge(&config.knowledge.folder)"));
+    }
+
     #[test]
     fn apply_config_resyncs_the_mode_mirror() {
         let app_src = lf(include_str!("app.rs"));
