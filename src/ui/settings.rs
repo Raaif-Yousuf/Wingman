@@ -1148,6 +1148,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
+            clear_accessible_names(hwnd);
             invalidate_edit_style();
             invalidate_rail_style();
             inner.closing = true;
@@ -2466,31 +2467,53 @@ const ACCESSIBLE_NAMES: [(i32, &str); 6] = [
 /// Best effort: with no service the buttons keep their short text, and the
 /// window works the same. Runs once as the window is built, never on a paint.
 fn annotate_accessible_names(hwnd: HWND) {
+    use windows::Win32::UI::Accessibility::PROPID_ACC_NAME;
+    with_prop_service(|service| unsafe {
+        for (id, name) in ACCESSIBLE_NAMES {
+            if let Some(button) = get_dlg_item(hwnd, id) {
+                let name = wide_z(name);
+                let _ = service.SetHwndPropStr(
+                    button,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    PROPID_ACC_NAME,
+                    PCWSTR(name.as_ptr()),
+                );
+            }
+        }
+    });
+}
+
+/// Takes the names of [`annotate_accessible_names`] back as the window goes:
+/// the service keeps them by window handle, and Windows recycles handles, so a
+/// later control must not inherit "Show OpenAI key".
+fn clear_accessible_names(hwnd: HWND) {
+    use windows::Win32::UI::Accessibility::PROPID_ACC_NAME;
+    with_prop_service(|service| unsafe {
+        for (id, _) in ACCESSIBLE_NAMES {
+            if let Some(button) = get_dlg_item(hwnd, id) {
+                let _ = service.ClearHwndProps(button, ACC_OBJID_CLIENT, 0, &[PROPID_ACC_NAME]);
+            }
+        }
+    });
+}
+
+const ACC_OBJID_CLIENT: u32 = 0xFFFF_FFFC;
+
+/// Runs `f` with the accessibility annotation service, when there is one.
+fn with_prop_service(f: impl FnOnce(&windows::Win32::UI::Accessibility::IAccPropServices)) {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_APARTMENTTHREADED,
     };
-    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices, PROPID_ACC_NAME};
-    const OBJID_CLIENT: u32 = 0xFFFF_FFFC;
-    const CHILDID_SELF: u32 = 0;
+    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices};
     unsafe {
         // Balanced below when it took: a thread that already has COM keeps it.
         let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         if let Ok(service) =
             CoCreateInstance::<_, IAccPropServices>(&CAccPropServices, None, CLSCTX_INPROC_SERVER)
         {
-            for (id, name) in ACCESSIBLE_NAMES {
-                if let Some(button) = get_dlg_item(hwnd, id) {
-                    let name = wide_z(name);
-                    let _ = service.SetHwndPropStr(
-                        button,
-                        OBJID_CLIENT,
-                        CHILDID_SELF,
-                        PROPID_ACC_NAME,
-                        PCWSTR(name.as_ptr()),
-                    );
-                }
-            }
+            f(&service);
         }
         if init.is_ok() {
             CoUninitialize();
@@ -3488,7 +3511,8 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
         }
     }
     // A hidden Ollama card also takes its own height off the page: from the
-    // hairline above its status to the bottom of its last line.
+    // hairline above its status to the bottom of its last line and the padding
+    // under it, which the page's end counts like any row's.
     let card_top = inner
         .models_flow
         .iter()
@@ -3503,7 +3527,11 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
         .map(|f| f.y + f.h)
         .max()
         .unwrap_or(0);
-    let card_gone = if shown[3] { 0 } else { card_bottom - card_top };
+    let card_gone = if shown[3] {
+        0
+    } else {
+        card_bottom + ROW_PAD - card_top
+    };
     inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch) + card_gone;
     if !inner.hwnd.0.is_null() {
         // One repaint for the whole change, as `show_page` does: the layout
@@ -3790,6 +3818,8 @@ struct EditColors {
     disabled_fill: u32,
     disabled_border: u32,
     disabled_text: u32,
+    /// #1109: a hovered combo's border (the system highlight in high contrast).
+    hover_border: u32,
 }
 
 /// How far a disabled box's fill moves from the text box fill toward the
@@ -3824,6 +3854,28 @@ fn edit_colors(
         disabled_fill,
         disabled_border,
         disabled_text: menu_text_color(theme, &t, sys, false, true),
+        hover_border: if high_contrast {
+            sys.highlight
+        } else {
+            blend(t.border, t.text, EDIT_HOVER_BORDER_PCT)
+        },
+    }
+}
+
+/// How far a hovered combo's border moves from the border colour toward the
+/// text colour, in percent. The tint of the field is left out: the system draws
+/// the arrow button, so a tinted field would sit beside a white button.
+const EDIT_HOVER_BORDER_PCT: u32 = 30;
+
+/// The colours the frame is drawn with: the border of a hovered box is firmer.
+fn frame_colors(colors: &EditColors, hovered: bool) -> EditColors {
+    EditColors {
+        border: if hovered {
+            colors.hover_border
+        } else {
+            colors.border
+        },
+        ..*colors
     }
 }
 
@@ -4014,7 +4066,7 @@ unsafe fn paint_edit_frame(hwnd: HWND) {
         wr.right - wr.left,
         wr.bottom - wr.top,
         dpi_for(hwnd),
-        &edit_style().colors,
+        &frame_colors(&edit_style().colors, combo_is_hovered(hwnd)),
         GetFocus() == hwnd,
         windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool(),
     );
@@ -7653,6 +7705,86 @@ fn combo_text_rect(
 
 const COMBO_SUBCLASS_ID: usize = 0x854;
 
+/// The Card corner combo, which the gallery puts the mouse over.
+#[cfg(debug_assertions)]
+pub(crate) const CARD_CORNER_COMBO: i32 = ID_CARD_CORNER;
+
+/// `WM_MOUSELEAVE`, sent once after `TrackMouseEvent(TME_LEAVE)`.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
+thread_local! {
+    /// #1109: the combo the mouse is over (0: none). One mouse, one hover.
+    static HOVERED_COMBO: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+    /// How many times a hover change repainted a combo, for the tests.
+    #[cfg(test)]
+    static COMBO_HOVER_REPAINTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn combo_is_hovered(hwnd: HWND) -> bool {
+    HOVERED_COMBO.get() == hwnd.0 as isize
+}
+
+#[cfg(test)]
+fn combo_hover_repaints() -> u32 {
+    COMBO_HOVER_REPAINTS.get()
+}
+
+/// Moves the hover to `hwnd` (`on`) or takes it off `hwnd`. Repaints the combos
+/// that changed, and returns whether anything did: a mouse moving inside the
+/// field changes nothing and costs nothing.
+fn set_combo_hover(hwnd: HWND, on: bool) -> bool {
+    let me = hwnd.0 as isize;
+    let before = HOVERED_COMBO.get();
+    let after = if on {
+        me
+    } else if before == me {
+        0
+    } else {
+        before
+    };
+    if after == before {
+        return false;
+    }
+    HOVERED_COMBO.set(after);
+    #[cfg(test)]
+    COMBO_HOVER_REPAINTS.set(COMBO_HOVER_REPAINTS.get() + 1);
+    for changed in [before, after] {
+        if changed != 0 {
+            unsafe {
+                let _ = RedrawWindow(
+                    Some(HWND(changed as *mut c_void)),
+                    None,
+                    None,
+                    windows::Win32::Graphics::Gdi::RDW_FRAME | RDW_INVALIDATE,
+                );
+            }
+        }
+    }
+    true
+}
+
+/// Asks Windows for one `WM_MOUSELEAVE` when the mouse leaves `hwnd`.
+fn track_mouse_leave(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    };
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        let _ = TrackMouseEvent(&mut track);
+    }
+}
+
+/// Gives the gallery a hovered combo: the state a mouse over it leaves.
+#[cfg(debug_assertions)]
+fn hover_combo_for_gallery(combo: HWND) {
+    set_combo_hover(combo, true);
+}
+
 /// An owner-drawn combo loses the system's light themed frame, so the frame is
 /// put back after each paint in the text box's look (#934): the same border,
 /// corners and accent line, which also keeps a row of controls consistent.
@@ -7671,7 +7803,20 @@ unsafe extern "system" fn combo_subclass(
             paint_edit_frame(hwnd);
             result
         }
+        // #1109: the mouse over the field hovers it; Windows says when it leaves.
+        // Only a change repaints, and nothing runs while the mouse is still.
+        windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE => {
+            if set_combo_hover(hwnd, true) {
+                track_mouse_leave(hwnd);
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            set_combo_hover(hwnd, false);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
         WM_NCDESTROY => {
+            set_combo_hover(hwnd, false);
             let _ = RemoveWindowSubclass(hwnd, Some(combo_subclass), COMBO_SUBCLASS_ID);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
@@ -9122,6 +9267,14 @@ impl GalleryWindow {
         }
     }
 
+    /// Puts the mouse over the combo `id` (what hovering it leaves), for the gallery.
+    pub(crate) fn hover_combo(&mut self, id: i32) {
+        let inner = unsafe { &mut *self.raw };
+        if let Some(combo) = get_dlg_item(inner.hwnd, id) {
+            hover_combo_for_gallery(combo);
+        }
+    }
+
     /// Shows every provider (what "Add another provider" does).
     pub(crate) fn reveal_providers(&mut self) {
         let inner = unsafe { &mut *self.raw };
@@ -9684,6 +9837,40 @@ mod tests {
         });
     }
 
+    /// The Gemini thinking row is greyed for a 2.5 model. Its Alt letter then
+    /// goes nowhere: the focus stays where it was, it never lands on whatever
+    /// control sits next to the greyed row.
+    #[test]
+    fn the_alt_letter_of_a_greyed_row_does_not_move_focus_to_a_neighbour() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, SetFocus};
+        use windows::Win32::UI::WindowsAndMessaging::{IsDialogMessageW, MSG, WM_SYSCHAR};
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["gemini".to_string()];
+        cfg.providers.gemini.model = "gemini-2.5-pro".to_string();
+        with_window(cfg, |hwnd, raw| {
+            unsafe { show_page(&mut *raw, Page::Models) };
+            sync_gemini_thinking_enabled(hwnd);
+            let label = get_dlg_item(hwnd, ID_GEMINI_EFFORT_LABEL).expect("label");
+            let m = mnemonic_of(&get_text(label)).expect("the label has a mnemonic");
+            let combo = get_dlg_item(hwnd, ID_GEMINI_MODEL).expect("combo");
+            assert!(!unsafe { IsWindowEnabled(label) }.as_bool(), "row greyed");
+            unsafe {
+                let _ = SetFocus(Some(combo));
+                let before = GetFocus();
+                assert_eq!(before, combo, "the test needs a real focus to compare");
+                let msg = MSG {
+                    hwnd: combo,
+                    message: WM_SYSCHAR,
+                    wParam: WPARAM(m as usize),
+                    lParam: LPARAM(0),
+                    ..Default::default()
+                };
+                let _ = IsDialogMessageW(hwnd, &msg);
+                assert_eq!(GetFocus(), before, "Alt+{m} moved the focus");
+            }
+        });
+    }
+
     /// A box (a combo, a text box or a slider) is named by the static title
     /// right before it in z-order, and a button by its text or its assigned
     /// name. On a page no two share a name, so a screen reader never says the
@@ -9776,6 +9963,56 @@ mod tests {
         }
     }
 
+    /// What UI Automation (which Narrator uses) reports as the control's name.
+    fn uia_name(hwnd: HWND) -> Option<String> {
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let uia: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let element = uia.ElementFromHandle(hwnd).ok()?;
+            Some(element.CurrentName().ok()?.to_string())
+        }
+    }
+
+    /// A window's names are taken back as it goes, so a recycled handle does
+    /// not carry "Show OpenAI key" into some other control.
+    #[test]
+    fn clearing_the_names_gives_the_button_its_own_text_back() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { show_page(&mut *raw, Page::Models) };
+            let button = get_dlg_item(hwnd, ID_OPENAI_SHOW_KEY).expect("button");
+            assert_eq!(msaa_name(button).as_deref(), Some("Show OpenAI key"));
+            clear_accessible_names(hwnd);
+            assert_eq!(msaa_name(button).as_deref(), Some("Show"));
+        });
+    }
+
+    /// #877: Narrator reads UI Automation, not MSAA. The long names must come
+    /// through that path too, or "Show" is all a screen reader says.
+    #[test]
+    fn ui_automation_reports_the_vendor_names() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe {
+                show_page(&mut *raw, Page::Models);
+                reveal_providers(&mut *raw);
+            }
+            for (id, want) in [
+                (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
+                (ID_OPENAI_MODEL, "OpenAI model"),
+            ] {
+                let control = get_dlg_item(hwnd, id).expect("control");
+                let name = uia_name(control)
+                    .unwrap_or_else(|| panic!("UI Automation gave no name for {id}"));
+                assert_eq!(name, want, "control id {id}");
+            }
+        });
+    }
+
     /// The readback: what Narrator would be told, asked of the real controls.
     /// The window is hidden, so this is the system's answer for a control and
     /// not a speech test; run by hand with Narrator for that.
@@ -9809,7 +10046,10 @@ mod tests {
     }
 
     /// Every title and description fits the room its row gives it, so nothing
-    /// is cut off at the row's edge. Measured with the real fonts at 100 %.
+    /// is cut off at the row's edge. Measured with the real fonts at 100, 150
+    /// and 250 %, where the wrapped lines grow with the type but the rows grow
+    /// with the same scale. The two-line descriptions are named, so a text that
+    /// stops being measured cannot make the test pass.
     #[test]
     fn titles_and_descriptions_fit_their_rows() {
         use windows::Win32::Graphics::Gdi::{
@@ -9817,58 +10057,65 @@ mod tests {
         };
         with_window(Config::default(), |hwnd, raw| {
             let inner = unsafe { &*raw };
-            let hint_font = unsafe { build_hint_font(inner.font, 96) };
-            assert!(!hint_font.0.is_null());
             let dc = unsafe { GetDC(Some(hwnd)) };
-            let mut checked = 0;
-            for c in &inner.children {
-                if unsafe { class_of(c.hwnd) } != "Static" {
-                    continue;
-                }
-                let id = unsafe { GetDlgCtrlID(c.hwnd) };
-                let text = get_text(c.hwnd);
-                if text.is_empty() || id == ID_OLLAMA_STATUS || id == ID_PULL_STATUS {
-                    continue;
-                }
-                let font = if is_hint_id(id) {
-                    hint_font
-                } else {
-                    inner.font
-                };
-                let old = unsafe { SelectObject(dc, HGDIOBJ(font.0)) };
-                let mut rect = windows::Win32::Foundation::RECT {
-                    left: 0,
-                    top: 0,
-                    right: to_px(c.w, 96),
-                    bottom: 0,
-                };
-                let mut wide: Vec<u16> = text.encode_utf16().collect();
-                unsafe {
-                    DrawTextW(
-                        dc,
-                        &mut wide,
-                        &mut rect,
-                        DT_CALCRECT | DT_LEFT | DT_WORDBREAK,
+            for dpi in [96u32, 144, 240] {
+                let font = build_font(dpi);
+                let hint_font = unsafe { build_hint_font(font, dpi) };
+                assert!(!font.0.is_null() && !hint_font.0.is_null());
+                let mut checked = 0;
+                let mut long_ones = 0;
+                for c in &inner.children {
+                    if unsafe { class_of(c.hwnd) } != "Static" {
+                        continue;
+                    }
+                    let id = unsafe { GetDlgCtrlID(c.hwnd) };
+                    let text = get_text(c.hwnd);
+                    if text.is_empty() || id == ID_OLLAMA_STATUS || id == ID_PULL_STATUS {
+                        continue;
+                    }
+                    let used = if is_hint_id(id) { hint_font } else { font };
+                    let old = unsafe { SelectObject(dc, HGDIOBJ(used.0)) };
+                    let mut rect = windows::Win32::Foundation::RECT {
+                        left: 0,
+                        top: 0,
+                        right: to_px(c.w, dpi),
+                        bottom: 0,
+                    };
+                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                    unsafe {
+                        DrawTextW(
+                            dc,
+                            &mut wide,
+                            &mut rect,
+                            DT_CALCRECT | DT_LEFT | DT_WORDBREAK,
+                        );
+                        SelectObject(dc, old);
+                    }
+                    assert!(
+                        rect.bottom <= to_px(c.h, dpi),
+                        "{dpi} dpi: {text:?} needs {} px of {} in {} px width",
+                        rect.bottom,
+                        to_px(c.h, dpi),
+                        to_px(c.w, dpi)
                     );
-                    SelectObject(dc, old);
+                    if text == MODE_DESC || text == REDACT_HINT {
+                        long_ones += 1;
+                    }
+                    checked += 1;
+                }
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(hint_font.0));
+                    let _ = DeleteObject(HGDIOBJ(font.0));
                 }
                 assert!(
-                    rect.bottom <= to_px(c.h, 96),
-                    "{text:?} needs {} px of {} in {} px width",
-                    rect.bottom,
-                    to_px(c.h, 96),
-                    to_px(c.w, 96)
+                    checked > 20,
+                    "{dpi} dpi: only {checked} texts were measured"
                 );
-                checked += 1;
+                assert_eq!(long_ones, 2, "{dpi} dpi: Mode and Redact descriptions");
             }
-            unsafe {
-                ReleaseDC(Some(hwnd), dc);
-                let _ = DeleteObject(HGDIOBJ(hint_font.0));
-            }
-            assert!(checked > 20, "only {checked} texts were measured");
+            unsafe { ReleaseDC(Some(hwnd), dc) };
         });
     }
-
     /// A hairline sits above every row but a page's first, and none is left
     /// loose: each one is a 1 dp tall control made on a page, so it hides with
     /// its page and, on Models, with its block.
@@ -10369,6 +10616,35 @@ mod tests {
             assert!(design_y(inner, ID_OPEN_CONFIG) > hint_y_one_vendor);
         });
     }
+    /// With the Ollama card hidden, the Models page ends where every other page
+    /// does: a row's padding and the body's under its lowest visible control.
+    #[test]
+    fn a_hidden_ollama_card_leaves_the_page_ending_where_other_pages_end() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            let lowest = inner
+                .children
+                .iter()
+                .filter(|c| c.page == Some(Page::Models))
+                .filter(|c| unsafe { IsWindowVisible(c.hwnd) }.as_bool())
+                // A combo's design height is its drop-down list: the box is a row.
+                .map(|c| {
+                    c.y + if unsafe { class_of(c.hwnd) } == "ComboBox" {
+                        ROW_H
+                    } else {
+                        c.h
+                    }
+                })
+                .max()
+                .expect("a visible control");
+            assert!(!shows(hwnd, ID_PULL_STATUS), "the card is hidden");
+            let content = inner.page_content_dp[Page::Models.index()] - inner.models_shrink_dp;
+            // The last row's own padding, then the body's: as every other page.
+            assert_eq!(content, lowest + ROW_PAD + BODY_PAD_BOTTOM);
+        });
+    }
+
     #[test]
     fn gemini_thinking_applies_only_to_the_3_line() {
         assert!(gemini_thinking_applies("gemini-3.8-flash"));
@@ -11002,6 +11278,55 @@ mod tests {
         }
     }
 
+    /// #1109: the hovered look is a firmer border in a normal theme and the system
+    /// highlight border in high contrast.
+    #[test]
+    fn hover_colours_come_from_the_tokens() {
+        use crate::ui::theme::{rgb, HC_BLACK, HC_WHITE};
+        let accent = rgb(0, 103, 192);
+        let face = rgb(240, 240, 240);
+        let c = edit_colors(false, &HC_BLACK, accent, face);
+        assert_ne!(
+            c.hover_border, c.border,
+            "a hovered box has a firmer border"
+        );
+        for sys in [HC_BLACK, HC_WHITE] {
+            let c = edit_colors(true, &sys, accent, face);
+            assert_eq!(c.hover_border, sys.highlight);
+        }
+        let hovered = frame_colors(&c, true);
+        assert_eq!(hovered.border, c.hover_border);
+        assert_eq!(frame_colors(&c, false).border, c.border);
+    }
+
+    /// #1109: the mouse over a combo hovers it, once: moving inside it again
+    /// repaints nothing, and leaving clears it. No timer is involved.
+    #[test]
+    fn a_combo_is_hovered_while_the_mouse_is_over_it() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+        const WM_MOUSELEAVE: u32 = 0x02A3;
+        with_window(Config::default(), |hwnd, _raw| {
+            let combo = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            let other = get_dlg_item(hwnd, ID_MONITOR).unwrap();
+            let send = |to: HWND, msg: u32| unsafe {
+                SendMessageW(to, msg, Some(WPARAM(0)), Some(LPARAM(0x0005_0005)));
+            };
+            let base = combo_hover_repaints();
+            assert!(!combo_is_hovered(combo));
+            send(combo, WM_MOUSEMOVE);
+            assert!(combo_is_hovered(combo));
+            assert!(!combo_is_hovered(other));
+            assert_eq!(combo_hover_repaints(), base + 1);
+            send(combo, WM_MOUSEMOVE);
+            assert_eq!(combo_hover_repaints(), base + 1, "no change, no repaint");
+            send(combo, WM_MOUSELEAVE);
+            assert!(!combo_is_hovered(combo));
+            assert_eq!(combo_hover_repaints(), base + 2);
+            send(combo, WM_MOUSELEAVE);
+            assert_eq!(combo_hover_repaints(), base + 2);
+        });
+    }
+
     /// #934: the focus line is a bar along the bottom of the box, inside the
     /// border and clear of the rounded corners, at every scale.
     #[test]
@@ -11093,6 +11418,7 @@ mod tests {
             disabled_fill: 0x0080_8080,
             disabled_border: 0x0000_8080,
             disabled_text: 0,
+            hover_border: 0x0000_0080,
         };
         for dpi in [96u32, 240] {
             let (w, h) = (to_px(120, dpi), to_px(ROW_H, dpi));
@@ -11142,6 +11468,7 @@ mod tests {
             disabled_fill: 0x0080_8080,
             disabled_border: 0x0000_8080,
             disabled_text: 0,
+            hover_border: 0x0000_0080,
         };
         let (w, h) = (to_px(120, 96), to_px(ROW_H, 96));
         let (screen, dc, bmp) = unsafe {
@@ -13200,6 +13527,7 @@ mod tests {
     }
 
     /// The combo is a real Settings combo, and the body window really draws it.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_settings_combo_is_owner_drawn_and_the_body_draws_it() {
         use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
@@ -14764,6 +15092,23 @@ mod tests {
             .then_some(m)
     }
 
+    /// Removes every queued message of `id` posted to `to`.
+    fn drain_posted(to: HWND, id: u32) {
+        while take_posted(to, id).is_some() {}
+    }
+
+    /// Takes the newest message of `id` posted to `to`, and drops the older
+    /// ones. A real activation change of the hidden window can post an earlier
+    /// "left" (count 0) of its own before the close's, so a test that reads the
+    /// close's count reads the last one.
+    fn take_last_posted(to: HWND, id: u32) -> Option<MSG> {
+        let mut last = None;
+        while let Some(m) = take_posted(to, id) {
+            last = Some(m);
+        }
+        last
+    }
+
     /// Opens a real, hidden Settings window the way `open` does, on the tests'
     /// class, and runs `body` with it. Always closes it.
     fn with_open_window(body: impl FnOnce(HWND, HWND)) {
@@ -15144,14 +15489,16 @@ mod tests {
                 unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
             inner.tracker.fail(Field::CardCorner, "disk full");
             inner.tracker.fail(Field::Redact, "disk full");
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 2);
         });
         with_open_window(|_hwnd, owner| {
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).unwrap();
             assert_eq!(left.wParam.0, 0);
         });
     }
@@ -15222,14 +15569,10 @@ mod tests {
             pick(hwnd, ID_CARD_CORNER, "Top left");
             assert!(answer(hwnd, "Card corner", Ok(())));
             assert!(!status(hwnd).starts_with("Error"), "the status moved on");
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             close_now();
-            // A real activation change of this hidden window can post an
-            // earlier "left" (count 0) of its own: the close's is the last.
-            let mut last = None;
-            while let Some(m) = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT) {
-                last = Some(m);
-            }
-            let left = last.expect("closing tells the owner");
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "the dropped number must be counted");
         });
     }
@@ -15616,27 +15959,21 @@ mod tests {
         with_open_window(|hwnd, owner| {
             away(hwnd, "not-a-key");
             // Drain the activation message so the left count is the close's.
-            while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             // The close button: `WM_CLOSE`, not a bare destroy.
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
-            // A real activation change of this hidden window, while other tests
-            // make windows, can post an earlier "left" (count 0) of its own:
-            // the close's is the last one posted.
-            let mut last = None;
-            while let Some(m) = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT) {
-                last = Some(m);
-            }
-            let left = last.expect("closing tells the owner");
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "a key that does not fit is counted");
         });
         with_open_window(|hwnd, owner| {
             away(hwnd, "sk-a-whole-key");
-            while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
+            drain_posted(owner, crate::app::WM_APP_SETTINGS_LEFT);
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
             // #876: the key was still being checked, so it was not stored, and
             // closing counts it as not saved instead of dropping it silently.
             assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_none());
-            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+            let left = take_last_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
                 .expect("closing tells the owner");
             assert_eq!(left.wParam.0, 1, "an unchecked key is counted");
         });

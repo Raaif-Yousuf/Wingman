@@ -627,7 +627,7 @@ impl Palette {
     }
 
     /// The UI gallery's widened thumb, as if the mouse were over its strip.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn set_thumb_hot_for_test(&mut self, hot: bool) {
         self.inner.thumb_hot = hot;
         self.inner.invalidate();

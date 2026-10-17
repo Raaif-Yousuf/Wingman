@@ -84,6 +84,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
             | SettingsNotSaved
             | SettingsKeyChecking
             | SettingsKeyRejected
+            | SettingsComboHover
     )
 }
 
@@ -147,6 +148,7 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
             | SettingsNotSaved
             | SettingsKeyChecking
             | SettingsKeyRejected
+            | SettingsComboHover
     )
 }
 
@@ -303,6 +305,8 @@ pub enum GalleryState {
     SettingsKeyChecking,
     /// #876: the Models page after a vendor refused a typed key.
     SettingsKeyRejected,
+    /// #1109: the General page with the mouse over the Card corner combo.
+    SettingsComboHover,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -370,6 +374,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsNotSaved,
         SettingsKeyChecking,
         SettingsKeyRejected,
+        SettingsComboHover,
         RegionOverlay,
         OverlayNotes,
         TrayMenu,
@@ -432,6 +437,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsNotSaved => "settings-not-saved",
         SettingsKeyChecking => "settings-key-checking",
         SettingsKeyRejected => "settings-key-rejected",
+        SettingsComboHover => "settings-combo-hover",
         RegionOverlay => "region-overlay",
         OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
@@ -701,6 +707,7 @@ mod driver {
             card.hide();
             palette.hide();
             crate::ui::overlay::gallery_png(variant.theme, variant.dpi.unwrap_or(96), path)?;
+            return Ok(card.hwnd());
         } else if matches!(
             state,
             GalleryState::TrayMenu | GalleryState::TrayMenuSubmenu
@@ -1263,6 +1270,7 @@ mod driver {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsComboHover
             | SettingsKeyChecking
             | SettingsKeyRejected => {
                 card.hide();
@@ -1292,6 +1300,7 @@ mod driver {
                         "Error: OpenAI key. OpenAI did not accept that key. Check it and try again.",
                         false,
                     ),
+                    SettingsComboHover => w.hover_combo(crate::ui::settings::CARD_CORNER_COMBO),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1315,6 +1324,7 @@ mod driver {
             | SettingsSaved
             | SettingsInvalid
             | SettingsNotSaved
+            | SettingsComboHover
             | SettingsKeyChecking
             | SettingsKeyRejected => settings
                 .as_ref()
@@ -1942,8 +1952,9 @@ mod tests {
         // = 41, + the palette with a widened thumb (#988) = 42, + the preview's
         // button states (#818) = 46, + the status line saved, not valid and not
         // saved (#875) = 49, + the in-place overlay (#809) = 50, + the key being
-        // checked and refused (#876) = 52.
-        assert_eq!(states.len(), 52);
+        // checked and refused (#876) = 52, + the Settings combo under the mouse
+        // (#1109) = 53.
+        assert_eq!(states.len(), 53);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1987,14 +1998,15 @@ mod tests {
             "settings-not-saved",
             "settings-key-checking",
             "settings-key-rejected",
+            "settings-combo-hover",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 8,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874) and the status line five (#875, #876)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 9,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876) and the combo hover (#1109)"
         );
     }
 

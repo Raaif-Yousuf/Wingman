@@ -216,11 +216,13 @@ fn rect_of(r: ScreenRect) -> RECT {
 }
 
 /// Draws `annotations` for the monitor `monitor`: measures every label, asks
-/// the pure planner where everything goes, draws it into a DIB, and finishes
+/// the pure planner where everything goes (keeping labels off `obstacles`, the
+/// boxes of the page's other text), draws it into a DIB, and finishes
 /// the alpha. `None` when nothing found a place or any step fails (the caller
 /// then shows the summary card alone).
 pub(crate) fn render(
     annotations: &[Annotation],
+    obstacles: &[ScreenRect],
     monitor: ScreenRect,
     look: &Look,
 ) -> Option<Frame> {
@@ -267,7 +269,7 @@ pub(crate) fn render(
             },
             halo: if look.high_contrast { 0 } else { 1 },
         };
-        let result = plan(annotations, &sizes, monitor, &metrics)
+        let result = plan(annotations, &sizes, obstacles, monitor, &metrics)
             .and_then(|scene| draw(&scene, annotations, look, border));
         // The measuring DC is done either way; the DIB has its own.
         SelectObject(dc, old_font);
@@ -907,8 +909,8 @@ const NOT_EXCLUDED: WINDOW_DISPLAY_AFFINITY = WDA_NONE;
 // ---------------------------------------------------------------------------
 
 /// The gallery's `overlay-notes` picture: a GDI-drawn fixture page, three
-/// marks over it (a label that has to go below because the text is at the top
-/// edge, a two-word anchor, an anchor that spans two lines), composited in
+/// marks over it (a label beside a phrase at the top edge, a two-word anchor,
+/// an anchor that spans two lines), composited in
 /// software and saved as a PNG. It does not use a window: `PrintWindow` on a
 /// layered window renders black (#626), and the pixels the real window shows
 /// are exactly the frame composited here.
@@ -932,7 +934,7 @@ pub(crate) fn gallery_png(
         Theme::Dark => (rgb(24, 24, 24), rgb(225, 225, 225)),
         Theme::HighContrast => (0, rgb(255, 255, 255)),
     };
-    let (w, h) = (look.px(640), look.px(130));
+    let (w, h) = (look.px(640), look.px(138));
     let (mut page, words) = fixture_page(&look, w, h, page_bg, page_ink)?;
     let word = |line: usize, index: usize| -> ScreenRect { words[line][index] };
     let join = |a: ScreenRect, b: ScreenRect| ScreenRect {
@@ -942,8 +944,8 @@ pub(crate) fn gallery_png(
         bottom: a.bottom.max(b.bottom),
     };
     let marks = [
-        // "Thursday", on the top line: no room above, so the label flips.
-        Annotation::note(vec![word(0, 3)], "Thu 17:00 your time"),
+        // "Thursday at 9:00 PT.", on the top line: the label goes beside it.
+        Annotation::note(vec![join(word(0, 3), word(0, 6))], "Thu 17:00 your time"),
         // "quarterly report": two words, one anchor.
         Annotation::note(
             vec![join(word(1, 3), word(1, 4))],
@@ -962,8 +964,9 @@ pub(crate) fn gallery_png(
         right: w,
         bottom: h,
     };
-    let frame =
-        render(&annotations, monitor, &look).ok_or_else(|| anyhow::anyhow!("nothing placed"))?;
+    let obstacles: Vec<ScreenRect> = words.iter().flatten().copied().collect();
+    let frame = render(&annotations, &obstacles, monitor, &look)
+        .ok_or_else(|| anyhow::anyhow!("nothing placed"))?;
     anyhow::ensure!(
         frame.labels.len() == annotations.len(),
         "{} of {} marks placed",
@@ -1060,7 +1063,7 @@ fn fixture_page(
         let _ = DeleteObject(brush.into());
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, COLORREF(ink));
-        let tops = [look.px(6), look.px(62), look.px(86)];
+        let tops = [look.px(6), look.px(70), look.px(94)];
         let mut words: Vec<Vec<ScreenRect>> = Vec::new();
         for (line, top) in LINES.iter().zip(tops) {
             let left = look.px(16);
@@ -1105,6 +1108,11 @@ fn fixture_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `render` with no other text on the page.
+    fn render(annotations: &[Annotation], monitor: ScreenRect, look: &Look) -> Option<Frame> {
+        super::render(annotations, &[], monitor, look)
+    }
     use crate::overlay::state::DEFAULT_AGE_MS;
 
     fn r(left: i32, top: i32, right: i32, bottom: i32) -> ScreenRect {
@@ -1452,7 +1460,7 @@ mod tests {
     fn overlay_detects_on_real_ocr_live() {
         use crate::capture::{RawShot, ScreenMap};
         let look = Look::for_theme(Theme::Light, &SysColors::read(), 96, 1.0);
-        let (w, h) = (look.px(640), look.px(130));
+        let (w, h) = (look.px(640), look.px(138));
         let (mut bgra, words) =
             fixture_page(&look, w, h, crate::ui::theme::rgb(255, 255, 255), 0).unwrap();
         for px in bgra.chunks_exact_mut(4) {
