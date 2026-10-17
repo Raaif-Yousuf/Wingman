@@ -74,6 +74,10 @@ palette (the full list is in `actions.example.toml` and
   3 days" or "end of the month" in the selection (or on screen) and lists the
   date each one works out to, from today's date on your PC. No model, no
   network. A phrase with two possible readings shows both.
+- **Ask my documents**: set a folder under `[knowledge]` in the config file,
+  type a question in Quick Ask and press Down to pick it. Wingman answers from
+  your `.txt` and `.md` files and cites the file for every quote. See
+  [docs/knowledge.md](docs/knowledge.md).
 
 The confirm-and-execute loop, the executors (calendar add, form fill, text
 replace, image-to-clipboard) and the actions framework itself
