@@ -417,6 +417,172 @@ impl Tracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A typed key is checked before it is written (#876)
+// ---------------------------------------------------------------------------
+
+/// What the vendor said about a typed key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyVerdict {
+    /// 2xx: the vendor knows the key.
+    Accepted,
+    /// 401 or 403: the vendor refused it. The only verdict that blocks the write.
+    Rejected,
+    /// Nothing is known: no network, a timeout, 5xx, a rate limit.
+    Unchecked,
+}
+
+/// What to do with a changed key of the right shape, given the mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyStep {
+    /// Ask the vendor, then write.
+    Check,
+    /// Make no request: write it, and say it was not checked.
+    SaveWithNote(&'static str),
+}
+
+/// The status line while the vendor is asked.
+pub(crate) const CHECKING_LINE: &str = "Checking key...";
+/// A key whose check could not finish is still saved, with this said.
+pub(crate) const UNCHECKED_NOTE: &str = "Saved. Could not check it right now.";
+const OFFLINE_NOTE: &str = "Saved. Not checked in Offline mode.";
+const LOCAL_NOTE: &str = "Saved. Not checked in Local mode.";
+/// Why a key still being checked when the window closed was not saved.
+pub(crate) const KEY_UNFINISHED: &str = "The key was not checked before the window closed.";
+
+/// Offline and Local keep every request on this computer, so a key is
+/// shape-checked and saved without asking its vendor.
+pub(crate) fn key_step(mode: crate::mode::Mode) -> KeyStep {
+    use crate::mode::Mode;
+    match mode {
+        Mode::Offline => KeyStep::SaveWithNote(OFFLINE_NOTE),
+        Mode::Local => KeyStep::SaveWithNote(LOCAL_NOTE),
+        _ => KeyStep::Check,
+    }
+}
+
+/// What the status line says after a key was saved, when it is more than "Saved".
+pub(crate) fn verdict_note(verdict: KeyVerdict) -> Option<&'static str> {
+    (verdict == KeyVerdict::Unchecked).then_some(UNCHECKED_NOTE)
+}
+
+/// Whether the key must not be written.
+pub(crate) fn verdict_blocks(verdict: KeyVerdict) -> bool {
+    verdict == KeyVerdict::Rejected
+}
+
+/// The row's error for a refused key. `vendor`: 0 OpenAI, 1 Anthropic, 2 Gemini.
+pub(crate) fn rejected_reason(vendor: usize) -> String {
+    let name = match vendor {
+        0 => "OpenAI",
+        1 => "Anthropic",
+        _ => "Gemini",
+    };
+    format!("{name} did not accept that key. Check it and try again.")
+}
+
+/// A verdict and the check it answers, as one message parameter. The generation
+/// takes all but the low two bits.
+pub(crate) fn encode_verdict(generation: u64, verdict: KeyVerdict) -> isize {
+    let code = match verdict {
+        KeyVerdict::Accepted => 0,
+        KeyVerdict::Rejected => 1,
+        KeyVerdict::Unchecked => 2,
+    };
+    ((generation << 2) | code) as isize
+}
+
+pub(crate) fn decode_verdict(param: isize) -> Option<(u64, KeyVerdict)> {
+    let bits = param as u64;
+    let verdict = match bits & 3 {
+        0 => KeyVerdict::Accepted,
+        1 => KeyVerdict::Rejected,
+        2 => KeyVerdict::Unchecked,
+        _ => return None,
+    };
+    Some((bits >> 2, verdict))
+}
+
+/// The key checks waiting on their vendor, one per vendor at most.
+#[derive(Debug, Default)]
+pub(crate) struct KeyChecks {
+    last: u64,
+    pending: [Option<PendingCheck>; 3],
+}
+
+#[derive(Debug)]
+struct PendingCheck {
+    generation: u64,
+    key: String,
+}
+
+impl KeyChecks {
+    /// Starts a check of `key` for `vendor` and returns its number, or `None`
+    /// when that same key is already being checked (Enter after leaving the box).
+    /// A different key replaces the one waiting: the older answer is then stale.
+    pub(crate) fn begin(&mut self, vendor: usize, key: &str) -> Option<u64> {
+        let key = key.trim();
+        let slot = self.pending.get_mut(vendor)?;
+        if slot.as_ref().is_some_and(|p| p.key == key) {
+            return None;
+        }
+        self.last += 1;
+        *slot = Some(PendingCheck {
+            generation: self.last,
+            key: key.to_string(),
+        });
+        Some(self.last)
+    }
+
+    pub(crate) fn is_pending(&self, vendor: usize) -> bool {
+        self.pending.get(vendor).is_some_and(Option::is_some)
+    }
+
+    /// An answer came for check `generation`. `typed_now` is what the box holds.
+    /// True when it still counts: it is the check waiting and the user has not
+    /// typed another key since. Otherwise it is ignored; if the text changed,
+    /// nothing is left waiting for it.
+    pub(crate) fn finish(&mut self, vendor: usize, generation: u64, typed_now: &str) -> bool {
+        let Some(slot) = self.pending.get_mut(vendor) else {
+            return false;
+        };
+        let Some(pending) = slot.as_ref().filter(|p| p.generation == generation) else {
+            return false;
+        };
+        let same = pending.key == typed_now.trim();
+        *slot = None;
+        same
+    }
+
+    /// The vendors still being checked, now forgotten (the window is closing).
+    pub(crate) fn take_pending(&mut self) -> Vec<usize> {
+        let mut vendors = Vec::new();
+        for (vendor, slot) in self.pending.iter_mut().enumerate() {
+            if slot.take().is_some() {
+                vendors.push(vendor);
+            }
+        }
+        vendors
+    }
+}
+
+/// What to say when each key write in flight is answered: one entry per write
+/// sent, in order, so the answer for a field finds its own.
+#[derive(Debug, Default)]
+pub(crate) struct KeyNotes(Vec<(Field, Option<&'static str>)>);
+
+impl KeyNotes {
+    pub(crate) fn push(&mut self, field: Field, note: Option<&'static str>) {
+        self.0.push((field, note));
+    }
+
+    /// The note of the oldest write of `field` still waiting, if it had one.
+    pub(crate) fn take(&mut self, field: Field) -> Option<&'static str> {
+        let at = self.0.iter().position(|(f, _)| *f == field)?;
+        self.0.remove(at).1
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -858,5 +1024,123 @@ card_seconds = {}
             undone.contains(&format!("card_seconds = {}", base.ui.card_seconds)),
             "{undone}"
         );
+    }
+
+    // -- typed key check (#876) ----------------------------------------------
+
+    #[test]
+    fn a_key_is_checked_unless_the_mode_forbids_cloud_requests() {
+        use crate::mode::Mode;
+        assert_eq!(key_step(Mode::Auto), KeyStep::Check);
+        assert_eq!(key_step(Mode::Cloud), KeyStep::Check);
+        assert_eq!(
+            key_step(Mode::Offline),
+            KeyStep::SaveWithNote("Saved. Not checked in Offline mode.")
+        );
+        assert_eq!(
+            key_step(Mode::Local),
+            KeyStep::SaveWithNote("Saved. Not checked in Local mode.")
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_blocks_and_only_an_unanswered_check_adds_a_note() {
+        assert_eq!(verdict_note(KeyVerdict::Accepted), None);
+        assert_eq!(
+            verdict_note(KeyVerdict::Unchecked),
+            Some("Saved. Could not check it right now.")
+        );
+        assert!(verdict_blocks(KeyVerdict::Rejected));
+        assert!(!verdict_blocks(KeyVerdict::Accepted));
+        assert!(!verdict_blocks(KeyVerdict::Unchecked));
+    }
+
+    #[test]
+    fn the_key_messages_are_plain_and_never_carry_a_dash() {
+        for vendor in 0..3 {
+            let why = rejected_reason(vendor);
+            assert!(why.ends_with("Check it and try again."), "{why}");
+            assert!(!why.contains('\u{2014}'), "{why}");
+        }
+        assert!(rejected_reason(0).starts_with("OpenAI did not accept"));
+        assert!(rejected_reason(1).starts_with("Anthropic did not accept"));
+        assert!(rejected_reason(2).starts_with("Gemini did not accept"));
+        for text in [
+            CHECKING_LINE,
+            KEY_UNFINISHED,
+            "Saved. Could not check it right now.",
+        ] {
+            assert!(!text.contains('\u{2014}'), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_verdict_survives_the_trip_through_a_message() {
+        for v in [
+            KeyVerdict::Accepted,
+            KeyVerdict::Rejected,
+            KeyVerdict::Unchecked,
+        ] {
+            for generation in [1u64, 2, 977, u64::MAX >> 3] {
+                assert_eq!(
+                    decode_verdict(encode_verdict(generation, v)),
+                    Some((generation, v))
+                );
+            }
+        }
+        assert_eq!(decode_verdict(3), None, "an unknown code is ignored");
+    }
+
+    #[test]
+    fn the_same_key_is_not_checked_twice_at_once() {
+        let mut checks = KeyChecks::default();
+        let first = checks.begin(0, "sk-one").expect("starts");
+        assert!(checks.is_pending(0));
+        assert_eq!(checks.begin(0, "sk-one"), None, "Enter after leaving");
+        assert_eq!(checks.begin(0, " sk-one "), None, "spaces do not matter");
+        // Another vendor is its own check.
+        assert!(checks.begin(1, "sk-ant-x").is_some());
+        // A different key replaces it: the first answer is then stale.
+        let second = checks.begin(0, "sk-two").expect("restarts");
+        assert_ne!(first, second);
+        assert!(
+            !checks.finish(0, first, "sk-two"),
+            "the old answer is ignored"
+        );
+        assert!(checks.is_pending(0), "the new check is still waiting");
+        assert!(checks.finish(0, second, "sk-two"));
+        assert!(!checks.is_pending(0));
+    }
+
+    #[test]
+    fn an_answer_for_text_the_user_has_since_changed_is_ignored() {
+        let mut checks = KeyChecks::default();
+        let generation = checks.begin(2, "AIzaOld").unwrap();
+        assert!(!checks.finish(2, generation, "AIzaOldPlusMore"));
+        assert!(!checks.is_pending(2), "nothing is left waiting for it");
+        // And an answer nobody asked for is ignored too.
+        assert!(!checks.finish(2, generation, "AIzaOld"));
+    }
+
+    #[test]
+    fn closing_with_a_check_running_names_the_keys_left_unsaved() {
+        let mut checks = KeyChecks::default();
+        checks.begin(0, "sk-a").unwrap();
+        checks.begin(2, "AIzaB").unwrap();
+        assert_eq!(checks.take_pending(), vec![0, 2]);
+        assert!(!checks.is_pending(0) && !checks.is_pending(2));
+        assert!(checks.take_pending().is_empty());
+    }
+
+    #[test]
+    fn a_note_is_taken_once_in_the_order_the_writes_were_sent() {
+        let mut notes = KeyNotes::default();
+        notes.push(Field::OpenAiKey, Some("first"));
+        notes.push(Field::OpenAiKey, None);
+        notes.push(Field::GeminiKey, Some("gemini"));
+        assert_eq!(notes.take(Field::OpenAiKey), Some("first"));
+        assert_eq!(notes.take(Field::OpenAiKey), None);
+        assert_eq!(notes.take(Field::OpenAiKey), None);
+        assert_eq!(notes.take(Field::GeminiKey), Some("gemini"));
     }
 }

@@ -67,6 +67,16 @@ fn follow(current: &str, next: Option<String>, total_bytes: usize) -> Option<Str
 /// so the caller keeps its built-in list instead of showing an empty
 /// dropdown. The key goes in a header, never the URL.
 pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
+    fetch_with(vendor, api_key, &|url, headers| {
+        common::get_json_with_headers(url, headers, LIST_TIMEOUT, vendor.tag())
+    })
+}
+
+/// One GET of a list page: the URL, the request headers, the body or why not.
+/// The seam the key check's tests put a fake transport behind.
+type GetPage<'a> = &'a dyn Fn(&str, &[(&str, &str)]) -> Result<String>;
+
+fn fetch_with(vendor: Vendor, api_key: &str, get: GetPage) -> Result<Vec<String>> {
     let mut url = match vendor {
         Vendor::OpenAi => OPENAI_URL.to_string(),
         Vendor::Anthropic => ANTHROPIC_URL.to_string(),
@@ -77,27 +87,15 @@ pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
     let mut total_bytes = 0usize;
     for _ in 0..MAX_PAGES {
         let body = match vendor {
-            Vendor::OpenAi => common::get_json_with_headers(
-                &url,
-                &[("Authorization", auth.as_str())],
-                LIST_TIMEOUT,
-                vendor.tag(),
-            ),
-            Vendor::Anthropic => common::get_json_with_headers(
+            Vendor::OpenAi => get(&url, &[("Authorization", auth.as_str())]),
+            Vendor::Anthropic => get(
                 &url,
                 &[
                     ("x-api-key", api_key),
                     ("anthropic-version", ANTHROPIC_VERSION),
                 ],
-                LIST_TIMEOUT,
-                vendor.tag(),
             ),
-            Vendor::Gemini => common::get_json_with_headers(
-                &url,
-                &[("x-goog-api-key", api_key)],
-                LIST_TIMEOUT,
-                vendor.tag(),
-            ),
+            Vendor::Gemini => get(&url, &[("x-goog-api-key", api_key)]),
         };
         let body = match body {
             Ok(b) => b,
@@ -119,6 +117,51 @@ pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
         return Err(anyhow!("{}: the list had no usable models", vendor.tag()));
     }
     Ok(ids)
+}
+
+/// What asking the vendor's list endpoint with a typed key found out (#876).
+#[derive(Debug)]
+pub enum KeyCheck {
+    /// 2xx: the vendor knows the key. Its model list came with the answer.
+    Accepted(Vec<String>),
+    /// 401 or 403 (or Gemini's 400 `API_KEY_INVALID`): the vendor refused it.
+    Rejected,
+    /// No network, a timeout, 5xx, a rate limit, an answer that is not a list:
+    /// nothing is known about the key.
+    Unchecked,
+}
+
+/// The cheapest check of a key: the read-only model-list request Settings makes
+/// anyway, through the guarded transport (Offline guard, egress log). Never
+/// called from the UI thread. No key text is in the result.
+#[cfg_attr(test, allow(dead_code))] // a test build's windows use a fake instead
+pub fn check_key(vendor: Vendor, api_key: &str) -> KeyCheck {
+    classify(fetch(vendor, api_key))
+}
+
+#[cfg(test)]
+fn check_key_with(vendor: Vendor, api_key: &str, get: GetPage) -> KeyCheck {
+    classify(fetch_with(vendor, api_key, get))
+}
+
+fn classify(result: Result<Vec<String>>) -> KeyCheck {
+    let err = match result {
+        Ok(ids) => return KeyCheck::Accepted(ids),
+        Err(err) => err,
+    };
+    let refused = err
+        .downcast_ref::<common::HttpStatus>()
+        .is_some_and(|http| match http.status {
+            401 | 403 => true,
+            // Gemini says a bad key with a 400 and a reason in the body.
+            400 => err.to_string().contains(common::KIND_KEY_INVALID),
+            _ => false,
+        });
+    if refused {
+        KeyCheck::Rejected
+    } else {
+        KeyCheck::Unchecked
+    }
 }
 
 /// The URL of the page after the one that returned `body`, if the vendor says
@@ -503,5 +546,117 @@ mod tests {
     fn merge_with_nothing_fetched_is_the_configured_list() {
         let configured = vec!["a".to_string(), "b".to_string()];
         assert_eq!(merge(&[], &configured), ["a", "b"]);
+    }
+}
+
+/// What asking a vendor about a typed key found out (#876).
+#[cfg(test)]
+mod key_check_tests {
+    use super::*;
+    use crate::provider::common::{http_error, HttpStatus};
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!("tests/fixtures/{name}"))
+            .expect("fixture file should exist")
+            .replace('\r', "")
+    }
+
+    /// What the guarded transport hands back for a non-2xx answer.
+    fn status_error(code: u16, body: &str) -> anyhow::Error {
+        HttpStatus::wrap(http_error("openai models", code, body), code)
+    }
+
+    #[test]
+    fn a_good_key_is_accepted_and_brings_the_list() {
+        let body = fixture("openai_models.json");
+        let seen = std::cell::RefCell::new(Vec::new());
+        let got = check_key_with(Vendor::OpenAi, "sk-good", &|url, headers| {
+            seen.borrow_mut().push((url.to_string(), headers.len()));
+            Ok(body.clone())
+        });
+        match got {
+            KeyCheck::Accepted(ids) => assert!(ids.contains(&"gpt-5".to_string())),
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+        // One cheap read-only request, to the vendor's own list endpoint.
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].0.starts_with("https://api.openai.com/"));
+    }
+
+    #[test]
+    fn a_401_or_403_is_a_rejection_for_every_vendor() {
+        for vendor in [Vendor::OpenAi, Vendor::Anthropic, Vendor::Gemini] {
+            for code in [401u16, 403] {
+                let got = check_key_with(vendor, "key", &|_, _| {
+                    Err(status_error(code, r#"{"error":{"message":"no"}}"#))
+                });
+                assert!(matches!(got, KeyCheck::Rejected), "{vendor:?} {code}");
+            }
+        }
+    }
+
+    /// Gemini answers a bad key with 400 and `API_KEY_INVALID`, not 401.
+    #[test]
+    fn geminis_400_api_key_invalid_is_a_rejection() {
+        let body = r#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","details":[{"reason":"API_KEY_INVALID"}]}}"#;
+        let got = check_key_with(Vendor::Gemini, "AIza", &|_, _| Err(status_error(400, body)));
+        assert!(matches!(got, KeyCheck::Rejected));
+        // Any other 400 says nothing about the key.
+        let got = check_key_with(Vendor::Gemini, "AIza", &|_, _| {
+            Err(status_error(
+                400,
+                r#"{"error":{"message":"bad page token"}}"#,
+            ))
+        });
+        assert!(matches!(got, KeyCheck::Unchecked));
+    }
+
+    /// Only a refusal blocks: a request that could not finish says nothing.
+    #[test]
+    fn everything_else_leaves_the_key_unchecked() {
+        let cases = [
+            status_error(429, "{}"),
+            status_error(500, "oops"),
+            status_error(503, "oops"),
+            status_error(404, "{}"),
+            anyhow::anyhow!("openai models: transport error: timed out"),
+        ];
+        for err in cases {
+            let text = format!("{err:#}");
+            let err = std::cell::RefCell::new(Some(err));
+            let got = check_key_with(Vendor::OpenAi, "sk-x", &|_, _| {
+                Err(err.borrow_mut().take().unwrap())
+            });
+            assert!(matches!(got, KeyCheck::Unchecked), "{text}");
+        }
+    }
+
+    /// A 2xx whose body is not a list proves nothing about the key.
+    #[test]
+    fn an_answer_with_no_usable_list_is_unchecked() {
+        let got = check_key_with(Vendor::OpenAi, "sk-x", &|_, _| Ok("not json".to_string()));
+        assert!(matches!(got, KeyCheck::Unchecked));
+        let got = check_key_with(Vendor::OpenAi, "sk-x", &|_, _| {
+            Ok(r#"{"data":[]}"#.to_string())
+        });
+        assert!(matches!(got, KeyCheck::Unchecked));
+    }
+
+    /// The key travels in a header and only to that vendor's own host.
+    #[test]
+    fn the_key_goes_in_a_header_to_the_vendors_own_host() {
+        for (vendor, host) in [
+            (Vendor::OpenAi, "api.openai.com"),
+            (Vendor::Anthropic, "api.anthropic.com"),
+            (Vendor::Gemini, "generativelanguage.googleapis.com"),
+        ] {
+            let _ = check_key_with(vendor, "SECRETKEY123", &|url, headers| {
+                assert!(url.contains(host), "{url}");
+                assert!(!url.contains("SECRETKEY123"), "key in the URL: {url}");
+                assert!(headers.iter().any(|(_, v)| v.contains("SECRETKEY123")));
+                Err(anyhow::anyhow!("down"))
+            });
+        }
     }
 }

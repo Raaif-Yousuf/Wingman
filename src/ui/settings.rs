@@ -779,6 +779,13 @@ struct SettingsInner {
     /// The key box that lost the focus while the window was deactivated and has
     /// not been applied: applied on close if nothing applied it sooner.
     deferred_key: Option<Field>,
+    /// #876: the typed keys waiting on their vendor, and what to say when the
+    /// write of a checked key is answered.
+    key_checks: commit::KeyChecks,
+    key_notes: commit::KeyNotes,
+    /// #876: how a typed key is asked of its vendor. The real request, except
+    /// in the tests, which put a fake behind it.
+    key_seams: KeySeams,
     /// #875: the file's path and the modified time the window last read, so
     /// coming back to the window reads it again only when it moved. `None` in the
     /// tests' windows (rule 9: they never read the real file).
@@ -804,6 +811,33 @@ struct SettingsInner {
 type SaveSink = Box<
     dyn Fn(&str, Vec<crate::config_writer::FieldChange>, &Config, &Config) -> Result<(), String>,
 >;
+
+/// What a typed key's check reads from outside the window, so the tests can put
+/// a fake vendor and a chosen mode behind them (rule 9: no real network, no
+/// process-wide mode shared between parallel tests).
+#[derive(Clone, Copy)]
+struct KeySeams {
+    /// Asks a vendor about a key. Runs on a worker thread.
+    check: fn(crate::provider::model_list::Vendor, &str) -> crate::provider::model_list::KeyCheck,
+    /// The mode now.
+    mode: fn() -> crate::mode::Mode,
+}
+
+impl KeySeams {
+    #[cfg(not(test))]
+    const REAL: KeySeams = KeySeams {
+        check: crate::provider::model_list::check_key,
+        mode: crate::mode::current,
+    };
+
+    /// In a test build a window never reaches a vendor, whichever test made it:
+    /// the check finds nothing out, in Auto mode.
+    #[cfg(test)]
+    const REAL: KeySeams = KeySeams {
+        check: |_, _| crate::provider::model_list::KeyCheck::Unchecked,
+        mode: || crate::mode::Mode::Auto,
+    };
+}
 
 /// What the re-read of the file found: its modified time and what it parsed to.
 struct Refreshed {
@@ -874,6 +908,9 @@ impl SettingsInner {
             closing: false,
             deactivated: false,
             deferred_key: None,
+            key_checks: Default::default(),
+            key_notes: Default::default(),
+            key_seams: KeySeams::REAL,
             file_path: None,
             file_mtime: None,
             refreshing: false,
@@ -1049,6 +1086,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // #876: a vendor answered for a typed key.
+        WM_KEY_CHECKED => {
+            if let Some((generation, verdict)) = commit::decode_verdict(lparam.0) {
+                on_key_checked(inner, wparam.0, generation, verdict);
+            }
+            LRESULT(0)
+        }
         // The gallery's simulated DPI stays whatever monitor this is.
         #[cfg(any(test, debug_assertions))]
         WM_DPICHANGED if forced_dpi().is_some() => LRESULT(0),
@@ -1132,6 +1176,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // queued for the main window, which would take it as a rebind.
                 // Free it unused.
                 drain_learned_messages();
+                // #876: a key still being checked is not written (it was not
+                // checked), and that is told like any other row left unsaved.
+                for vendor in inner.key_checks.take_pending() {
+                    if let Some(field) = key_field_of(vendor) {
+                        inner.tracker.fail(field, commit::KEY_UNFINISHED);
+                    }
+                }
                 // A row still failed is told once, as a card (rule 7): inline
                 // is all a window being typed in can show.
                 tell_owner_left(inner.owner, inner.tracker.failed_count());
@@ -1159,16 +1210,22 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
     // #585: a key typed but not applied yet still fetches its model list once
     // the user leaves the field. Leaving it applies it too (#875).
     if let Some(index) = typed_key_vendor(id, notify) {
-        fetch_for_typed_key(inner, index);
         // A box the window lost because it was deactivated (alt-tab) keeps its
         // text: a half-typed key must not be stored. Enter and moving to another
         // control of Settings apply it.
+        // No early model-list fetch here: the deferred commit's key check brings
+        // the list, so the key is not sent twice.
         if inner.deactivated {
             inner.deferred_key = commit_trigger(id, notify);
             return;
         }
         if let Some(field) = commit_trigger(id, notify) {
             commit_field(inner, field);
+        }
+        // A key sent to its vendor to be checked brings the model list with the
+        // answer: no second request.
+        if !inner.key_checks.is_pending(index) {
+            fetch_for_typed_key(inner, index);
         }
         return;
     }
@@ -1411,8 +1468,8 @@ fn raw_text(raw: &RawForm, field: Field) -> &str {
 
 /// Why a typed API key is not stored, or `None`: it has the wrong shape for its
 /// vendor (#678). Only a key that differs from the applied one is checked, so the
-/// mask, the unreadable-key placeholder and a cleared box are left alone. The
-/// typed-key network check is a later slice.
+/// mask, the unreadable-key placeholder and a cleared box are left alone. What
+/// the vendor says about a well-shaped key is `start_key_check`'s.
 fn key_refusal(applied: &Config, field: Field, raw: &RawForm) -> Option<&'static str> {
     let (index, text, applied_key, why) = match field {
         Field::OpenAiKey => (
@@ -1493,7 +1550,160 @@ fn commit_field(inner: &mut SettingsInner, field: Field) {
         set_status(inner, &commit::invalid_line(field.label(), why), false);
         return;
     }
-    let edited = finalize_config(inner, &raw);
+    let mut note = None;
+    // Pause is deliberately not consulted: this is a read-only GET of something
+    // the user typed, like the model-list fetch Settings already makes.
+    if let Some(index) = field.key_vendor() {
+        if let Some(key) = typed_key_to_check(&inner.original, index, &raw) {
+            match commit::key_step((inner.key_seams.mode)()) {
+                commit::KeyStep::Check => {
+                    start_key_check(inner, field, index, key);
+                    return;
+                }
+                commit::KeyStep::SaveWithNote(text) => note = Some(text),
+            }
+        }
+    }
+    apply_field(inner, field, &raw, note);
+}
+
+/// The key typed in vendor `index`'s box when it is a new, non-empty one: the
+/// only kind that is asked of its vendor. The mask, the unreadable-key
+/// placeholder and a cleared box are not.
+fn typed_key_to_check(applied: &Config, index: usize, raw: &RawForm) -> Option<String> {
+    let (applied_key, typed) = match index {
+        0 => (&applied.providers.openai.api_key, &raw.openai_key),
+        1 => (&applied.providers.anthropic.api_key, &raw.anthropic_key),
+        _ => (&applied.providers.gemini.api_key, &raw.gemini_key),
+    };
+    let key = resolve_key_field(applied_key, typed);
+    let key = key.trim();
+    (!key.is_empty() && key != applied_key.trim() && key != crate::config::UNREADABLE_KEY_MARKER)
+        .then(|| key.to_string())
+}
+
+/// The key box of vendor `index`.
+fn key_field_of(index: usize) -> Option<Field> {
+    match index {
+        0 => Some(Field::OpenAiKey),
+        1 => Some(Field::AnthropicKey),
+        2 => Some(Field::GeminiKey),
+        _ => None,
+    }
+}
+
+/// Asks the vendor about a typed key on a worker thread (the UI thread hosts the
+/// keyboard hook and never waits on the network). The row says so; the answer
+/// comes back as `WM_KEY_CHECKED`, and only then is the key written. Nothing
+/// runs once the answer is in.
+fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: String) {
+    let Some(generation) = inner.key_checks.begin(index, &key) else {
+        // This very key is already out for checking.
+        return;
+    };
+    // A fresh attempt: an earlier refusal of this row no longer stands.
+    inner.tracker.clear_failed(field);
+    set_status(inner, commit::CHECKING_LINE, false);
+    let vendor = CLOUD_VENDORS[index];
+    let check = inner.key_seams.check;
+    // The list that comes with the answer replaces a slower list fetch's.
+    let mine = inner.cloud_sync.generation[index].fetch_add(1, Ordering::SeqCst) + 1;
+    let slots = inner.cloud_models.clone();
+    let sync = inner.cloud_sync.clone();
+    let alive = inner.alive.clone();
+    let hwnd_raw = inner.hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("settings-key-check".into())
+        .spawn(move || {
+            use crate::provider::model_list::KeyCheck;
+            let verdict = match check(vendor, &key) {
+                KeyCheck::Accepted(ids) => {
+                    if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
+                        post_while_open(&alive, || unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd_raw as *mut c_void)),
+                                WM_CLOUD_MODELS,
+                                WPARAM(index),
+                                LPARAM(0),
+                            );
+                        });
+                    }
+                    commit::KeyVerdict::Accepted
+                }
+                KeyCheck::Rejected => commit::KeyVerdict::Rejected,
+                KeyCheck::Unchecked => {
+                    // No key text and no error text: the report is pasted into
+                    // public issues. The egress log has the failure.
+                    crate::diagnostics::note_warning(&format!(
+                        "Key check for {} could not finish: saving the key unchecked",
+                        vendor.tag()
+                    ));
+                    commit::KeyVerdict::Unchecked
+                }
+            };
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd_raw as *mut c_void)),
+                    WM_KEY_CHECKED,
+                    WPARAM(index),
+                    LPARAM(commit::encode_verdict(generation, verdict)),
+                );
+            });
+        });
+}
+
+/// A vendor answered for a typed key. A refusal keeps the text for fixing and
+/// fails the row; anything else writes the key through the same path an
+/// unchecked field takes, with the status line saying how far the check got. An
+/// answer for a key replaced or edited since is ignored.
+fn on_key_checked(
+    inner: &mut SettingsInner,
+    index: usize,
+    generation: u64,
+    verdict: commit::KeyVerdict,
+) {
+    let Some(field) = key_field_of(index) else {
+        return;
+    };
+    if inner.closing {
+        return;
+    }
+    let raw = read_raw_form(inner);
+    let typed = match index {
+        0 => resolve_key_field(&inner.original.providers.openai.api_key, &raw.openai_key),
+        1 => resolve_key_field(
+            &inner.original.providers.anthropic.api_key,
+            &raw.anthropic_key,
+        ),
+        _ => resolve_key_field(&inner.original.providers.gemini.api_key, &raw.gemini_key),
+    };
+    if !inner.key_checks.finish(index, generation, &typed) {
+        // Replaced or retyped: the newer key has its own check, or none yet and
+        // commits when it is left. Only the "Checking" line is taken down.
+        if !inner.key_checks.is_pending(index) && status_is(inner.hwnd, commit::CHECKING_LINE) {
+            set_status(inner, "", false);
+        }
+        return;
+    }
+    if commit::verdict_blocks(verdict) {
+        let why = commit::rejected_reason(index);
+        inner.tracker.fail(field, &why);
+        set_status(inner, &commit::invalid_line(field.label(), &why), false);
+        return;
+    }
+    apply_field(inner, field, &raw, commit::verdict_note(verdict));
+}
+
+/// Whether the status line shows exactly `text`.
+fn status_is(hwnd: HWND, text: &str) -> bool {
+    get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).is_some_and(|line| get_text(line) == text)
+}
+
+/// Writes what `field` changed: the part of a commit after the field is known to
+/// be valid and, for a key, checked. `note` is what the status line says once the
+/// write is saved, in place of "Saved: <field>".
+fn apply_field(inner: &mut SettingsInner, field: Field, raw: &RawForm, note: Option<&'static str>) {
+    let edited = finalize_config(inner, raw);
     let plan = match commit::plan(field, &inner.baseline, &inner.original, &edited) {
         Ok(Some(plan)) => plan,
         Ok(None) => {
@@ -1532,6 +1742,9 @@ fn commit_field(inner: &mut SettingsInner, field: Field) {
         before_baseline: std::mem::replace(&mut inner.baseline, plan.baseline),
     });
     inner.tracker.clear_failed(field);
+    if field.key_vendor().is_some() {
+        inner.key_notes.push(field, note);
+    }
     // Undo covers the latest change, and never a key.
     inner.tracker.undo = (!plan.key_changed).then(|| commit::UndoSlot {
         field,
@@ -1629,6 +1842,8 @@ fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
     let Some(entry) = inner.tracker.finish(field) else {
         return false;
     };
+    // The note belongs to this write, saved or not.
+    let note = inner.key_notes.take(field);
     match answer.result {
         Ok(()) => {
             inner.tracker.clear_failed(field);
@@ -1642,7 +1857,8 @@ fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
                     .as_ref()
                     .is_some_and(|u| u.field == field)
                     && inner.tracker.writes_in_flight() == 0;
-                set_status(inner, &commit::saved_line(field.label()), latest);
+                let line = note.map_or_else(|| commit::saved_line(field.label()), str::to_string);
+                set_status(inner, &line, latest);
             }
         }
         Err(reason) => {
@@ -4642,6 +4858,11 @@ fn apply_cloud_models(hwnd: HWND, combo_id: i32, fetched: &[String], configured:
 /// index in [`CLOUD_VENDORS`].
 const WM_CLOUD_MODELS: u32 = 0x8000 + 42; // WM_APP + 42
 
+/// Posted to the Settings window when a vendor has answered for a typed key:
+/// `wparam` is the vendor's index in [`CLOUD_VENDORS`], `lparam` the check's
+/// number and the verdict (`commit::encode_verdict`).
+const WM_KEY_CHECKED: u32 = 0x8000 + 48; // WM_APP + 48
+
 /// The cloud vendors Settings refreshes, in the order [`CloudModels`] stores
 /// them.
 const CLOUD_VENDORS: [crate::provider::model_list::Vendor; 3] = [
@@ -4818,23 +5039,9 @@ fn spawn_one_cloud_fetch(
                     return;
                 }
             };
-            // A newer fetch for this vendor started while this one ran: its
-            // result wins, so this one is dropped. The check and the store
-            // happen under one lock, so an older worker cannot pass the check
-            // and then store after a newer one finished (#678).
-            let Ok(mut guard) = slots.lock() else {
-                return;
-            };
-            if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
+            if !store_fetched_list(&slots, &sync, index, mine, &key, ids) {
                 return;
             }
-            guard[index] = Some(ids);
-            // The fetched-key record is written under the same slots lock
-            // (always slots first, then keys), so it cannot go stale.
-            if let Ok(mut keys) = sync.fetched_keys.lock() {
-                keys[index] = key.trim().to_string();
-            }
-            drop(guard);
             post_while_open(&alive, || unsafe {
                 let _ = PostMessageW(
                     Some(HWND(hwnd_raw as *mut c_void)),
@@ -4844,6 +5051,33 @@ fn spawn_one_cloud_fetch(
                 );
             });
         });
+}
+
+/// Keeps a fetched list for vendor `index`, unless a newer fetch for that vendor
+/// started while this one ran: its result wins, so this one is dropped. The check
+/// and the store happen under one lock, so an older worker cannot pass the check
+/// and then store after a newer one finished (#678). Returns whether it stored.
+fn store_fetched_list(
+    slots: &CloudModels,
+    sync: &CloudSync,
+    index: usize,
+    mine: u64,
+    key: &str,
+    ids: Vec<String>,
+) -> bool {
+    let Ok(mut guard) = slots.lock() else {
+        return false;
+    };
+    if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
+        return false;
+    }
+    guard[index] = Some(ids);
+    // The fetched-key record is written under the same slots lock (always slots
+    // first, then keys), so it cannot go stale.
+    if let Ok(mut keys) = sync.fetched_keys.lock() {
+        keys[index] = key.trim().to_string();
+    }
+    true
 }
 
 /// Runs `post` only while the Settings window is still open (#569). `alive`
@@ -14819,6 +15053,7 @@ mod tests {
                 SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(1)), Some(LPARAM(0)));
             }
             leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
             assert_eq!(seen.borrow().len(), 1, "moving inside Settings applies it");
         });
     }
@@ -14838,8 +15073,262 @@ mod tests {
             assert_eq!(get_text(key), "sk-this-is-an-openai-key");
             set_text(key, "sk-ant-right-one");
             leave(hwnd, ID_ANTHROPIC_KEY);
+            settle_key_check(hwnd);
             assert_eq!(seen.borrow().len(), 1);
             assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+        });
+    }
+
+    // -- typed key check (#876) ----------------------------------------------
+
+    use crate::provider::model_list::{KeyCheck, Vendor};
+    use std::sync::atomic::AtomicUsize;
+
+    static ONCE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static OFFLINE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn accepts(_: Vendor, _: &str) -> KeyCheck {
+        KeyCheck::Accepted(vec!["gpt-5".to_string()])
+    }
+    fn accepts_and_counts(_: Vendor, _: &str) -> KeyCheck {
+        ONCE_CALLS.fetch_add(1, Ordering::SeqCst);
+        KeyCheck::Accepted(vec!["claude-x".to_string()])
+    }
+    fn rejects(_: Vendor, _: &str) -> KeyCheck {
+        KeyCheck::Rejected
+    }
+    fn unsure(_: Vendor, _: &str) -> KeyCheck {
+        KeyCheck::Unchecked
+    }
+    fn counts_offline(_: Vendor, _: &str) -> KeyCheck {
+        OFFLINE_CALLS.fetch_add(1, Ordering::SeqCst);
+        KeyCheck::Unchecked
+    }
+    fn counts_shape(_: Vendor, _: &str) -> KeyCheck {
+        SHAPE_CALLS.fetch_add(1, Ordering::SeqCst);
+        KeyCheck::Unchecked
+    }
+    fn auto() -> crate::mode::Mode {
+        crate::mode::Mode::Auto
+    }
+    fn offline() -> crate::mode::Mode {
+        crate::mode::Mode::Offline
+    }
+
+    fn with_vendor(
+        raw: *mut SettingsInner,
+        check: fn(Vendor, &str) -> KeyCheck,
+        mode: fn() -> crate::mode::Mode,
+    ) {
+        unsafe { &mut *raw }.key_seams = KeySeams { check, mode };
+    }
+
+    /// Delivers the check worker's answer, the way the message loop would. Fails
+    /// the test if none comes.
+    fn settle_key_check(hwnd: HWND) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(m) = take_posted(hwnd, WM_KEY_CHECKED) {
+                unsafe { SendMessageW(hwnd, WM_KEY_CHECKED, Some(m.wParam), Some(m.lParam)) };
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "no answer came");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The observable of slice 6: a well-shaped key is asked of its vendor before
+    /// it is written. The row says "Checking key..." and nothing is stored until
+    /// the answer; a good answer stores it and the status line says saved. If the
+    /// check were wired to nothing the sink would hear the key at once.
+    #[test]
+    fn a_good_key_is_stored_only_after_its_vendor_accepts_it() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, accepts, auto);
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(key, "sk-a-whole-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            assert!(
+                seen.borrow().is_empty(),
+                "stored before the vendor answered"
+            );
+            assert_eq!(status(hwnd), "Checking key...");
+            assert!(unsafe { &*raw }.key_checks.is_pending(0));
+            settle_key_check(hwnd);
+            assert_eq!(seen.borrow().len(), 1, "an accepted key is stored");
+            assert!(!unsafe { &*raw }.key_checks.is_pending(0));
+            assert!(answer(hwnd, "OpenAI key", Ok(())));
+            assert_eq!(status(hwnd), "Saved: OpenAI key");
+            assert!(!status(hwnd).contains("sk-a-whole-key"));
+            // The key is the applied one now: no second check for the same text.
+            assert_eq!(get_text(key), key_field_display("sk-a-whole-key"));
+        });
+    }
+
+    /// A refused key is not stored: the row errors in plain words and the text
+    /// stays typed so it can be corrected. Typing again starts a fresh check.
+    #[test]
+    fn a_key_the_vendor_refuses_is_not_stored_and_stays_typed() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, rejects, auto);
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(key, "sk-a-wrong-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
+            assert!(seen.borrow().is_empty(), "a refused key was stored");
+            assert_eq!(
+                status(hwnd),
+                "Error: OpenAI key. OpenAI did not accept that key. Check it and try again."
+            );
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 1);
+            assert_eq!(get_text(key), "sk-a-wrong-key", "the text stays for fixing");
+            assert!(!status(hwnd).contains("sk-a-wrong-key"));
+            // A corrected key is a fresh attempt: the old refusal no longer stands.
+            with_vendor(raw, accepts, auto);
+            set_text(key, "sk-a-right-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+            settle_key_check(hwnd);
+            assert_eq!(seen.borrow().len(), 1);
+        });
+    }
+
+    /// A check that could not finish does not hold the key back: it is written
+    /// and the status line says it was not checked.
+    #[test]
+    fn a_key_that_could_not_be_checked_is_saved_with_a_note() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, unsure, auto);
+            set_text(get_dlg_item(hwnd, ID_GEMINI_KEY).unwrap(), "AIzaWholeKey");
+            leave(hwnd, ID_GEMINI_KEY);
+            settle_key_check(hwnd);
+            assert_eq!(seen.borrow().len(), 1);
+            assert!(answer(hwnd, "Gemini key", Ok(())));
+            assert_eq!(status(hwnd), "Saved. Could not check it right now.");
+        });
+    }
+
+    /// The note goes with its own write: a failed write shows the failure, and the
+    /// next key saved says plain "Saved".
+    #[test]
+    fn the_unchecked_note_is_not_kept_for_a_later_write() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            with_vendor(raw, unsure, auto);
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(key, "sk-first-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
+            assert!(answer(hwnd, "OpenAI key", Err("Disk full.".to_string())));
+            assert!(
+                status(hwnd).starts_with("Not saved: OpenAI key."),
+                "{}",
+                status(hwnd)
+            );
+            with_vendor(raw, accepts, auto);
+            set_text(key, "sk-second-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
+            assert!(answer(hwnd, "OpenAI key", Ok(())));
+            assert_eq!(status(hwnd), "Saved: OpenAI key");
+        });
+    }
+
+    /// Offline keeps every request on this computer: the key is shape-checked and
+    /// saved, no vendor is asked, and the status line says why.
+    #[test]
+    fn in_offline_mode_a_key_is_saved_without_asking_its_vendor() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, counts_offline, offline);
+            let before = OFFLINE_CALLS.load(Ordering::SeqCst);
+            set_text(get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(), "sk-offline-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            assert_eq!(seen.borrow().len(), 1, "saved at once");
+            assert!(!unsafe { &*raw }.key_checks.is_pending(0));
+            assert!(answer(hwnd, "OpenAI key", Ok(())));
+            assert_eq!(status(hwnd), "Saved. Not checked in Offline mode.");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(
+                OFFLINE_CALLS.load(Ordering::SeqCst),
+                before,
+                "a request was made"
+            );
+            assert!(take_posted(hwnd, WM_KEY_CHECKED).is_none());
+        });
+    }
+
+    /// A key of the wrong shape never leaves the PC: it is refused before any
+    /// request, as before.
+    #[test]
+    fn a_wrong_shaped_key_is_never_sent_to_a_vendor() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, counts_shape, auto);
+            let before = SHAPE_CALLS.load(Ordering::SeqCst);
+            set_text(
+                get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(),
+                "AIza-a-gemini-key",
+            );
+            leave(hwnd, ID_OPENAI_KEY);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(seen.borrow().is_empty());
+            assert!(status(hwnd).starts_with("Error"), "{}", status(hwnd));
+            assert_eq!(
+                SHAPE_CALLS.load(Ordering::SeqCst),
+                before,
+                "the key was sent"
+            );
+        });
+    }
+
+    /// An answer for a key the user has typed over since is ignored: nothing is
+    /// stored for it, and "Checking key..." does not stay up.
+    #[test]
+    fn an_answer_for_a_key_typed_over_since_is_ignored() {
+        with_window(Config::default(), |hwnd, raw| {
+            let seen = record_sink(raw);
+            with_vendor(raw, accepts, auto);
+            let key = get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap();
+            set_text(key, "sk-first-draft");
+            leave(hwnd, ID_OPENAI_KEY);
+            set_text(key, "sk-second-draft");
+            settle_key_check(hwnd);
+            assert!(seen.borrow().is_empty(), "the stale answer stored a key");
+            assert_ne!(status(hwnd), "Checking key...");
+            assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
+            assert_eq!(get_text(key), "sk-second-draft");
+            // The new text commits and checks on its own.
+            leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
+            assert_eq!(seen.borrow().len(), 1);
+        });
+    }
+
+    /// Enter after leaving the box does not send the same key out twice.
+    #[test]
+    fn the_same_key_is_asked_of_its_vendor_once() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            with_vendor(raw, accepts_and_counts, auto);
+            let before = ONCE_CALLS.load(Ordering::SeqCst);
+            set_text(
+                get_dlg_item(hwnd, ID_ANTHROPIC_KEY).unwrap(),
+                "sk-ant-one-key",
+            );
+            leave(hwnd, ID_ANTHROPIC_KEY);
+            leave(hwnd, ID_ANTHROPIC_KEY);
+            settle_key_check(hwnd);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(ONCE_CALLS.load(Ordering::SeqCst) - before, 1);
+            assert!(
+                take_posted(hwnd, WM_KEY_CHECKED).is_none(),
+                "a second answer"
+            );
         });
     }
 
@@ -14860,8 +15349,9 @@ mod tests {
         });
     }
 
-    /// A key typed, then the window deactivated, then closed: it is applied if it
-    /// fits and counted as not saved if it does not. Never silently dropped.
+    /// A key typed, then the window deactivated, then closed: counted as not
+    /// saved, whether it does not fit its vendor or has not been checked yet.
+    /// Never silently dropped.
     #[test]
     fn closing_while_inactive_does_not_drop_a_typed_key() {
         use windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE;
@@ -14890,10 +15380,12 @@ mod tests {
             away(hwnd, "sk-a-whole-key");
             while take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some() {}
             unsafe { SendMessageW(hwnd, WM_CLOSE, None, None) };
-            assert!(
-                take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_some(),
-                "a key that fits is applied on close"
-            );
+            // #876: the key was still being checked, so it was not stored, and
+            // closing counts it as not saved instead of dropping it silently.
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE).is_none());
+            let left = take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT)
+                .expect("closing tells the owner");
+            assert_eq!(left.wParam.0, 1, "an unchecked key is counted");
         });
     }
 

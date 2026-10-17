@@ -575,6 +575,37 @@ pub(crate) fn failure_kind(status: u16, body: &str) -> Option<&'static str> {
     }
 }
 
+/// The status of a non-2xx answer, kept on the error so a caller can tell a
+/// refused key (401) from a vendor having a bad day (#876). It shows the same
+/// text the wrapped error did.
+#[derive(Debug)]
+pub(crate) struct HttpStatus {
+    pub status: u16,
+    text: String,
+}
+
+impl HttpStatus {
+    pub(crate) fn wrap(error: anyhow::Error, status: u16) -> anyhow::Error {
+        // A decline stops the chain and is recognised by its own type (#942):
+        // it stays what it is.
+        if error.downcast_ref::<super::Declined>().is_some() {
+            return error;
+        }
+        anyhow::Error::new(HttpStatus {
+            status,
+            text: format!("{error:#}"),
+        })
+    }
+}
+
+impl std::fmt::Display for HttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for HttpStatus {}
+
 /// The truncated-body error text shared by every non-2xx branch except 429
 /// (which gets its own message naming the retry delay, see
 /// `rate_limited_error`).
@@ -1094,7 +1125,10 @@ pub(crate) fn get_json_with_headers(
     // `e` was redacted by `get_with_headers_raw` already.
     let resp = result.map_err(|e| anyhow!("{tag}: transport error: {}", e))?;
     if !(200..300).contains(&resp.status) {
-        return Err(http_error(tag, resp.status, &resp.body));
+        return Err(HttpStatus::wrap(
+            http_error(tag, resp.status, &resp.body),
+            resp.status,
+        ));
     }
     Ok(resp.body)
 }
@@ -4006,6 +4040,21 @@ mod tests {
                 "{name}: {err:#}"
             );
         }
+    }
+
+    /// #876: the model-list GET keeps the status of a refusal on its error, which
+    /// is how Settings tells a refused key (401) from a vendor having a bad day.
+    /// Without the wrap in `get_json_with_headers` the downcast finds nothing.
+    #[test]
+    fn a_model_list_refusal_carries_its_http_status() {
+        let _g = network_guard();
+        let t = Duration::from_secs(3);
+        let err = get_json_with_headers(&status_server(401, "{}"), &[], t, "test")
+            .expect_err("a 401 is an error");
+        assert_eq!(
+            err.downcast_ref::<HttpStatus>().map(|h| h.status),
+            Some(401)
+        );
     }
 
     /// #941: the vendor's own error type and code survive redaction on the
