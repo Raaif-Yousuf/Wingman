@@ -7,10 +7,8 @@
 //! Regenerate after an intentional default change:
 //! `UPDATE_EXAMPLES=1 cargo test config_example`, then commit the result.
 //!
-//! `actions.example.toml` is intentionally not generated here: actions (the
-//! typed-proposal contribution surface described in the expansion plan)
-//! do not exist in the codebase yet, so there is no `Default` to generate an
-//! example from. See issue #9's comment for that call.
+//! `actions.example.toml` is not generated here: it is kept in sync with
+//! `actions::builtin_actions()` by `src/actions_example.rs`.
 
 #[cfg(test)]
 mod tests {

@@ -1219,6 +1219,34 @@ fn keys_still_in_file(before: &Config, on_disk: Option<&Config>) -> Vec<String> 
     out
 }
 
+/// For openai, anthropic and gemini: does the file hold a `models` key under
+/// `[providers.<name>]`? A text that does not parse as TOML says no for all
+/// (the caller has already failed to read it as a config in that case).
+fn models_keys_in(text: &str) -> [bool; 3] {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return [false; 3];
+    };
+    let has = |provider: &str| {
+        table
+            .get("providers")
+            .and_then(|p| p.get(provider))
+            .is_some_and(|p| p.get("models").is_some())
+    };
+    [has("openai"), has("anthropic"), has("gemini")]
+}
+
+/// Whether an environment variable's value counts as "set" (#1226). A variable
+/// that is set but empty (a blank `setx`, a stray `export X=`) is treated as
+/// unset, so it never replaces a stored key with nothing.
+pub(crate) fn env_value_usable(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+/// [`env_value_usable`] for the process environment.
+pub(crate) fn env_var_usable(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| env_value_usable(&v))
+}
+
 /// The one atomic write of `config.toml`, shared by [`Config::save_to`] and the
 /// field-level writer (`config_writer`, #870): temp file, owner-only ACL on the
 /// temp file, one-generation backup, rename, then note the new mtime.
@@ -1775,7 +1803,7 @@ impl Config {
     #[allow(dead_code)]
     pub fn parse_or_default(toml_str: &str) -> Config {
         let mut cfg: Config = toml::from_str(toml_str).unwrap_or_default();
-        cfg.backfill();
+        cfg.backfill(models_keys_in(toml_str));
         cfg
     }
 
@@ -1784,7 +1812,7 @@ impl Config {
     /// on-disk copy stops disagreeing with what is actually being sent.
     fn parse_reporting_repair(toml_str: &str) -> Result<(Config, bool), toml::de::Error> {
         let mut cfg: Config = toml::from_str(toml_str)?;
-        let repaired = cfg.backfill();
+        let repaired = cfg.backfill(models_keys_in(toml_str));
         Ok((cfg, repaired))
     }
 
@@ -1797,7 +1825,7 @@ impl Config {
     /// Defaults, marked "not loaded" so nothing saves them over the file.
     fn not_loaded(problem: String) -> Config {
         let mut cfg = Config::default();
-        cfg.backfill();
+        cfg.backfill([false; 3]);
         // Fail safe: the file may have said Offline or set a budget, and
         // defaults would be looser. Nothing leaves the machine until it parses.
         cfg.mode = Mode::Offline;
@@ -1812,19 +1840,21 @@ impl Config {
     /// For `models` that means an existing config.toml silently yields an
     /// empty model list and an empty tray submenu, so an absent list is
     /// backfilled here rather than left empty. A list the user has genuinely
-    /// customized is never touched.
-    fn backfill(&mut self) -> bool {
+    /// customized is never touched, and neither is one emptied by hand
+    /// (#1226): `models_set` says, for openai, anthropic and gemini, whether
+    /// the file has a `models` key at all (see [`models_keys_in`]).
+    fn backfill(&mut self, models_set: [bool; 3]) -> bool {
         let d = Providers::default();
         let mut changed = false;
-        if self.providers.openai.models.is_empty() {
+        if self.providers.openai.models.is_empty() && !models_set[0] {
             self.providers.openai.models = d.openai.models;
             changed = true;
         }
-        if self.providers.anthropic.models.is_empty() {
+        if self.providers.anthropic.models.is_empty() && !models_set[1] {
             self.providers.anthropic.models = d.anthropic.models;
             changed = true;
         }
-        if self.providers.gemini.models.is_empty() {
+        if self.providers.gemini.models.is_empty() && !models_set[2] {
             self.providers.gemini.models = d.gemini.models;
             changed = true;
         }
@@ -1937,13 +1967,15 @@ impl Config {
     /// `apply_env_overrides`, passes `std::env::var`; a test passes a
     /// closure over a fixed map (or `|_| None`) instead.
     fn apply_overrides_from(&mut self, lookup: &dyn Fn(&str) -> Option<String>) {
-        if let Some(key) = lookup("OPENAI_API_KEY") {
+        // #1226: a variable that is set but empty is treated as unset.
+        let usable = |name: &str| lookup(name).filter(|v| env_value_usable(v));
+        if let Some(key) = usable("OPENAI_API_KEY") {
             self.providers.openai.api_key = key;
         }
-        if let Some(key) = lookup("ANTHROPIC_API_KEY") {
+        if let Some(key) = usable("ANTHROPIC_API_KEY") {
             self.providers.anthropic.api_key = key;
         }
-        if let Some(key) = lookup("GEMINI_API_KEY") {
+        if let Some(key) = usable("GEMINI_API_KEY") {
             self.providers.gemini.api_key = key;
         }
     }
@@ -1964,9 +1996,7 @@ impl Config {
     /// [`Config::load_from`] does (rule 9).
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        self.save_with_store(&path, &CredManagerStore, &|name| {
-            std::env::var(name).is_ok()
-        })
+        self.save_with_store(&path, &CredManagerStore, &env_var_usable)
     }
 
     /// [`Config::save`] with the path and secret store injected. The store is
@@ -2007,9 +2037,7 @@ impl Config {
     /// the field-level writer (`config_writer`, #870) keeps keys out of
     /// `config.toml`, and runs this only after the file write has succeeded.
     pub(crate) fn push_changed_secrets(original: &Config, edited: &Config) -> Result<()> {
-        Self::push_changed_secrets_with(original, edited, &CredManagerStore, &|name| {
-            std::env::var(name).is_ok()
-        })
+        Self::push_changed_secrets_with(original, edited, &CredManagerStore, &env_var_usable)
     }
 
     fn push_changed_secrets_with(
@@ -5457,6 +5485,53 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
             config.keys_left_in_file
         );
         cleanup(&path);
+    }
+
+    // -- #1226: empty env vars and hand-emptied model lists ------------------
+
+    #[test]
+    fn an_empty_env_var_does_not_override_a_stored_key() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "sk-stored".into();
+        config.providers.anthropic.api_key = "sk-ant-stored".into();
+        config.providers.gemini.api_key = "g-stored".into();
+        config.apply_overrides_from(&|name| match name {
+            "OPENAI_API_KEY" => Some(String::new()),
+            "ANTHROPIC_API_KEY" => Some("   ".into()),
+            "GEMINI_API_KEY" => Some("g-env".into()),
+            _ => None,
+        });
+        assert_eq!(config.providers.openai.api_key, "sk-stored");
+        assert_eq!(config.providers.anthropic.api_key, "sk-ant-stored");
+        assert_eq!(config.providers.gemini.api_key, "g-env");
+    }
+
+    #[test]
+    fn an_env_value_only_counts_when_it_has_something_in_it() {
+        assert!(env_value_usable("sk-x"));
+        assert!(!env_value_usable(""));
+        assert!(!env_value_usable(" \t"));
+    }
+
+    #[test]
+    fn a_models_list_emptied_by_hand_is_kept_and_not_written_back() {
+        let path = scratch_path("models-emptied");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = "[providers.openai]\nmodels = []\n";
+        fs::write(&path, text).unwrap();
+        let config = Config::load_from_with(&path, &|_| None).unwrap();
+        assert!(config.providers.openai.models.is_empty());
+        // The providers that have no `models` key still get the defaults.
+        assert!(!config.providers.anthropic.models.is_empty());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("models = []"), "{on_disk}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_missing_models_key_is_still_backfilled() {
+        let cfg = Config::parse_or_default("[providers.openai]\nmodel = \"gpt-5\"\n");
+        assert!(!cfg.providers.openai.models.is_empty());
     }
 
     #[test]
