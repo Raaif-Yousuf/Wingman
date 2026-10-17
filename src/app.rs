@@ -3132,11 +3132,11 @@ impl App {
     /// "Copy region to clipboard" (#29): opens the region/window-selection
     /// overlay and, on confirm, copies the crop to the clipboard as
     /// `CF_DIB` via the `"image_clipboard"` executor. Unlike `ask`/
-    /// `extract_text`, this needs no worker thread: opening the overlay
-    /// already blocks the caller (it pumps its own message loop --
-    /// `ui::region::Overlay::run`) until the user is done, and the
-    /// clipboard write itself is local CPU-only work, not a network call --
-    /// there is nothing left here that would justify a second thread. On
+    /// `extract_text`, opening the overlay needs no worker thread: it
+    /// pumps its own message loop (`ui::region::Overlay::run`) until the
+    /// user is done. The clipboard write does run on the executor worker
+    /// (#772, `spawn_executor`), because it can wait on another app that
+    /// holds the clipboard and this thread also runs the keyboard hook. On
     /// cancel (Esc/right-click) this shows no card at all, the same
     /// "backing out is not a failure" status `Ok(None)` gets everywhere
     /// else in this crate (e.g. a declined confirm-card proposal).
@@ -3168,38 +3168,30 @@ impl App {
             }
         };
 
-        let (width, height) = (raw.width, raw.height);
-        let proposal_value = serde_json::json!({
-            "rgba_base64": base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                &raw.rgba,
-            ),
-            "width": width,
-            "height": height,
-        });
+        // The selector pumped its own message loop: a hotkey or tray command
+        // may have started another action meanwhile. Check again, or two runs
+        // would overlap. The picked region is dropped, as on a busy press.
+        if self.busy_now() {
+            self.show_busy_card();
+            return;
+        }
 
-        let result: Result<()> = (|| {
-            let executor = crate::executors::registry::resolve("image_clipboard")?;
-            let confirmed = crate::ui::confirm::auto_confirm_read_only(
-                executor.as_ref(),
-                crate::ui::confirm::Proposal::new(proposal_value),
-            )?;
-            executor.execute(confirmed)?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.card
-                    .show_answer(&format!("Copied {width}x{height} region"), "", 3, None)
-            }
+        // #772: the clipboard write can wait on another app that holds the
+        // clipboard, and this thread also runs the keyboard hook, so it runs
+        // on the executor worker. A missing executor is an error card here.
+        let executor = match crate::executors::registry::resolve("image_clipboard") {
+            Ok(executor) => executor,
             Err(e) => {
                 let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't copy the region", &detail);
                 self.set_watch(true);
+                return;
             }
-        }
+        };
+        self.spawn_executor(Box::new(move || {
+            exec_work_region_copy(executor.as_ref(), raw)
+        }));
     }
 
     /// #39: "Add event from screen", the action framework's first real
@@ -4704,6 +4696,20 @@ impl App {
                         self.card.show_error_with_details(&title, &detail);
                     }
                 }
+            }
+            ExecDone::RegionCopy {
+                width,
+                height,
+                result: Ok(()),
+            } => {
+                self.card
+                    .show_answer(&format!("Copied {width}x{height} region"), "", 3, None);
+            }
+            ExecDone::RegionCopy { result: Err(e), .. } => {
+                let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't copy the region", &detail);
+                self.set_watch(true);
             }
             ExecDone::RestoreForm(Ok(())) => {
                 self.card.show_answer(
@@ -8213,6 +8219,12 @@ enum ExecDone {
         report: actions::generic_replace::ReplaceReport,
     },
     RestoreForm(anyhow::Result<()>),
+    /// #772: the region copy's clipboard write, with the size for the card.
+    RegionCopy {
+        width: u32,
+        height: u32,
+        result: anyhow::Result<()>,
+    },
 }
 
 impl std::fmt::Debug for ExecDone {
@@ -8226,6 +8238,7 @@ impl std::fmt::Debug for ExecDone {
             ExecDone::Generic { .. } => "ExecDone::Generic",
             ExecDone::Replace { .. } => "ExecDone::Replace",
             ExecDone::RestoreForm(_) => "ExecDone::RestoreForm",
+            ExecDone::RegionCopy { .. } => "ExecDone::RegionCopy",
         })
     }
 }
@@ -8289,6 +8302,34 @@ fn exec_work_replace(
 
 fn exec_work_restore(undo: executors::Undo) -> ExecDone {
     ExecDone::RestoreForm(undo.undo())
+}
+
+/// #772: puts the selected region on the clipboard as an image. Encoding the
+/// pixels and the clipboard write both run here, on the worker.
+fn exec_work_region_copy(
+    executor: &dyn executors::Executor,
+    raw: crate::capture::RawShot,
+) -> ExecDone {
+    let (width, height) = (raw.width, raw.height);
+    let result = (|| {
+        let proposal_value = serde_json::json!({
+            "rgba_base64": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &raw.rgba,
+            ),
+            "width": width,
+            "height": height,
+        });
+        let confirmed =
+            confirm::auto_confirm_read_only(executor, confirm::Proposal::new(proposal_value))?;
+        executor.execute(confirmed)?;
+        Ok(())
+    })();
+    ExecDone::RegionCopy {
+        width,
+        height,
+        result,
+    }
 }
 
 /// #712: why Quit is refused right now, if it is. An executor worker that is
@@ -12605,6 +12646,123 @@ mod tests {
         );
     }
 
+    /// A read-only stand-in for the image clipboard executor: it records
+    /// what the proposal said and never touches the real clipboard.
+    struct FakeImageCopy {
+        fail: bool,
+        seen: std::sync::Mutex<Option<Value>>,
+    }
+
+    impl executors::Executor for FakeImageCopy {
+        fn name(&self) -> &'static str {
+            "image_clipboard"
+        }
+        fn effect(&self) -> executors::Effect {
+            executors::Effect::ReadOnly
+        }
+        fn execute(&self, confirmed: confirm::Confirmed<Value>) -> anyhow::Result<executors::Undo> {
+            *self.seen.lock().unwrap() = Some(confirmed.into_value());
+            if self.fail {
+                anyhow::bail!("the clipboard is busy")
+            }
+            Ok(executors::Undo::none("copied"))
+        }
+    }
+
+    fn two_by_one_shot() -> capture::RawShot {
+        capture::RawShot {
+            rgba: vec![255; 2 * 4],
+            width: 2,
+            height: 1,
+            screen: None,
+        }
+    }
+
+    /// #772: the region copy's worker half builds the proposal from the
+    /// pixels and reports the size on success.
+    #[test]
+    fn the_region_copy_worker_half_sends_the_pixels_and_reports_the_size() {
+        let fake = FakeImageCopy {
+            fail: false,
+            seen: Default::default(),
+        };
+        let done = super::exec_work_region_copy(&fake, two_by_one_shot());
+        assert!(
+            matches!(
+                done,
+                ExecDone::RegionCopy {
+                    width: 2,
+                    height: 1,
+                    result: Ok(())
+                }
+            ),
+            "{done:?}"
+        );
+        let seen = fake.seen.lock().unwrap().clone().expect("executor ran");
+        assert_eq!(seen["width"], 2);
+        assert_eq!(seen["height"], 1);
+        assert!(seen["rgba_base64"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    /// #772: a busy clipboard comes back as an error value, not a panic, so
+    /// the UI thread can end in an error card.
+    #[test]
+    fn a_failed_region_copy_comes_back_as_an_error_message() {
+        let fake = FakeImageCopy {
+            fail: true,
+            seen: Default::default(),
+        };
+        let done = super::exec_work_region_copy(&fake, two_by_one_shot());
+        assert!(
+            matches!(done, ExecDone::RegionCopy { result: Err(ref e), .. } if e.root_cause().to_string().contains("clipboard is busy")),
+            "{done:?}"
+        );
+    }
+
+    /// #772: an executor that is not read-only is refused before it runs.
+    #[test]
+    fn the_region_copy_refuses_an_executor_that_writes_to_the_screen() {
+        let done = super::exec_work_region_copy(&FakeExecutor { fail: false }, two_by_one_shot());
+        assert!(
+            matches!(done, ExecDone::RegionCopy { result: Err(_), .. }),
+            "{done:?}"
+        );
+    }
+
+    /// #772: `copy_region` hands the write to the executor worker and does
+    /// not run an executor itself.
+    #[test]
+    fn copy_region_spawns_the_executor_worker() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src.split("\nmod tests {").next().expect("production part");
+        let start = production
+            .find("    fn copy_region(")
+            .expect("copy_region exists");
+        let rest = &production[start + 1..];
+        let body = &rest[..rest.find("\n    fn ").expect("end of copy_region")];
+        assert!(body.contains("spawn_executor("), "{body}");
+        assert!(!body.contains(".execute("), "{body}");
+    }
+
+    /// #772: the region selector pumps its own message loop, so another
+    /// action can start while it is open. `copy_region` must check busy
+    /// again after the selector returns and before it spawns the worker.
+    #[test]
+    fn copy_region_rechecks_busy_after_the_selector() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src.split("\nmod tests {").next().expect("production part");
+        let start = production
+            .find("    fn copy_region(")
+            .expect("copy_region exists");
+        let rest = &production[start + 1..];
+        let body = &rest[..rest.find("\n    fn ").expect("end of copy_region")];
+        let select = body.find("select_region(").expect("opens the selector");
+        let spawn = body.find("spawn_executor(").expect("spawns the worker");
+        let between = &body[select..spawn];
+        assert!(between.contains("busy_now()"), "{between}");
+        assert!(between.contains("show_busy_card()"), "{between}");
+    }
+
     #[test]
     fn quit_is_refused_only_while_an_executor_is_writing() {
         assert!(super::quit_refusal(true, false).is_some_and(|t| !t.contains('\u{2014}')));
@@ -12669,10 +12827,9 @@ mod tests {
             ] {
                 if t.contains(call) {
                     hits += 1;
-                    // `copy_region` only puts an image on the clipboard: no UIA,
-                    // no typed input, nothing slow.
+                    // #772: the region copy runs on the worker like the rest.
                     assert!(
-                        current.starts_with("exec_work_") || current == "copy_region",
+                        current.starts_with("exec_work_"),
                         "{call} is called from `{current}`, not an exec_work_ function"
                     );
                 }
