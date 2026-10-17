@@ -6086,15 +6086,24 @@ impl App {
     /// everything instead of forming a second `&mut App` (see its doc
     /// comment). What was deferred is delivered afterwards, as
     /// `open_settings` does. The closure must not touch `self`.
+    ///
+    /// A press of the key meanwhile is answered by "A menu or dialog was
+    /// open", shown here. When the caller then puts up its own card (the import
+    /// preview, an error, "Action saved") that card replaces the note. That is
+    /// intended: the press was dropped, and the caller's card appearing right
+    /// after the dialog closes is the visible answer that Wingman is awake. When
+    /// the dialog was cancelled the caller shows nothing and the note stays.
     fn run_os_dialog<T>(&mut self, dialog: impl FnOnce() -> T) -> T {
         // Like `open_settings`: no card timers or click watcher while the
         // nested loop runs.
         self.hide_card();
         self.set_watch(false);
         SETTINGS_OPEN.with(|c| c.set(true));
-        // #900: the menu's policy, so a press or a second launch meanwhile is
-        // held and answered with a card afterwards, not dropped.
-        TRAY_MENU_OPEN.with(|c| c.set(true));
+        // #900: a press or a second launch meanwhile is held and answered with
+        // a card afterwards, not dropped. Only those two: the tray menu's other
+        // deferrals (a send preview, a stage, the router) would be shown under
+        // the card the caller puts up next, where Settings' policy frees them.
+        FILE_DIALOG_OPEN.with(|c| c.set(true));
         // #1013: Settings is not owned by the owner window, so the dialog does
         // not stop it, yet its Tab, Enter and Esc need the main pump this
         // loop replaces. Disabled, it is plainly out of play until the dialog
@@ -6110,7 +6119,7 @@ impl App {
                 settings::bring_to_front();
             }
         }
-        TRAY_MENU_OPEN.with(|c| c.set(false));
+        FILE_DIALOG_OPEN.with(|c| c.set(false));
         SETTINGS_OPEN.with(|c| c.set(false));
         let pending = take_pending_messages(settings::is_foreground());
         let tray_restore_error = if TASKBAR_RECREATED_WHILE_SETTINGS.with(|c| c.replace(false)) {
@@ -7733,6 +7742,10 @@ thread_local! {
     /// selects [`tray_menu_policy`] instead of the Settings one.
     static TRAY_MENU_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// True while an OS file dialog runs (#900). Always set together with
+    /// `SETTINGS_OPEN`; selects [`file_dialog_policy`].
+    static FILE_DIALOG_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// True while a command chosen from the tray runs (#1012). The menu takes
     /// the foreground, so "Settings is in front" is never true for such a
     /// command; `refuse_for_settings` asks whether Settings is open instead.
@@ -8170,6 +8183,19 @@ fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
         | WM_APP_PAUSE_TOGGLE
         | WM_APP_HOTKEY
         | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
+        _ => settings_reentrancy_policy(msg, taskbar_created_msg),
+    }
+}
+
+/// #900: the policy while an OS file dialog is open. The card is hidden first
+/// (as for Settings), so the Settings policy stands, with one change: a press
+/// of the Wingman key or a second launch is deferred, not dropped, so it ends
+/// in a card (`DeferredMessage::KeyDuringMenu`/`ActivateDuringMenu`). The tray
+/// menu's other deferrals do not apply: they exist to keep a card that is
+/// still up, and none is, so they stay freed as Settings frees them.
+fn file_dialog_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
+    match msg {
+        WM_APP_HOTKEY | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
         _ => settings_reentrancy_policy(msg, taskbar_created_msg),
     }
 }
@@ -8909,6 +8935,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         let taskbar_created_msg = TASKBAR_CREATED_MSG.with(|c| c.get());
         let policy = if TRAY_MENU_OPEN.with(|c| c.get()) {
             tray_menu_policy(msg, taskbar_created_msg)
+        } else if FILE_DIALOG_OPEN.with(|c| c.get()) {
+            file_dialog_policy(msg, taskbar_created_msg)
         } else {
             settings_reentrancy_policy(msg, taskbar_created_msg)
         };
@@ -9795,20 +9823,56 @@ mod tests {
         let body = body_between(&src, "    fn run_os_dialog<T>(", "\n    }\n");
         assert!(!body.is_empty());
         let on = body
-            .find("TRAY_MENU_OPEN.with(|c| c.set(true))")
-            .expect("run_os_dialog never selects the menu policy");
+            .find("FILE_DIALOG_OPEN.with(|c| c.set(true))")
+            .expect("run_os_dialog never selects the file dialog policy");
         let run = body.find("dialog()").expect("no dialog call");
         let off = body
-            .find("TRAY_MENU_OPEN.with(|c| c.set(false))")
-            .expect("run_os_dialog never clears the menu policy");
+            .find("FILE_DIALOG_OPEN.with(|c| c.set(false))")
+            .expect("run_os_dialog never clears the file dialog policy");
         assert!(
             on < run && run < off,
             "set before the dialog, cleared after"
         );
+        // wnd_proc reads the cell, or the policy is wired to nothing.
+        let wnd = body_between(&src, "let policy = if TRAY_MENU_OPEN", "};");
+        assert!(wnd.contains("FILE_DIALOG_OPEN") && wnd.contains("file_dialog_policy"));
         // And the policy it selects defers both, never ignores them.
         for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE] {
-            assert_eq!(super::tray_menu_policy(id, 0), SettingsReentrancy::Defer);
+            assert_eq!(super::file_dialog_policy(id, 0), SettingsReentrancy::Defer);
         }
+    }
+
+    /// #900: nothing else the tray menu defers is delivered during a file
+    /// dialog. The card is hidden, so a send preview, a stage, a first-run
+    /// answer or a router result would be shown under the card the caller puts
+    /// up next (or strand a blocked worker behind it). They stay freed, as
+    /// Settings frees them, and every other id matches the Settings policy.
+    #[test]
+    fn a_file_dialog_frees_what_settings_frees_except_the_press_and_the_second_launch() {
+        use super::file_dialog_policy;
+        for msg in [
+            WM_APP_SEND_PREVIEW,
+            WM_APP_PENDING_STAGE,
+            WM_APP_FIRST_RUN,
+            WM_APP_ROUTER_RESULT,
+        ] {
+            assert_eq!(file_dialog_policy(msg, 0), SettingsReentrancy::Ignore);
+            assert_ne!(super::tray_menu_policy(msg, 0), SettingsReentrancy::Ignore);
+            // Ignored ids have their boxed payload freed in wnd_proc.
+        }
+        let mut checked = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            if [WM_APP_HOTKEY, WM_APP_ACTIVATE].contains(id) {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                file_dialog_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                settings_reentrancy_policy(*id, FAKE_TASKBAR_CREATED_MSG),
+                "{name}"
+            );
+        }
+        assert!(checked > 10, "the registry scan found {checked} ids");
     }
 
     /// The gate is in the one place every model action starts, before the
