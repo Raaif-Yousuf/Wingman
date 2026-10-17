@@ -89,8 +89,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW,
     PM_REMOVE, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
-    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT,
-    WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
     WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -741,6 +741,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             update_text_scale_label(hwnd);
             LRESULT(0)
         }
+        WM_PAINT => {
+            paint_footer_divider(hwnd);
+            LRESULT(0)
+        }
         WM_OLLAMA_STATUS => {
             let section = inner.ollama_status.lock().ok().and_then(|g| g.clone());
             if let Some(section) = section {
@@ -1088,6 +1092,11 @@ const ID_GEMINI_EFFORT_LABEL: i32 = 143;
 const ID_MODEL_LIST_HINT: i32 = 144;
 /// The "Open config file" button beside the model hint (#823).
 const ID_OPEN_CONFIG: i32 = 145;
+/// #972: the two helper lines that had no id, so the hint colour could not
+/// find them: the note under the Capture group's two dropdowns and the one
+/// under the redact checkbox.
+const ID_CAPTURE_DETAIL_HINT: i32 = 146;
+const ID_REDACT_HINT: i32 = 147;
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -1154,6 +1163,8 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_GEMINI_EFFORT_LABEL", ID_GEMINI_EFFORT_LABEL),
     ("ID_MODEL_LIST_HINT", ID_MODEL_LIST_HINT),
     ("ID_OPEN_CONFIG", ID_OPEN_CONFIG),
+    ("ID_CAPTURE_DETAIL_HINT", ID_CAPTURE_DETAIL_HINT),
+    ("ID_REDACT_HINT", ID_REDACT_HINT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1913,17 +1924,78 @@ fn create_body(parent: HWND, instance: HINSTANCE, dpi: u32) -> HWND {
     .unwrap_or(HWND(std::ptr::null_mut()))
 }
 
-/// The text colour of the hotkey hint line (#824). Secondary text, never the
+/// Where a checkbox's own text starts, in dp from the control's left edge
+/// (13 dp box plus a 3 dp gap; MEASURED 2026-10-17 at 250 %, the one gallery scale where the system draws the box at its true size: 40 px). A
+/// note under a checkbox starts here so it lines up with the label above it
+/// (#972).
+const CHECKBOX_TEXT_INDENT_DP: i32 = 16;
+
+/// #972: whether `id` is a helper line: secondary text under or beside a
+/// control, drawn in the hint colour. Status lines that carry a result (the
+/// Ollama check, the pull progress) are not hints.
+fn is_hint_id(id: i32) -> bool {
+    matches!(
+        id,
+        ID_HOTKEY_STATUS | ID_MODEL_LIST_HINT | ID_CAPTURE_DETAIL_HINT | ID_REDACT_HINT
+    )
+}
+
+/// The text colour of the helper lines (#824, #972). Secondary text, never the
 /// disabled grey: `theme::LIGHT.text_dim` on the light button face, and the
 /// system's own button text in high contrast (where grey means disabled).
 /// Settings is drawn on the system face today; the dark-mode work swaps in
 /// the theme's tokens.
-fn hotkey_hint_color(high_contrast: bool, btn_text: u32) -> u32 {
+fn hint_text_color(high_contrast: bool, btn_text: u32) -> u32 {
     if high_contrast {
         btn_text
     } else {
         crate::ui::theme::LIGHT.text_dim
     }
+}
+
+/// #935: the divider above the footer, as `(left, top, right, bottom)` in
+/// client px. One physical pixel on the footer's first row, directly under the
+/// body, so a row the scrolling body cuts off reads as an edge.
+fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i32, i32, i32) {
+    let top = client_h_px - to_px(FOOTER_H_DP, dpi);
+    (0, top, client_w_px, top + 1)
+}
+
+/// #935: the divider's colour. The theme's hairline token; the system's own
+/// text colour in high contrast, where a pale hairline would not show.
+fn footer_divider_color(high_contrast: bool, btn_text: u32) -> u32 {
+    if high_contrast {
+        btn_text
+    } else {
+        crate::ui::theme::LIGHT.border
+    }
+}
+
+/// Paints the footer divider (#935). The class background has already filled
+/// the client area; only the line is drawn here.
+unsafe fn paint_footer_divider(hwnd: HWND) {
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, CreateSolidBrush, EndPaint, FillRect, GetSysColor, COLOR_BTNTEXT, PAINTSTRUCT,
+    };
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+        let ink = footer_divider_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+        let (l, t, r, b) =
+            footer_divider_rect(rc.right - rc.left, rc.bottom - rc.top, dpi_for(hwnd));
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(ink));
+        let line = windows::Win32::Foundation::RECT {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        };
+        FillRect(hdc, &line, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 /// The body forwards what its controls tell their parent (button clicks, the
@@ -1939,10 +2011,10 @@ unsafe extern "system" fn body_wndproc(
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
         }
-        // #824: the hotkey hint is secondary text, not the disabled grey.
+        // #824, #972: a helper line is secondary text, not the disabled grey.
         // Every other static keeps the default colours.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
-            if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == ID_HOTKEY_STATUS =>
+            if is_hint_id(GetDlgCtrlID(HWND(lparam.0 as *mut c_void))) =>
         {
             use windows::Win32::Graphics::Gdi::{
                 GetSysColor, GetSysColorBrush, SetBkMode, SetTextColor, COLOR_3DFACE,
@@ -1950,7 +2022,7 @@ unsafe extern "system" fn body_wndproc(
             };
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void);
             let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
-            let ink = hotkey_hint_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
+            let ink = hint_text_color(high_contrast, GetSysColor(COLOR_BTNTEXT));
             SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
             SetBkMode(hdc, TRANSPARENT);
             LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
@@ -4367,7 +4439,7 @@ fn build_ui_recorded(
         r.y,
         r.w,
         ROW_H,
-        0,
+        ID_CAPTURE_DETAIL_HINT,
     );
     r.advance();
 
@@ -4391,11 +4463,11 @@ fn build_ui_recorded(
         REDACT_HINT,
         0,
         0,
-        r.x + 20,
+        r.x + CHECKBOX_TEXT_INDENT_DP,
         r.y,
-        r.w - 20,
+        r.w - CHECKBOX_TEXT_INDENT_DP,
         ROW_H * 2,
-        0,
+        ID_REDACT_HINT,
     );
     r.advance();
     r.advance();
@@ -6647,13 +6719,96 @@ mod tests {
                     windows::Win32::Graphics::Gdi::COLOR_3DFACE,
                 )
             };
-            let ink = hotkey_hint_color(false, rgb(0, 0, 0));
+            let ink = hint_text_color(false, rgb(0, 0, 0));
             let ratio = contrast_ratio(relative_luminance(ink), relative_luminance(face));
             assert!(ratio >= 4.5, "hint contrast {ratio:.2}:1 is under 4.5:1");
         }
         // High contrast uses the system's own text colour, never a grey.
         let hc = rgb(255, 255, 255);
-        assert_eq!(hotkey_hint_color(true, hc), hc);
+        assert_eq!(hint_text_color(true, hc), hc);
+    }
+
+    /// #972: every helper line is drawn as a hint (secondary text colour), and
+    /// nothing else is.
+    #[test]
+    fn every_helper_line_is_a_hint_and_nothing_else_is() {
+        for id in [
+            ID_HOTKEY_STATUS,
+            ID_MODEL_LIST_HINT,
+            ID_CAPTURE_DETAIL_HINT,
+            ID_REDACT_HINT,
+        ] {
+            assert!(is_hint_id(id), "control {id} is a helper line");
+        }
+        for id in [
+            ID_PRIMARY_LABEL,
+            ID_PULL_STATUS,
+            ID_OLLAMA_STATUS,
+            ID_REDACT,
+            0,
+        ] {
+            assert!(!is_hint_id(id), "control {id} is not a helper line");
+        }
+        with_window(Config::default(), |hwnd, _raw| {
+            for id in [ID_CAPTURE_DETAIL_HINT, ID_REDACT_HINT] {
+                assert!(get_dlg_item(hwnd, id).is_some(), "hint {id} is built");
+            }
+        });
+    }
+
+    /// #972: helper lines share one left edge: the row labels' edge, or, under
+    /// a checkbox, where the checkbox's own text starts.
+    #[test]
+    fn helper_lines_share_two_left_edges_by_one_rule() {
+        use windows::Win32::Foundation::RECT;
+        let left = |hwnd: HWND, id: i32| {
+            let c = get_dlg_item(hwnd, id).expect("control exists");
+            let mut r = RECT::default();
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(c, &mut r);
+            }
+            r.left
+        };
+        with_window(Config::default(), |hwnd, _raw| {
+            let dpi = dpi_for(hwnd);
+            let label_edge = left(hwnd, ID_PRIMARY_LABEL);
+            assert_eq!(left(hwnd, ID_HOTKEY_STATUS), label_edge);
+            assert_eq!(left(hwnd, ID_MODEL_LIST_HINT), label_edge);
+            assert_eq!(left(hwnd, ID_CAPTURE_DETAIL_HINT), label_edge);
+            assert_eq!(
+                left(hwnd, ID_REDACT_HINT) - left(hwnd, ID_REDACT),
+                to_px(CHECKBOX_TEXT_INDENT_DP, dpi),
+                "the note under a checkbox starts at the checkbox's text"
+            );
+        });
+    }
+
+    /// #935: a 1 px line sits on the first row of the footer, directly under
+    /// the scrolling body, at every scale and for every client size, so a row
+    /// the body cuts off reads as an edge under a divider.
+    #[test]
+    fn footer_divider_sits_on_the_body_edge() {
+        for dpi in [96u32, 144, 192, 240] {
+            let (client_w, client_h) = (to_px(WIN_W_DP, dpi) + 17, to_px(700, dpi));
+            let (l, t, r, b) = footer_divider_rect(client_w, client_h, dpi);
+            let body_bottom = client_h - to_px(FOOTER_H_DP, dpi);
+            assert_eq!(
+                t, body_bottom,
+                "the line starts where the body ends ({dpi} dpi)"
+            );
+            assert_eq!(b - t, 1, "a hairline at every scale ({dpi} dpi)");
+            assert_eq!((l, r), (0, client_w), "the line spans the client width");
+        }
+    }
+
+    /// #935: the divider uses the theme's hairline token, and the system's
+    /// own text colour in high contrast (a light grey would vanish there).
+    #[test]
+    fn footer_divider_colour_comes_from_the_tokens() {
+        use crate::ui::theme::{rgb, LIGHT};
+        assert_eq!(footer_divider_color(false, rgb(1, 2, 3)), LIGHT.border);
+        let hc = rgb(255, 255, 255);
+        assert_eq!(footer_divider_color(true, hc), hc);
     }
 
     /// Dispatches this thread's queued messages until `done` is true or 10 s
