@@ -2,8 +2,9 @@ name: Install smoke
 
 # Installs the release build the two ways a person would (the zip from the
 # README, and install.ps1's sparse package), starts it, checks it is up and
-# wrote an owner-only config, quits it and removes it (issue #128). It needs
-# no API key and no network model.
+# wrote an owner-only config, runs one real action against a stand-in provider
+# on 127.0.0.1 (scripts/stub-provider.ps1), quits it and removes it (issue
+# #128). It needs no API key and no network model.
 #
 # It runs on pull requests that touch what it exercises, and by hand. It is
 # not in ci.yml on purpose: it installs a package and a certificate on the
@@ -15,6 +16,7 @@ on:
       - 'uninstall.ps1'
       - 'packaging/**'
       - 'scripts/install-smoke*'
+      - 'scripts/stub-provider*'
       - '.github/workflows/install-smoke.yml'
       - 'src/portable.rs'
       - 'src/single_instance.rs'

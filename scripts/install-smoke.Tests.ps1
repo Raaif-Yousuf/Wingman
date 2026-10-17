@@ -117,3 +117,49 @@ Describe 'the safety rails' {
         $text.Contains('if (-not $env:CI -and -not $AllowLocal)') | Should -BeTrue
     }
 }
+
+Describe 'the stub run (#128)' {
+    It 'posts the same message number the keyboard hook posts' {
+        $src = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\hotkey.rs') -Raw) -replace "`r", ''
+        $src | Should -Not -BeNullOrEmpty
+        $src.Contains('pub const WM_APP_HOTKEY: u32 = WM_APP + 2;') | Should -BeTrue
+        $WM_APP_HOTKEY | Should -Be (0x8000 + 2)
+    }
+
+    It 'writes a config that keeps the run local, on the stub port, and runs Check my work at once' {
+        $cfg = Get-StubSmokeConfig -Port 4242
+        $cfg | Should -Match 'mode = "local"'
+        $cfg | Should -Match 'base_url = "http://127\.0\.0\.1:4242"'
+        $cfg | Should -Match 'primary_action = "check-my-work"'
+        $cfg | Should -Match 'double_press_ms = 0'
+        $cfg | Should -Not -Match 'api_key'
+    }
+
+    It 'names the action id the app uses for Check my work' {
+        $src = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\actions\mod.rs') -Raw) -replace "`r", ''
+        $src | Should -Not -BeNullOrEmpty
+        $src.Contains('pub const DEFAULT_ACTION_ID: &str = "check-my-work";') | Should -BeTrue
+    }
+
+    It 'answers over real HTTP on loopback, and records what it was asked' {
+        $stub = Start-StubProvider
+        try {
+            $tags = Invoke-RestMethod -Uri "http://127.0.0.1:$($stub.Port)/api/tags"
+            $tags.models[0].name | Should -Be $StubModel
+            $big = '{"images":["' + ('A' * 200000) + '"]}'
+            $chat = Invoke-RestMethod -Uri "http://127.0.0.1:$($stub.Port)/api/chat" -Method Post -Body $big -ContentType 'application/json'
+            $chat.done | Should -BeTrue
+            ($chat.message.content | ConvertFrom-Json).headline | Should -Be $StubHeadline
+            $req = @($stub.Requests.ToArray() | Where-Object { $_.Path -eq '/api/chat' })
+            $req.Count | Should -Be 1
+            $req[0].Bytes | Should -BeGreaterThan 200000
+            $req[0].Body.Contains('"images"') | Should -BeTrue
+            { Invoke-RestMethod -Uri "http://127.0.0.1:$($stub.Port)/nope" } | Should -Throw
+        }
+        finally { Stop-StubProvider -Stub $stub }
+    }
+
+    It 'listens on the loopback address only' {
+        (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'stub-provider.ps1') -Raw) | Should -Match '\[System\.Net\.IPAddress\]::Loopback'
+    }
+}
