@@ -196,8 +196,8 @@ key saved, opening Settings asks the provider for its current model list, so
 a new model shows up on its own; this is skipped in Offline mode), a model
 list for Ollama (models you have pulled, with "(vision)" on the ones that can
 read images), and an Active provider choice. A Gemini key on its own is
-enough: Gemini is tried after OpenAI and Anthropic, or pick it as the Active
-provider to make it first. The tray's Provider menu picks the
+enough. If you also have an OpenAI or Anthropic key, Gemini is not tried unless
+you pick it as the Active provider. The tray's Provider menu picks the
 active provider too. An OpenAI-compatible endpoint still needs a hand-edit of
 `config.toml`; see
 [`docs/providers.md`](docs/providers.md#how-to-add-ollama-gemini-or-a-compat-endpoint-to-providersorder-by-hand-today)

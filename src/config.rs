@@ -1937,21 +1937,28 @@ impl Providers {
 
     /// #923: `order` as it is used at runtime. Gemini is not in the stock
     /// order, and #780 stops an untouched Save from adding it, so a Gemini key
-    /// pasted on its own would never be used. While `order` is still the stock
-    /// list (nobody edited it) a Gemini entry with a key is appended here, in
-    /// memory only: the file is not rewritten. An edited order is a choice and
-    /// is returned unchanged, so a vendor the user left out never gets a
-    /// screenshot.
+    /// pasted on its own would never be used. When `order` is still the stock
+    /// pair (in either order, so choosing Anthropic as Active keeps this) and
+    /// Gemini is the only cloud provider with a key, it is appended here, in
+    /// memory only: the file is not rewritten. If OpenAI or Anthropic has a
+    /// key too, nothing is added, so a `GEMINI_API_KEY` set for another tool
+    /// never becomes a silent extra fallback that gets screenshots. An edited
+    /// order is a choice and is returned unchanged.
     fn effective_order(&self) -> Vec<String> {
         let mut order = self.order.clone();
-        if order == Providers::default().order
-            && !unreadable_as_empty(&self.gemini.api_key).is_empty()
+        let stock_pair = order.len() == 2
+            && order.iter().any(|n| n == "openai")
+            && order.iter().any(|n| n == "anthropic");
+        let keyed = |key: &str| !unreadable_as_empty(key).is_empty();
+        if stock_pair
+            && keyed(&self.gemini.api_key)
+            && !keyed(&self.openai.api_key)
+            && !keyed(&self.anthropic.api_key)
         {
             order.push("gemini".to_string());
         }
         order
     }
-
     /// #133: whether a first press with no model ready may look for a local
     /// Ollama and adopt it. Only for a setup the user has not shaped: Cloud
     /// mode is a choice to use the cloud, an `order` that already names
@@ -2876,6 +2883,30 @@ model = "gpt-5.5"
         );
     }
 
+    /// A Gemini key set globally for another tool must not become a silent
+    /// extra fallback: Gemini is added only when no other cloud provider has a
+    /// key, in either order of the stock pair (choosing Anthropic as Active
+    /// makes it anthropic, openai).
+    #[test]
+    fn gemini_is_added_only_when_it_is_the_only_keyed_cloud_provider() {
+        for order in [["openai", "anthropic"], ["anthropic", "openai"]] {
+            let mut p = Config::default().providers;
+            p.order = order.iter().map(|s| s.to_string()).collect();
+            p.gemini.api_key = "g-key".to_string();
+            let mut expected: Vec<String> = p.order.clone();
+            expected.push("gemini".to_string());
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), expected);
+            p.openai.api_key = "o-key".to_string();
+            assert_eq!(
+                p.selected_order_for_mode(Mode::Cloud, false),
+                order,
+                "another keyed provider: no gemini"
+            );
+            p.openai.api_key.clear();
+            p.anthropic.api_key = "a-key".to_string();
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), order);
+        }
+    }
     /// A hand-edited order is a choice: a keyed vendor the user left out
     /// stays out, so a screenshot never goes to a vendor they removed.
     #[test]
