@@ -35,6 +35,9 @@ for a short list of small issues, or the
 - Rust 1.80 or newer (`rust-version` in `Cargo.toml`), stable toolchain.
 - Windows 11. This is a Win32 application; it will not build meaningfully on
   another OS, though `cargo check` may get partway on one.
+- The MSVC build tools (to link) and the Windows SDK (`makeappx.exe` and
+  `signtool.exe`, only needed to run `install.ps1`): the Visual Studio
+  Installer's "Desktop development with C++" workload covers both.
 - An OpenAI or Anthropic API key to exercise the running app end to end.
   Not required to build or run the unit tests.
 - Optional: [Ollama](https://ollama.com) running locally on `127.0.0.1:11434`

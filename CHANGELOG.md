@@ -20,7 +20,7 @@ Review this email, Fill this form (works with no model too), Action items to a
 checklist, Summarize this page, Summarize a link, Explain this error, Define
 this word, Translate selection, Describe image (alt text), Explain what's on
 screen, Table to CSV, Chart to data table, Receipt to expense row, Convert
-times to my time zone, Relative dates to real dates, Is this a scam?, Jargon to
+times to my time zone, Relative dates to real dates, Is this a scam?, Contact to address book, Jargon to
 plain English, Explain, fix and write tests for code, and three Rewrite for
 tone actions.
 

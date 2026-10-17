@@ -21,10 +21,25 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.example.toml")
     }
 
+    /// The serialiser writes no comments, so notes that belong in the example
+    /// are added here, after the section header they describe.
+    fn with_notes(generated: &str) -> String {
+        const HEADER: &str = "[palette]\n";
+        const NOTE: &str = "# Not used yet: nothing reads this until the key picks an option\n\
+                            # (#308). Changing it has no effect today.\n";
+        assert!(
+            generated.contains(HEADER),
+            "the [palette] section moved; update with_notes"
+        );
+        generated.replacen(HEADER, &format!("{HEADER}{NOTE}"), 1)
+    }
+
     #[test]
     fn config_example_matches_defaults() {
-        let expected = toml::to_string_pretty(&Config::default())
-            .expect("Config::default() must serialize to TOML");
+        let expected = with_notes(
+            &toml::to_string_pretty(&Config::default())
+                .expect("Config::default() must serialize to TOML"),
+        );
 
         let path = example_path();
 
