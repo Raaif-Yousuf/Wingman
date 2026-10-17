@@ -17,6 +17,7 @@ pub(crate) mod send_gate;
 pub mod settings;
 mod settings_commit;
 mod settings_models;
+mod settings_theme;
 pub(crate) mod text;
 pub(crate) mod theme;
 pub mod tray;
