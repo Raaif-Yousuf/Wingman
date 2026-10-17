@@ -80,6 +80,40 @@ function Get-OwnerOnlyAclProblem {
     $problems
 }
 
+# The README's command for running a script of ours, as an argument list for
+# powershell.exe (#1050): no profile, Bypass for a Restricted default policy,
+# -File. Pure.
+function Get-DocumentedScriptArgs {
+    param(
+        [Parameter(Mandatory)] [string] $Script,
+        [string[]] $ScriptArgs = @()
+    )
+    @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Script) + $ScriptArgs
+}
+
+# Runs install.ps1 or uninstall.ps1 the way the README tells a person to: in
+# a child powershell.exe (Windows PowerShell 5.1, not this pwsh). The child
+# starts from a Restricted policy (the default on a client Windows), so the
+# script only runs because of -ExecutionPolicy Bypass; a runner is not
+# Restricted, so without this the flag would never be checked. Output goes
+# straight to the log; a non-zero exit fails the smoke.
+function Invoke-DocumentedScript {
+    param(
+        [Parameter(Mandatory)] [string] $Script,
+        [string[]] $ScriptArgs = @()
+    )
+    $before = $env:PSExecutionPolicyPreference
+    try {
+        $env:PSExecutionPolicyPreference = 'Restricted'
+        & powershell.exe @(Get-DocumentedScriptArgs -Script $Script -ScriptArgs $ScriptArgs) | Out-Host
+        $code = $LASTEXITCODE
+    }
+    finally {
+        $env:PSExecutionPolicyPreference = $before
+    }
+    if ($code -ne 0) { Exit-InstallSmoke "$(Split-Path -Leaf $Script) exited with code $code" }
+}
+
 # Dot-sourcing (the Pester tests do) loads the functions without running.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
@@ -233,7 +267,8 @@ try {
 
         # install.ps1 signs the exe in place and writes target\msix; it is
         # the real path, so it runs against the repo checkout as it is.
-        & (Join-Path $repo 'install.ps1') -SkipBuild
+        # #1050: started the README way, in a child powershell.exe.
+        Invoke-DocumentedScript -Script (Join-Path $repo 'install.ps1') -ScriptArgs @('-SkipBuild')
         Write-Fact 'ok: install.ps1 finished'
 
         if (-not (Get-AppxPackage -Name $id.Current.PackageName)) { Exit-InstallSmoke "package $($id.Current.PackageName) is not registered" }
@@ -251,7 +286,7 @@ try {
         Assert-Up -Process $proc
         Invoke-CleanQuit -Process $proc
 
-        & (Join-Path $repo 'uninstall.ps1')
+        Invoke-DocumentedScript -Script (Join-Path $repo 'uninstall.ps1')
         Write-Fact 'ok: uninstall.ps1 finished'
         if (Get-AppxPackage -Name $id.Current.PackageName) { Exit-InstallSmoke 'the package is still registered after uninstall' }
         if (Test-Path -LiteralPath $installDir) { Exit-InstallSmoke "$installDir is still there after uninstall" }
