@@ -499,7 +499,35 @@ fn refine_key_phase(
         {
             keypress::Phase::Answer
         }
+        keypress::Phase::Other if matches!(card_state, CardState::Preview) => {
+            keypress::Phase::Preview
+        }
         other => other,
+    }
+}
+
+/// #809, #324: after a click hid the overlay's marks, whether the summary card
+/// stays and so needs its line rewritten: the click landed on it, or the click
+/// is outside it and click-away would not hide this card (the setting is off).
+/// Pure; the click-away rule lives in [`click_away_hides`] only.
+fn click_leaves_card_up(
+    click_in_card: bool,
+    card: crate::ui::card::CardState,
+    click_away_dismiss: bool,
+) -> bool {
+    click_in_card || !click_away_hides(card, click_away_dismiss)
+}
+
+/// #324: whether a click outside the card hides it. `click_away_dismiss` is
+/// `options.click_away_dismiss`; it governs answer and options cards. A
+/// preview never closes on a click (it can hold edits), and a card that is
+/// not showing has nothing to hide. Pure.
+fn click_away_hides(card: crate::ui::card::CardState, click_away_dismiss: bool) -> bool {
+    use crate::ui::card::CardState;
+    match card {
+        CardState::Hidden | CardState::Preview => false,
+        CardState::Collapsed | CardState::Expanded | CardState::Options => click_away_dismiss,
+        CardState::Pending => true,
     }
 }
 
@@ -2236,7 +2264,7 @@ impl App {
     fn begin_model_action<T>(
         &mut self,
         extra: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<(capture::RawShot, isize, T)> {
+    ) -> Option<(capture::PendingShot, isize, T)> {
         let (raw, foreground_hwnd, value) = self.begin_action(BeginPlan::MODEL, extra)?;
         Some((raw?, foreground_hwnd, value))
     }
@@ -2249,7 +2277,7 @@ impl App {
         &mut self,
         plan: BeginPlan,
         extra: impl FnOnce(&mut Self) -> Option<T>,
-    ) -> Option<(Option<capture::RawShot>, isize, T)> {
+    ) -> Option<(Option<capture::PendingShot>, isize, T)> {
         // #871: never on settings that are about to change, and never over the
         // window being typed in.
         if self.refuse_for_settings() {
@@ -2315,9 +2343,11 @@ impl App {
 
         let extra_value = extra(self)?;
 
-        // Capture (grab the pixels and downscale) runs here, on the main
-        // thread, and must happen before the pending card is shown --
-        // otherwise the card is in its own screenshot. Encoding those pixels
+        // Capture (grab the pixels) runs here, on the main thread, and must
+        // happen before the pending card is shown -- otherwise the card is in
+        // its own screenshot. The downscale does NOT happen here (#1200,
+        // MEASURED 2026-10-17: ~220 ms from 4K in release): the caller's
+        // worker calls `PendingShot::finish`. Encoding those pixels
         // to PNG does NOT happen here: issue #177 measured
         // `CompressionType::Best` PNG encoding at up to ~1s in a release
         // build on a 1402x876 image, which froze the message loop for that
@@ -2352,7 +2382,7 @@ impl App {
                 ),
                 capture::LookupWindow::Foreground,
             );
-            match capture::grab_raw_for(
+            match capture::grab_full_size_for(
                 &self.config.capture.monitor,
                 max_long_edge,
                 max_pixels,
@@ -2441,7 +2471,7 @@ impl App {
     }
 
     fn ask_inner(&mut self, trigger: Trigger) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
         };
@@ -2470,6 +2500,8 @@ impl App {
             crate::activation::set_worker_trigger(trigger);
             let result: std::result::Result<Answer, String> = catch_worker(|| {
                 (|| -> Result<Answer> {
+                    // #1200: the downscale runs here, not on the hook's thread.
+                    let mut raw = pending.finish();
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     worker(
                         &providers,
@@ -2692,7 +2724,7 @@ impl App {
         // A heavily downscaled capture, see `router::ROUTER_IMAGE_LONG_EDGE`.
         // Grabbed on the main thread (Win32 capture must not run on a worker);
         // the PNG encode happens on the worker.
-        let raw = match capture::grab_raw_for(
+        let pending = match capture::grab_full_size_for(
             &self.config.capture.monitor,
             router::ROUTER_IMAGE_LONG_EDGE,
             router::ROUTER_IMAGE_MAX_PIXELS,
@@ -2723,7 +2755,7 @@ impl App {
         self.card
             .show_options(generation, router::LOOKING_SUMMARY, &[], behavior);
         self.set_watch(true);
-        self.start_options_router(raw, candidates, generation, trigger);
+        self.start_options_router(pending, candidates, generation, trigger);
     }
 
     /// Starts the router for the options card showing `generation`. The call
@@ -2733,7 +2765,7 @@ impl App {
     /// `WM_APP_ROUTER_RESULT`, a failure included.
     fn start_options_router(
         &mut self,
-        mut raw: capture::RawShot,
+        pending: capture::PendingShot,
         candidates: Vec<router::RouterCandidate>,
         generation: u32,
         trigger: Trigger,
@@ -2751,6 +2783,8 @@ impl App {
                 crate::activation::set_worker_trigger(trigger);
                 let result: std::result::Result<router::RouterResult, String> =
                     catch_worker(|| {
+                        // #1200: the downscale runs here, not on the hook's thread.
+                        let mut raw = pending.finish();
                         router_worker(&providers, mode, &mut raw, redact, &candidates, limits)
                             .map_err(|e| {
                                 let chain_text = worker_error_chain_text(&e);
@@ -3522,7 +3556,7 @@ impl App {
     /// that helper's `extra` closure so it still runs exactly where it did
     /// before -- after the readiness gate, before capture.
     fn add_event_from_screen(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, (today, offset_minutes))) = self
+        let Some((pending, foreground_hwnd_isize, (today, offset_minutes))) = self
             .begin_model_action(|app| match local_today_and_utc_offset() {
                 Ok(v) => Some(v),
                 Err(e) => {
@@ -3547,6 +3581,7 @@ impl App {
             crate::activation::set_worker_trigger_opt(trigger);
             let result: std::result::Result<Value, String> = catch_worker(|| {
                 (|| -> Result<Value> {
+                    let mut raw = pending.finish();
                     let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                     calendar_worker(
                         &providers,
@@ -3772,7 +3807,7 @@ impl App {
                 && actions::generic_inputs::screen_may_be_needed(&action.inputs),
             ..BeginPlan::MODEL
         };
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_action(plan, |_| Some(()))
         else {
             return;
         };
@@ -3829,6 +3864,8 @@ impl App {
             crate::activation::set_worker_trigger_opt(trigger);
             let result: GenericResult = catch_worker(|| {
                 (|| -> Result<_, GenericFailure> {
+                    // #1200: the downscale runs here, not on the hook's thread.
+                    let mut raw = pending.map(capture::PendingShot::finish);
                     // #127 step 1: find the link, check it, and hand it back for
                     // confirmation. Nothing is fetched and no model is asked.
                     if link_step == actions::link_summary::Step::Confirm {
@@ -4474,7 +4511,7 @@ impl App {
     /// `begin_model_action`, exactly like `add_event_from_screen`'s already
     /// does.
     fn review_this_email(&mut self) {
-        let Some((mut raw, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
+        let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
         };
@@ -4491,6 +4528,7 @@ impl App {
             let result: std::result::Result<actions::review_email::ReviewOutcome, String> =
                 catch_worker(|| {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
+                        let mut raw = pending.finish();
                         let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
                         review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
                     })()
@@ -4672,7 +4710,7 @@ impl App {
                 .unwrap_or_default(),
         )
         .is_none();
-        let Some((raw, foreground_hwnd_isize, ())) =
+        let Some((pending, foreground_hwnd_isize, ())) =
             self.begin_action(BeginPlan::for_fill_form(use_model), |_| Some(()))
         else {
             return;
@@ -4688,8 +4726,9 @@ impl App {
         std::thread::spawn(move || {
             crate::ui::send_gate::set_worker_run(run);
             crate::activation::set_worker_trigger_opt(trigger);
-            let mut raw = raw;
             let result: std::result::Result<Value, String> = catch_worker(|| {
+                // #1200: the downscale runs here, not on the hook's thread.
+                let mut raw = pending.map(capture::PendingShot::finish);
                 form_fill_worker(
                     &providers,
                     mode,
@@ -5301,7 +5340,11 @@ impl App {
                 return;
             }
             HideReason::OwnerGone => return,
-            HideReason::Click => click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+            HideReason::Click => click_leaves_card_up(
+                click.is_some_and(|(x, y)| self.point_in_card(x, y)),
+                self.card.state(),
+                self.config.options.click_away_dismiss,
+            ),
             HideReason::Changed | HideReason::Age => true,
         };
         if rewrite {
@@ -6519,6 +6562,12 @@ impl App {
             SettingsCommand::Mode(mode) => self.set_mode_with(mode, true),
             SettingsCommand::Pause(choice) => self.pause_for(choice),
             SettingsCommand::Resume => self.resume(),
+            SettingsCommand::ImportAction => self.import_action(),
+            SettingsCommand::ExportPicked => {
+                if let Some(id) = take_export_pick() {
+                    self.export_action_by_id(&id);
+                }
+            }
         }
     }
 
@@ -7129,6 +7178,11 @@ impl App {
         if self.point_in_card(x, y) {
             return;
         }
+        // #324: with click-away off the card stays, and the watcher stays
+        // armed so a later click still reaches this check.
+        if !click_away_hides(self.card.state(), self.config.options.click_away_dismiss) {
+            return;
+        }
         self.hide_card();
         self.set_watch(false);
     }
@@ -7270,6 +7324,12 @@ impl App {
         let Some(id) = self.tray.export_action_at(index).map(str::to_owned) else {
             return;
         };
+        self.export_action_by_id(&id);
+    }
+
+    /// #117, #1152: exports the action `id` to a file the user picks. The tray
+    /// item and Settings' Export button both end here.
+    fn export_action_by_id(&mut self, id: &str) {
         let owner = HWND(self.hwnd_isize() as *mut _);
         let mut turned_off = false;
         let text = actions::load_actions().and_then(|all| {
@@ -7283,7 +7343,7 @@ impl App {
             actions::share::export_toml(&found.action)
         });
         let outcome = text.and_then(|text| {
-            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, &id));
+            let picked = self.run_os_dialog(|| crate::ui::file_dialog::pick_save_path(owner, id));
             let Some(path) = picked else {
                 return Ok(None);
             };
@@ -9610,6 +9670,41 @@ pub(crate) enum SettingsCommand {
     Mode(Mode),
     Pause(PauseChoice),
     Resume,
+    /// #1152: Settings' Import action button, the tray's Import item.
+    ImportAction,
+    /// #1152: Settings' Export button picked an action: its id waits in
+    /// `EXPORT_PICK` (see `post_export_pick`).
+    ExportPicked,
+}
+
+thread_local! {
+    /// #1152: the action id Settings picked for export. A command carries a
+    /// number, not a string, so the id waits here; Settings and the app share
+    /// the one UI thread. One slot, not a queue: every command is preceded by
+    /// a pick that overwrites it, so a command that was dropped can never
+    /// leave an old id for the next one to export. Two picks before the first
+    /// command runs export the newer one once.
+    static EXPORT_PICK: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn push_export_pick(id: String) {
+    EXPORT_PICK.with(|p| *p.borrow_mut() = Some(id));
+}
+
+fn take_export_pick() -> Option<String> {
+    EXPORT_PICK.with(|p| p.borrow_mut().take())
+}
+
+/// #1152: Settings' Export button picked the action `id`. `false` when the
+/// owner is gone (the id is not kept), which the caller says on its own line.
+pub(crate) fn post_export_pick(owner: isize, id: String) -> bool {
+    push_export_pick(id);
+    let posted = post_settings_command(owner, SettingsCommand::ExportPicked);
+    if !posted {
+        take_export_pick();
+    }
+    posted
 }
 
 impl SettingsCommand {
@@ -9624,6 +9719,8 @@ impl SettingsCommand {
             SettingsCommand::Pause(PauseChoice::UntilTomorrow) => 11,
             SettingsCommand::Pause(PauseChoice::UntilResumed) => 12,
             SettingsCommand::Resume => 20,
+            SettingsCommand::ImportAction => 30,
+            SettingsCommand::ExportPicked => 31,
         }
     }
 
@@ -9639,6 +9736,8 @@ impl SettingsCommand {
             11 => SettingsCommand::Pause(PauseChoice::UntilTomorrow),
             12 => SettingsCommand::Pause(PauseChoice::UntilResumed),
             20 => SettingsCommand::Resume,
+            30 => SettingsCommand::ImportAction,
+            31 => SettingsCommand::ExportPicked,
             _ => return None,
         })
     }
@@ -11935,6 +12034,8 @@ mod tests {
             C::Pause(PauseChoice::UntilTomorrow),
             C::Pause(PauseChoice::UntilResumed),
             C::Resume,
+            C::ImportAction,
+            C::ExportPicked,
         ];
         let mut seen = std::collections::HashSet::new();
         for c in all {
@@ -11943,6 +12044,38 @@ mod tests {
         }
         assert_eq!(C::from_wparam(999), None);
         assert_eq!(C::from_wparam(usize::MAX), None);
+    }
+
+    /// #1152: the action Settings picked for export waits in a queue, in the
+    /// order it was picked, and an empty queue gives nothing.
+    #[test]
+    fn a_dropped_export_command_never_leaves_an_old_id_for_the_next_pick() {
+        assert_eq!(super::take_export_pick(), None);
+        // A pick whose command was dropped, then a new pick: the new id wins.
+        super::push_export_pick("stale".to_string());
+        super::push_export_pick("fresh".to_string());
+        assert_eq!(super::take_export_pick().as_deref(), Some("fresh"));
+        // The second command of two quick picks finds nothing, not an old id.
+        assert_eq!(super::take_export_pick(), None);
+    }
+
+    /// #1152: the tray's Export item and Settings' Export button share the
+    /// one routine that writes the file.
+    #[test]
+    fn the_tray_export_and_the_settings_export_share_one_routine() {
+        let src = lf(include_str!("app.rs"));
+        let tray = body_between(
+            &src,
+            "    fn export_action(&mut self, index: usize) {",
+            "\n    }\n",
+        );
+        assert!(tray.contains("self.export_action_by_id("), "{tray}");
+        let shared = body_between(
+            &src,
+            "    fn export_action_by_id(&mut self, id: &str) {",
+            "\n    }\n",
+        );
+        assert!(shared.contains("pick_save_path"), "{shared}");
     }
 
     /// #873: the command can wait for a nested loop, and keeps what it carries.
@@ -11968,7 +12101,14 @@ mod tests {
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_COMMAND => {"), "no arm");
         let run = body_between(&src, "    fn on_settings_command(", "\n    }\n");
-        for call in ["self.set_mode_with(", "self.pause_for(", "self.resume()"] {
+        // #1152: Import and Export run the tray's own handlers too.
+        for call in [
+            "self.set_mode_with(",
+            "self.pause_for(",
+            "self.resume()",
+            "self.import_action()",
+            "self.export_action_by_id(",
+        ] {
             assert!(run.contains(call), "{call} is not the tray's path:\n{run}");
         }
         for head in [
@@ -12595,7 +12735,7 @@ mod tests {
                     "refuse_for_settings()",
                     "model_action_gate(",
                     "refuse_if_password_manager()",
-                    "grab_raw_for(",
+                    "grab_full_size_for(",
                 ],
             ),
             (
@@ -12701,12 +12841,48 @@ mod tests {
                 Phase::Answer
             );
         }
-        for st in [CardState::Hidden, CardState::Pending, CardState::Preview] {
+        for st in [CardState::Hidden, CardState::Pending] {
             assert_eq!(
                 super::refine_key_phase(Phase::Other, st, None, ms(300), false),
                 Phase::Other
             );
         }
+        // #324: a preview survives focus loss, so the key is how it closes.
+        assert_eq!(
+            super::refine_key_phase(Phase::Other, CardState::Preview, None, ms(300), false),
+            Phase::Preview
+        );
+
+        // #324: `options.click_away_dismiss` governs answer and options cards.
+        for st in [
+            CardState::Collapsed,
+            CardState::Expanded,
+            CardState::Options,
+        ] {
+            assert!(super::click_away_hides(st, true), "{st:?}");
+            assert!(!super::click_away_hides(st, false), "{st:?}");
+        }
+        // Nothing else follows the setting: a preview never closes on a click,
+        // a hidden card has nothing to hide, a pending card hides as before.
+        assert!(!super::click_away_hides(CardState::Preview, true));
+        assert!(!super::click_away_hides(CardState::Preview, false));
+        assert!(!super::click_away_hides(CardState::Hidden, true));
+        assert!(super::click_away_hides(CardState::Pending, true));
+        assert!(super::click_away_hides(CardState::Pending, false));
+
+        // #809: the overlay's summary card is rewritten when it stays.
+        use super::click_leaves_card_up as stays;
+        assert!(
+            !stays(false, CardState::Expanded, true),
+            "hides, no rewrite"
+        );
+        assert!(
+            stays(false, CardState::Expanded, false),
+            "setting off: rewrite"
+        );
+        assert!(stays(false, CardState::Collapsed, false));
+        assert!(stays(true, CardState::Expanded, true), "click on the card");
+        assert!(stays(true, CardState::Expanded, false));
         let opts = Phase::Options {
             count: 2,
             pickable: [true, true],
@@ -17324,7 +17500,9 @@ mod tests {
         let notice = body
             .find("show_remote_ollama_notice()")
             .expect("begin_action must call the notice");
-        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let capture = body
+            .find("capture::grab_full_size_for")
+            .expect("capture call");
         assert!(notice < capture, "the notice must come before the capture");
         assert!(src.contains("fn show_remote_ollama_notice(&mut self)"));
     }
@@ -17344,7 +17522,9 @@ mod tests {
         let notice = body
             .find("show_remote_ollama_notice()")
             .expect("the router must call the notice");
-        let capture = body.find("capture::grab_raw_for").expect("capture call");
+        let capture = body
+            .find("capture::grab_full_size_for")
+            .expect("capture call");
         // The worker that sends is started by a later fn, after the capture.
         assert!(notice < capture, "the notice must come before the capture");
     }
@@ -17506,7 +17686,7 @@ mod tests {
             "on_taskbar_created",
             "copy_region",
             "commit_import",
-            "export_action",
+            "export_action_by_id",
         ];
         for name in names {
             let body = body_of(name);

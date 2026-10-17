@@ -282,7 +282,11 @@ showing closes it. Under `[hotkeys]` in `config.toml`, `key_mode` is
 `"dynamic"` (the default), `"pick"` (the key never closes an answer card) or
 `"close"` (the key only ever closes a card), and `double_press_ms` (default
 300, from 150 to 600) is how fast the second press must come; `0` turns
-double press off, so the first press acts at once. To make
+double press off, so the first press acts at once. A click outside an answer
+or options card closes it; set `click_away_dismiss = false` under `[options]`
+to keep the card up (Esc and the key still close it). A preview with a "Do it"
+button stays up when you switch to another window, so a half-edited entry is
+not lost; Esc or the key closes it. To make
 one press run a single action instead, set `primary_action` under `[hotkeys]`
 in `config.toml`:
 

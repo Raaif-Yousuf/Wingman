@@ -2041,7 +2041,7 @@ mod tests {
         );
 
         let capture = norm(include_str!("capture.rs"));
-        for f in ["pub fn grab_raw_for(", "pub fn grab_virtual_desktop_raw("] {
+        for f in ["pub fn finish(", "pub fn grab_virtual_desktop_raw("] {
             let at = capture.find(f).unwrap_or_else(|| panic!("{f} exists"));
             let body = &capture[at..at + capture[at..].find("\n}\n").unwrap()];
             assert!(
@@ -2049,9 +2049,9 @@ mod tests {
                 "{f}"
             );
         }
-        let at = capture.find("pub fn grab_raw_for(").unwrap();
+        let at = capture.find("pub fn grab_full_size_for(").unwrap();
         let body = &capture[at..at + capture[at..].find("\n}\n").unwrap()];
-        assert!(body.contains("PasswordLookup::start"), "grab_raw_for");
+        assert!(body.contains("PasswordLookup::start"), "grab_full_size_for");
         // The decision to look is one helper, used by the gate and by the
         // capture call sites.
         assert!(capture.contains("if needs_password_lookup(redact_setting, providers, mode)"));
@@ -2116,7 +2116,7 @@ mod tests {
             + at];
         assert!(body.contains("apply_manager_windows(raw)"), "{body}");
         let capture = norm(include_str!("capture.rs"));
-        let at = capture.find("pub fn grab_raw_for(").unwrap();
+        let at = capture.find("pub fn grab_full_size_for(").unwrap();
         let body = &capture[at..at
             + capture[at..]
                 .find(
@@ -2125,9 +2125,18 @@ mod tests {
 ",
                 )
                 .unwrap()];
+        assert!(body.contains("manager_windows_on("), "{body}");
+        let at = capture.find("pub fn finish(").unwrap();
+        let body = &capture[at..at
+            + capture[at..]
+                .find(
+                    "
+    }
+",
+                )
+                .unwrap()];
         assert!(
-            body.contains("screen.manager_windows = managers;")
-                && body.contains("manager_windows_on("),
+            body.contains("screen.manager_windows = self.managers;"),
             "{body}"
         );
     }
