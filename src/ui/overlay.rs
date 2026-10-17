@@ -895,12 +895,30 @@ pub(crate) fn target_at(stack: &[Stacked], x: i32, y: i32, own_pid: u32) -> Opti
         .map(|w| w.hwnd)
 }
 
+/// The desktop and taskbar windows. They cover large areas but are never what
+/// a mark was drawn over.
+fn is_shell_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    )
+}
+
+/// A layered window set to alpha 0 (`LWA_ALPHA`, value 0): drawn as nothing.
+fn is_invisible_layered(flags: u32, alpha: u8) -> bool {
+    const LWA_ALPHA: u32 = 2;
+    flags & LWA_ALPHA != 0 && alpha == 0
+}
+
 /// The visible, un-cloaked, un-minimised top-level windows, topmost first.
 /// `None` when the enumeration fails: the caller treats that as unknown.
 fn window_stack() -> Option<Vec<Stacked>> {
-    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::Graphics::Dwm::{
+        DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, GWL_EXSTYLE,
+        EnumWindows, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongW, GetWindowRect,
+        IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_LAYERED,
     };
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
         // SAFETY: `lparam` is the `&mut Vec<Stacked>` passed below, which
@@ -915,16 +933,41 @@ fn window_stack() -> Option<Vec<Stacked>> {
                 std::mem::size_of::<u32>() as u32,
             )
         };
+        // The visible frame, without the invisible ~7 px DWM shadow border;
+        // the plain window rect when DWM cannot say.
         let mut r = RECT::default();
-        let got = unsafe { GetWindowRect(hwnd, &mut r) }.is_ok();
+        let dwm_ok = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut r as *mut RECT as *mut core::ffi::c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+        }
+        .is_ok();
+        let got = dwm_ok || unsafe { GetWindowRect(hwnd, &mut r) }.is_ok();
+        let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+        let shell = is_shell_class(&String::from_utf16_lossy(&buf[..n.min(buf.len())]));
+        let mut invisible = false;
+        if ex & WS_EX_LAYERED.0 != 0 {
+            let (mut alpha, mut flags) = (0u8, Default::default());
+            if unsafe { GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)) }
+                .is_ok()
+            {
+                invisible = is_invisible_layered(flags.0, alpha);
+            }
+        }
         if got
             && cloaked == 0
+            && !shell
+            && !invisible
             && unsafe { IsWindowVisible(hwnd) }.as_bool()
             && !unsafe { IsIconic(hwnd) }.as_bool()
         {
             let mut pid = 0u32;
             unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-            let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
             out.push(Stacked {
                 hwnd: hwnd.0 as isize,
                 rect: ScreenRect {
@@ -1261,6 +1304,7 @@ mod tests {
     #[test]
     fn target_at_over_real_windows_with_a_topmost_cover() {
         use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_VISIBLE};
+        let _dpi = DpiAware::enter();
         let make = |ex, rc: ScreenRect| unsafe {
             CreateWindowExW(
                 ex,
@@ -1287,6 +1331,7 @@ mod tests {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
             r(400, 400, 600, 500),
         );
+        let _cleanup = Destroy(vec![ghost, cover, target]);
         let (t, c, g) = (target.0 as isize, cover.0 as isize, ghost.0 as isize);
         let (x, y) = (500, 450);
         let own = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
@@ -1313,12 +1358,64 @@ mod tests {
             w.pid = own;
         }
         assert_eq!(target_at(&mixed, x, y, own), Some(t));
+    }
 
-        unsafe {
-            let _ = DestroyWindow(ghost);
-            let _ = DestroyWindow(cover);
-            let _ = DestroyWindow(target);
+    /// Destroys its windows on drop, so a failed assert cannot leak topmost
+    /// test windows onto the desktop.
+    struct Destroy(Vec<HWND>);
+    impl Drop for Destroy {
+        fn drop(&mut self) {
+            for h in &self.0 {
+                let _ = unsafe { DestroyWindow(*h) };
+            }
         }
+    }
+
+    /// Per-monitor-v2 on this thread, as the app runs, restored on drop. DWM
+    /// frame bounds are physical pixels; a DPI-unaware test thread would see
+    /// scaled `GetWindowRect` values and disagree with them.
+    struct DpiAware(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+    impl DpiAware {
+        fn enter() -> Self {
+            use windows::Win32::UI::HiDpi::{
+                SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            };
+            Self(unsafe {
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            })
+        }
+    }
+    impl Drop for DpiAware {
+        fn drop(&mut self) {
+            unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+
+    #[test]
+    fn shell_windows_are_never_a_target() {
+        for c in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+        ] {
+            assert!(is_shell_class(c), "{c}");
+        }
+        for c in ["Notepad", "Chrome_WidgetWin_1", "STATIC", ""] {
+            assert!(!is_shell_class(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn fully_transparent_layered_windows_are_skipped() {
+        const LWA_ALPHA: u32 = 2;
+        const LWA_COLORKEY: u32 = 1;
+        assert!(is_invisible_layered(LWA_ALPHA, 0));
+        assert!(!is_invisible_layered(LWA_ALPHA, 1));
+        assert!(!is_invisible_layered(LWA_ALPHA, 255));
+        // Alpha is not in play (colour key only): the alpha byte means nothing.
+        assert!(!is_invisible_layered(LWA_COLORKEY, 0));
+        assert!(!is_invisible_layered(0, 0));
     }
 
     fn instance() -> HINSTANCE {
