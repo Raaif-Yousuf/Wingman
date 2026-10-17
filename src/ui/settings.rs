@@ -31,6 +31,12 @@
 //! moves between the rail and the page. Save and Cancel are still pinned under
 //! the pages and still send every touched field at once.
 //!
+//! The General page's Mode row and Pause and Resume buttons act at once, not on
+//! Save (#873): they post `WM_APP_SETTINGS_COMMAND` to the owner, which runs the
+//! tray's own `set_mode`, `pause_for` and `resume`. The app calls [`sync_live`]
+//! after any change, so the controls follow the tray and the pause key too. The
+//! pause shortcut is staged and saved like the other two.
+//!
 //! Notes for the integrating app:
 //! - If a settings window is already open, `open` brings it to the front and
 //!   returns `true` without opening a second one. The guard is a process-wide
@@ -111,7 +117,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{ActiveProvider, CardCorner, Config, Hotkeys, OllamaConfig, RequireTickFor};
 use crate::hotkey::{
     apply_learned, arm_learning, chord_to_string, disarm_learning, judge_learned, Chord,
-    LearnedVerdict, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
+    LearnedVerdict, HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_LEARNED,
 };
 use crate::provider::ollama_admin::{self, GpuStatus, ListenerKind, OllamaHealth};
 use crate::provider::ollama_gpu_fix;
@@ -428,7 +434,8 @@ static OPEN_HWND: AtomicIsize = AtomicIsize::new(0);
 fn enter_command(ctrl_id: i32) -> i32 {
     match ctrl_id {
         ID_CANCEL | ID_PROMPT_TOGGLE | ID_RESET_PROMPT | ID_OLLAMA_LINK | ID_CHANGE_PRIMARY
-        | ID_CHANGE_SECONDARY | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
+        | ID_CHANGE_SECONDARY | ID_CHANGE_PAUSE | ID_PAUSE_BUTTON | ID_RESUME_BUTTON
+        | ID_PULL_BUTTON | ID_OPEN_CONFIG => ctrl_id,
         // #635: Enter in the Pull model box starts the pull.
         ID_PULL_NAME => ID_PULL_BUTTON,
         _ => ID_SAVE,
@@ -809,6 +816,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+    if msg == WM_PAUSE_MENU {
+        run_pause_menu(hwnd);
+        return LRESULT(0);
+    }
     let inner = &mut *ptr;
 
     match msg {
@@ -1093,6 +1104,29 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
         ID_OLLAMA_MODEL if notify == CBN_SELCHANGE => inner.pull_select = None,
         ID_CHANGE_PRIMARY if notify == BN_CLICKED => start_change(inner, HK_PRIMARY),
         ID_CHANGE_SECONDARY if notify == BN_CLICKED => start_change(inner, HK_SECONDARY),
+        ID_CHANGE_PAUSE if notify == BN_CLICKED => start_change(inner, HK_PAUSE),
+        ID_MODE if notify == CBN_SELCHANGE => {
+            if let Some(combo) = get_dlg_item(inner.hwnd, ID_MODE) {
+                let picked = unsafe { SendMessageW(combo, CB_GETCURSEL, None, None).0 };
+                if let Some(mode) = mode_at(picked) {
+                    send_command(inner, crate::app::SettingsCommand::Mode(mode));
+                }
+            }
+        }
+        ID_PAUSE_BUTTON if notify == BN_CLICKED => {
+            // A pending Change leaves the keyboard hook capturing, which would
+            // eat the menu's arrow keys and Esc as a new shortcut.
+            if inner.learning.is_some() {
+                stop_learning(inner);
+                set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            }
+            unsafe {
+                let _ = PostMessageW(Some(inner.hwnd), WM_PAUSE_MENU, WPARAM(0), LPARAM(0));
+            }
+        }
+        ID_RESUME_BUTTON if notify == BN_CLICKED => {
+            send_command(inner, crate::app::SettingsCommand::Resume)
+        }
         ID_PROMPT_TOGGLE if notify == BN_CLICKED => {
             inner.prompt_expanded = !inner.prompt_expanded;
             unsafe { show_prompt_state(inner) };
@@ -1242,6 +1276,15 @@ const ID_REDACT_HINT: i32 = 147;
 const ID_RAIL: i32 = 148;
 /// #872: the Actions page's explanation. That page has no setting yet.
 const ID_ACTIONS_NOTE: i32 = 149;
+/// #873: the Mode combo, the pause line with its Pause and Resume buttons, and
+/// the pause shortcut's label and Change button, all on General. Mode and
+/// Pause act at once through the tray's own handlers; they are not form fields.
+const ID_MODE: i32 = 150;
+const ID_PAUSE_STATUS: i32 = 151;
+const ID_PAUSE_BUTTON: i32 = 152;
+const ID_RESUME_BUTTON: i32 = 153;
+const ID_PAUSE_LABEL: i32 = 154;
+const ID_CHANGE_PAUSE: i32 = 155;
 
 /// #872: the five pages of the window, in rail order. Each existing control
 /// lives on exactly one (see [`PAGE_CONTROLS`]); the rail shows one page at a
@@ -1335,10 +1378,16 @@ const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
     (
         Page::General,
         &[
+            ID_MODE,
+            ID_PAUSE_STATUS,
+            ID_PAUSE_BUTTON,
+            ID_RESUME_BUTTON,
             ID_PRIMARY_LABEL,
             ID_CHANGE_PRIMARY,
             ID_SECONDARY_LABEL,
             ID_CHANGE_SECONDARY,
+            ID_PAUSE_LABEL,
+            ID_CHANGE_PAUSE,
             ID_HOTKEY_STATUS,
             ID_AUTOSTART,
             ID_CARD_SECONDS,
@@ -1469,6 +1518,12 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_REDACT_HINT", ID_REDACT_HINT),
     ("ID_RAIL", ID_RAIL),
     ("ID_ACTIONS_NOTE", ID_ACTIONS_NOTE),
+    ("ID_MODE", ID_MODE),
+    ("ID_PAUSE_STATUS", ID_PAUSE_STATUS),
+    ("ID_PAUSE_BUTTON", ID_PAUSE_BUTTON),
+    ("ID_RESUME_BUTTON", ID_RESUME_BUTTON),
+    ("ID_PAUSE_LABEL", ID_PAUSE_LABEL),
+    ("ID_CHANGE_PAUSE", ID_CHANGE_PAUSE),
 ];
 
 // ---------------------------------------------------------------------------
@@ -4207,6 +4262,192 @@ fn secondary_label(chord: &crate::hotkey::Chord) -> String {
     format!("Shortcut for any keyboard: {}", chord_to_string(chord))
 }
 
+/// The Mode combo's rows: the tray submenu's four, in its order, labelled by
+/// `Mode::label` so the two cannot drift (#873).
+const MODE_CHOICES: [crate::mode::Mode; 4] = [
+    crate::mode::Mode::Cloud,
+    crate::mode::Mode::Local,
+    crate::mode::Mode::Auto,
+    crate::mode::Mode::Offline,
+];
+
+/// The combo row for `mode`.
+fn mode_index(mode: crate::mode::Mode) -> usize {
+    MODE_CHOICES.iter().position(|m| *m == mode).unwrap_or(0)
+}
+
+/// The mode on combo row `index`; `None` for CB_ERR (-1) or a row past the list.
+fn mode_at(index: isize) -> Option<crate::mode::Mode> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| MODE_CHOICES.get(i).copied())
+}
+
+/// The line beside the Pause buttons (#873). `paused` is the tray's own wording
+/// of the state (`pause::tooltip_text`), or `None` while running.
+fn pause_status_line(paused: Option<&str>) -> String {
+    match paused {
+        None => "Wingman is running.".to_string(),
+        Some(text) => format!("{text}."),
+    }
+}
+
+/// Which of (Pause, Resume) can be used: one or the other, as in the tray menu.
+fn pause_buttons_enabled(paused: bool) -> (bool, bool) {
+    (!paused, paused)
+}
+
+/// What the Pause button offers, in the tray's order and words.
+const PAUSE_MENU: [(crate::pause::PauseChoice, &str); 3] = [
+    (crate::pause::PauseChoice::OneHour, "1 hour"),
+    (crate::pause::PauseChoice::UntilTomorrow, "Until tomorrow"),
+    (crate::pause::PauseChoice::UntilResumed, "Until resumed"),
+];
+
+/// The pause shortcut's line; it may be unset (#873).
+fn pause_label(chord: &Option<crate::hotkey::Chord>) -> String {
+    match chord {
+        Some(c) => format!("Pause shortcut: {}", chord_to_string(c)),
+        None => format!(
+            "Pause shortcut: {}",
+            crate::hotkey::pause_binding_label(None)
+        ),
+    }
+}
+
+/// Shows the app's current mode and pause state in the open Settings window, so
+/// it follows a change made from the tray (#873). `paused` is the tray's wording
+/// of the pause (`None` while running). A no-op when no window is open. Must run
+/// on the UI thread.
+pub fn sync_live(mode: crate::mode::Mode, paused: Option<&str>) {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open != 0 {
+        apply_live(HWND(open as *mut c_void), mode, paused);
+    }
+}
+
+/// [`sync_live`] on a given window. `CB_SETCURSEL` sends no notification, so this
+/// never echoes back to the app as a new choice.
+fn apply_live(hwnd: HWND, mode: crate::mode::Mode, paused: Option<&str>) {
+    if let Some(combo) = get_dlg_item(hwnd, ID_MODE) {
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_SETCURSEL,
+                Some(WPARAM(mode_index(mode))),
+                Some(LPARAM(0)),
+            );
+        }
+    }
+    if let Some(line) = get_dlg_item(hwnd, ID_PAUSE_STATUS) {
+        let text = pause_status_line(paused);
+        if get_text(line) != text {
+            set_text(line, &text);
+        }
+    }
+    let (can_pause, _) = pause_buttons_enabled(paused.is_some());
+    let pause = get_dlg_item(hwnd, ID_PAUSE_BUTTON);
+    let resume = get_dlg_item(hwnd, ID_RESUME_BUTTON);
+    if let (Some(pause), Some(resume)) = (pause, resume) {
+        unsafe {
+            // A button that is switched off while it has the keyboard focus
+            // would strand the focus: hand it to the one that takes over.
+            let (off, on) = if can_pause {
+                (resume, pause)
+            } else {
+                (pause, resume)
+            };
+            let had_focus = GetFocus() == off;
+            let _ = EnableWindow(on, true);
+            let _ = EnableWindow(off, false);
+            if had_focus {
+                let _ = SetFocus(Some(on));
+            }
+        }
+    }
+}
+
+/// Asks the app to do `command` (#873). The app runs the handler the tray menu
+/// item runs. A window with no owner (the tests') asks nobody.
+fn send_command(inner: &SettingsInner, command: crate::app::SettingsCommand) {
+    send_command_to(inner.hwnd, inner.owner, command);
+}
+
+/// [`send_command`] with the two handles copied out, for code that holds no
+/// borrow of the window's state.
+fn send_command_to(hwnd: HWND, owner: HWND, command: crate::app::SettingsCommand) {
+    if owner.0.is_null() {
+        return;
+    }
+    if !crate::app::post_settings_command(owner.0 as isize, command) {
+        // Rule 7: say so inline, never a silent no-op.
+        if let Some(msg) = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE) {
+            set_text(msg, "Wingman's main window is not running.");
+        }
+    }
+}
+
+/// Posted by the Pause button to the window itself. The menu's own message
+/// loop must not run inside `handle_command`, which holds `&mut SettingsInner`:
+/// a Quit during the menu can free that state, and other messages handled in the
+/// loop take their own borrow. The window procedure runs it before it borrows.
+const WM_PAUSE_MENU: u32 = 0x8000 + 0x873;
+
+/// The Pause button's menu: a small menu under it with the three choices; the pick
+/// is sent to the app. Dismissing the menu does nothing. Holds no borrow of the
+/// window's state: the owner is copied first, and nothing of the state is read
+/// after the menu, which may have outlived the window.
+unsafe fn run_pause_menu(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, IsWindow, TrackPopupMenu, MF_STRING,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+    };
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if state.is_null() {
+        return;
+    }
+    let owner = (*state).owner;
+    let Some(button) = get_dlg_item(hwnd, ID_PAUSE_BUTTON) else {
+        return;
+    };
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+    for (i, (_, label)) in PAUSE_MENU.iter().enumerate() {
+        let text = wide_z(label);
+        unsafe {
+            let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(text.as_ptr()));
+        }
+    }
+    let mut at = windows::Win32::Foundation::RECT::default();
+    let picked = unsafe {
+        let _ = GetWindowRect(button, &mut at);
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            at.left,
+            at.bottom,
+            None,
+            hwnd,
+            None,
+        )
+    };
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+    // A Quit while the menu was up closed the window: say nothing to it.
+    if !IsWindow(Some(hwnd)).as_bool() {
+        return;
+    }
+    let choice = usize::try_from(picked.0)
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| PAUSE_MENU.get(i));
+    if let Some((choice, _)) = choice {
+        send_command_to(hwnd, owner, crate::app::SettingsCommand::Pause(*choice));
+    }
+}
+
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
 
@@ -4949,6 +5190,64 @@ fn build_ui_recorded(
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
     let change_w = 90;
     let label_w = r.w - change_w - 12;
+    // #873: Mode and Pause act at once, through the tray's own handlers.
+    ctx.create(WC_STATIC, "Mode:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    let mode_combo = ctx.create(
+        WC_COMBOBOX,
+        "",
+        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        0,
+        r.x + LABEL_W,
+        r.y,
+        r.w - LABEL_W,
+        ROW_H * 5,
+        ID_MODE,
+    );
+    for m in MODE_CHOICES {
+        combo_add(mode_combo, m.label());
+    }
+    combo_select(mode_combo, config.mode.label());
+    r.advance();
+    let paused_now = crate::pause::is_paused_now();
+    let (can_pause, can_resume) = pause_buttons_enabled(paused_now);
+    ctx.create(
+        WC_STATIC,
+        &pause_status_line(paused_now.then_some("Paused")),
+        0,
+        0,
+        r.x,
+        r.y,
+        label_w - change_w - 8,
+        ROW_H,
+        ID_PAUSE_STATUS,
+    );
+    let pause_button = ctx.create(
+        WC_BUTTON,
+        "Pause...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - 2 * change_w - 8,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_PAUSE_BUTTON,
+    );
+    let resume_button = ctx.create(
+        WC_BUTTON,
+        "Resume",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - change_w,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_RESUME_BUTTON,
+    );
+    unsafe {
+        let _ = EnableWindow(pause_button, can_pause);
+        let _ = EnableWindow(resume_button, can_resume);
+    }
+    r.advance();
     ctx.create(
         WC_STATIC,
         &format!("Copilot key: {}", chord_to_string(&config.hotkeys.primary)),
@@ -4993,6 +5292,30 @@ fn build_ui_recorded(
         change_w,
         ROW_H,
         ID_CHANGE_SECONDARY,
+    );
+    r.advance();
+    // #873: the pause shortcut, moved here from the tray menu.
+    ctx.create(
+        WC_STATIC,
+        &pause_label(&config.hotkeys.pause),
+        0,
+        0,
+        r.x,
+        r.y,
+        label_w,
+        ROW_H,
+        ID_PAUSE_LABEL,
+    );
+    ctx.create(
+        WC_BUTTON,
+        "Change...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.x + r.w - change_w,
+        r.y,
+        change_w,
+        ROW_H,
+        ID_CHANGE_PAUSE,
     );
     r.advance();
     // The learn flow's whole conversation happens on this one line, inline:
@@ -5553,6 +5876,7 @@ fn build_ui_recorded(
         ID_PROMPT_EDIT,
         ID_SAVE,
         ID_AUTOSTART,
+        ID_MODE,
     ] {
         if let Some(h) = get_dlg_item(hwnd, id) {
             add_style(h, WS_GROUP.0);
@@ -5576,6 +5900,7 @@ fn build_ui_recorded(
         ID_MAX_EDGE,
         ID_MONITOR,
         ID_REDACT,
+        ID_MODE,
         ID_CARD_SECONDS,
         ID_TEXT_SCALE_TRACK,
         ID_CARD_CORNER,
@@ -6302,6 +6627,9 @@ fn set_hotkey_labels(hwnd: HWND, hotkeys: &Hotkeys) {
     }
     if let Some(l) = get_dlg_item(hwnd, ID_SECONDARY_LABEL) {
         set_text(l, &secondary_label(&hotkeys.secondary));
+    }
+    if let Some(l) = get_dlg_item(hwnd, ID_PAUSE_LABEL) {
+        set_text(l, &pause_label(&hotkeys.pause));
     }
 }
 
@@ -12514,5 +12842,208 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+
+    // -- #873: Mode, Pause and the pause shortcut on General ----------------
+
+    #[test]
+    fn the_mode_rows_are_the_trays_labels_in_the_trays_order() {
+        use crate::mode::Mode;
+        let labels: Vec<&str> = MODE_CHOICES.iter().map(|m| m.label()).collect();
+        assert_eq!(labels, ["Cloud", "Local", "Auto", "Offline"]);
+        for (i, m) in MODE_CHOICES.iter().enumerate() {
+            assert_eq!(mode_index(*m), i);
+            assert_eq!(mode_at(i as isize), Some(*m));
+        }
+        // A combo with nothing picked answers CB_ERR (-1).
+        assert_eq!(mode_at(-1), None);
+        assert_eq!(mode_at(MODE_CHOICES.len() as isize), None);
+        assert_eq!(
+            mode_at(mode_index(Mode::Offline) as isize),
+            Some(Mode::Offline)
+        );
+    }
+
+    #[test]
+    fn the_pause_line_says_running_or_how_long_it_is_paused() {
+        assert_eq!(pause_status_line(None), "Wingman is running.");
+        assert_eq!(
+            pause_status_line(Some("Paused until 14:05")),
+            "Paused until 14:05."
+        );
+        assert_eq!(pause_status_line(Some("Paused")), "Paused.");
+        for text in [pause_status_line(None), pause_status_line(Some("Paused"))] {
+            assert!(!text.contains('\u{2014}'), "no em dash in {text}");
+        }
+    }
+
+    #[test]
+    fn pause_is_offered_while_running_and_resume_while_paused() {
+        assert_eq!(pause_buttons_enabled(false), (true, false));
+        assert_eq!(pause_buttons_enabled(true), (false, true));
+    }
+
+    #[test]
+    fn the_pause_menu_offers_the_trays_three_choices_in_order() {
+        use crate::pause::PauseChoice;
+        let choices: Vec<PauseChoice> = PAUSE_MENU.iter().map(|(c, _)| *c).collect();
+        assert_eq!(
+            choices,
+            [
+                PauseChoice::OneHour,
+                PauseChoice::UntilTomorrow,
+                PauseChoice::UntilResumed
+            ]
+        );
+        for (_, label) in PAUSE_MENU {
+            assert!(!label.contains('\u{2014}'), "no em dash in {label}");
+        }
+    }
+
+    /// Posts what the control would, so a combo or button wired to nothing fails.
+    fn command_posted_for(owner: HWND) -> Option<crate::app::SettingsCommand> {
+        take_posted(owner, crate::app::WM_APP_SETTINGS_COMMAND)
+            .and_then(|m| crate::app::SettingsCommand::from_wparam(m.wParam.0))
+    }
+
+    /// #873 wired-to-nothing: picking Offline in the real combo posts the
+    /// owner window the command whose handler moves the tray's check mark.
+    #[test]
+    fn picking_a_mode_in_the_combo_asks_the_owner_to_switch() {
+        use crate::mode::Mode;
+        with_open_window(|hwnd, owner| {
+            let combo = get_dlg_item(hwnd, ID_MODE).expect("mode combo");
+            combo_select(combo, Mode::Offline.label());
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(((CBN_SELCHANGE as usize) << 16) | ID_MODE as usize)),
+                    Some(LPARAM(combo.0 as isize)),
+                );
+            }
+            assert_eq!(
+                command_posted_for(owner),
+                Some(crate::app::SettingsCommand::Mode(Mode::Offline))
+            );
+        });
+    }
+
+    #[test]
+    fn the_resume_button_asks_the_owner_to_resume() {
+        with_open_window(|hwnd, owner| {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_RESUME_BUTTON as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_eq!(
+                command_posted_for(owner),
+                Some(crate::app::SettingsCommand::Resume)
+            );
+        });
+    }
+
+    /// #873: the controls follow a change made in the tray while Settings is open.
+    #[test]
+    fn the_controls_follow_the_trays_mode_and_pause() {
+        use crate::mode::Mode;
+        use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+        with_open_window(|hwnd, _owner| {
+            let status = get_dlg_item(hwnd, ID_PAUSE_STATUS).expect("pause line");
+            let pause = get_dlg_item(hwnd, ID_PAUSE_BUTTON).expect("pause button");
+            let resume = get_dlg_item(hwnd, ID_RESUME_BUTTON).expect("resume button");
+            let enabled = |h: HWND| unsafe { IsWindowEnabled(h) }.as_bool();
+
+            apply_live(hwnd, Mode::Offline, Some("Paused until 14:05"));
+            assert_eq!(combo_selected_text(hwnd, ID_MODE), "Offline");
+            assert_eq!(get_text(status), "Paused until 14:05.");
+            assert!(!enabled(pause) && enabled(resume));
+
+            apply_live(hwnd, Mode::Auto, None);
+            assert_eq!(combo_selected_text(hwnd, ID_MODE), "Auto");
+            assert_eq!(get_text(status), "Wingman is running.");
+            assert!(enabled(pause) && !enabled(resume));
+        });
+    }
+
+    /// #873: the Pause button asks for its menu by message, so the menu's own
+    /// loop never runs inside the handler that holds the window's state, and a
+    /// pending Change is cancelled first (the hook would eat the menu's keys).
+    #[test]
+    fn the_pause_button_defers_its_menu_and_cancels_a_pending_change() {
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            inner.learning = Some(HK_PRIMARY);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_PAUSE_BUTTON as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            let inner =
+                unsafe { &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner) };
+            assert_eq!(inner.learning, None, "the pending Change was not cancelled");
+            assert!(
+                take_posted(hwnd, WM_PAUSE_MENU).is_some(),
+                "the menu was not asked for by message"
+            );
+        });
+    }
+
+    /// The Change beside the pause shortcut arms the pause slot (`HK_PAUSE`):
+    /// the arm is in the handler, and pressing it speaks on the status line
+    /// (no keyboard hook runs in the test, so it says why it cannot arm).
+    #[test]
+    fn the_pause_change_button_arms_the_pause_slot() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        assert!(
+            src.contains(
+                "ID_CHANGE_PAUSE if notify == BN_CLICKED => start_change(inner, HK_PAUSE),"
+            ),
+            "the Change button is not wired to HK_PAUSE"
+        );
+        with_open_window(|hwnd, _owner| {
+            let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
+            let before = get_text(status);
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(
+                        ((BN_CLICKED as usize) << 16) | ID_CHANGE_PAUSE as usize,
+                    )),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_ne!(get_text(status), before, "pressing Change said nothing");
+            stop_learning(unsafe {
+                &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner)
+            });
+        });
+    }
+
+    /// The pause shortcut is a row on General: a label and a Change button.
+    #[test]
+    fn the_pause_shortcut_label_shows_the_staged_chord_or_not_set() {
+        let mut hk = Config::default().hotkeys;
+        hk.pause = None;
+        assert_eq!(pause_label(&hk.pause), "Pause shortcut: not set");
+        let c = chord(b'P' as u32, true, false, true, false);
+        hk.pause = Some(c);
+        assert_eq!(
+            pause_label(&hk.pause),
+            format!("Pause shortcut: {}", chord_to_string(&c))
+        );
     }
 }
