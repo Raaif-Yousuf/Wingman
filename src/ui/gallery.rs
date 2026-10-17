@@ -50,7 +50,7 @@ pub fn dpi_from_arg(value: &str) -> Option<u32> {
 }
 
 /// The display scale in percent a DPI is, rounded: 144 is 150.
-#[cfg(any(test, debug_assertions))]
+#[cfg(test)]
 pub fn scale_percent(dpi: u32) -> u32 {
     (dpi * 100 + 48) / 96
 }
@@ -61,16 +61,6 @@ pub fn scale_percent(dpi: u32) -> u32 {
 #[cfg(any(test, debug_assertions))]
 pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> String {
     format!("{state_name}--{theme_name}--{percent}.png")
-}
-
-/// Whether a state can be drawn under a simulated theme and DPI. Every state
-/// can: the card states, the palette, the region overlay, the tray menu and,
-/// since #582, Settings (its light and high contrast pictures are the stock
-/// controls, its dark one is the dark paint, which real windows keep off until
-/// the last slice).
-#[cfg(any(test, debug_assertions))]
-pub fn follows_variants(_state: GalleryState) -> bool {
-    true
 }
 
 /// Whether a state is captured by sending `WM_PRINT` instead of calling
@@ -498,52 +488,23 @@ mod driver {
                 .ok_or_else(|| anyhow::anyhow!("--matrix needs --screenshot <dir>"))?;
             std::fs::create_dir_all(dir)?;
             for state in &states {
-                if follows_variants(*state) {
-                    for theme_name in MATRIX_THEMES {
-                        for percent in MATRIX_SCALES {
-                            let variant = Variant {
-                                theme: theme_from_arg(theme_name),
-                                dpi: dpi_from_arg(&percent.to_string()),
-                            };
-                            let name = matrix_filename(state_name(*state), theme_name, percent);
-                            shoot(
-                                &mut card,
-                                &mut palette,
-                                &mut settings,
-                                &mut region,
-                                variant,
-                                *state,
-                                &dir.join(name),
-                            )?;
-                        }
+                for theme_name in MATRIX_THEMES {
+                    for percent in MATRIX_SCALES {
+                        let variant = Variant {
+                            theme: theme_from_arg(theme_name),
+                            dpi: dpi_from_arg(&percent.to_string()),
+                        };
+                        let name = matrix_filename(state_name(*state), theme_name, percent);
+                        shoot(
+                            &mut card,
+                            &mut palette,
+                            &mut settings,
+                            &mut region,
+                            variant,
+                            *state,
+                            &dir.join(name),
+                        )?;
                     }
-                } else {
-                    // Tray menus and the like: once, at the monitor's own DPI,
-                    // named for the DPI the window really had.
-                    let variant = Variant::default();
-                    let path = dir.join("pending.png");
-                    let named = shoot(
-                        &mut card,
-                        &mut palette,
-                        &mut settings,
-                        &mut region,
-                        variant,
-                        *state,
-                        &path,
-                    )
-                    .and_then(|hwnd| {
-                        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-                        // 0 means the window is gone: a "0" file would lie.
-                        anyhow::ensure!(dpi > 0, "no DPI for the {} window", state_name(*state));
-                        let name =
-                            matrix_filename(state_name(*state), "system", scale_percent(dpi));
-                        std::fs::rename(&path, dir.join(name))?;
-                        Ok(())
-                    });
-                    if named.is_err() {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    named?;
                 }
             }
             std::process::exit(0);
@@ -624,8 +585,7 @@ mod driver {
     }
 
     /// The theme and DPI a state is drawn under. `None` follows the system.
-    /// Applies to the card states and the region overlay (see
-    /// [`follows_variants`]).
+    /// Every state is drawn under a variant in the matrix.
     #[derive(Debug, Clone, Copy, Default)]
     struct Variant {
         theme: Option<crate::ui::theme::Theme>,
@@ -1828,10 +1788,7 @@ mod tests {
         }
         let mut files = std::collections::HashSet::new();
         let mut count = 0;
-        for state in gallery_states()
-            .into_iter()
-            .filter(|s| follows_variants(*s))
-        {
+        for state in gallery_states() {
             for t in MATRIX_THEMES {
                 for pct in MATRIX_SCALES {
                     files.insert(matrix_filename(state_name(state), t, pct));
@@ -1845,14 +1802,9 @@ mod tests {
 
     #[test]
     fn every_state_follows_theme_and_scale_settings_included() {
-        assert!(follows_variants(GalleryState::CardError));
-        assert!(follows_variants(GalleryState::RegionOverlay));
-        assert!(follows_variants(GalleryState::TrayMenu));
-        assert!(follows_variants(GalleryState::TrayMenuSubmenu));
         let mut settings_states = 0;
         for state in gallery_states() {
             let n = state_name(state);
-            assert!(follows_variants(state), "{n}");
             settings_states += usize::from(n.starts_with("settings-"));
         }
         assert_eq!(
@@ -1869,7 +1821,6 @@ mod tests {
         for state in gallery_states() {
             let n = state_name(state);
             if n.starts_with("palette-") {
-                assert!(follows_variants(state), "{n}");
                 palette_states += 1;
             }
         }
@@ -2008,7 +1959,6 @@ mod tests {
     fn the_long_button_state_is_listed_and_follows_themes_and_scales() {
         let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
         assert!(names.contains(&"card-preview-long-button"));
-        assert!(follows_variants(GalleryState::CardPreviewLongButton));
     }
 
     #[test]
@@ -2022,8 +1972,6 @@ mod tests {
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
-        assert!(follows_variants(GalleryState::CardOptionsReady));
-        assert!(follows_variants(GalleryState::CardOptionsDefaultLong));
         assert!(
             !names.iter().any(|n| n.contains("router-suggestion")),
             "the palette no longer shows a router suggestion (#805)"

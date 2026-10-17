@@ -1182,18 +1182,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         | windows::Win32::UI::WindowsAndMessaging::WM_SYSCOLORCHANGE
         | windows::Win32::UI::WindowsAndMessaging::WM_THEMECHANGED
         | WM_DWMCOLORIZATIONCOLORCHANGED_MSG => {
+            // #582: the erase repaints the painted face, so it is only asked
+            // for when the face was painted before or is now (light does not
+            // flicker more than it did).
+            let was_painted = edit_style().paints_face;
             invalidate_edit_style();
             invalidate_rail_style();
-            // #582: the one owner of the theme resolves it again here; the
-            // title bar follows, and the erase repaints the face.
+            // The one owner of the theme resolves it again here; the title
+            // bar follows.
             apply_title_bar(hwnd);
+            let erase = if was_painted || edit_style().paints_face {
+                windows::Win32::Graphics::Gdi::RDW_ERASE
+            } else {
+                Default::default()
+            };
             let _ = RedrawWindow(
                 Some(hwnd),
                 None,
                 None,
                 windows::Win32::Graphics::Gdi::RDW_FRAME
                     | RDW_INVALIDATE
-                    | windows::Win32::Graphics::Gdi::RDW_ERASE
+                    | erase
                     | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
             );
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -3466,11 +3475,19 @@ fn current_look() -> Look {
 /// Sets the title bar to the theme (`DWMWA_USE_IMMERSIVE_DARK_MODE`, documented
 /// since Windows 10 20H1). Left alone in high contrast, where the system draws
 /// the caption. A failure leaves the title bar as it was: the body is still
-/// right, so it fails safe.
+/// right, so it fails safe. Light is only written back after a dark one was
+/// applied, so a light-only run never touches the attribute.
 unsafe fn apply_title_bar(hwnd: HWND) {
     use windows::core::BOOL;
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    thread_local! {
+        static DARK_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     if let Some(dark) = crate::ui::settings_theme::title_bar_dark(edit_style().look.theme) {
+        if !dark && !DARK_APPLIED.get() {
+            return;
+        }
+        DARK_APPLIED.set(dark);
         let value = BOOL::from(dark);
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -12210,18 +12227,24 @@ mod tests {
     /// What the window answers a label's colour request with: the brush's
     /// colour and the text colour left on the DC.
     fn label_answer(hwnd: HWND) -> (u32, u32) {
+        let status = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line");
+        label_answer_for(hwnd, status)
+    }
+
+    /// The same, asked of `window` about `label` (the body answers for its own
+    /// labels).
+    fn label_answer_for(window: HWND, label: HWND) -> (u32, u32) {
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, DeleteDC, GetObjectW, GetTextColor, LOGBRUSH,
         };
         use windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC;
-        let status = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("status line");
         unsafe {
             let dc = CreateCompatibleDC(None);
             let brush = SendMessageW(
-                hwnd,
+                window,
                 WM_CTLCOLORSTATIC,
                 Some(WPARAM(dc.0 as usize)),
-                Some(LPARAM(status.0 as isize)),
+                Some(LPARAM(label.0 as isize)),
             );
             let mut logbrush = LOGBRUSH::default();
             GetObjectW(
@@ -12233,6 +12256,32 @@ mod tests {
             let _ = DeleteDC(dc);
             (logbrush.lbColor.0, text)
         }
+    }
+
+    fn get_dlg_item_body(hwnd: HWND) -> HWND {
+        unsafe { GetDlgItem(Some(hwnd), ID_BODY) }.expect("body window")
+    }
+
+    /// A plain label under the body, with no id the body singles out.
+    fn body_test_label(body: HWND) -> HWND {
+        let class = wide_z("STATIC");
+        unsafe {
+            CreateWindowExW(
+                Default::default(),
+                PCWSTR(class.as_ptr()),
+                PCWSTR::null(),
+                WS_CHILD,
+                0,
+                0,
+                10,
+                10,
+                Some(body),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("a body label")
     }
 
     /// Whether the title bar asks for the dark frame.
@@ -12268,11 +12317,17 @@ mod tests {
                 assert_eq!(erased_face_pixel(hwnd), DARK.surface);
                 assert_eq!(label_answer(hwnd), (DARK.surface, DARK.text));
                 assert!(title_bar_is_dark(hwnd));
+                // The body answers for its own face and labels too.
+                let body = get_dlg_item_body(hwnd);
+                let label = body_test_label(body);
+                assert_eq!(erased_face_pixel(body), DARK.surface);
+                assert_eq!(label_answer_for(body, label), (DARK.surface, DARK.text));
                 // Live re-theme: back to light, the same window.
                 force_theme(Some(Theme::Light));
                 unsafe { SendMessageW(hwnd, WM_THEMECHANGED, None, None) };
                 assert_eq!(erased_face_pixel(hwnd), system_face);
                 assert!(!title_bar_is_dark(hwnd));
+                assert_ne!(label_answer_for(body, label).0, DARK.surface);
             });
         }
         {
