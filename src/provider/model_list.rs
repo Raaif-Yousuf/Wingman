@@ -77,6 +77,17 @@ pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
 type GetPage<'a> = &'a dyn Fn(&str, &[(&str, &str)]) -> Result<String>;
 
 fn fetch_with(vendor: Vendor, api_key: &str, get: GetPage) -> Result<Vec<String>> {
+    fetch_pages(vendor, api_key, get, MAX_PAGES).map(|(ids, _)| ids)
+}
+
+/// [`fetch_with`], reading at most `max_pages` pages. The flag is true when the
+/// vendor had no further page to give, so the ids are the whole list.
+fn fetch_pages(
+    vendor: Vendor,
+    api_key: &str,
+    get: GetPage,
+    max_pages: usize,
+) -> Result<(Vec<String>, bool)> {
     let mut url = match vendor {
         Vendor::OpenAi => OPENAI_URL.to_string(),
         Vendor::Anthropic => ANTHROPIC_URL.to_string(),
@@ -85,7 +96,8 @@ fn fetch_with(vendor: Vendor, api_key: &str, get: GetPage) -> Result<Vec<String>
     let auth = format!("Bearer {api_key}");
     let mut bodies: Vec<String> = Vec::new();
     let mut total_bytes = 0usize;
-    for _ in 0..MAX_PAGES {
+    let mut complete = false;
+    for _ in 0..max_pages {
         let body = match vendor {
             Vendor::OpenAi => get(&url, &[("Authorization", auth.as_str())]),
             Vendor::Anthropic => get(
@@ -109,21 +121,25 @@ fn fetch_with(vendor: Vendor, api_key: &str, get: GetPage) -> Result<Vec<String>
         bodies.push(body);
         match follow(&url, next, total_bytes) {
             Some(n) => url = n,
-            None => break,
+            None => {
+                complete = true;
+                break;
+            }
         }
     }
     let ids = parse_pages(vendor, &bodies)?;
     if ids.is_empty() {
         return Err(anyhow!("{}: the list had no usable models", vendor.tag()));
     }
-    Ok(ids)
+    Ok((ids, complete))
 }
 
 /// What asking the vendor's list endpoint with a typed key found out (#876).
 #[derive(Debug)]
 pub enum KeyCheck {
-    /// 2xx: the vendor knows the key. Its model list came with the answer.
-    Accepted(Vec<String>),
+    /// 2xx: the vendor knows the key. The first page of its model list came with
+    /// the answer; the flag says that page was the whole list.
+    Accepted(Vec<String>, bool),
     /// 401 or 403 (or Gemini's 400 `API_KEY_INVALID`): the vendor refused it.
     Rejected,
     /// No network, a timeout, 5xx, a rate limit, an answer that is not a list:
@@ -136,17 +152,26 @@ pub enum KeyCheck {
 /// called from the UI thread. No key text is in the result.
 #[cfg_attr(test, allow(dead_code))] // a test build's windows use a fake instead
 pub fn check_key(vendor: Vendor, api_key: &str) -> KeyCheck {
-    classify(fetch(vendor, api_key))
+    classify(check_pages(vendor, api_key, &|url, headers| {
+        common::get_json_with_headers(url, headers, LIST_TIMEOUT, vendor.tag())
+    }))
+}
+
+/// #1140: one page answers "does the vendor know this key", so the check
+/// never waits on the rest of a paginated list (up to `MAX_PAGES` x
+/// `LIST_TIMEOUT`). A list that goes on is fetched in full afterwards.
+fn check_pages(vendor: Vendor, api_key: &str, get: GetPage) -> Result<(Vec<String>, bool)> {
+    fetch_pages(vendor, api_key, get, 1)
 }
 
 #[cfg(test)]
 fn check_key_with(vendor: Vendor, api_key: &str, get: GetPage) -> KeyCheck {
-    classify(fetch_with(vendor, api_key, get))
+    classify(check_pages(vendor, api_key, get))
 }
 
-fn classify(result: Result<Vec<String>>) -> KeyCheck {
+fn classify(result: Result<(Vec<String>, bool)>) -> KeyCheck {
     let err = match result {
-        Ok(ids) => return KeyCheck::Accepted(ids),
+        Ok((ids, complete)) => return KeyCheck::Accepted(ids, complete),
         Err(err) => err,
     };
     let refused = err
@@ -575,13 +600,39 @@ mod key_check_tests {
             Ok(body.clone())
         });
         match got {
-            KeyCheck::Accepted(ids) => assert!(ids.contains(&"gpt-5".to_string())),
+            KeyCheck::Accepted(ids, _) => assert!(ids.contains(&"gpt-5".to_string())),
             other => panic!("expected Accepted, got {other:?}"),
         }
         // One cheap read-only request, to the vendor's own list endpoint.
         let seen = seen.borrow();
         assert_eq!(seen.len(), 1);
         assert!(seen[0].0.starts_with("https://api.openai.com/"));
+    }
+
+    /// #1140: the check needs one answer, not the whole paginated list.
+    #[test]
+    fn a_key_check_reads_one_page_even_when_the_vendor_says_more() {
+        let anthropic = r#"{"data":[{"id":"claude-sonnet-5-5","created_at":"2026-01-01T00:00:00Z"}],"has_more":true,"last_id":"claude-sonnet-5-5"}"#;
+        let gemini = r#"{"models":[{"name":"models/gemini-3-pro","supportedGenerationMethods":["generateContent"]}],"nextPageToken":"abc"}"#;
+        for (vendor, body) in [(Vendor::Anthropic, anthropic), (Vendor::Gemini, gemini)] {
+            let calls = std::cell::Cell::new(0);
+            let got = check_key_with(vendor, "key", &|_, _| {
+                calls.set(calls.get() + 1);
+                Ok(body.to_string())
+            });
+            assert!(
+                matches!(got, KeyCheck::Accepted(_, false)),
+                "{vendor:?}: {got:?}"
+            );
+            assert_eq!(calls.get(), 1, "{vendor:?} followed a next page");
+        }
+        // The full list fetch still follows pages.
+        let calls = std::cell::Cell::new(0);
+        let _ = fetch_with(Vendor::Anthropic, "key", &|_, _| {
+            calls.set(calls.get() + 1);
+            Ok(anthropic.to_string())
+        });
+        assert!(calls.get() > 1, "the full fetch must keep following pages");
     }
 
     #[test]
