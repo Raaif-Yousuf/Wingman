@@ -3001,18 +3001,10 @@ impl App {
             self.show_busy_card();
             return;
         }
-        let today = match local_today_and_utc_offset() {
-            Ok((today, _)) => today,
-            Err(e) => {
-                let detail = self.track_error("Couldn't read the local date", &format!("{e:#}"));
-                self.card
-                    .show_error_with_details("Couldn't read the local date", &detail);
-                return;
-            }
-        };
+        let (today, now_minute) = local_date_and_minute();
         let week = local_week_start();
         self.run_model_free_screen_action(move |raw| {
-            actions::relative_dates::run(raw, today, week)
+            actions::relative_dates::run(raw, today, Some(now_minute), week)
         });
     }
 
@@ -7379,11 +7371,26 @@ fn with_fallback_footer(detail: &str, footer: Option<&str>) -> String {
     }
 }
 
-/// The first day of the week the user's Windows region sets (#336), for "this
-/// week" and "next week". Monday when Windows cannot say. Win32, so checked by
-/// hand (rule 8): set the region's first day of the week to Sunday and run
-/// "Relative dates to real dates" on "Friday this week" on a Sunday; the date
-/// moves a week.
+/// Today's local date and the local time of day in minutes since midnight
+/// (#706), from one `GetLocalTime` call so the two cannot straddle midnight.
+/// Win32, so checked by hand (rule 8): run "Relative dates to real dates" on
+/// "in 2 hours"; the card shows the time two hours from the clock.
+fn local_date_and_minute() -> (CivilDate, u16) {
+    let now = unsafe { GetLocalTime() };
+    let today = CivilDate {
+        year: i32::from(now.wYear),
+        month: now.wMonth as u8,
+        day: now.wDay as u8,
+    };
+    (today, now.wHour * 60 + now.wMinute)
+}
+
+/// The first day of the week the user's Windows region sets (#336, #707), for
+/// "this week" and "next week". Monday when Windows cannot say. Read on each
+/// press (a settings lookup, not a hot path), so a region change applies at
+/// once. Win32, so checked by hand (rule 8): set the region's first day of the
+/// week to Saturday and run "Relative dates to real dates" on "Friday this
+/// week" on a Saturday; the date moves a week.
 fn local_week_start() -> actions::dates::WeekStart {
     use windows::core::PCWSTR;
     use windows::Win32::Globalization::{
