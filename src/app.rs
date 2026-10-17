@@ -1892,7 +1892,8 @@ impl App {
     /// network). Today's local date is read here, on the main thread, and
     /// handed to the worker.
     fn resolve_dates(&mut self) {
-        if self.busy {
+        if self.busy_now() {
+            self.show_busy_card();
             return;
         }
         let today = match local_today_and_utc_offset() {
@@ -7794,6 +7795,16 @@ mod tests {
             seen += 1;
         }
         assert!(seen >= 3, "expected the busy gates, found {seen}");
+        // The raw flag must not gate a press either: it skips the stuck-run
+        // abandon and returns with no card.
+        let raw = "if self.".to_owned() + "busy {";
+        for (i, _) in src.match_indices(&raw) {
+            let after = src.get(i..i + 120).unwrap_or(&src[i..]);
+            assert!(
+                after.contains("self.card.show_answer(") || after.contains("self.show_busy_card()"),
+                "a raw busy check returns without a card: {after}"
+            );
+        }
         let gate = src
             .find("ModelActionGate::Busy => {")
             .expect("begin_action has no Busy arm");
