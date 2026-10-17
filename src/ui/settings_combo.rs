@@ -34,12 +34,6 @@ pub(crate) fn chevron_points(button: &RECT, dpi: u32) -> [(i32, i32); 3] {
 /// is held down and while the list is dropped open.
 const STATE_SYSTEM_PRESSED: u32 = 0x0000_0008;
 
-/// How far the button's fill moves toward the text ink when the mouse is over
-/// it and when it is pressed or the list is open, in percent: the secondary
-/// push button's hover and pressed steps (`card_buttons::look`).
-const ARROW_HOT_PCT: u32 = 8;
-const ARROW_PRESSED_PCT: u32 = 16;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArrowState {
     Normal,
@@ -76,12 +70,12 @@ pub(crate) fn arrow_colors(
     ink: u32,
     highlight: Option<(u32, u32)>,
 ) -> (u32, u32) {
-    use crate::ui::card_buttons::blend;
+    use crate::ui::card_buttons::{blend, SECONDARY_HOVER_PCT, SECONDARY_PRESSED_PCT};
     match (state, highlight) {
         (ArrowState::Normal, _) => (fill, ink),
         (_, Some(pair)) => pair,
-        (ArrowState::Hot, None) => (blend(fill, ink, ARROW_HOT_PCT), ink),
-        (ArrowState::Pressed, None) => (blend(fill, ink, ARROW_PRESSED_PCT), ink),
+        (ArrowState::Hot, None) => (blend(fill, ink, SECONDARY_HOVER_PCT), ink),
+        (ArrowState::Pressed, None) => (blend(fill, ink, SECONDARY_PRESSED_PCT), ink),
     }
 }
 

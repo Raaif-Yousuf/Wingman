@@ -1352,7 +1352,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
     // #1143: a combo whose list opens is no longer under the pointer.
     if notify == windows::Win32::UI::WindowsAndMessaging::CBN_DROPDOWN {
         if let Some(combo) = get_dlg_item(inner.hwnd, id) {
-            set_combo_hover(combo, false);
+            end_combo_hover(combo);
         }
     }
     match id {
@@ -8919,6 +8919,10 @@ thread_local! {
 fn set_arrow_hot(hwnd: HWND, lparam: LPARAM) {
     use windows::Win32::UI::Controls::COMBOBOXINFO;
     use windows::Win32::UI::WindowsAndMessaging::CB_GETCOMBOBOXINFO;
+    // Light and the system's high contrast keep the system's button.
+    if !unsafe { edit_style() }.paints_face {
+        return;
+    }
     let me = hwnd.0 as isize;
     let mut info = COMBOBOXINFO {
         cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
@@ -8991,6 +8995,15 @@ fn set_combo_hover(hwnd: HWND, on: bool) -> bool {
         }
     }
     true
+}
+
+/// Takes the hover and the hot arrow off `hwnd`. The arrow goes first: another
+/// combo may already hold the hover, which would end `set_combo_hover` early.
+fn end_combo_hover(hwnd: HWND) {
+    if HOT_ARROW.get() == hwnd.0 as isize {
+        HOT_ARROW.set(0);
+    }
+    set_combo_hover(hwnd, false);
 }
 
 /// Asks Windows for one `WM_MOUSELEAVE` when the mouse leaves `hwnd`.
@@ -9125,7 +9138,7 @@ unsafe extern "system" fn combo_subclass(
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_MOUSELEAVE => {
-            set_combo_hover(hwnd, false);
+            end_combo_hover(hwnd);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         // #1143: Windows does not always send `WM_MOUSELEAVE` to a combo that is
@@ -9133,15 +9146,15 @@ unsafe extern "system" fn combo_subclass(
         // end the hover themselves. (The list opening is `CBN_DROPDOWN`, which
         // the window handles.)
         WM_ENABLE | WM_SHOWWINDOW if wparam.0 == 0 => {
-            set_combo_hover(hwnd, false);
+            end_combo_hover(hwnd);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_CAPTURECHANGED => {
-            set_combo_hover(hwnd, false);
+            end_combo_hover(hwnd);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_NCDESTROY => {
-            set_combo_hover(hwnd, false);
+            end_combo_hover(hwnd);
             let _ = RemoveWindowSubclass(hwnd, Some(combo_subclass), COMBO_SUBCLASS_ID);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
@@ -13661,7 +13674,11 @@ mod tests {
             mv(5, 5);
             assert_eq!(pixel(), fill, "mouse on the field, not the button");
             mv((b.left + b.right) / 2, (b.top + b.bottom) / 2);
-            assert_eq!(pixel(), blend(fill, ink, 8), "mouse over the button");
+            assert_eq!(
+                pixel(),
+                blend(fill, ink, crate::ui::card_buttons::SECONDARY_HOVER_PCT),
+                "mouse over the button"
+            );
             mv(5, 5);
             assert_eq!(pixel(), fill, "mouse back on the field");
             mv((b.left + b.right) / 2, (b.top + b.bottom) / 2);
@@ -13670,11 +13687,61 @@ mod tests {
             unsafe {
                 SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(1)), Some(LPARAM(0)));
             }
-            assert_eq!(pixel(), blend(fill, ink, 16), "list dropped open");
+            assert_eq!(
+                pixel(),
+                blend(fill, ink, crate::ui::card_buttons::SECONDARY_PRESSED_PCT),
+                "list dropped open"
+            );
             unsafe {
                 SendMessageW(combo, CB_SHOWDROPDOWN, Some(WPARAM(0)), Some(LPARAM(0)));
             }
             assert_eq!(pixel(), fill, "list closed again");
+        });
+    }
+
+    /// #1238 review: the hot arrow follows the hover. Light never tracks it, and
+    /// leaving combo A after combo B took the hover still clears A's arrow.
+    #[test]
+    fn the_hot_arrow_is_dark_only_and_clears_when_the_hover_moves_on() {
+        use windows::Win32::UI::Controls::COMBOBOXINFO;
+        use windows::Win32::UI::WindowsAndMessaging::{CB_GETCOMBOBOXINFO, WM_MOUSEMOVE};
+        const WM_MOUSELEAVE: u32 = 0x02A3;
+        let on_button = |combo: HWND| unsafe {
+            let mut info = COMBOBOXINFO {
+                cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            SendMessageW(
+                combo,
+                CB_GETCOMBOBOXINFO,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+            );
+            let b = info.rcButton;
+            let (x, y) = ((b.left + b.right) / 2, (b.top + b.bottom) / 2);
+            LPARAM(((y as isize) << 16) | (x as isize & 0xFFFF))
+        };
+        {
+            let _forced = Forced::new(Theme::Light);
+            with_window(Config::default(), |hwnd, _raw| {
+                let a = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+                unsafe { SendMessageW(a, WM_MOUSEMOVE, Some(WPARAM(0)), Some(on_button(a))) };
+                assert_eq!(HOT_ARROW.get(), 0, "light does not track the arrow");
+            });
+        }
+        let _forced = Forced::new(Theme::Dark);
+        with_window(Config::default(), |hwnd, _raw| {
+            let a = get_dlg_item(hwnd, ID_CARD_CORNER).unwrap();
+            let b = get_dlg_item(hwnd, ID_MONITOR).unwrap();
+            let mv = |c: HWND, lp: LPARAM| unsafe {
+                SendMessageW(c, WM_MOUSEMOVE, Some(WPARAM(0)), Some(lp));
+            };
+            mv(a, on_button(a));
+            assert_eq!(HOT_ARROW.get(), a.0 as isize, "A's arrow is hot");
+            mv(b, LPARAM(0x0005_0005));
+            assert!(combo_is_hovered(b), "B took the hover");
+            unsafe { SendMessageW(a, WM_MOUSELEAVE, None, None) };
+            assert_eq!(HOT_ARROW.get(), 0, "A's arrow is cleared at its leave");
         });
     }
 
