@@ -6,32 +6,33 @@
 //! # Public API
 //!
 //! ```ignore
-//! pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config>;
+//! pub fn open(instance: HINSTANCE, owner: HWND, config: &Config) -> bool;
+//! pub fn pre_dispatch(msg: &MSG) -> bool;
 //! ```
 //!
-//! `show_modal` creates the window, runs its own `GetMessageW` loop until
-//! the window is closed, and returns the edited config on Save or `None` on
-//! Cancel/close. The caller (the integrating agent's tray/app glue) is
-//! responsible for persisting (`Config::save`) and applying the result --
-//! this module never touches disk.
+//! The window is **modeless** (#871). `open` creates it and returns at once;
+//! there is no loop of its own and no `&mut App` held while it is open, so Quit,
+//! the tray, the pause key and every worker result are handled as they arrive.
+//! `owner` is the main window: the window posts to it when it loses the
+//! foreground or closes (`WM_APP_SETTINGS_LEFT`), and the writer's answer
+//! returns to it (`WM_APP_CONFIG_WRITTEN`).
 //!
-//! Notes for the integrating agent:
-//! - If a settings window is already open, a second `show_modal` call does
-//!   not open a second one: it brings the existing window to the front and
-//!   returns `None` immediately. This is guarded by a process-wide static,
-//!   not by anything the caller has to manage.
-//! - The message loop here pumps *all* thread messages (`GetMessageW` with
-//!   `hwnd = NULL`), not just this window's -- a window with child controls
-//!   cannot filter by its own `HWND`, because input messages for a control
-//!   are addressed to that control's `HWND`, not its parent's, and
-//!   `GetMessageW(hwnd)` only ever returns messages addressed to exactly
-//!   that handle. Filtering here would leave every edit/combo/button
-//!   keystroke and click undelivered. Consequently, anything else already
-//!   queued on this thread (e.g. a posted hotkey message aimed at the main
-//!   app window) can still be dispatched to its own window proc while this
-//!   modal loop runs. Whether that should be suppressed is a decision for
-//!   the integrating app's own message handling, not something this module
-//!   can enforce without owning that window.
+//! Save no longer returns a `Config`. It sends only the fields the user changed
+//! (`config_writer::diff` of the config the window opened with against the
+//! form) to the `settings-writer` thread, which patches them onto the file as it
+//! is on disk now, so a hand edit made meanwhile survives, and then closes the
+//! window. This module never touches the disk or the network on the UI thread.
+//!
+//! Notes for the integrating app:
+//! - If a settings window is already open, `open` brings it to the front and
+//!   returns `true` without opening a second one. The guard is a process-wide
+//!   static, not something the caller manages.
+//! - The window has no message loop, so the app's own pump must offer every
+//!   message to [`pre_dispatch`] first: it takes Enter, Esc and the wheel,
+//!   gives the dialog manager Tab and the mnemonics (`IsDialogMessage`), scrolls
+//!   a newly focused control into view, and takes a captured shortcut
+//!   (`WM_APP_LEARNED`, posted to the main window) while a Change is pending.
+//!   It is one atomic load when no window is open.
 //! - **Theme**: this window is always drawn with the stock (light) system
 //!   control appearance, regardless of the OS light/dark setting. Unlike
 //!   `card.rs` (which paints its own surface and can safely follow
@@ -52,10 +53,10 @@
 //! - `hotkeys.primary` / `hotkeys.secondary` are shown with a Change button
 //!   each (#345). Change arms the tray's own learn mode (`hotkey::arm_learning`),
 //!   and the captured chord comes back as `WM_APP_LEARNED`, posted to the main
-//!   window. This module's message loop takes that message off the queue
-//!   itself (`take_learned`) while a Change is pending, because the main
-//!   window's proc ignores it whenever Settings is open. The new chord is
-//!   only staged in the window and saved with everything else on Save.
+//!   window. [`pre_dispatch`] takes that message off the queue itself
+//!   (`take_learned`) while a Change is pending, so the app never sees it as a
+//!   rebind. The new chord is only staged in the window and saved with
+//!   everything else on Save.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -81,16 +82,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, VK_ESC
 use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDlgCtrlID, GetDlgItem,
-    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild,
-    IsDialogMessageW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW, PM_REMOVE, SPI_GETNONCLIENTMETRICS,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SETREDRAW,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME,
-    WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    IsChild, IsDialogMessageW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW,
+    RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOP, IDC_ARROW, MSG, NONCLIENTMETRICSW,
+    PM_REMOVE, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
+    WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT,
+    WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
+    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, GetScrollInfo, GetWindow, CBN_SELCHANGE, GW_CHILD, GW_HWNDNEXT,
@@ -111,31 +112,75 @@ use crate::provider::DEFAULT_PROMPT;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Opens the settings window modally and pumps messages until it is closed.
-/// Returns the edited config on Save, `None` on Cancel/close.
-///
-/// If a settings window is already open, brings it to the front and returns
-/// `None` without opening a second one.
-pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
+/// Opens the settings window and returns at once (#871): the window lives on
+/// the caller's message loop, which must offer every message to
+/// [`pre_dispatch`]. `owner` is the main window (see the module docs). Returns
+/// `false` only when Windows would not create the window; an already open one
+/// is brought to the front and counts as success.
+pub fn open(instance: HINSTANCE, owner: HWND, config: &Config) -> bool {
     let existing = OPEN_HWND.load(Ordering::SeqCst);
     if existing != 0 {
         let hwnd = HWND(existing as *mut c_void);
         unsafe {
             let _ = SetForegroundWindow(hwnd);
         }
-        return None;
+        return true;
     }
 
     if !ensure_class_registered(instance) {
-        return None;
+        return false;
     }
+    open_impl(instance, owner, config, CLASS_NAME, true)
+}
+
+/// [`open`] without the "already open" check and the class registration. `live`
+/// is false in the tests: the window is not shown or activated and the
+/// background probes (Ollama, the cloud model lists) are not started. The
+/// tests give their own class name (rule 9).
+fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, live: bool) -> bool {
     ensure_common_controls();
 
-    let inner = Box::new(SettingsInner::new(config.clone()));
+    let mut inner = Box::new(SettingsInner::new(config.clone()));
+    // The window owns this box from here: `WM_NCDESTROY` frees it.
+    inner.owner = owner;
+    inner.owns_itself = true;
+    let owner_raw = owner.0 as isize;
+    // What the FILE held when the window opened, defaults for keys it does not
+    // spell out. The running config is not that (a tray change not yet written,
+    // a default never written), and comparing with it refuses a save that
+    // touched nothing by hand. Tests do not read the real file (rule 9).
+    let file_baseline = if live {
+        crate::config::Config::path()
+            .ok()
+            .and_then(|p| crate::config_writer::file_baseline(&p))
+    } else {
+        None
+    };
+    inner.save_sink = Some(Box::new(move |original: &Config, edited: &Config| {
+        let changes = crate::config_writer::diff(original, edited).map_err(|e| format!("{e:#}"))?;
+        // A list changed here replaces the whole list in the file, so it is
+        // written only if the file's list is still the one this window opened
+        // with; a hand edit of a sibling entry is not silently dropped.
+        let changes = crate::config_writer::guard_whole_values(
+            changes,
+            file_baseline.as_ref().unwrap_or(original),
+        )
+        .map_err(|e| format!("{e:#}"))?;
+        crate::app::post_settings_save(
+            owner_raw,
+            crate::app::SettingsSave {
+                changes,
+                original: original.clone(),
+                edited: edited.clone(),
+            },
+        )
+    }));
     let raw = Box::into_raw(inner);
 
-    let class_name = wide_z(CLASS_NAME);
+    let class_name = wide_z(class);
     let title = wide_z("Wingman settings");
+    // See `FREED_BY_WINDOW`: forget a stale answer before creating.
+    FREED_BY_WINDOW.with(|c| c.set(0));
 
     // 96dpi guess for the very first CreateWindowExW call, before we have an
     // HWND to ask GetDpiForWindow about -- corrected immediately below, same
@@ -163,10 +208,15 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let hwnd = match create_result {
         Ok(hwnd) => hwnd,
         Err(_) => {
-            unsafe {
-                drop(Box::from_raw(raw));
+            // Windows destroys a window whose creation failed after
+            // `WM_NCCREATE`, and `WM_NCDESTROY` has already freed the box then.
+            // Freeing it again here would be a double free.
+            if FREED_BY_WINDOW.with(|c| c.replace(0)) != raw as usize {
+                unsafe {
+                    drop(Box::from_raw(raw));
+                }
             }
-            return None;
+            return false;
         }
     };
 
@@ -212,30 +262,32 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
     let built = build_ui_recorded(hwnd, instance, dpi, inner_ref.font, config, client_h_dp);
     inner_ref.adopt(built);
     sync_card_display_enabled(hwnd);
-    // #527, #568: the Ollama status and button arrive later, off the UI
-    // thread; the group says "Checking Ollama..." until then.
-    spawn_ollama_status_probe(
-        hwnd,
-        config.providers.ollama.clone(),
-        config.providers.order.iter().any(|p| p == "ollama"),
-        inner_ref.ollama_status.clone(),
-        inner_ref.alive.clone(),
-    );
-    // #183: the model list arrives later, off the UI thread.
-    spawn_ollama_models_fetch(
-        hwnd,
-        config.providers.ollama.base_url.clone(),
-        inner_ref.ollama_tags.clone(),
-        inner_ref.alive.clone(),
-    );
-    // #380: the cloud providers' live model lists, the same way.
-    spawn_cloud_models_fetch(
-        hwnd,
-        config,
-        inner_ref.cloud_models.clone(),
-        inner_ref.cloud_sync.clone(),
-        inner_ref.alive.clone(),
-    );
+    if live {
+        // #527, #568: the Ollama status and button arrive later, off the UI
+        // thread; the group says "Checking Ollama..." until then.
+        spawn_ollama_status_probe(
+            hwnd,
+            config.providers.ollama.clone(),
+            config.providers.order.iter().any(|p| p == "ollama"),
+            inner_ref.ollama_status.clone(),
+            inner_ref.alive.clone(),
+        );
+        // #183: the model list arrives later, off the UI thread.
+        spawn_ollama_models_fetch(
+            hwnd,
+            config.providers.ollama.base_url.clone(),
+            inner_ref.ollama_tags.clone(),
+            inner_ref.alive.clone(),
+        );
+        // #380: the cloud providers' live model lists, the same way.
+        spawn_cloud_models_fetch(
+            hwnd,
+            config,
+            inner_ref.cloud_models.clone(),
+            inner_ref.cloud_sync.clone(),
+            inner_ref.alive.clone(),
+        );
+    }
     // #342: the prompt starts hidden, so shrink the window to match.
     unsafe { show_prompt_state(inner_ref) };
     unsafe {
@@ -259,31 +311,21 @@ pub fn show_modal(instance: HINSTANCE, config: &Config) -> Option<Config> {
         }
     }
 
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-        // #346: without an explicit initial focus, keyboard focus landed
-        // wherever it happened to fall (reported as the Max edge box) --
-        // pin it to the first field instead, so Tab order starts from the
-        // top of the window every time it opens.
-        if let Some(first) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
-            let _ = SetFocus(Some(first));
+    if live {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            // #346: without an explicit initial focus, keyboard focus landed
+            // wherever it happened to fall (reported as the Max edge box) --
+            // pin it to the first field instead, so Tab order starts from the
+            // top of the window every time it opens.
+            if let Some(first) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
+                let _ = SetFocus(Some(first));
+            }
         }
     }
 
-    run_message_loop(hwnd, inner_ref.prompt_edit);
-
-    // #345: a key captured while Save was being pressed may still be queued
-    // for the main window, which would take it as a rebind. Free it unused.
-    drain_learned_messages();
-
-    // `inner_ref` is only valid up to WM_NCDESTROY, which has already run by
-    // the time DestroyWindow (called from our WM_CLOSE/command handling)
-    // returns, and that happens synchronously inside the message loop above.
-    // Reclaim the box now to read the result and free everything.
-    let inner = unsafe { Box::from_raw(raw) };
-    OPEN_HWND.store(0, Ordering::SeqCst);
-    inner.result
+    true
 }
 
 /// Asks the open Settings window to close without saving (#673), as its own
@@ -301,6 +343,32 @@ pub fn request_close() {
             );
         }
     }
+}
+
+/// Closes the open Settings window at once, without saving. For the app's own
+/// shutdown: Settings is a top-level window of its own, so it does not go away
+/// with the main window. Must run on the UI thread. A no-op when none is open.
+pub fn close_now() {
+    let existing = OPEN_HWND.load(Ordering::SeqCst);
+    if existing != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(existing as *mut c_void));
+        }
+    }
+}
+
+/// Whether the Settings window is open and is the foreground window. The app
+/// holds back anything that would put a card on top of it while this is true.
+pub fn is_foreground() -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    open != 0 && unsafe { GetForegroundWindow() }.0 as isize == open
+}
+
+thread_local! {
+    /// The address of the `SettingsInner` the window procedure freed in
+    /// `WM_NCDESTROY` (0: none). `open_impl` reads it when `CreateWindowExW`
+    /// fails, to know whether the window already took the box with it.
+    static FREED_BY_WINDOW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Process-wide guard: 0 when no settings window is open, else the open
@@ -372,68 +440,76 @@ unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
     false
 }
 
-fn run_message_loop(hwnd: HWND, prompt_edit: HWND) {
-    // #481: the focused window as of the last message, to scroll a newly
-    // focused control into view without a timer.
-    let mut last_focus = HWND(std::ptr::null_mut());
-    loop {
-        let mut msg = MSG::default();
-        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if ret.0 <= 0 {
-            // WM_QUIT (0) or an error (-1). We never post WM_QUIT ourselves,
-            // but bail cleanly either way rather than spin.
-            break;
-        }
+/// The window that had the keyboard focus after the last message this module
+/// looked at, to scroll a newly focused control into view without a timer
+/// (#481).
+static LAST_FOCUS: AtomicIsize = AtomicIsize::new(0);
 
+/// The settings window's share of the app's message pump (#871). Called with
+/// every message before it is translated and dispatched; returns true when the
+/// message was used here and must not go any further. Messages that are not
+/// the open window's, or its children's, pass straight through.
+pub fn pre_dispatch(msg: &MSG) -> bool {
+    let open = OPEN_HWND.load(Ordering::SeqCst);
+    if open == 0 {
+        return false;
+    }
+    let hwnd = HWND(open as *mut c_void);
+    unsafe {
         // #345: the hook posts a captured key to the MAIN window, so it is
         // not addressed to us. While a Change is pending it is ours.
-        if msg.message == WM_APP_LEARNED && unsafe { take_learned(hwnd, &msg) } {
-            continue;
+        if msg.message == WM_APP_LEARNED && take_learned(hwnd, msg) {
+            return true;
         }
-
-        let belongs_to_us = msg.hwnd == hwnd || unsafe { IsChild(hwnd, msg.hwnd) }.as_bool();
-
-        if belongs_to_us
-            && msg.message == WM_KEYDOWN
-            && unsafe { handle_key(hwnd, &msg, prompt_edit) }
-        {
-            continue;
+        let ours = msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd).as_bool();
+        if !ours {
+            return false;
         }
-
+        let prompt_edit = prompt_edit_of(hwnd);
+        if msg.message == WM_KEYDOWN && handle_key(hwnd, msg, prompt_edit) {
+            return true;
+        }
         // #481: the wheel scrolls the body wherever the pointer is in the
         // window (a control under it would otherwise eat the notch).
-        if belongs_to_us && unsafe { scroll_with_wheel(hwnd, &msg, prompt_edit) } {
-            continue;
+        if scroll_with_wheel(hwnd, msg, prompt_edit) {
+            return true;
         }
+        let used = IsDialogMessageW(hwnd, msg).as_bool();
+        let focus = GetFocus();
+        if LAST_FOCUS.swap(focus.0 as isize, Ordering::SeqCst) != focus.0 as isize
+            // Only keyboard moves scroll: scrolling between a click's
+            // mouse-down and mouse-up would cancel the click.
+            && !is_mouse_message(msg.message)
+        {
+            follow_focus(hwnd, focus);
+        }
+        used
+    }
+}
 
-        unsafe {
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            let focus = GetFocus();
-            if focus != last_focus {
-                last_focus = focus;
-                // Only keyboard moves scroll: scrolling between a click's
-                // mouse-down and mouse-up would cancel the click.
-                if !is_mouse_message(msg.message) {
-                    follow_focus(hwnd, focus);
-                }
-            }
-        }
+/// The multi-line prompt box of the window `hwnd`, or null.
+unsafe fn prompt_edit_of(hwnd: HWND) -> HWND {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner;
+    if ptr.is_null() {
+        HWND(std::ptr::null_mut())
+    } else {
+        (*ptr).prompt_edit
+    }
+}
 
-        // SAFETY: `hwnd` is still alive until WM_NCDESTROY finishes, which
-        // is dispatched synchronously above; GWLP_USERDATA was set to a
-        // valid, still-owned SettingsInner pointer at WM_NCCREATE time.
-        let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SettingsInner;
-        let should_close = if ptr.is_null() {
-            true
-        } else {
-            unsafe { (*ptr).should_close }
-        };
-        if should_close {
-            break;
-        }
+/// Tells the owner window that Settings lost the foreground or closed, so what
+/// waited for it can be shown. A window with no owner (the tests') says nothing.
+fn tell_owner_left(owner: HWND) {
+    if owner.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            Some(owner),
+            crate::app::WM_APP_SETTINGS_LEFT,
+            WPARAM(0),
+            LPARAM(0),
+        );
     }
 }
 
@@ -548,10 +624,16 @@ struct SettingsInner {
     /// The config this window was opened with -- fields not touched by the
     /// UI (e.g. model lists, hotkeys) are carried through from here.
     original: Config,
-    /// What `config.toml` looked like when this window opened (#851). Save
-    /// refuses to write over a file that changed since, so a hand edit made
-    /// through "Open config file" is never lost.
-    config_stamp: Option<ConfigStamp>,
+    /// The main window, told when this one loses the foreground or closes. Null
+    /// in the tests' windows.
+    owner: HWND,
+    /// True for the window `open` creates: it frees its own state in
+    /// `WM_NCDESTROY` and owns the `OPEN_HWND` guard. The tests' windows are
+    /// reclaimed by the test and leave both alone.
+    owns_itself: bool,
+    /// Where Save sends the edit: in production the writer thread (see `open`).
+    /// `None` in the tests' windows, which only record `result`.
+    save_sink: Option<SaveSink>,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and only reaches the returned config on Save.
     hotkeys: Hotkeys,
@@ -560,9 +642,26 @@ struct SettingsInner {
     /// #345: the `(slot, chord)` last warned about, so pressing the same
     /// conflicting chord again confirms it (same flow as the tray's).
     pending_conflict: Option<(usize, Chord)>,
-    /// Set on Save; left `None` on Cancel/close.
+    /// The config the last Save produced; `None` until then and on
+    /// Cancel/close.
     result: Option<Config>,
-    should_close: bool,
+}
+
+/// Takes the config the window opened with and the one Save built, and hands
+/// the difference to whatever persists it. An `Err` is a plain sentence and
+/// keeps the window open.
+type SaveSink = Box<dyn Fn(&Config, &Config) -> Result<(), String>>;
+
+/// Counts the `SettingsInner` values dropped, so a test can tell a double free
+/// from a single one.
+#[cfg(test)]
+static INNERS_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+impl Drop for SettingsInner {
+    fn drop(&mut self) {
+        INNERS_DROPPED.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl SettingsInner {
@@ -590,12 +689,13 @@ impl SettingsInner {
             alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             prompt_expanded: false,
             hotkeys: original.hotkeys.clone(),
-            config_stamp: current_config_stamp(),
+            owner: HWND(std::ptr::null_mut()),
+            owns_itself: false,
+            save_sink: None,
             learning: None,
             pending_conflict: None,
             original,
             result: None,
-            should_close: false,
         }
     }
 
@@ -702,6 +802,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // in another app would otherwise be captured as the new shortcut.
             stop_learning(inner);
             set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+            tell_owner_left(inner.owner);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // #871: losing the foreground releases whatever waited for it (a
+        // finished request's card, a press of the Wingman key).
+        WM_ACTIVATE if (wparam.0 & 0xFFFF) == 0 => {
+            tell_owner_left(inner.owner);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER if wparam.0 == LEARN_TIMER_ID => {
@@ -710,6 +817,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_DESTROY => {
             inner.alive.store(false, Ordering::SeqCst);
+            if inner.owns_itself {
+                OPEN_HWND.store(0, Ordering::SeqCst);
+            }
             // #566: closing the window mid-pull stops the download.
             if let Some(cancel) = inner.pull_cancel.take() {
                 cancel.store(true, Ordering::SeqCst);
@@ -722,14 +832,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
                 inner.font = HFONT(std::ptr::null_mut());
             }
-            inner.should_close = true;
+            if inner.owns_itself {
+                // #345: a key captured while Save was being pressed may still be
+                // queued for the main window, which would take it as a rebind.
+                // Free it unused.
+                drain_learned_messages();
+                tell_owner_left(inner.owner);
+            }
             LRESULT(0)
         }
         WM_NCDESTROY => {
             // Detach GWLP_USERDATA so no later message can dereference a
-            // pointer whose Box the caller is about to reclaim.
+            // pointer whose Box is about to be freed.
+            let owned = inner.owns_itself;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            let result = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if owned {
+                // `inner` is not used again: this is the window's last message.
+                FREED_BY_WINDOW.with(|c| c.set(ptr as usize));
+                drop(Box::from_raw(ptr));
+            }
+            result
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -748,15 +871,6 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             if inner.pull_cancel.is_some() {
                 if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
                     set_text(msg, "A pull is running. Stop it first.");
-                }
-                return;
-            }
-            // #851: the file changed while this window was open (a hand edit
-            // from "Open config file", or the tray). Saving the snapshot taken
-            // at open would silently overwrite it.
-            if config_changed_since(inner.config_stamp, current_config_stamp()) {
-                if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
-                    set_text(msg, CONFIG_CHANGED_MESSAGE);
                 }
                 return;
             }
@@ -795,7 +909,21 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                     return;
                 }
             }
-            inner.result = Some(finalize_config(inner, &raw));
+            let edited = finalize_config(inner, &raw);
+            // Only the fields that differ from what this window opened with go
+            // on, patched onto the file as it is now (#871), so a hand edit
+            // made while the window was open (#851's concern) is never undone.
+            if let Some(sink) = &inner.save_sink {
+                if let Err(reason) = sink(&inner.original, &edited) {
+                    // Rule 7: say so inline and keep the window, never a
+                    // dialog or a silent no-op.
+                    if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
+                        set_text(msg, &format!("Could not save: {reason}"));
+                    }
+                    return;
+                }
+            }
+            inner.result = Some(edited);
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
             }
@@ -3349,34 +3477,6 @@ fn ollama_installed() -> bool {
 fn secondary_label(chord: &crate::hotkey::Chord) -> String {
     format!("Shortcut for any keyboard: {}", chord_to_string(chord))
 }
-
-/// When `config.toml` was last written and how long it was (#851). Enough to
-/// notice an edit without reading the file, which holds keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ConfigStamp {
-    modified: Option<std::time::SystemTime>,
-    len: u64,
-}
-
-/// The stamp of the config file now; `None` when it is missing or unreadable.
-fn current_config_stamp() -> Option<ConfigStamp> {
-    let meta = std::fs::metadata(Config::path().ok()?).ok()?;
-    Some(ConfigStamp {
-        modified: meta.modified().ok(),
-        len: meta.len(),
-    })
-}
-
-/// Whether the file changed since the window opened. Any difference counts,
-/// including the file appearing or disappearing. If the stamp cannot be read
-/// both times, nothing is known to have changed.
-fn config_changed_since(opened: Option<ConfigStamp>, now: Option<ConfigStamp>) -> bool {
-    opened != now
-}
-
-/// Shown on the validation line when Save is refused for that reason.
-const CONFIG_CHANGED_MESSAGE: &str =
-    "config.toml changed while Settings was open. Close Settings and open it again.";
 
 /// Width of the "Open config file" button, in dp (#823).
 const OPEN_CONFIG_W: i32 = 120;
@@ -6453,41 +6553,25 @@ mod tests {
         });
     }
 
-    /// #851: the decision on whether the file changed under the window.
+    /// #871 wired-to-nothing: Save in a real window hands the sink the config
+    /// the window opened with and the one it built, so the sink (the writer
+    /// thread in production) can send only what changed. The sink is the one
+    /// path out of the window, so if Save never called it nothing would be
+    /// saved.
     #[test]
-    fn a_changed_config_file_is_noticed() {
-        let t = std::time::UNIX_EPOCH;
-        let a = Some(ConfigStamp {
-            modified: Some(t),
-            len: 10,
-        });
-        let later = Some(ConfigStamp {
-            modified: Some(t + Duration::from_secs(5)),
-            len: 10,
-        });
-        let longer = Some(ConfigStamp {
-            modified: Some(t),
-            len: 11,
-        });
-        assert!(!config_changed_since(a, a));
-        assert!(!config_changed_since(None, None));
-        assert!(config_changed_since(a, later));
-        assert!(config_changed_since(a, longer));
-        assert!(config_changed_since(a, None), "deleted while open");
-        assert!(config_changed_since(None, a), "created while open");
-        assert!(!CONFIG_CHANGED_MESSAGE.contains('\u{2014}'));
-    }
-
-    /// #851 wired-to-nothing: Save in a real window refuses when the stamp
-    /// taken at open no longer matches, keeps the window open and says why.
-    #[test]
-    fn save_is_refused_when_the_config_file_changed_since_open() {
+    fn save_sends_only_the_touched_fields_to_the_sink() {
         use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+        let seen: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let record = seen.clone();
         with_window(Config::default(), |hwnd, raw| {
-            unsafe { &mut *raw }.config_stamp = Some(ConfigStamp {
-                modified: None,
-                len: u64::MAX,
-            });
+            unsafe { &mut *raw }.save_sink = Some(Box::new(move |original, edited| {
+                let changes = crate::config_writer::diff(original, edited).unwrap();
+                record
+                    .borrow_mut()
+                    .extend(changes.iter().map(|c| c.path().join(".")));
+                Ok(())
+            }));
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
             unsafe {
                 SendMessageW(
                     hwnd,
@@ -6496,10 +6580,33 @@ mod tests {
                     Some(LPARAM(0)),
                 );
             }
-            let inner = unsafe { &*raw };
-            assert!(inner.result.is_none(), "Save must not produce a config");
+        });
+        assert_eq!(*seen.borrow(), vec!["ui.card_seconds"]);
+    }
+
+    /// #871: a sink that cannot take the edit keeps the window open and says
+    /// why inline (rule 7), and produces no result.
+    #[test]
+    fn a_sink_that_refuses_keeps_the_window_open_and_says_why() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { &mut *raw }.save_sink =
+                Some(Box::new(|_, _| Err("the writer is not running".into())));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert!(
+                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "window must stay"
+            );
+            assert!(unsafe { &*raw }.result.is_none());
             let msg = get_dlg_item(hwnd, ID_VALIDATION_MESSAGE).expect("message line");
-            assert_eq!(get_text(msg), CONFIG_CHANGED_MESSAGE);
+            assert_eq!(get_text(msg), "Could not save: the writer is not running");
         });
     }
 
@@ -9635,18 +9742,260 @@ mod tests {
         assert_eq!(clamp_suggested_to_work(pos, &work(0, 0), 96), pos);
     }
 
+    /// The tests that use the process-wide `OPEN_HWND` guard take this lock, so
+    /// two of them never see each other's window.
+    static OPEN_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A real top-level window of this thread to stand in for the app's main
+    /// window: Settings posts to it.
+    fn test_owner() -> HWND {
+        unsafe {
+            CreateWindowExW(
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!("settings test owner"),
+                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("owner window")
+    }
+
+    /// Takes one message of `id` posted to `to`, if any.
+    fn take_posted(to: HWND, id: u32) -> Option<MSG> {
+        let mut m = MSG::default();
+        unsafe { PeekMessageW(&mut m, Some(to), id, id, PM_REMOVE) }
+            .as_bool()
+            .then_some(m)
+    }
+
+    /// Opens a real, hidden Settings window the way `open` does, on the tests'
+    /// class, and runs `body` with it. Always closes it.
+    fn with_open_window(body: impl FnOnce(HWND, HWND)) {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        ensure_test_class(instance);
+        let owner = test_owner();
+        assert!(open_impl(
+            instance,
+            owner,
+            &Config::default(),
+            TEST_CLASS_NAME,
+            false
+        ));
+        let hwnd = HWND(OPEN_HWND.load(Ordering::SeqCst) as *mut c_void);
+        assert!(!hwnd.0.is_null(), "open must set the guard");
+        body(hwnd, owner);
+        close_now();
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
+    /// #871 wired-to-nothing: the window `open` makes exists with no loop of its
+    /// own, frees itself when destroyed (no `Box::from_raw` by a caller), clears
+    /// the guard, and tells the owner it is gone. If the owner post or the
+    /// self-free were not wired, this would leak, crash or time out.
     #[test]
-    fn second_show_modal_call_while_one_is_open_returns_none() {
+    fn open_makes_a_modeless_window_that_frees_itself_and_tells_the_owner() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_open_window(|hwnd, owner| {
+            assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+            let inner =
+                unsafe { &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const SettingsInner) };
+            assert!(inner.owns_itself);
+            assert_eq!(inner.owner, owner);
+            assert!(take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_none());
+            close_now();
+            assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+            assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0);
+            assert!(
+                take_posted(owner, crate::app::WM_APP_SETTINGS_LEFT).is_some(),
+                "closing must tell the owner, or a waiting card never shows"
+            );
+        });
+    }
+
+    /// #871 wired-to-nothing: Save in the real window posts the changed fields
+    /// (and only those) to the owner as `WM_APP_SETTINGS_SAVE`, then closes. If the
+    /// sink were not the production one, or the post were dropped, nothing would
+    /// reach the writer and no card would ever say "Settings saved".
+    #[test]
+    fn save_posts_only_the_changed_fields_to_the_owner_and_closes() {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SendMessageW};
+        with_open_window(|hwnd, owner| {
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "42");
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            let posted = take_posted(owner, crate::app::WM_APP_SETTINGS_SAVE)
+                .expect("Save must post the save to the owner window");
+            let save = unsafe { *Box::from_raw(posted.lParam.0 as *mut crate::app::SettingsSave) };
+            let paths: Vec<String> = save.changes.iter().map(|c| c.path().join(".")).collect();
+            assert_eq!(paths, vec!["ui.card_seconds"]);
+            assert_eq!(save.edited.ui.card_seconds, 42);
+            assert!(
+                !unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "Save closes the window"
+            );
+        });
+    }
+
+    /// #871 finding 7: Windows destroys a window whose creation fails after
+    /// `WM_NCCREATE`, and the window procedure already freed the state then. The
+    /// failure path must not free it a second time.
+    #[test]
+    fn a_window_that_fails_to_create_after_nccreate_frees_its_state_exactly_once() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::WM_CREATE;
+        const FAIL_CLASS: &str = "Wingman.Settings.Test.FailCreate.2c8e51d7";
+        unsafe extern "system" fn fail_create(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_CREATE {
+                return LRESULT(-1);
+            }
+            wndproc(hwnd, msg, wparam, lparam)
+        }
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let instance = HINSTANCE(h.0);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let class = wide_z(FAIL_CLASS);
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(fail_create),
+                hInstance: instance,
+                lpszClassName: PCWSTR(class.as_ptr()),
+                ..Default::default()
+            };
+            assert!(unsafe { RegisterClassExW(&wc) } != 0);
+        });
+        let before = INNERS_DROPPED.load(Ordering::SeqCst);
+        let opened = open_impl(
+            instance,
+            HWND(std::ptr::null_mut()),
+            &Config::default(),
+            FAIL_CLASS,
+            false,
+        );
+        assert!(!opened, "the window cannot be created");
+        assert_eq!(
+            INNERS_DROPPED.load(Ordering::SeqCst) - before,
+            1,
+            "the window state must be freed once, not twice"
+        );
+        assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0, "no guard is left set");
+    }
+
+    /// The same failure before `WM_NCCREATE` (the class does not exist): the
+    /// window never saw the state, so `open_impl` frees it, once.
+    #[test]
+    fn a_window_that_fails_before_nccreate_is_freed_once_by_the_caller() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let before = INNERS_DROPPED.load(Ordering::SeqCst);
+        let opened = open_impl(
+            HINSTANCE(h.0),
+            HWND(std::ptr::null_mut()),
+            &Config::default(),
+            "Wingman.Settings.Test.NoSuchClass.91b4",
+            false,
+        );
+        assert!(!opened);
+        assert_eq!(INNERS_DROPPED.load(Ordering::SeqCst) - before, 1);
+    }
+
+    /// #871: Esc in the open window is taken by `pre_dispatch` and becomes a
+    /// Cancel command for the window; a key for some other window is left alone.
+    #[test]
+    fn pre_dispatch_takes_keys_for_the_settings_window_and_nothing_else() {
+        use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, IsWindow};
+        with_open_window(|hwnd, owner| {
+            let field = get_dlg_item(hwnd, ID_CARD_SECONDS).expect("a child control");
+            let esc = MSG {
+                hwnd: field,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            };
+            assert!(pre_dispatch(&esc), "Esc in a Settings control is ours");
+            let cancel = take_posted(hwnd, WM_COMMAND).expect("Esc posts Cancel");
+            assert_eq!(cancel.wParam.0 & 0xFFFF, ID_CANCEL as usize);
+
+            let foreign = MSG {
+                hwnd: owner,
+                message: WM_KEYDOWN,
+                wParam: WPARAM(VK_ESCAPE.0 as usize),
+                ..Default::default()
+            };
+            assert!(
+                !pre_dispatch(&foreign),
+                "another window's key passes through"
+            );
+
+            // Delivering the Cancel closes it, with no loop of ours involved.
+            unsafe { DispatchMessageW(&cancel) };
+            assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        });
+    }
+
+    /// #871: with no window open, `pre_dispatch` never claims a message.
+    #[test]
+    fn pre_dispatch_ignores_everything_while_no_window_is_open() {
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(OPEN_HWND.load(Ordering::SeqCst), 0);
+        let msg = MSG {
+            message: WM_KEYDOWN,
+            wParam: WPARAM(VK_ESCAPE.0 as usize),
+            ..Default::default()
+        };
+        assert!(!pre_dispatch(&msg));
+        assert!(!is_foreground());
+    }
+
+    #[test]
+    fn a_second_open_while_one_is_open_creates_no_window() {
+        let _lock = OPEN_GUARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Simulate "already open" without actually creating a window: set
         // the guard directly, exactly like a real open would, and confirm
-        // show_modal's early-return path is taken (no window is created,
-        // no panic, no hang).
+        // open's early-return path is taken (no window is created, no panic,
+        // no hang) and counts as success: the open one is brought forward.
         let prev = OPEN_HWND.swap(1, Ordering::SeqCst);
         let h = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }
             .expect("GetModuleHandleW");
         let instance = HINSTANCE(h.0);
-        let result = show_modal(instance, &Config::default());
-        assert!(result.is_none());
+        let result = open(instance, HWND(std::ptr::null_mut()), &Config::default());
+        assert!(result);
         OPEN_HWND.store(prev, Ordering::SeqCst);
     }
 
