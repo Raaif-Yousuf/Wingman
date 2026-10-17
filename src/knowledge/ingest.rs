@@ -22,6 +22,9 @@ use crate::store::knowledge::{DocumentRow, DocumentUpdate};
 use crate::store::{self, Store, StoreError};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Most files indexed per root; the rest are left out (spec: caps).
 pub const MAX_FILES_PER_ROOT: usize = 20_000;
@@ -96,7 +99,9 @@ pub fn root_key(folder: &str) -> String {
 /// folder set it indexes that folder. With the setting empty or invalid it
 /// reads no folder at all and only retires a folder indexed earlier (a cheap
 /// store check), so clearing the setting also clears the stored text.
-/// Returns the thread so a test can wait for it; the app drops it.
+/// Returns a handle the app keeps: dropping it asks the scan to stop (see
+/// [`ScanHandle`]), so a Reload or a quit never leaves a scan of a retired
+/// folder running.
 ///
 /// Until Settings can add folders, `[knowledge] folder` is the whole
 /// configuration. When Settings lands, this value is imported into
@@ -105,12 +110,55 @@ pub fn root_key(folder: &str) -> String {
 /// An `Err` is a plain sentence for a card (the thread could not be created,
 /// so no index will be made this run). A setting that is invalid is told
 /// apart before this by [`startup_problem`], which the start-up card shows.
-pub fn start_scan(folder: &str) -> Result<std::thread::JoinHandle<()>, String> {
-    let setting = read_setting(folder);
-    std::thread::Builder::new()
+pub fn start_scan(folder: &str) -> Result<ScanHandle, String> {
+    spawn_scan(read_setting(folder), Arc::new(AtomicBool::new(false)))
+}
+
+fn spawn_scan(setting: Setting, stop: Arc<AtomicBool>) -> Result<ScanHandle, String> {
+    let for_thread = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
         .name("knowledge-scan".into())
-        .spawn(move || guarded(|| run_scan(setting)))
-        .map_err(|e| spawn_failed_notice(&e.to_string()))
+        .spawn(move || guarded(|| run_scan(setting, &for_thread)))
+        .map_err(|e| spawn_failed_notice(&e.to_string()))?;
+    Ok(ScanHandle {
+        stop,
+        thread: Some(thread),
+    })
+}
+
+/// The start-up scan's handle on the outside (#81), like the watcher's:
+/// dropping it asks the scan to stop. The scan asks before the root is
+/// inserted and before every file, so it ends within one file and writes
+/// nothing more, which keeps a retired folder from coming back.
+pub struct ScanHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScanHandle {
+    /// Waits for the scan to end (tests).
+    #[cfg(test)]
+    fn join(mut self) -> std::thread::Result<()> {
+        match self.thread.take() {
+            Some(t) => t.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The longest dropping a [`ScanHandle`] waits for its thread to notice the
+/// stop. Bounded on purpose: the UI thread never waits on a busy disk, and a
+/// thread still inside one file is covered by the per-file check.
+const SCAN_STOP_WAIT: Duration = Duration::from_millis(150);
+
+impl Drop for ScanHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let end = Instant::now() + SCAN_STOP_WAIT;
+        while self.thread.as_ref().is_some_and(|t| !t.is_finished()) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 /// What is wrong with the `[knowledge] folder` setting itself, knowable
@@ -187,7 +235,7 @@ pub(super) fn summary_notice(summary: &ScanSummary) -> Option<String> {
     }
 }
 
-fn run_scan(setting: Setting) {
+fn run_scan(setting: Setting, stop: &AtomicBool) {
     // #1053: the first open of the store (if the start-up open has not done
     // it yet) must run at normal priority. At background priority it would
     // hold the store's lock for a long time while any other thread waits.
@@ -209,13 +257,20 @@ fn run_scan(setting: Setting) {
     };
     // A store that cannot open has already reported itself.
     let Ok(store) = opened else { return };
+    // Replaced or quit while the store was opening: touch nothing.
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
     let keep = wanted.as_ref().map(|r| r.to_string_lossy().into_owned());
     if let Err(e) = store.retire_default_roots_except(keep.as_deref()) {
         store::report(&e);
         return;
     }
     let Some(root) = wanted else { return };
-    match scan_folder(&store, &root, now_unix()) {
+    let stopped = || stop.load(Ordering::SeqCst);
+    match scan_folder_until(&store, &root, now_unix(), &stopped) {
+        // A stopped scan is incomplete on purpose: no notice for it.
+        Ok(_) if stopped() => {}
         Ok(summary) => {
             if let Some(text) = summary_notice(&summary) {
                 notice::report(&text);
@@ -801,6 +856,32 @@ mod tests {
             "the stopped scan must not have created the root"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #81: a start-up scan told to stop before it begins writes nothing, and
+    /// dropping the handle is what tells it.
+    #[test]
+    fn a_start_up_scan_that_is_stopped_indexes_nothing() {
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("startup-stopped");
+        fs::write(dir.join("a.md"), "# A\nstartupstoppedword\n").unwrap();
+        let setting = read_setting(&dir.to_string_lossy());
+        spawn_scan(setting, Arc::new(AtomicBool::new(true)))
+            .expect("thread starts")
+            .join()
+            .unwrap();
+        let store = store::global().unwrap();
+        assert_eq!(store.fts_hits("startupstoppedword").unwrap(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_the_scan_handle_sets_the_stop_flag() {
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
+        let flag = Arc::new(AtomicBool::new(false));
+        let handle = spawn_scan(Setting::Off, Arc::clone(&flag)).expect("thread starts");
+        drop(handle);
+        assert!(flag.load(Ordering::SeqCst), "the drop must ask for a stop");
     }
 
     #[test]
