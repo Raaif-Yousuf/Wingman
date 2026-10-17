@@ -30,6 +30,10 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         sql: include_str!("schema/v003.sql"),
     },
+    Migration {
+        version: 4,
+        sql: include_str!("schema/v004.sql"),
+    },
 ];
 
 pub fn current_version(conn: &Connection) -> Result<i64, StoreError> {
@@ -229,7 +233,7 @@ mod tests {
         )
         .unwrap();
 
-        run(&mut conn, MIGRATIONS, None).unwrap();
+        run(&mut conn, &MIGRATIONS[..3], None).unwrap();
 
         assert_eq!(current_version(&conn).unwrap(), 3);
         let (egress, usage): (i64, i64) = conn
@@ -244,6 +248,40 @@ mod tests {
             .query_row("SELECT count(*) FROM profile_field", [], |r| r.get(0))
             .unwrap();
         assert_eq!(profile, 0, "the new table is there and empty");
+    }
+
+    #[test]
+    fn the_real_v3_database_upgrades_to_v4_with_its_rows_intact() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn, &MIGRATIONS[..3], None).unwrap();
+        conn.execute(
+            "INSERT INTO profile_field (key, value, updated_unix) VALUES ('full_name', x'00', 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO egress (time_unix, provider, outcome) VALUES (5, 'anthropic', 'success')",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn, &MIGRATIONS[..4], None).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 4);
+        let (profile, egress): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM profile_field), (SELECT count(*) FROM egress)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((profile, egress), (1, 1));
+        for table in ["knowledge_root", "document", "chunk"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} is there and empty");
+        }
     }
 
     #[test]
