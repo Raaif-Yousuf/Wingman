@@ -17,6 +17,7 @@ pub mod mask;
 pub mod notice;
 pub mod parse;
 pub mod retrieve;
+pub mod runner;
 pub mod watch;
 
 #[cfg(test)]

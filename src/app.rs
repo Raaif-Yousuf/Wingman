@@ -879,14 +879,10 @@ struct App {
     /// it spawns can label its egress rows. Set around one dispatch, then cleared.
     run_trigger: Option<Trigger>,
     chain: Arc<Chain>,
-    /// #81: the knowledge folder watcher, while a usable folder is set and the
-    /// watch is alive. Dropping it asks its thread to stop.
-    knowledge_watch: Option<crate::knowledge::watch::Watcher>,
-    /// #81: the start-up scan, while it may still be running. Dropping it asks
-    /// it to stop, so a Reload or quit ends it within one file.
-    knowledge_scan: Option<crate::knowledge::ingest::ScanHandle>,
-    /// The `[knowledge] folder` text the scan and watcher were last started for.
-    knowledge_folder: String,
+    /// #81: the knowledge folder watcher and the start-up scan. A Reload or a
+    /// Settings save restarts them on a worker thread (#1201), so the UI
+    /// thread never waits on the old or the new one.
+    knowledge: crate::knowledge::runner::Runner<crate::knowledge::runner::Live>,
     card: Card,
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
     /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
@@ -1203,13 +1199,18 @@ pub fn run() -> Result<()> {
         card.show_error(&headline, &detail);
     }
 
-    let knowledge_folder = config.knowledge.folder.clone();
+    let knowledge = crate::knowledge::runner::Runner::new(
+        config.knowledge.folder.clone(),
+        Some(crate::knowledge::runner::Live {
+            watch: knowledge_watch,
+            scan: knowledge_scan,
+        }),
+        restart_knowledge,
+    );
     let mut app = Box::new(App {
         instance,
         taskbar_created_msg,
-        knowledge_watch,
-        knowledge_scan,
-        knowledge_folder,
+        knowledge,
         config,
         unsaved: Vec::new(),
         carried_reload: None,
@@ -1450,6 +1451,22 @@ fn startup_card(
 /// folder went away) and Reload is the retry. Pure.
 fn knowledge_needs_restart(started_for: &str, wanted: &str, watch_ended: bool) -> bool {
     started_for != wanted || watch_ended
+}
+
+/// #1201: the restart a Reload or Settings save asks for, run on the
+/// runner's worker thread after the old watch and scan have ended. Problems
+/// have no start-up card to ride, so they wait in the scan's own notice queue
+/// for the next result card.
+fn restart_knowledge(folder: &str) -> Option<crate::knowledge::runner::Live> {
+    crate::knowledge::ingest::reset_indexed_files();
+    let (watch, scan, problem) = start_knowledge(folder);
+    for text in [crate::knowledge::ingest::startup_problem(folder), problem]
+        .into_iter()
+        .flatten()
+    {
+        crate::knowledge::notice::report(&text);
+    }
+    Some(crate::knowledge::runner::Live { watch, scan })
 }
 
 /// #81: starts watching the knowledge folder, then the start-up scan. The
@@ -6421,30 +6438,11 @@ impl App {
     /// Problems have no start-up card to ride, so they wait for the next
     /// result card like the scan's own notices.
     fn restart_knowledge_if_needed(&mut self) {
-        let folder = self.config.knowledge.folder.clone();
-        let watch_ended = self
-            .knowledge_watch
-            .as_ref()
-            .is_some_and(|w| !w.is_running());
-        if !knowledge_needs_restart(&self.knowledge_folder, &folder, watch_ended) {
-            return;
-        }
-        // Stop the old watch first, so it cannot apply a batch to a root the
-        // new scan is about to retire.
-        // The old start-up scan too: dropping it stops it within one file.
-        self.knowledge_watch = None;
-        self.knowledge_scan = None;
-        crate::knowledge::ingest::reset_indexed_files();
-        self.knowledge_folder = folder.clone();
-        let (watch, scan, problem) = start_knowledge(&folder);
-        self.knowledge_watch = watch;
-        self.knowledge_scan = scan;
-        for text in [crate::knowledge::ingest::startup_problem(&folder), problem]
-            .into_iter()
-            .flatten()
-        {
-            crate::knowledge::notice::report(&text);
-        }
+        // The runner stops the old watch first, so it cannot apply a batch to a
+        // root the new scan is about to retire, and the old start-up scan too.
+        // All of it happens off this thread (#1201).
+        self.knowledge
+            .restart_if_needed(&self.config.knowledge.folder, knowledge_needs_restart);
     }
 
     /// #174: `edit_settings` only needs to save when the file did not exist
@@ -15753,13 +15751,22 @@ mod tests {
             .nth(1)
             .and_then(|b| b.split("\n    }\n").next())
             .expect("restart_knowledge_if_needed exists");
-        let drop_scan = restart
-            .find("self.knowledge_scan = None")
-            .expect("a Reload stops the old start-up scan (#81)");
-        let new_start = restart.find("start_knowledge(&folder)").expect("restarts");
+        // #1201: the UI thread only asks. The stop-old-then-start-new order
+        // is the runner's (tested in knowledge::runner), and the start itself
+        // runs on its worker, never here.
         assert!(
-            drop_scan < new_start,
-            "the old scan stops before the new one starts"
+            restart.contains(".restart_if_needed("),
+            "a Reload must go through the runner (#1201):
+{restart}"
+        );
+        assert!(
+            !restart.contains("start_knowledge("),
+            "the UI thread must not start the watch itself (#1201):
+{restart}"
+        );
+        assert!(
+            app_src.contains(concat!("        restart_knowledge", ",\n    );")),
+            "the runner must be built with the restart function (#1201)"
         );
     }
 
