@@ -2359,8 +2359,8 @@ x = 1
     fn the_tray_mode_change_goes_through_the_writer_thread() {
         let app = include_str!("app.rs").replace('\r', "");
         let start = app
-            .find("    fn set_mode(&mut self, mode: Mode) {")
-            .expect("set_mode moved: this scan is no longer looking at anything");
+            .find("    fn set_mode_with(&mut self, mode: Mode, quiet: bool) {")
+            .expect("set_mode_with moved: this scan is no longer looking at anything");
         let rest = &app[start..];
         let end = rest.find("\n    }\n").expect("end of set_mode");
         let body = &rest[..end];

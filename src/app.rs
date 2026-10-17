@@ -41,9 +41,8 @@ use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
-    apply_learned, chord_to_string, slot_name, Chord, HotkeyHook, LearnedVerdict, HK_PAUSE,
-    HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE,
-    WM_APP_PAUSE_TOGGLE,
+    apply_learned, chord_to_string, slot_name, Chord, HotkeyHook, LearnedVerdict, HK_PRIMARY,
+    HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::keypress;
 use crate::mode::{self, Mode};
@@ -5441,14 +5440,6 @@ impl App {
             _ => None,
         };
         settings::sync_live(self.config.mode, paused.as_deref());
-    }
-
-    /// Hands one field change to the writer thread. `label` names it in the
-    /// card that reports the outcome. Never blocks and never touches the disk
-    /// here; if the writer cannot even be reached the failure is posted back
-    /// like any other, so it still ends in a card (rule 7).
-    fn persist_field(&mut self, label: &str, change: crate::config_writer::FieldChange) {
-        self.persist_changes(crate::config_writer::Outcome::simple(label), vec![change]);
     }
 
     /// Writes whatever differs between `before` (the config before this tray
