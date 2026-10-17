@@ -323,6 +323,7 @@ impl Palette {
             sys,
             colors: palette_colors(theme, &sys, live_accent(theme, &sys)),
             theme_forced: false,
+            keep_open: false,
             edit_brush: HBRUSH(std::ptr::null_mut()),
         });
         let raw = Box::into_raw(inner);
@@ -544,6 +545,14 @@ impl Palette {
         self.inner.sys = crate::ui::theme::HC_BLACK;
         self.inner.theme_forced = true;
         self.inner.apply_colors();
+    }
+
+    /// The UI gallery (#919): the palette hides itself when its query box
+    /// loses focus, so any other window taking the foreground during a run
+    /// hid it before the capture. With this set it stays up.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn keep_open_for_gallery(&mut self) {
+        self.inner.keep_open = true;
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1109,6 +1118,8 @@ struct PaletteInner {
     colors: PaletteColors,
     /// The gallery's --theme: later theme messages are ignored.
     theme_forced: bool,
+    /// The gallery (#919): losing focus does not hide the palette.
+    keep_open: bool,
     /// The brush WM_CTLCOLOREDIT returns for the query box, in the
     /// background colour. Created on first use, dropped when the theme changes.
     edit_brush: HBRUSH,
@@ -1966,7 +1977,7 @@ impl PaletteInner {
                     ID_PALETTE_ESCAPE => {
                         self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Escape)
                     }
-                    ID_PALETTE_LOST_FOCUS => self.hide(),
+                    ID_PALETTE_LOST_FOCUS if !self.keep_open => self.hide(),
                     _ => {}
                 }
                 Some(LRESULT(0))
@@ -2336,6 +2347,33 @@ mod tests {
                 );
             }
             assert_ne!(p.inner.colors, live_colors());
+        }
+
+        /// #919: the palette hides when its query box loses focus, so another
+        /// window taking the foreground hid it mid-run and `--matrix` stopped.
+        /// The gallery asks it to stay up; a normal palette still hides.
+        #[test]
+        fn a_gallery_palette_stays_up_when_focus_leaves_but_a_normal_one_hides() {
+            use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+            let lost_focus = |p: &Palette| unsafe {
+                SendMessageW(
+                    p.hwnd(),
+                    WM_COMMAND,
+                    Some(WPARAM(ID_PALETTE_LOST_FOCUS as usize)),
+                    Some(LPARAM(0)),
+                );
+            };
+            let mut normal = Palette::new_for_test(instance()).unwrap();
+            normal.show(free_actions(), true, String::new());
+            lost_focus(&normal);
+            assert!(!unsafe { IsWindowVisible(normal.hwnd()) }.as_bool());
+
+            let mut gallery = Palette::new_for_test(instance()).unwrap();
+            gallery.keep_open_for_gallery();
+            gallery.show(free_actions(), true, String::new());
+            lost_focus(&gallery);
+            assert!(unsafe { IsWindowVisible(gallery.hwnd()) }.as_bool());
+            assert!(gallery.inner.visible);
         }
 
         #[test]
