@@ -58,8 +58,9 @@ pub fn parser_for(file_name: &str) -> Option<Parser> {
 /// Reads a file's bytes as text. Never panics: size caps, binary detection and
 /// character-boundary-safe truncation make every input either text or an error.
 pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
-    let decoded = decode(bytes)?;
-    let (normalized, truncated) = truncate(normalize(&decoded), MAX_TEXT_BYTES);
+    let (decoded, cut_input) = decode(bytes)?;
+    let (normalized, cut_text) = truncate(normalize(&decoded), MAX_TEXT_BYTES);
+    let truncated = cut_input || cut_text;
     match parser {
         Parser::Text => Ok(Parsed {
             title: None,
@@ -80,36 +81,46 @@ pub fn parse(parser: Parser, bytes: &[u8]) -> Result<Parsed, ParseError> {
 
 /// UTF-8 (with or without a BOM) and UTF-16 with a BOM. A NUL byte in
 /// anything else, or mostly undecodable bytes, means a binary file.
-fn decode(bytes: &[u8]) -> Result<String, ParseError> {
+///
+/// Only the first `MAX_TEXT_BYTES` bytes are decoded (the text is cut to that
+/// size anyway), so a 25 MB file never costs 25 MB of copies. The flag says the
+/// input was cut.
+fn decode(bytes: &[u8]) -> Result<(String, bool), ParseError> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err(ParseError::TooLarge);
     }
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units = rest
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]));
-        return Ok(char::decode_utf16(units)
-            .map(|r| r.unwrap_or('\u{FFFD}'))
-            .collect());
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let units = rest
-            .chunks_exact(2)
-            .map(|p| u16::from_be_bytes([p[0], p[1]]));
-        return Ok(char::decode_utf16(units)
-            .map(|r| r.unwrap_or('\u{FFFD}'))
-            .collect());
-    }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    if bytes.contains(&0) {
+    // UTF-32 is not supported; its BOMs would otherwise read as UTF-16 (LE)
+    // or as NUL-ridden bytes.
+    if bytes.starts_with(&[0xFF, 0xFE, 0, 0]) || bytes.starts_with(&[0, 0, 0xFE, 0xFF]) {
         return Err(ParseError::NotText);
     }
-    let text = String::from_utf8_lossy(bytes).into_owned();
+    let cut = bytes.len() > MAX_TEXT_BYTES;
+    let bytes = bytes.get(..MAX_TEXT_BYTES).unwrap_or(bytes);
+    let text = if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        decode_utf16(rest, u16::from_le_bytes)
+    } else if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        decode_utf16(rest, u16::from_be_bytes)
+    } else {
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+        if bytes.contains(&0) {
+            return Err(ParseError::NotText);
+        }
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    // Mostly undecodable means a binary file, in either encoding. A cut that
+    // lands inside a character adds one replacement, far under the ratio.
     let bad = text.chars().filter(|&c| c == '\u{FFFD}').count();
     if bad > 0 && bad * 10 > text.chars().count() {
         return Err(ParseError::NotText);
     }
-    Ok(text)
+    Ok((text, cut))
+}
+
+fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
+    let units = bytes.chunks_exact(2).map(|p| unit([p[0], p[1]]));
+    char::decode_utf16(units)
+        .map(|r| r.unwrap_or('\u{FFFD}'))
+        .collect()
 }
 
 /// Newlines to `\n`; control characters to spaces, except tab, newline and
@@ -146,8 +157,10 @@ fn truncate(mut text: String, max: usize) -> (String, bool) {
     (text, true)
 }
 
-/// Longest line whose links are rewritten. Past this the line is kept as is,
-/// which keeps the link scan linear on adversarial input.
+const MAX_TITLE_CHARS: usize = 200;
+/// Longest line whose links are rewritten. Past this the line is kept as is.
+/// Within it, each link scan stops at the next `[` or `(` (see `link_at`), so
+/// the work per line is bounded by a small multiple of its length.
 const MAX_LINK_LINE_CHARS: usize = 5_000;
 const MAX_LABEL_CHARS: usize = 500;
 const MAX_URL_CHARS: usize = 2_000;
@@ -175,7 +188,14 @@ fn markdown_to_text(text: &str) -> (Option<String>, String) {
             continue;
         }
         if in_fence {
-            out.push(line.to_string());
+            // Code stays literal, but a `#` comment line must not read as a
+            // heading to the chunker, so it gets a backslash (searchable
+            // words are unchanged).
+            if trimmed.starts_with('#') {
+                out.push(format!("\\{trimmed}"));
+            } else {
+                out.push(line.to_string());
+            }
             continue;
         }
         let Some(line) = strip_comments(line, &mut in_comment) else {
@@ -183,7 +203,7 @@ fn markdown_to_text(text: &str) -> (Option<String>, String) {
         };
         if let Some((level, heading)) = atx_heading(&line) {
             if first_heading.is_none() && !heading.is_empty() {
-                first_heading = Some(heading.clone());
+                first_heading = Some(heading.chars().take(MAX_TITLE_CHARS).collect());
             }
             out.push(format!("{} {}", "#".repeat(level), heading));
             continue;
@@ -209,7 +229,7 @@ fn front_matter(lines: &[&str]) -> Option<(Option<String>, usize)> {
     let title = lines.get(1..close)?.iter().find_map(|l| {
         let v = l.strip_prefix("title:")?.trim();
         let v = v.trim_matches(|c| c == '"' || c == '\'').trim();
-        (!v.is_empty()).then(|| v.to_string())
+        (!v.is_empty()).then(|| v.chars().take(MAX_TITLE_CHARS).collect())
     });
     Some((title, close + 1))
 }
@@ -305,14 +325,20 @@ fn link_at(chars: &[char], open: usize) -> Option<(usize, usize)> {
     if chars.get(open) != Some(&'[') {
         return None;
     }
-    let label_end =
-        (open + 1..chars.len().min(open + 1 + MAX_LABEL_CHARS)).find(|&j| chars[j] == ']')?;
+    // The label ends at the first `]`; another `[` first means this one is
+    // not a link (a later `[` gets its own try). The url ends at the first
+    // `)`; a `(` first means it is not a simple link. Stopping at the next
+    // delimiter keeps the scans over a line disjoint, so they are linear.
+    let label_end = (open + 1..chars.len().min(open + 1 + MAX_LABEL_CHARS))
+        .find(|&j| matches!(chars[j], ']' | '['))
+        .filter(|&j| chars[j] == ']')?;
     if chars.get(label_end + 1) != Some(&'(') {
         return None;
     }
     let url_start = label_end + 2;
-    let url_end =
-        (url_start..chars.len().min(url_start + MAX_URL_CHARS)).find(|&k| chars[k] == ')')?;
+    let url_end = (url_start..chars.len().min(url_start + MAX_URL_CHARS))
+        .find(|&k| matches!(chars[k], ')' | '('))
+        .filter(|&k| chars[k] == ')')?;
     Some((label_end, url_end))
 }
 
@@ -514,6 +540,103 @@ mod tests {
         assert!(md(&lists).text.contains("item 4999"));
         let many_opens = "![".repeat(30_000);
         assert!(!md(&many_opens).text.is_empty());
+    }
+
+    #[test]
+    fn link_heavy_lines_under_the_line_limit_stay_fast() {
+        // Each fixture is many lines just under MAX_LINK_LINE_CHARS, so the
+        // link scan really runs on every line (a longer line is skipped).
+        let fixtures = [
+            "[a](".repeat(1_200),
+            "[".repeat(4_900),
+            "![".repeat(2_400),
+            format!("[a]({}", "x".repeat(4_900)),
+            "[a](x [b](y ".repeat(400),
+            "[x]".repeat(1_600),
+        ];
+        for f in fixtures {
+            assert!(
+                f.chars().count() < MAX_LINK_LINE_CHARS,
+                "fixture is vacuous"
+            );
+            let doc = vec![f.as_str(); 400].join("\n");
+            let start = std::time::Instant::now();
+            let p = md(&doc);
+            assert!(!p.text.is_empty());
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(3),
+                "took {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn parser_names_are_the_stored_ones() {
+        // Stored in `document.parser` and `document.parser_ver`.
+        assert_eq!(Parser::Text.name(), "txt");
+        assert_eq!(Parser::Markdown.name(), "md");
+        assert_eq!(PARSER_VERSION, 1);
+    }
+
+    #[test]
+    fn a_link_with_a_title_still_loses_its_url() {
+        assert_eq!(md("[x](http://a.b \"the title\") y").text, "x y");
+    }
+
+    #[test]
+    fn a_utf32_bom_is_not_text() {
+        assert_eq!(
+            parse(Parser::Text, b"\xFF\xFE\x00\x00h\x00\x00\x00"),
+            Err(ParseError::NotText)
+        );
+        assert_eq!(
+            parse(Parser::Text, b"\x00\x00\xFE\xFF\x00\x00\x00h"),
+            Err(ParseError::NotText)
+        );
+    }
+
+    #[test]
+    fn utf16_garbage_is_refused_like_utf8_garbage() {
+        // Unpaired surrogates only: every unit decodes to a replacement.
+        let mut b = vec![0xFF, 0xFE];
+        for _ in 0..200 {
+            b.extend_from_slice(&0xD800u16.to_le_bytes());
+        }
+        assert_eq!(parse(Parser::Text, &b), Err(ParseError::NotText));
+    }
+
+    #[test]
+    fn titles_are_capped_like_headings() {
+        let long = "t".repeat(5_000);
+        let p = md(&format!("---\ntitle: {long}\n---\nbody"));
+        assert_eq!(p.title.unwrap().chars().count(), 200);
+        let p = md(&format!("# {long}\nbody"));
+        assert_eq!(p.title.unwrap().chars().count(), 200);
+    }
+
+    #[test]
+    fn hash_lines_in_a_code_fence_do_not_become_chunk_headings() {
+        use crate::knowledge::chunk::chunk_text;
+        let p = md("# Real\ntext\n```sh\n# a shell comment\nls\n```\nmore");
+        assert!(p.text.contains("# a shell comment"));
+        let chunks = chunk_text(&p.text);
+        assert_eq!(chunks.len(), 1, "{chunks:?}");
+        assert_eq!(chunks[0].heading.as_deref(), Some("Real"));
+    }
+
+    #[test]
+    fn a_huge_input_is_cut_before_it_is_decoded() {
+        let big = vec![b'a'; MAX_FILE_BYTES];
+        let p = parse(Parser::Text, &big).unwrap();
+        assert!(p.truncated);
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
+        // UTF-16 too.
+        let mut u16s = vec![0xFF, 0xFE];
+        u16s.extend(std::iter::repeat_n(b'a', MAX_FILE_BYTES - 2));
+        let p = parse(Parser::Text, &u16s).unwrap();
+        assert!(p.truncated);
+        assert!(p.text.len() <= MAX_TEXT_BYTES);
     }
 
     #[test]

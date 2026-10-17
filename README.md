@@ -50,8 +50,9 @@ Wingman ships more than two dozen built-in actions, all listed in the
 palette (the full list is in `actions.example.toml` and
 [docs/actions.md](docs/actions.md)). The first of them, built and running:
 
-- **Check my work**: press the key, Wingman screenshots your active
-  monitor, sends it to a vision model with a prompt tuned for checking a
+- **Check my work**: pick it from the options card (or the palette), or set
+  `primary_action = "check-my-work"` under `[hotkeys]` so one press of the key
+  runs it. Wingman screenshots your active monitor, sends it to a vision model with a prompt tuned for checking a
   hand-worked physics or statistics problem, and shows the verdict as a
   small GDI card in the corner. Click the card for the full working; click
   anywhere else and it goes away. Read-only: it skips Confirm and Do.
@@ -257,6 +258,21 @@ Two bindings, both live at once:
 |---|---|---|
 | primary | the Copilot key | Windows emits it as `Win+Shift+F23` |
 | secondary | `Ctrl+Shift+/` | works on any keyboard |
+
+One press of the primary key shows the options card: a few choices for what
+is on your screen. Press the key again while the card is up to run the first
+choice (never one that writes to the clipboard), or to close the card. To make
+one press run a single action instead, set `primary_action` under `[hotkeys]`
+in `config.toml`:
+
+| `primary_action` | what one press does |
+|---|---|
+| `"options"` (default) | shows the options card |
+| `"check-my-work"` | runs Check my work at once, as before |
+| any other action id | runs that action at once, with no options card |
+
+An id that no action has is named on a card once. After that the key shows the
+options card.
 
 If the Copilot key does nothing, use **Set Copilot key...** in the tray menu
 and press it once: whatever your firmware actually emits gets captured and

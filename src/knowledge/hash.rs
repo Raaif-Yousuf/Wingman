@@ -10,15 +10,20 @@ use windows::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDL
 #[derive(Debug, PartialEq, Eq)]
 pub struct HashError;
 
-/// Lower-case hex SHA-256 of `data`.
-pub fn sha256_hex(data: &[u8]) -> Result<String, HashError> {
+/// Raw SHA-256 of `data`. Also used by the OAuth PKCE challenge.
+pub fn sha256(data: &[u8]) -> Result<[u8; 32], HashError> {
     let mut out = [0u8; 32];
     // SAFETY: both slices are valid for the whole call; the algorithm handle
     // is a pseudo-handle owned by the OS.
     unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, data, &mut out) }
         .ok()
         .map_err(|_| HashError)?;
-    Ok(hex(&out))
+    Ok(out)
+}
+
+/// Lower-case hex SHA-256 of `data`.
+pub fn sha256_hex(data: &[u8]) -> Result<String, HashError> {
+    Ok(hex(&sha256(data)?))
 }
 
 fn hex(bytes: &[u8]) -> String {

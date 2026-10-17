@@ -11,6 +11,7 @@ mod capture;
 mod config;
 #[cfg(test)]
 mod config_example;
+mod config_writer;
 mod connectors;
 mod crash_note;
 mod diagnostics;
@@ -21,6 +22,9 @@ mod executors;
 mod hotkey;
 mod hotkey_conflicts;
 mod inputs;
+mod keypress;
+// Called by the ingest worker in a later slice; until then only tests use it.
+#[cfg_attr(not(test), expect(dead_code))]
 mod knowledge;
 mod known_folder;
 mod machine;
@@ -37,6 +41,7 @@ mod profile;
 mod provider;
 mod redact;
 mod remote_ollama;
+mod report_problem;
 mod router;
 mod secrets;
 mod single_instance;

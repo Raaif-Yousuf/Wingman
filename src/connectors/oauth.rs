@@ -34,9 +34,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::Value;
-use windows::Win32::Security::Cryptography::{
-    BCryptGenRandom, BCryptHash, BCRYPT_SHA256_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-};
+use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 
 use crate::secrets::SecretStore;
 
@@ -271,13 +269,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 fn sha256(data: &[u8]) -> Result<[u8; 32]> {
-    let mut out = [0u8; 32];
-    // SAFETY: both slices are valid for the whole call; the algorithm handle
-    // is a pseudo-handle owned by the OS.
-    unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, data, &mut out) }
-        .ok()
-        .context("BCryptHash failed")?;
-    Ok(out)
+    crate::knowledge::hash::sha256(data).map_err(|_| anyhow!("BCryptHash failed"))
 }
 
 /// `BASE64URL(SHA256(verifier))`, no padding.

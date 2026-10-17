@@ -9,9 +9,6 @@
 //! Every function takes bytes or text and returns a value or a plain-words
 //! error; none panics on file contents.
 
-// Called by the ingest worker in the next slice; until then only tests use it.
-#![allow(dead_code)]
-
 pub mod chunk;
 pub mod diff;
 pub mod hash;

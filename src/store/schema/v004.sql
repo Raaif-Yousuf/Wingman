@@ -14,7 +14,7 @@
 --   under the owner-only store directory (spec decision, same as the files).
 -- chunk_fts: full-text index over chunk.text, kept in step by triggers. The
 --   unicode61 tokenizer does not split Chinese, Japanese or Korean runs into
---   words (documented in docs/knowledge.md).
+--   words (the knowledge design records this limit, resolved question 13).
 --
 -- Later migrations add embeddings and memory; nothing here is a placeholder.
 

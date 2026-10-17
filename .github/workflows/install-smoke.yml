@@ -1,0 +1,61 @@
+name: Install smoke
+
+# Installs the release build the two ways a person would (the zip from the
+# README, and install.ps1's sparse package), starts it, checks it is up and
+# wrote an owner-only config, quits it and removes it (issue #128). It needs
+# no API key and no network model.
+#
+# It runs on pull requests that touch what it exercises, and by hand. It is
+# not in ci.yml on purpose: it installs a package and a certificate on the
+# runner, and most pull requests cannot change what it checks.
+on:
+  pull_request:
+    paths:
+      - 'install.ps1'
+      - 'uninstall.ps1'
+      - 'packaging/**'
+      - 'scripts/install-smoke*'
+      - '.github/workflows/install-smoke.yml'
+      - 'src/portable.rs'
+      - 'src/single_instance.rs'
+      - 'src/hotkey.rs'
+      - 'src/config.rs'
+      - 'src/owner_acl.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  install-smoke:
+    name: zip install, sparse install, uninstall
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Zip install (unzip, run, config, quit)
+        shell: pwsh
+        run: ./scripts/install-smoke.ps1 -Mode Zip
+
+      # The runner is already an administrator and install.ps1's self-elevation
+      # does not work there, so the script trusts the certificate itself (see
+      # the script). Runs even when the zip step failed, so one run reports both.
+      - name: Sparse install (install.ps1, run, config, quit, uninstall.ps1)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./scripts/install-smoke.ps1 -Mode Sparse

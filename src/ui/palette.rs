@@ -99,7 +99,7 @@ use std::sync::{Once, OnceLock};
 
 use crate::ui::theme::{
     detect_theme, ensure_contrast, setting_change_affects_theme, setting_change_name, SysColors,
-    Theme, Tokens,
+    Theme, Tokens, SPACE_SM_DP,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -125,10 +125,10 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    GetStockObject, InvalidateRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT,
+    BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
+    GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TEXTMETRICW,
     TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -145,8 +145,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
     WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
-    WM_THEMECHANGED, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE,
+    WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
@@ -203,14 +203,71 @@ const PADDING: i32 = 8;
 const ROW_TEXT_INSET: i32 = 12;
 /// How far the query box's hairline sits outside the edit control.
 const QUERY_BORDER_OUTSET: i32 = 3;
+/// Space between the query box's left and right edges and its text (#881), on
+/// top of the padding the box sits in.
+const QUERY_TEXT_INSET: i32 = SPACE_SM_DP;
+/// The placeholder in an empty query box (#881). No em dash (rule 11).
+const QUERY_CUE: &str = "Type to filter";
+/// Private message the query edit's subclass sends its parent to have the
+/// placeholder drawn into the DC it just painted (`wParam` is the HDC, `lParam`
+/// the edit). `WM_USER` range: private to this window class.
+const WM_PALETTE_DRAW_CUE: u32 = WM_USER + 1;
+/// `EM_GETMARGINS`: the low word of the result is the left margin.
+const EM_GETMARGINS: u32 = 0x00D4;
 /// #217: rows beyond `crate::ui::palette_model::MAX_VISIBLE_ROWS` are
 /// reachable by scrolling (keyboard: Up/Down/PageUp/PageDown drag the
 /// viewport via `PaletteState::offset`; mouse: `WM_MOUSEWHEEL` below) rather
 /// than being truncated -- that constant is the single source of truth for
 /// both the window's fixed height here and the palette-side viewport math in
 /// `palette_model.rs`.
+/// #883: the scroll thumb is this wide, this far from the window's right edge
+/// and never shorter than this, in logical pixels.
+const SCROLL_THUMB_WIDTH: i32 = 3;
+const SCROLL_THUMB_EDGE: i32 = 2;
+const SCROLL_THUMB_MIN: i32 = 24;
 fn scale(v: i32, dpi: u32) -> i32 {
     v * dpi as i32 / 96
+}
+
+/// Where the query `EDIT` goes, in client pixels (#881). A single-line EDIT
+/// draws its text from the top of its client area and cannot be told to centre
+/// it, so the control is exactly one text line high (`text_h`, from the font
+/// it uses) and sits in the middle of the box, inset from the box's left and
+/// right edges.
+fn query_edit_rect(window_w: i32, dpi: u32, text_h: i32) -> RECT {
+    let pad = scale(PADDING, dpi);
+    let inset = scale(QUERY_TEXT_INSET, dpi);
+    let box_h = scale(EDIT_HEIGHT, dpi);
+    let h = text_h.clamp(1, box_h.max(1));
+    let top = pad + (box_h - h) / 2;
+    RECT {
+        left: pad + inset,
+        top,
+        right: window_w - pad - inset,
+        bottom: top + h,
+    }
+}
+
+/// The height in pixels of one line of text in `font`, or the body line
+/// height at `dpi` when it cannot be measured.
+fn font_text_height(font: HFONT, dpi: u32) -> i32 {
+    let fallback = scale(crate::ui::theme::TYPE_BODY_LINE_PX, dpi);
+    if font.0.is_null() {
+        return fallback;
+    }
+    unsafe {
+        let dc = GetDC(None);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let mut tm = TEXTMETRICW::default();
+        let ok = GetTextMetricsW(dc, &mut tm).as_bool();
+        SelectObject(dc, old);
+        ReleaseDC(None, dc);
+        if ok && tm.tmHeight > 0 {
+            tm.tmHeight
+        } else {
+            fallback
+        }
+    }
 }
 
 fn window_height(dpi: u32) -> i32 {
@@ -245,6 +302,43 @@ fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
         Some(idx)
     } else {
         None
+    }
+}
+
+/// Where the scroll thumb is drawn (#883), in client pixels at `dpi`, for a
+/// list of `row_count` rows scrolled to `offset`. `None` when every row fits.
+/// It sits in the padding to the right of the rows, so it never covers a row's
+/// fill or text.
+fn thumb_rect(dpi: u32, offset: usize, row_count: usize) -> Option<RECT> {
+    let list_top = scale(PADDING, dpi) + scale(EDIT_HEIGHT, dpi) + scale(PADDING, dpi);
+    let track = scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32;
+    let (top, len) = crate::ui::palette_model::scroll_thumb(
+        offset,
+        row_count,
+        crate::ui::palette_model::MAX_VISIBLE_ROWS,
+        track,
+        scale(SCROLL_THUMB_MIN, dpi),
+    )?;
+    let right = scale(WINDOW_WIDTH, dpi) - scale(SCROLL_THUMB_EDGE, dpi);
+    Some(RECT {
+        left: right - scale(SCROLL_THUMB_WIDTH, dpi).max(2),
+        top: list_top + top,
+        right,
+        bottom: list_top + top + len,
+    })
+}
+
+/// The path of the query box's 1 px hairline in logical pixels, for Direct2D
+/// (#886). A stroke is centred on its path, so the path sits half a pixel in
+/// from the box's outer edge: the line then covers whole pixels at 100% scale
+/// instead of blurring across two rows, and lands where the GDI path's fills do.
+fn query_border_rect() -> D2D_RECT_F {
+    let (pad, o) = (PADDING as f32, QUERY_BORDER_OUTSET as f32);
+    D2D_RECT_F {
+        left: pad - o + 0.5,
+        top: pad - o + 0.5,
+        right: WINDOW_WIDTH as f32 - pad + o - 0.5,
+        bottom: pad + EDIT_HEIGHT as f32 + o - 0.5,
     }
 }
 
@@ -293,7 +387,8 @@ impl Palette {
             edit_hwnd: HWND(std::ptr::null_mut()),
             owner: None,
             dpi: 96,
-            font: unsafe { HFONT(GetStockObject(DEFAULT_GUI_FONT).0) },
+            // Made once the window (and so its DPI) exists.
+            font: HFONT(std::ptr::null_mut()),
             d2d: None,
             catalogue: Vec::new(),
             model_configured: true,
@@ -346,6 +441,7 @@ impl Palette {
         let inner_ref = unsafe { &mut *raw };
         inner_ref.hwnd = hwnd;
         inner_ref.dpi = unsafe { GetDpiForWindow(hwnd) }.max(1);
+        inner_ref.font = gdi_font(inner_ref.dpi, FW_NORMAL.0 as i32);
 
         // Best-effort rounded corners (Windows 11), as the card does (#361).
         // A square window on an older system is an acceptable degrade.
@@ -504,6 +600,25 @@ impl Palette {
         self.inner.set_query(query);
     }
 
+    /// The UI gallery's scroll: moves the viewport by `delta_rows`, clamped,
+    /// like the mouse wheel.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn scroll_for_test(&mut self, delta_rows: i32) {
+        self.inner.state.offset = crate::ui::palette_model::scroll_by(
+            self.inner.state.offset,
+            delta_rows,
+            self.inner.state.rows.len(),
+            crate::ui::palette_model::MAX_VISIBLE_ROWS,
+        );
+    }
+
+    /// The UI gallery's hovered row, as if the mouse were over it.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn set_hover_for_test(&mut self, row: Option<usize>) {
+        self.inner.hover = row;
+        self.inner.invalidate();
+    }
+
     #[cfg(test)]
     pub(crate) fn state_offset(&self) -> usize {
         self.inner.state.offset
@@ -599,13 +714,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn create_query_edit(parent: HWND, instance: HINSTANCE, font: HFONT, dpi: u32) -> HWND {
     let class_w = wide_z(WC_EDIT);
     let text_w = wide_z("");
-    let pad = scale(PADDING, dpi);
-    let rect = RECT {
-        left: pad,
-        top: pad,
-        right: scale(WINDOW_WIDTH, dpi) - pad,
-        bottom: pad + scale(EDIT_HEIGHT, dpi),
-    };
+    let rect = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, font_text_height(font, dpi));
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -674,6 +783,25 @@ unsafe extern "system" fn palette_edit_subclass(
             // default proc.
             return LRESULT(0);
         }
+    }
+    // The placeholder (#881): the control paints itself, then the palette
+    // draws its cue over the empty box.
+    if msg == WM_PAINT || msg == WM_PRINTCLIENT {
+        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+        if GetWindowTextLengthW(hwnd) == 0 {
+            let own_dc = (msg == WM_PAINT).then(|| GetDC(Some(hwnd)));
+            let hdc = own_dc.unwrap_or(HDC(wparam.0 as *mut c_void));
+            SendMessageW(
+                parent,
+                WM_PALETTE_DRAW_CUE,
+                Some(WPARAM(hdc.0 as usize)),
+                Some(LPARAM(hwnd.0 as isize)),
+            );
+            if own_dc.is_some() {
+                ReleaseDC(Some(hwnd), hdc);
+            }
+        }
+        return result;
     }
     if msg == WM_KILLFOCUS {
         let _ = PostMessageW(
@@ -874,7 +1002,17 @@ struct PaletteColors {
     /// The "no matching actions" hint.
     hint: u32,
     footer: u32,
-    /// The fill of the selected and the hovered row.
+    /// The scroll thumb shown when there are more rows than fit (#883).
+    thumb: u32,
+    /// The placeholder in an empty query box. High contrast uses GrayText,
+    /// which Windows keeps readable on Window.
+    cue: u32,
+    /// The fill of a row the mouse is over: quieter than the selection's.
+    /// High contrast has no tints, so there it is the background and the row
+    /// gets `hover_outline` instead.
+    hover_fill: u32,
+    hover_outline: Option<u32>,
+    /// The fill of the selected row.
     selected_fill: u32,
     selected_text: u32,
     /// The 3 px bar on the selected row.
@@ -900,6 +1038,10 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
             header: t.text,
             hint: t.text,
             footer: t.text,
+            cue: sys.gray_text,
+            thumb: t.text,
+            hover_fill: t.surface,
+            hover_outline: Some(t.text),
             selected_fill: sys.highlight,
             selected_text: sys.highlight_text,
             // The whole row is the highlight, so the bar is the same colour.
@@ -916,6 +1058,10 @@ fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> PaletteColors {
         header: t.text_dim,
         hint: t.text_faint,
         footer: t.text_faint,
+        cue: t.text_faint,
+        thumb: t.text_faint,
+        hover_fill: blend(t.surface, bar, 8),
+        hover_outline: None,
         selected_fill: blend(t.surface, bar, 16),
         selected_text: t.text,
         bar,
@@ -1040,6 +1186,11 @@ struct PaletteInner {
 impl Drop for PaletteInner {
     fn drop(&mut self) {
         self.drop_edit_brush();
+        if !self.font.0.is_null() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
+            }
+        }
     }
 }
 
@@ -1145,17 +1296,57 @@ impl PaletteInner {
     /// handler can re-run the same layout after a DPI change without
     /// re-centering the window on the active monitor too.
     fn layout_edit_control(&self, w: i32) {
-        let pad = scale(PADDING, self.dpi);
+        let r = query_edit_rect(w, self.dpi, font_text_height(self.font, self.dpi));
         unsafe {
             let _ = SetWindowPos(
                 self.edit_hwnd,
                 None,
-                pad,
-                pad,
-                w - pad * 2,
-                scale(EDIT_HEIGHT, self.dpi),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
+        }
+    }
+
+    /// Draws the placeholder into `hdc`, which the query `edit` has just
+    /// painted (#881). Left-aligned with the text the user would type.
+    fn draw_query_cue(&self, hdc: HDC, edit: HWND) {
+        let mut rc = RECT::default();
+        unsafe {
+            if GetClientRect(edit, &mut rc).is_err() {
+                return;
+            }
+            let margins = SendMessageW(edit, EM_GETMARGINS, None, None).0 as u32 & 0xFFFF;
+            rc.left += margins as i32;
+            let old_font = SelectObject(hdc, HGDIOBJ(self.font.0));
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(self.colors.cue));
+            draw_text_line(
+                hdc,
+                QUERY_CUE,
+                rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old_font);
+        }
+    }
+
+    /// A new font for a new DPI, given to the query box (#881).
+    fn rebuild_font(&mut self) {
+        let old = self.font;
+        self.font = gdi_font(self.dpi, FW_NORMAL.0 as i32);
+        unsafe {
+            SendMessageW(
+                self.edit_hwnd,
+                WM_SETFONT,
+                Some(WPARAM(self.font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+            if !old.0.is_null() {
+                let _ = DeleteObject(HGDIOBJ(old.0));
+            }
         }
     }
 
@@ -1212,6 +1403,10 @@ impl PaletteInner {
     fn apply_colors(&mut self) {
         self.colors = palette_colors(self.theme, &self.sys, live_accent(self.theme, &self.sys));
         self.drop_edit_brush();
+        // RedrawWindow with no window redraws the desktop.
+        if self.hwnd.0.is_null() {
+            return;
+        }
         unsafe {
             use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
             let _ = RedrawWindow(
@@ -1326,13 +1521,7 @@ impl PaletteInner {
             if let Ok(brush) = target
                 .CreateSolidColorBrush(&colorref_to_d2d(COLORREF(colors.border)) as *const _, None)
             {
-                let o = QUERY_BORDER_OUTSET as f32;
-                let rect = D2D_RECT_F {
-                    left: pad - o,
-                    top: pad - o,
-                    right: content_w - pad + o,
-                    bottom: pad + EDIT_HEIGHT as f32 + o,
-                };
+                let rect = query_border_rect();
                 target.DrawRectangle(&rect as *const _, &brush, 1.0, None);
             }
         }
@@ -1364,9 +1553,9 @@ impl PaletteInner {
                     draw_text_line_d2d(&target, &format, text, row_rect, COLORREF(colors.hint));
                 }
                 crate::ui::palette_model::Row::Action { name, .. } => {
-                    // The selected row has the fill and the bar; a row only
-                    // hovered gets an outline in the bar colour (3:1 on the
-                    // background), so the two never look alike.
+                    // The selected row has the strong fill and the bar; a row
+                    // only hovered gets a quiet fill (an outline in high
+                    // contrast), so the two never look alike.
                     if i == self.state.selected {
                         if let Ok(hl) = unsafe {
                             target.CreateSolidColorBrush(
@@ -1379,20 +1568,32 @@ impl PaletteInner {
                             }
                         }
                     } else if self.hover == Some(i) {
-                        if let Ok(outline) = unsafe {
+                        if let Ok(fill) = unsafe {
                             target.CreateSolidColorBrush(
-                                &colorref_to_d2d(COLORREF(colors.bar)) as *const _,
+                                &colorref_to_d2d(COLORREF(colors.hover_fill)) as *const _,
                                 None,
                             )
                         } {
-                            let inset = D2D_RECT_F {
-                                left: row_rect.left + 0.5,
-                                top: row_rect.top + 0.5,
-                                right: row_rect.right - 0.5,
-                                bottom: row_rect.bottom - 0.5,
-                            };
                             unsafe {
-                                target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
+                                target.FillRectangle(&row_rect as *const _, &fill);
+                            }
+                        }
+                        if let Some(ink) = colors.hover_outline {
+                            if let Ok(outline) = unsafe {
+                                target.CreateSolidColorBrush(
+                                    &colorref_to_d2d(COLORREF(ink)) as *const _,
+                                    None,
+                                )
+                            } {
+                                let inset = D2D_RECT_F {
+                                    left: row_rect.left + 0.5,
+                                    top: row_rect.top + 0.5,
+                                    right: row_rect.right - 0.5,
+                                    bottom: row_rect.bottom - 0.5,
+                                };
+                                unsafe {
+                                    target.DrawRectangle(&inset as *const _, &outline, 1.0, None);
+                                }
                             }
                         }
                     }
@@ -1430,6 +1631,27 @@ impl PaletteInner {
                             colors.text
                         }),
                     );
+                }
+            }
+        }
+
+        // #883: more rows than fit, so say where the viewport is. Drawn at 96
+        // DPI: the render target scales logical pixels itself.
+        if let Some(t) = thumb_rect(96, self.state.offset, self.state.rows.len()) {
+            if let Ok(brush) = unsafe {
+                target.CreateSolidColorBrush(
+                    &colorref_to_d2d(COLORREF(colors.thumb)) as *const _,
+                    None,
+                )
+            } {
+                let rect = D2D_RECT_F {
+                    left: t.left as f32,
+                    top: t.top as f32,
+                    right: t.right as f32,
+                    bottom: t.bottom as f32,
+                };
+                unsafe {
+                    target.FillRectangle(&rect as *const _, &brush);
                 }
             }
         }
@@ -1571,29 +1793,34 @@ impl PaletteInner {
                             FillRect(hdc, &row_rect, hl);
                             let _ = DeleteObject(hl.into());
                         } else if self.hover == Some(i) {
-                            let outline = CreateSolidBrush(COLORREF(colors.bar));
-                            let line = scale(1, self.dpi).max(1);
-                            for edge in [
-                                RECT {
-                                    bottom: row_rect.top + line,
-                                    ..row_rect
-                                },
-                                RECT {
-                                    top: row_rect.bottom - line,
-                                    ..row_rect
-                                },
-                                RECT {
-                                    right: row_rect.left + line,
-                                    ..row_rect
-                                },
-                                RECT {
-                                    left: row_rect.right - line,
-                                    ..row_rect
-                                },
-                            ] {
-                                FillRect(hdc, &edge, outline);
+                            let fill = CreateSolidBrush(COLORREF(colors.hover_fill));
+                            FillRect(hdc, &row_rect, fill);
+                            let _ = DeleteObject(fill.into());
+                            if let Some(ink) = colors.hover_outline {
+                                let outline = CreateSolidBrush(COLORREF(ink));
+                                let line = scale(1, self.dpi).max(1);
+                                for edge in [
+                                    RECT {
+                                        bottom: row_rect.top + line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        top: row_rect.bottom - line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        right: row_rect.left + line,
+                                        ..row_rect
+                                    },
+                                    RECT {
+                                        left: row_rect.right - line,
+                                        ..row_rect
+                                    },
+                                ] {
+                                    FillRect(hdc, &edge, outline);
+                                }
+                                let _ = DeleteObject(outline.into());
                             }
-                            let _ = DeleteObject(outline.into());
                         }
                         if i == self.state.selected {
                             let accent = CreateSolidBrush(COLORREF(colors.bar));
@@ -1626,6 +1853,13 @@ impl PaletteInner {
                         );
                     }
                 }
+            }
+
+            // #883: more rows than fit, so say where the viewport is.
+            if let Some(t) = thumb_rect(self.dpi, self.state.offset, self.state.rows.len()) {
+                let brush = CreateSolidBrush(COLORREF(colors.thumb));
+                FillRect(hdc, &t, brush);
+                let _ = DeleteObject(brush.into());
             }
 
             let footer_rect = RECT {
@@ -1665,6 +1899,10 @@ impl PaletteInner {
             WM_ERASEBKGND => Some(LRESULT(1)), // we paint the whole client area ourselves
             // #579: without this the query box keeps the stock white
             // background and black text whatever the theme.
+            WM_PALETTE_DRAW_CUE => {
+                self.draw_query_cue(HDC(wparam.0 as *mut c_void), HWND(lparam.0 as *mut c_void));
+                Some(LRESULT(0))
+            }
             WM_CTLCOLOREDIT => {
                 let hdc = HDC(wparam.0 as *mut c_void);
                 unsafe {
@@ -1847,6 +2085,7 @@ impl PaletteInner {
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
+                self.rebuild_font();
                 self.layout_edit_control(w);
                 if let Some(renderer) = &mut self.d2d {
                     renderer.set_dpi(self.dpi);
@@ -1985,6 +2224,7 @@ mod tests {
                     ("header", c.header),
                     ("hint", c.hint),
                     ("footer", c.footer),
+                    ("cue", c.cue),
                 ] {
                     let r = ratio(fg, c.background);
                     assert!(r >= 4.5, "{name}: {what} is {r:.2}:1 on the background");
@@ -2001,8 +2241,32 @@ mod tests {
         }
 
         #[test]
-        fn the_bar_and_the_hover_outline_have_at_least_3_to_1_on_the_background() {
-            // The hover outline is drawn in the bar colour, so this holds both.
+        fn the_hovered_row_differs_from_the_selected_row_and_keeps_readable_text() {
+            for (name, theme, c) in cases() {
+                let r = ratio(c.text, c.hover_fill);
+                assert!(r >= 4.5, "{name}: text is {r:.2}:1 on a hovered row");
+                assert_ne!(c.hover_fill, c.selected_fill, "{name}");
+                if theme == Theme::HighContrast {
+                    // No fill in high contrast: an outline in the text colour.
+                    assert_eq!(c.hover_fill, c.background, "{name}");
+                    let o = c
+                        .hover_outline
+                        .expect("high contrast hovers with an outline");
+                    assert!(ratio(o, c.background) >= 3.0, "{name}: outline");
+                } else {
+                    // A quiet fill, lighter than the selection's.
+                    assert_ne!(c.hover_fill, c.background, "{name}");
+                    assert_eq!(c.hover_outline, None, "{name}");
+                    assert!(
+                        ratio(c.hover_fill, c.background) < ratio(c.selected_fill, c.background),
+                        "{name}: the hover fill is not quieter than the selection"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn the_bar_has_at_least_3_to_1_on_the_background() {
             for (name, theme, c) in cases() {
                 // In high contrast the whole row is the system highlight and
                 // the bar is that colour: the row itself must stand out.
@@ -2013,6 +2277,14 @@ mod tests {
                 };
                 let r = ratio(bar, under);
                 assert!(r >= 3.0, "{name}: the selection is {r:.2}:1");
+            }
+        }
+
+        #[test]
+        fn the_scroll_thumb_has_at_least_3_to_1_on_the_background() {
+            for (name, _, c) in cases() {
+                let r = ratio(c.thumb, c.background);
+                assert!(r >= 3.0, "{name}: the thumb is {r:.2}:1");
             }
         }
 
@@ -2052,12 +2324,21 @@ mod tests {
             palette_colors(theme, &sys, live_accent(theme, &sys))
         }
 
+        /// Colours that can never equal the live ones, whatever theme this
+        /// machine runs: the background is not a valid COLORREF (#886).
+        fn stale_colors() -> PaletteColors {
+            PaletteColors {
+                background: 0x0100_0000,
+                ..live_colors()
+            }
+        }
+
         #[test]
         fn a_theme_message_makes_the_palette_read_the_system_again() {
             for msg in [WM_THEMECHANGED, WM_SYSCOLORCHANGE] {
                 let mut p = Palette::new_for_test(instance()).unwrap();
                 // Stale colours, as if the theme had just changed.
-                p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+                p.inner.colors = stale_colors();
                 assert_ne!(p.inner.colors, live_colors(), "the setup must differ");
                 unsafe {
                     SendMessageW(p.hwnd(), msg, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -2069,7 +2350,7 @@ mod tests {
         #[test]
         fn a_theme_setting_change_makes_the_palette_read_the_system_again() {
             let mut p = Palette::new_for_test(instance()).unwrap();
-            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            p.inner.colors = stale_colors();
             let name = wide_z("ImmersiveColorSet");
             unsafe {
                 SendMessageW(
@@ -2081,7 +2362,7 @@ mod tests {
             }
             assert_eq!(p.inner.colors, live_colors());
             // An unrelated setting leaves it alone.
-            p.inner.colors = palette_colors(Theme::HighContrast, &HC_BLACK, 0);
+            p.inner.colors = stale_colors();
             let other = wide_z("intl");
             unsafe {
                 SendMessageW(
@@ -2165,6 +2446,149 @@ mod tests {
             assert_eq!(text.0, colors.text);
         }
     }
+    // #886: a 1 px stroke is centred on its path, so a path on whole pixels
+    // blurs across two rows of pixels.
+    #[test]
+    fn the_query_border_path_sits_on_half_pixels_inside_the_outer_edge() {
+        let r = query_border_rect();
+        for v in [r.left, r.top, r.right, r.bottom] {
+            assert_eq!(v.fract(), 0.5, "{v}");
+        }
+        // The stroke fills the outermost pixel, like the GDI path's four fills.
+        let pad = PADDING as f32;
+        let o = QUERY_BORDER_OUTSET as f32;
+        assert_eq!(r.left - 0.5, pad - o);
+        assert_eq!(r.top - 0.5, pad - o);
+        assert_eq!(r.right + 0.5, WINDOW_WIDTH as f32 - pad + o);
+        assert_eq!(r.bottom + 0.5, pad + EDIT_HEIGHT as f32 + o);
+    }
+
+    // #881: the query box centres its text and shows a placeholder.
+    mod query_box_tests {
+        use super::super::{
+            query_edit_rect, scale, EDIT_HEIGHT, PADDING, QUERY_TEXT_INSET, WINDOW_WIDTH,
+        };
+
+        #[test]
+        fn the_text_line_is_centred_in_the_box_at_every_scale() {
+            for dpi in [96u32, 120, 144, 192, 240] {
+                let text_h = scale(20, dpi);
+                let r = query_edit_rect(scale(WINDOW_WIDTH, dpi), dpi, text_h);
+                let box_top = scale(PADDING, dpi);
+                let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+                assert_eq!(r.bottom - r.top, text_h, "dpi {dpi}");
+                let (above, below) = (r.top - box_top, box_bottom - r.bottom);
+                assert!(above > 0 && (above - below).abs() <= 1, "dpi {dpi}");
+                // The text clears the box edge by the inset on both sides.
+                assert_eq!(r.left, scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi));
+                assert_eq!(
+                    scale(WINDOW_WIDTH, dpi) - r.right,
+                    scale(PADDING, dpi) + scale(QUERY_TEXT_INSET, dpi)
+                );
+            }
+        }
+
+        #[test]
+        fn a_font_taller_than_the_box_is_clamped_to_the_box() {
+            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 500);
+            assert_eq!(r.bottom - r.top, scale(EDIT_HEIGHT, 96));
+            let r = query_edit_rect(scale(WINDOW_WIDTH, 96), 96, 0);
+            assert!(
+                r.bottom > r.top,
+                "a zero-height font still leaves a control"
+            );
+        }
+    }
+
+    // The placeholder is painted into the EDIT by the palette (a plain EDIT
+    // has no cue banner in the palette's colours), so these print the real
+    // control and look at its pixels.
+    mod query_cue_tests {
+        use super::*;
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+        /// How many pixels of the printed edit, at or right of `from_x`, are not
+        /// the background colour.
+        fn ink_right_of(p: &Palette, from_x: i32) -> usize {
+            let edit = p.edit_hwnd();
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetClientRect(edit, &mut rc);
+                let screen = GetDC(None);
+                let dc = CreateCompatibleDC(Some(screen));
+                let bmp = CreateCompatibleBitmap(screen, rc.right, rc.bottom);
+                let old = SelectObject(dc, HGDIOBJ(bmp.0));
+                let bg = CreateSolidBrush(COLORREF(p.inner.colors.background));
+                FillRect(dc, &rc, bg);
+                let _ = DeleteObject(bg.into());
+                // PRF_CLIENT
+                SendMessageW(
+                    edit,
+                    WM_PRINTCLIENT,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(0x4)),
+                );
+                let mut n = 0;
+                for y in 0..rc.bottom {
+                    for x in from_x..rc.right {
+                        if GetPixel(dc, x, y).0 != p.inner.colors.background {
+                            n += 1;
+                        }
+                    }
+                }
+                SelectObject(dc, old);
+                let _ = DeleteObject(bmp.into());
+                let _ = DeleteDC(dc);
+                ReleaseDC(None, screen);
+                n
+            }
+        }
+
+        fn shown() -> Palette {
+            let mut p = Palette::new_for_test(instance()).unwrap();
+            p.force_theme_for_gallery(Theme::Dark);
+            p.show(free_actions(), true, String::new());
+            p
+        }
+
+        #[test]
+        fn an_empty_query_box_shows_the_placeholder() {
+            let p = shown();
+            assert!(ink_right_of(&p, 0) > 0, "nothing is drawn in an empty box");
+        }
+
+        #[test]
+        fn typing_removes_the_placeholder() {
+            let mut p = shown();
+            let from = scale(60, p.inner.dpi);
+            assert!(
+                ink_right_of(&p, from) > 0,
+                "the placeholder is wider than 60 DIP"
+            );
+            p.set_query_for_test("a");
+            assert_eq!(ink_right_of(&p, from), 0, "the placeholder is still drawn");
+        }
+
+        #[test]
+        fn the_edit_is_one_text_line_high_and_centred_in_the_box() {
+            let p = shown();
+            let (mut er, mut pr) = (RECT::default(), RECT::default());
+            unsafe {
+                let _ = GetWindowRect(p.edit_hwnd(), &mut er);
+                let _ = GetWindowRect(p.hwnd(), &mut pr);
+            }
+            let dpi = p.inner.dpi;
+            let box_top = scale(PADDING, dpi);
+            let box_bottom = box_top + scale(EDIT_HEIGHT, dpi);
+            let (top, bottom) = (er.top - pr.top, er.bottom - pr.top);
+            assert!(bottom - top < scale(EDIT_HEIGHT, dpi), "{top}..{bottom}");
+            assert!(((top - box_top) - (box_bottom - bottom)).abs() <= 1);
+        }
+    }
+
     mod row_at_tests {
         use super::super::row_at;
 
@@ -2266,6 +2690,143 @@ mod tests {
         );
         assert_eq!(empty.0, p.inner.colors.background, "the palette background");
     }
+    /// The colours of the window's pixels at `points`, read from a `WM_PRINT`
+    /// of the palette (the GDI path, like the UI gallery's pictures).
+    fn printed_pixels(p: &Palette, points: &[(i32, i32)]) -> Vec<u32> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let (w, h) = (scale(WINDOW_WIDTH, p.inner.dpi), window_height(p.inner.dpi));
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+            let out = points.iter().map(|&(x, y)| GetPixel(mem, x, y).0).collect();
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+            out
+        }
+    }
+
+    /// #883: a list longer than the viewport draws a thumb on the right that
+    /// sits at the top, then at the bottom once scrolled to the end, and a
+    /// list that fits draws none.
+    #[test]
+    fn a_long_list_draws_a_scroll_thumb_that_follows_the_offset() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.force_theme_for_gallery(Theme::Dark);
+        p.show(many_ungrouped_actions(30), true, String::new());
+        let dpi = p.inner.dpi;
+        let rows = p.inner.state.rows.len();
+        let at = |offset: usize| thumb_rect(dpi, offset, rows).expect("30 rows overflow 12");
+        let (top_rect, end_rect) = (at(0), at(rows - crate::ui::palette_model::MAX_VISIBLE_ROWS));
+        let x = (top_rect.left + top_rect.right) / 2;
+        let track_top = top_rect.top;
+        let track_bottom = end_rect.bottom;
+        let probes = [(x, track_top + 2), (x, track_bottom - 2)];
+        let thumb = p.inner.colors.thumb;
+        let bg = p.inner.colors.background;
+
+        assert_eq!(printed_pixels(&p, &probes), [thumb, bg], "at the top");
+        p.inner.state.offset = rows - crate::ui::palette_model::MAX_VISIBLE_ROWS;
+        assert_eq!(
+            printed_pixels(&p, &probes),
+            [bg, thumb],
+            "scrolled to the end"
+        );
+
+        p.show(many_ungrouped_actions(5), true, String::new());
+        assert_eq!(
+            printed_pixels(&p, &probes),
+            [bg, bg],
+            "a short list has no thumb"
+        );
+    }
+
+    #[test]
+    fn the_thumb_rect_sits_in_the_padding_beside_the_rows_at_every_scale() {
+        for dpi in [96u32, 120, 144, 192, 240] {
+            let w = scale(WINDOW_WIDTH, dpi);
+            // Each term is scaled on its own, as the rows are laid out.
+            let list_top = scale(PADDING, dpi) + scale(EDIT_HEIGHT, dpi) + scale(PADDING, dpi);
+            let track = scale(ROW_HEIGHT, dpi) * crate::ui::palette_model::MAX_VISIBLE_ROWS as i32;
+            assert_eq!(thumb_rect(dpi, 0, 12), None, "12 rows fit");
+            let r = thumb_rect(dpi, 0, 40).unwrap();
+            assert!(
+                r.left >= w - scale(PADDING, dpi),
+                "dpi {dpi}: overlaps the rows"
+            );
+            assert!(r.right < w, "dpi {dpi}: leaves the window");
+            assert!(
+                r.top >= list_top && r.bottom <= list_top + track,
+                "dpi {dpi}"
+            );
+            assert!(r.right - r.left >= 2, "dpi {dpi}: too thin to see");
+        }
+    }
+
+    /// #882: a row the mouse is over is filled lighter than the selected row,
+    /// so two rows never look selected. Prints the window and reads the
+    /// pixels of the hovered row and of the selected one.
+    #[test]
+    fn a_hovered_row_is_filled_lighter_than_the_selected_row() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel,
+            ReleaseDC, SelectObject, HDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.force_theme_for_gallery(Theme::Dark);
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        // Rows: header, action (selected), header, action.
+        p.inner.hover = Some(3);
+        let dpi = p.inner.dpi;
+        let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+        let (screen, mem, bmp, old);
+        unsafe {
+            screen = GetDC(None);
+            mem = CreateCompatibleDC(Some(screen));
+            bmp = CreateCompatibleBitmap(screen, w, h);
+            old = SelectObject(mem, bmp.into());
+            SendMessageW(
+                p.hwnd(),
+                WM_PRINT,
+                Some(WPARAM(mem.0 as usize)),
+                Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+            );
+        }
+        let list_top = scale(PADDING + EDIT_HEIGHT + PADDING, dpi);
+        let row_y = |pos: i32| list_top + scale(ROW_HEIGHT, dpi) * pos + scale(ROW_HEIGHT, dpi) / 2;
+        let x = w - scale(PADDING, dpi) - 4;
+        let (selected, hovered) = unsafe {
+            (
+                GetPixel(mem as HDC, x, row_y(1)).0,
+                GetPixel(mem as HDC, x, row_y(3)).0,
+            )
+        };
+        unsafe {
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+        let c = p.inner.colors;
+        assert_eq!(selected, c.selected_fill);
+        assert_eq!(hovered, c.hover_fill, "the hovered row fill");
+        assert_ne!(hovered, selected);
+        assert_ne!(hovered, c.background);
+    }
+
     #[test]
     fn window_and_edit_control_are_created() {
         let p = Palette::new_for_test(instance()).expect("palette window creation must succeed");

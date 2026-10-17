@@ -25,8 +25,8 @@ mod tests {
     /// are added here, after the section header they describe.
     fn with_notes(generated: &str) -> String {
         const HEADER: &str = "[palette]\n";
-        const NOTE: &str = "# Not used yet: nothing reads this until the key picks an option\n\
-                            # (#308). Changing it has no effect today.\n";
+        const NOTE: &str = "# Not used yet: the key never runs a clipboard option on the model's\n\
+                            # confidence alone (#859). Changing it has no effect today.\n";
         assert!(
             generated.contains(HEADER),
             "the [palette] section moved; update with_notes"
