@@ -31,7 +31,7 @@ pub use egress::append_pending;
 pub(crate) use egress::append_pending_at;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -98,6 +98,7 @@ impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
         if let rusqlite::Error::SqliteFailure(f, _) = &e {
             if matches!(f.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) {
+                CORRUPT_EVENTS.fetch_add(1, Ordering::SeqCst);
                 return StoreError::Corrupt(e.to_string());
             }
         }
@@ -105,8 +106,17 @@ impl From<rusqlite::Error> for StoreError {
     }
 }
 
+/// Counts corrupt-class errors seen anywhere in the process (#660). A store
+/// whose own count is behind checks itself the next time it is locked.
+static CORRUPT_EVENTS: AtomicU64 = AtomicU64::new(0);
+
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Where the file lives; `None` for an in-memory store, which has nothing
+    /// to move aside.
+    path: Option<PathBuf>,
+    /// The value of [`CORRUPT_EVENTS`] this store last checked itself against.
+    seen: AtomicU64,
 }
 
 impl Store {
@@ -119,9 +129,15 @@ impl Store {
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
         migrate::run(&mut conn, migrate::MIGRATIONS, Some(path))?;
-        Ok(Store {
+        Ok(Store::over(conn, Some(path.to_path_buf())))
+    }
+
+    fn over(conn: Connection, path: Option<PathBuf>) -> Store {
+        Store {
             conn: Mutex::new(conn),
-        })
+            path,
+            seen: AtomicU64::new(CORRUPT_EVENTS.load(Ordering::SeqCst)),
+        }
     }
 
     /// [`Store::open_at`], but a damaged file is moved aside to
@@ -145,16 +161,73 @@ impl Store {
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // A panic elsewhere must not take the history with it.
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let events = CORRUPT_EVENTS.load(Ordering::SeqCst);
+        if self.seen.swap(events, Ordering::SeqCst) != events {
+            if let Some(notice) = self.heal(&mut conn) {
+                note_recovery(notice);
+            }
+        }
+        conn
+    }
+
+    /// Runs after a corrupt-class error was seen (#660): if this store's file
+    /// really is damaged, closes it, moves it aside and opens a fresh one.
+    /// Returns the notice for the user, or `None` when the file is fine (the
+    /// error came from another store, or was not about the file). Never
+    /// deletes the damaged file. If it cannot be moved or a fresh file cannot
+    /// be made, the store is left empty so every later call is an ordinary
+    /// error (the callers already handle those) and the notice says so.
+    fn heal(&self, conn: &mut Connection) -> Option<String> {
+        let path = self.path.as_ref()?;
+        if !file_is_damaged(conn) {
+            return None;
+        }
+        // Closing the old connection first: Windows will not rename an open file.
+        let empty = Connection::open_in_memory().ok()?;
+        drop(std::mem::replace(conn, empty));
+        let kept = match quarantine(path) {
+            Ok(kept) => kept,
+            Err(e) => return Some(runtime_recovery_notice(Err(&e.to_string()))),
+        };
+        match Store::open_at(path) {
+            Ok(fresh) => {
+                *conn = fresh.conn.into_inner().unwrap_or_else(|e| e.into_inner());
+                Some(runtime_recovery_notice(Ok(&kept)))
+            }
+            Err(e) => Some(runtime_recovery_notice(Err(&e.to_string()))),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn in_memory() -> Store {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate::run(&mut conn, migrate::MIGRATIONS, None).unwrap();
-        Store {
-            conn: Mutex::new(conn),
-        }
+        Store::over(conn, None)
+    }
+}
+
+/// True only when SQLite itself says the file is damaged. Any other outcome,
+/// including a check that could not run (busy, I/O), counts as healthy: a file
+/// is never moved aside on a guess.
+fn file_is_damaged(conn: &Connection) -> bool {
+    match conn.query_row("PRAGMA quick_check(1)", [], |r| r.get::<_, String>(0)) {
+        Ok(verdict) => verdict != "ok",
+        Err(e) => matches!(StoreError::from(e), StoreError::Corrupt(_)),
+    }
+}
+
+/// The card text after a store was replaced mid-run. `Ok` holds where the
+/// damaged copy was kept; `Err` holds why it could not be replaced.
+fn runtime_recovery_notice(kept: Result<&Path, &str>) -> String {
+    match kept {
+        Ok(path) => format!(
+            "Wingman's saved data was damaged while it was running. A copy was kept at {}. Starting fresh: usage and request history are lost, and your saved profile and indexed documents start empty.",
+            path.display()
+        ),
+        Err(why) => format!(
+            "Wingman's saved data was damaged while it was running and could not be replaced ({why}), so it is not saving history until you restart Wingman. The damaged file was not deleted."
+        ),
     }
 }
 
@@ -563,6 +636,13 @@ fn note(text: String) {
     }
 }
 
+/// Like [`note`], but a recovery replaces an earlier notice: it is the one the
+/// user most needs to read.
+fn note_recovery(text: String) {
+    NOTICE_USED.store(true, Ordering::SeqCst);
+    *NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+}
+
 /// Takes the pending notice, if any. `app.rs` adds it to the next card.
 pub fn take_notice() -> Option<String> {
     NOTICE.lock().unwrap_or_else(|e| e.into_inner()).take()
@@ -859,6 +939,100 @@ mod tests {
         assert_eq!(moved.len(), 1);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store with one saved day, then its file overwritten with garbage
+    /// while the connection stays open (#660). The checkpoint moves the data
+    /// into the main file and `shrink_memory` drops the page cache, so the next
+    /// query really reads the garbage.
+    fn store_damaged_while_open(name: &str) -> (Store, PathBuf) {
+        let dir = scratch(name);
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        s.lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .unwrap();
+        std::fs::write(&path, vec![b'x'; 8192]).unwrap();
+        (s, dir)
+    }
+
+    fn damaged_copies(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .count()
+    }
+
+    #[test]
+    fn a_file_damaged_while_running_is_replaced_by_a_fresh_store() {
+        let (s, dir) = store_damaged_while_open("runtime-corrupt");
+
+        let first = s.day_total("2026-10-15");
+        assert!(matches!(first, Err(StoreError::Corrupt(_))), "{first:?}");
+
+        // The next call heals: the old file is kept, a fresh one works.
+        assert_eq!(s.day_total("2026-10-15").unwrap(), None);
+        s.record_usage("2026-10-16", "a", "m", Some(0.2), None)
+            .unwrap();
+        assert!(s.day_total("2026-10-16").unwrap().is_some());
+        assert_eq!(damaged_copies(&dir), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_healthy_store_is_never_moved_aside_after_a_corrupt_error_elsewhere() {
+        let dir = scratch("runtime-healthy");
+        let s = Store::open_at(&dir.join("wingman.db")).unwrap();
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        // Any corrupt-class error in the process makes every store check itself.
+        let _ = StoreError::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+        assert!(s.day_total("2026-10-15").unwrap().is_some());
+        assert_eq!(damaged_copies(&dir), 0);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn if_the_damaged_file_cannot_be_moved_the_store_fails_without_panicking() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (s, dir) = store_damaged_while_open("runtime-stuck");
+        // Share read and write but not delete: the rename must fail.
+        let _hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(dir.join("wingman.db"))
+            .unwrap();
+
+        assert!(s.day_total("2026-10-15").is_err());
+        // Healing fails here; every later call is an ordinary error, not a panic.
+        assert!(s.day_total("2026-10-15").is_err());
+        assert!(s.record_usage("2026-10-16", "a", "m", None, None).is_err());
+        assert_eq!(damaged_copies(&dir), 0);
+        drop(_hold);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_runtime_notice_says_what_was_lost_and_where_the_copy_is() {
+        let kept = runtime_recovery_notice(Ok(Path::new("C:/x/wingman.db.corrupt-5")));
+        assert!(kept.contains("wingman.db.corrupt-5"), "{kept}");
+        assert!(kept.contains("history"), "{kept}");
+        assert!(kept.contains("documents"), "{kept}");
+        let stuck = runtime_recovery_notice(Err("in use"));
+        assert!(stuck.contains("in use"), "{stuck}");
+        assert!(stuck.contains("not saving"), "{stuck}");
+        for t in [kept, stuck] {
+            assert!(!t.contains('\u{2014}'), "{t}");
+        }
     }
 
     #[test]
