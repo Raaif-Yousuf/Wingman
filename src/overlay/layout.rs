@@ -87,21 +87,24 @@ fn clamp_span(v: i32, len: i32, lo: i32, hi: i32) -> i32 {
     }
 }
 
-/// How far a label may slide along the text, in label heights. Past that it
-/// is too far from its word to read as being about it.
-const SLIDE_REACH_HEIGHTS: i32 = 10;
+/// How far a label may slide along the text, in label heights. There is no
+/// leader line, so past this it no longer reads as being about its word.
+const SLIDE_REACH_HEIGHTS: i32 = 3;
 
 /// Most steps a slide takes. Each step jumps past every blocker in the way, so
 /// this bounds the cost per candidate to a few passes over `blockers`.
 const SLIDE_STEPS: usize = 16;
 
 /// Moves `from` sideways (`dir` is 1 for right, -1 for left) until nothing in
-/// `blockers` touches it. `None` if it leaves the monitor, goes further than
-/// `reach` from where it started, or does not settle in [`SLIDE_STEPS`].
+/// `blockers` touches it. `stops` (other requests' anchors) are never passed:
+/// a slide that would touch or cross one gives up. `None` if it leaves the
+/// monitor, goes further than `reach` from where it started, or does not
+/// settle in [`SLIDE_STEPS`].
 fn slide(
     from: ScreenRect,
     dir: i32,
     blockers: &[ScreenRect],
+    stops: &[ScreenRect],
     monitor: &ScreenRect,
     gap: i32,
     reach: i32,
@@ -124,11 +127,22 @@ fn slide(
                 Some(edge) => edge.saturating_sub(gap).saturating_sub(size.0),
             }
         };
-        c = at(left, c.top, size);
-        let moved = i64::from(c.left) - i64::from(from.left);
-        if moved.abs() > i64::from(reach) || c.left < monitor.left || c.right > monitor.right {
+        let next = at(left, c.top, size);
+        let moved = i64::from(next.left) - i64::from(from.left);
+        if moved.abs() > i64::from(reach) || next.left < monitor.left || next.right > monitor.right
+        {
             return None;
         }
+        // Everything the label sweeps over on this jump, ends included.
+        let swept = ScreenRect {
+            left: c.left.min(next.left),
+            right: c.right.max(next.right),
+            ..c
+        };
+        if stops.iter().any(|o| intersects(&swept, o)) {
+            return None;
+        }
+        c = next;
     }
     None
 }
@@ -140,8 +154,10 @@ fn slide(
 /// anchor's edge first, so a label near a monitor edge is not lost), does not
 /// cover any annotation's anchor, and does not overlap a label already
 /// placed. Of the spots that qualify, the one covering the least of
-/// `obstacles` (the page's other text) wins, the first on a tie: a spot
-/// touching no text beats any other, and text never costs a label its place.
+/// `obstacles` (the page's other text) wins, then the one nearest its base
+/// spot, then the first listed: a spot touching no text beats any other, and
+/// text never costs a label its place. A spot may be slid sideways along the
+/// text, at most [`SLIDE_REACH_HEIGHTS`] label heights, never past another mark.
 /// Requests are served in order, so reading order wins a contested spot.
 pub fn place_labels(
     requests: &[Request],
@@ -167,22 +183,27 @@ pub fn place_labels(
         };
         let x = clamp_span(b.left, size.0, monitor.left, monitor.right);
         let y = clamp_span(b.top, size.1, monitor.top, monitor.bottom);
-        let mut candidates = vec![
+        // Each candidate carries how far it slid from its base, 0 if it did not.
+        let mut candidates: Vec<(Side, ScreenRect, i64)> = vec![
             (
                 Side::Above,
                 at(x, b.top.saturating_sub(gap).saturating_sub(size.1), size),
+                0,
             ),
-            (Side::Right, at(b.right.saturating_add(gap), y, size)),
-            (Side::Below, at(x, b.bottom.saturating_add(gap), size)),
+            (Side::Right, at(b.right.saturating_add(gap), y, size), 0),
+            (Side::Below, at(x, b.bottom.saturating_add(gap), size), 0),
             (
                 Side::Left,
                 at(b.left.saturating_sub(gap).saturating_sub(size.0), y, size),
+                0,
             ),
         ];
         // On a packed page every spot above, below or beside the word touches
         // a neighbouring line. Slide each spot along the text, past whatever is
         // in the way, to the white space at a line end or start (#1134).
         // Everything stays in the candidate list, so the least-covered one wins.
+        // A slide may pass plain text and placed labels, but never another
+        // mark: it stops at the first anchor in its way.
         let blockers: Vec<ScreenRect> = text
             .iter()
             .chain(all_anchors.iter())
@@ -212,14 +233,18 @@ pub fn place_labels(
         for (side, base) in bases {
             let toward_right = matches!(side, Side::Right | Side::Above | Side::Below);
             let toward_left = matches!(side, Side::Left | Side::Above | Side::Below);
-            if toward_right {
-                if let Some(c) = slide(base, 1, &blockers, &monitor, gap, reach) {
-                    candidates.push((side, c));
+            for (dir, wanted) in [(1, toward_right), (-1, toward_left)] {
+                if !wanted {
+                    continue;
                 }
-            }
-            if toward_left {
-                if let Some(c) = slide(base, -1, &blockers, &monitor, gap, reach) {
-                    candidates.push((side, c));
+                let Some(c) = slide(base, dir, &blockers, &all_anchors, &monitor, gap, reach)
+                else {
+                    continue;
+                };
+                // No blocker in the way: it is a candidate already.
+                if !candidates.iter().any(|(_, r, _)| *r == c) {
+                    let moved = (i64::from(c.left) - i64::from(base.left)).abs();
+                    candidates.push((side, c, moved));
                 }
             }
         }
@@ -228,14 +253,16 @@ pub fn place_labels(
                 && !all_anchors.iter().any(|a| intersects(c, a))
                 && !placed.iter().any(|p| intersects(c, &p.rect))
         };
-        // The free spot that covers the least other text; the first on a tie,
-        // so the nearer spots (listed first) win.
+        // The free spot that covers the least other text; of those, the one
+        // that slid least, then the first listed, so the nearer spots win.
         let pick = candidates
             .into_iter()
-            .filter(|(_, c)| free(c))
-            .min_by_key(|(_, c)| text.iter().map(|o| overlap_area(c, o)).sum::<i64>());
+            .filter(|(_, c, _)| free(c))
+            .min_by_key(|(_, c, moved)| {
+                (text.iter().map(|o| overlap_area(c, o)).sum::<i64>(), *moved)
+            });
         match pick {
-            Some((side, rect)) => placed.push(Placed { index, rect, side }),
+            Some((side, rect, _)) => placed.push(Placed { index, rect, side }),
             None => dropped.push(index),
         }
     }
@@ -586,7 +613,7 @@ mod tests {
             .filter(|w| **w != anchor)
             .map(|w| overlap_area(&l.placed[0].rect, w))
             .sum();
-        assert!(covered <= 20, "covers {covered} px of other text");
+        assert_eq!(covered, 0, "covers {covered} px of other text");
     }
 
     #[test]
@@ -597,7 +624,8 @@ mod tests {
         let l = place_labels(&[req(anchor, 90, 28)], &words, MON, GAP_DESIGN_PX);
         assert_eq!(l.placed.len(), 1);
         let dx = l.placed[0].rect.left - anchor.left;
-        assert!(dx.abs() <= 300, "label moved {dx} px away");
+        // Its own width and the gap, then at most three label heights.
+        assert!(dx.abs() <= 60 + 4 + 3 * 28, "label moved {dx} px away");
     }
 
     #[test]
@@ -612,10 +640,56 @@ mod tests {
             GAP_DESIGN_PX,
         );
         assert_eq!(l.placed.len(), 2);
+        // The first label can only keep off the text by sliding along it.
+        assert_eq!(l.placed[0].rect.left, a.right + GAP_DESIGN_PX, "not slid");
+        for p in &l.placed {
+            let covered: i64 = words
+                .iter()
+                .filter(|w| **w != a && **w != b)
+                .map(|w| overlap_area(&p.rect, w))
+                .sum();
+            assert_eq!(covered, 0, "{p:?} covers text");
+        }
         assert!(!intersects(&l.placed[0].rect, &l.placed[1].rect));
         for p in &l.placed {
             assert!(!intersects(&p.rect, &a) && !intersects(&p.rect, &b));
             assert!(inside(&p.rect, &MON));
         }
+    }
+
+    #[test]
+    fn a_slide_does_not_jump_over_another_mark() {
+        let a = r(100, 100, 200, 120);
+        // Text then another request's anchor to the right; white space past it.
+        let text = r(204, 100, 220, 140);
+        let other = r(224, 100, 240, 140);
+        let bars = [
+            r(0, 50, 1000, 98),
+            r(0, 141, 1000, 170),
+            r(0, 100, 96, 140),
+            text,
+        ];
+        let l = place_labels(
+            &[req(a, 50, 40), req(other, 1, 1)],
+            &bars,
+            MON,
+            GAP_DESIGN_PX,
+        );
+        let first = l.placed.iter().find(|p| p.index == 0).expect("placed");
+        assert!(first.rect.left <= other.left, "jumped to {:?}", first.rect);
+    }
+
+    #[test]
+    fn of_two_clear_slides_the_nearer_one_wins() {
+        let a = r(300, 100, 360, 120);
+        let bars = [
+            r(0, 70, 1000, 98),
+            r(0, 124, 1000, 150),
+            r(364, 100, 420, 120), // blocks Right, 60 px of sliding
+            r(280, 100, 296, 120), // blocks Left, 20 px of sliding
+        ];
+        let l = place_labels(&[req(a, 50, 20)], &bars, MON, GAP_DESIGN_PX);
+        assert_eq!(l.placed[0].rect, r(226, 100, 276, 120));
+        assert_eq!(l.placed[0].side, Side::Left);
     }
 }
