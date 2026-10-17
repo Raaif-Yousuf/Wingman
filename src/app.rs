@@ -258,9 +258,42 @@ fn copy_failed_headline(kind: CopyKind) -> &'static str {
     }
 }
 
-/// Only one gather runs at a time; a second click while one is running just
-/// shows the working card again.
-static COPY_TEXT_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Which copy gathers are running, one flag per command, so a click on the
+/// other command during a gather still gets its own text. A second click on the
+/// same command is refused and the card says it is still gathering.
+///
+/// A gather has no timeout: it only reads local sources (the store file, the
+/// port table, the registry), so it is expected to end. If one ever hangs, its
+/// flag stays set and that command shows "still working" until restart; the
+/// other command and the rest of the app are unaffected.
+#[derive(Default)]
+struct CopyTextGate([std::sync::atomic::AtomicBool; 2]);
+
+impl CopyTextGate {
+    fn slot(&self, kind: CopyKind) -> &std::sync::atomic::AtomicBool {
+        match kind {
+            CopyKind::Diagnostics => &self.0[0],
+            CopyKind::EgressLog => &self.0[1],
+        }
+    }
+
+    /// `true` when this call took the slot; `false` when `kind` is running.
+    fn claim(&self, kind: CopyKind) -> bool {
+        !self
+            .slot(kind)
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn release(&self, kind: CopyKind) {
+        self.slot(kind)
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+static COPY_TEXT_RUNNING: CopyTextGate = CopyTextGate([
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+]);
 
 /// The spend part of the tooltip as the last worker read it (#1181). Written
 /// by the worker, read by `update_tooltip` on the UI thread: no IO there.
@@ -5565,13 +5598,14 @@ impl App {
     /// `WM_APP_COPY_TEXT_RESULT` (#1199). The click is never silent: the
     /// working card shows at once, and the answer or the failure replaces it.
     fn start_copy_text(&mut self, kind: CopyKind) {
-        use std::sync::atomic::Ordering;
-        self.card
-            .show_pending(crate::ui::card::PendingStage::Working);
-        if COPY_TEXT_RUNNING.swap(true, Ordering::SeqCst) {
-            // One gather at a time; the card above already says it is working.
+        if !COPY_TEXT_RUNNING.claim(kind) {
+            // This command is already gathering: say so, never a silent click.
+            self.card
+                .show_pending(crate::ui::card::PendingStage::StillWorking);
             return;
         }
+        self.card
+            .show_pending(crate::ui::card::PendingStage::Working);
         // What the worker needs, taken here (the app's own state is not Sync).
         let config = self.config.clone();
         let last_error = self
@@ -5595,7 +5629,7 @@ impl App {
                     ),
                     CopyKind::EgressLog => crate::diagnostics::egress_report(),
                 };
-                COPY_TEXT_RUNNING.store(false, Ordering::SeqCst);
+                COPY_TEXT_RUNNING.release(kind);
                 let payload = Box::into_raw(Box::new(CopyTextResult { kind, text }));
                 unsafe {
                     if windows::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -5613,7 +5647,7 @@ impl App {
             });
         if let Err(e) = spawned {
             // No thread: say so on the card the click is looking at.
-            COPY_TEXT_RUNNING.store(false, Ordering::SeqCst);
+            COPY_TEXT_RUNNING.release(kind);
             let headline = copy_failed_headline(kind);
             let detail = self.track_error(headline, &format!("starting the worker: {e}"));
             self.card.show_error_with_details(headline, &detail);
@@ -13506,6 +13540,23 @@ mod tests {
             }
             _ => panic!("the copy result must be deferred"),
         }
+    }
+
+    /// #1199 review: each command has its own gather, so a click on the other
+    /// one during a gather is not answered with the wrong text; a second click
+    /// on the same one is refused (the card then says it is still gathering).
+    #[test]
+    fn each_copy_command_has_its_own_gather() {
+        let gate = super::CopyTextGate::default();
+        assert!(gate.claim(super::CopyKind::Diagnostics));
+        assert!(!gate.claim(super::CopyKind::Diagnostics), "same twice");
+        assert!(
+            gate.claim(super::CopyKind::EgressLog),
+            "the other command runs alongside"
+        );
+        gate.release(super::CopyKind::Diagnostics);
+        assert!(gate.claim(super::CopyKind::Diagnostics), "free again");
+        assert!(!gate.claim(super::CopyKind::EgressLog));
     }
 
     #[test]
