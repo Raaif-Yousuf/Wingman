@@ -7885,6 +7885,13 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
+    // #825: the tray menu's rows are owner-drawn and answer through this
+    // window. Thread-local state only, so it is safe before `&mut App` and
+    // while the menu's own message loop runs.
+    if let Some(answer) = crate::ui::tray_menu::handle_message(msg, wparam, lparam) {
+        return answer;
+    }
+
     // #723: a result from a run the app gave up on is dropped here, before
     // anything else, so it can neither clear the new run's busy flag nor
     // show an old answer.
