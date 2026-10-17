@@ -38,8 +38,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, GetForegroundWindow, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+    HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Posted to the target `HWND` when a bound chord fires. `wparam` is
@@ -750,28 +751,69 @@ fn options_modifiers(chord: &Chord) -> crate::options_keys::Modifiers {
 ///
 /// Bounded by `options_keys::claimed_choice`: no modifier down, only digits
 /// that name an option, real (not injected) input, and a claim that lapses by
-/// itself at its expiry tick. The claim is spent here, so a second digit
-/// before the main thread has handled the first reaches the app.
+/// itself at its expiry tick. It also follows the keyboard: the card never
+/// takes focus, so the claim is for the window that was in front when it was
+/// armed, and a key typed in any other window passes through. The claim is
+/// spent here, so a second digit before the main thread has handled the first
+/// reaches the app. When the post fails the key is not swallowed and the claim
+/// is put back, so the card never eats a key it did not act on.
 fn claim_for_options_card(kb: &KBDLLHOOKSTRUCT, chord: &Chord) -> bool {
-    if crate::options_keys::current().is_none() {
+    let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
+    claim_for_options_card_with(
+        kb.vkCode,
+        kb.time,
+        options_modifiers(chord),
+        injected,
+        || unsafe { GetForegroundWindow() }.0 as isize,
+        |choice, generation| {
+            let hwnd = HWND(TARGET_HWND.load(Ordering::Relaxed) as *mut _);
+            unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    crate::options_keys::WM_APP_OPTIONS_CHOICE,
+                    WPARAM(choice.to_wparam()),
+                    LPARAM(generation as isize),
+                )
+            }
+            .is_ok()
+        },
+    )
+}
+
+/// The decision of [`claim_for_options_card`] with the two Win32 calls passed
+/// in, so the order and the failure handling are testable. `foreground_now` is
+/// only called for a key the card would claim; `post` returns whether the
+/// message was queued.
+fn claim_for_options_card_with(
+    vk: u32,
+    tick: u32,
+    mods: crate::options_keys::Modifiers,
+    injected: bool,
+    foreground_now: impl FnOnce() -> isize,
+    post: impl FnOnce(crate::options_keys::Choice, u32) -> bool,
+) -> bool {
+    let Some(claim) = crate::options_keys::current() else {
+        return false;
+    };
+    if crate::options_keys::claimed_choice(Some(claim), vk, tick, mods, injected).is_none() {
         return false;
     }
-    let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
-    let Some((choice, generation)) =
-        crate::options_keys::take_for_key(kb.vkCode, kb.time, options_modifiers(chord), injected)
+    if !crate::options_keys::foreground_matches(
+        crate::options_keys::armed_foreground(),
+        foreground_now(),
+    ) {
+        return false;
+    }
+    let Some((choice, generation)) = crate::options_keys::take_for_key(vk, tick, mods, injected)
     else {
         return false;
     };
-    let hwnd = HWND(TARGET_HWND.load(Ordering::Relaxed) as *mut _);
-    let _ = unsafe {
-        PostMessageW(
-            Some(hwnd),
-            crate::options_keys::WM_APP_OPTIONS_CHOICE,
-            WPARAM(choice.to_wparam()),
-            LPARAM(generation as isize),
-        )
-    };
-    true
+    if post(choice, generation) {
+        true
+    } else {
+        crate::options_keys::arm(claim);
+        false
+    }
 }
 
 /// Reads [`PAUSE_CHORD`] and unpacks it, lock-free. `None` if no pause
@@ -1053,25 +1095,140 @@ mod tests {
     #[test]
     fn the_claim_posts_its_message_and_costs_one_load_when_idle() {
         let src = hook_source();
-        let start = src
-            .find("fn claim_for_options_card(")
-            .expect("no claim_for_options_card");
-        let body = &src[start..];
-        let body = &body[..body.find("\n}\n").expect("fn has no end")];
-        let idle = body
-            .find("options_keys::current().is_none()")
-            .expect("no idle check");
-        let take = body.find("take_for_key(").expect("never takes the claim");
-        assert!(idle < take, "the cheap check must come first");
-        assert!(body.contains("WM_APP_OPTIONS_CHOICE"));
+        let fn_body = |name: &str| {
+            let start = src.find(name).unwrap_or_else(|| panic!("no {name}"));
+            let body = &src[start..];
+            body[..body.find("\n}\n").expect("fn has no end")].to_string()
+        };
+        let outer = fn_body("fn claim_for_options_card(");
+        assert!(outer.contains("WM_APP_OPTIONS_CHOICE"));
         assert!(
-            body.contains("LLKHF_INJECTED"),
+            outer.contains("LLKHF_INJECTED"),
             "injected input is never claimed"
         );
         assert!(
-            !body.contains("lock()"),
-            "the hook must not take a lock here"
+            outer.contains("GetForegroundWindow"),
+            "the claim follows the foreground window"
         );
+        let inner = fn_body("fn claim_for_options_card_with(");
+        let idle = inner
+            .find("options_keys::current()")
+            .expect("no idle check");
+        let take = inner.find("take_for_key(").expect("never takes the claim");
+        assert!(idle < take, "the cheap check must come first");
+        for body in [&outer, &inner] {
+            assert!(
+                !body.contains("lock()"),
+                "the hook must not take a lock here"
+            );
+        }
+    }
+
+    // -- #307: the claim follows the foreground window and the post -------
+
+    const NO_MODS: crate::options_keys::Modifiers = crate::options_keys::Modifiers {
+        shift: false,
+        ctrl: false,
+        alt: false,
+        win: false,
+    };
+
+    fn arm_for_test(fg: isize) {
+        crate::options_keys::set_armed_foreground(fg);
+        crate::options_keys::arm(crate::options_keys::Claim {
+            generation: 6,
+            count: 3,
+            expiry_tick: 50_000,
+        });
+    }
+
+    fn options_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::options_keys::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn a_digit_typed_in_another_window_passes_through_and_keeps_the_claim() {
+        let _g = options_lock();
+        arm_for_test(0xAAAA);
+        let mut posted = false;
+        let claimed = claim_for_options_card_with(
+            0x31,
+            1_000,
+            NO_MODS,
+            false,
+            || 0xBBBB,
+            |_, _| {
+                posted = true;
+                true
+            },
+        );
+        assert!(!claimed, "the digit belongs to the other window");
+        assert!(!posted);
+        assert!(crate::options_keys::current().is_some(), "claim kept");
+        crate::options_keys::clear();
+    }
+
+    #[test]
+    fn a_digit_typed_in_the_armed_window_is_claimed_and_posted() {
+        let _g = options_lock();
+        arm_for_test(0xAAAA);
+        let mut got = None;
+        let claimed = claim_for_options_card_with(
+            0x32,
+            1_000,
+            NO_MODS,
+            false,
+            || 0xAAAA,
+            |c, g| {
+                got = Some((c, g));
+                true
+            },
+        );
+        assert!(claimed);
+        assert_eq!(got, Some((crate::options_keys::Choice::Pick(2), 6)));
+        assert_eq!(crate::options_keys::current(), None, "spent");
+        crate::options_keys::clear();
+    }
+
+    #[test]
+    fn an_unknown_foreground_passes_the_key_through() {
+        let _g = options_lock();
+        arm_for_test(0xAAAA);
+        let claimed = claim_for_options_card_with(0x31, 1_000, NO_MODS, false, || 0, |_, _| true);
+        assert!(!claimed);
+        crate::options_keys::clear();
+    }
+
+    #[test]
+    fn a_failed_post_passes_the_key_through_and_keeps_the_claim() {
+        let _g = options_lock();
+        arm_for_test(0xAAAA);
+        let claimed =
+            claim_for_options_card_with(0x31, 1_000, NO_MODS, false, || 0xAAAA, |_, _| false);
+        assert!(!claimed, "nothing was posted, so the key must not vanish");
+        assert!(
+            crate::options_keys::current().is_some(),
+            "the card still shows, so its claim stays"
+        );
+        crate::options_keys::clear();
+    }
+
+    #[test]
+    fn a_key_the_card_does_not_claim_never_asks_for_the_foreground() {
+        let _g = options_lock();
+        arm_for_test(0xAAAA);
+        let claimed = claim_for_options_card_with(
+            0x41,
+            1_000,
+            NO_MODS,
+            false,
+            || panic!("the foreground is only read for a claimed key"),
+            |_, _| true,
+        );
+        assert!(!claimed);
+        crate::options_keys::clear();
     }
 
     // -- learn-mode state machine --------------------------------------

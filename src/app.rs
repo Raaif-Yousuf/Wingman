@@ -355,6 +355,20 @@ fn options_choice_action(
     }
 }
 
+/// The keyboard layout (`HKL`) of the thread that owns the foreground window,
+/// as an integer; `0` when there is no foreground window (not a CJK layout, so
+/// the claim stays as configured).
+fn foreground_keyboard_layout() -> usize {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return 0;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(fg, None) };
+    unsafe { GetKeyboardLayout(thread) }.0 as usize
+}
+
 /// #307: the card's buttons for a ranked shortlist: the action id each runs and
 /// the label it shows.
 fn option_rows(options: &[router::RouterOption]) -> Vec<OptionRow> {
@@ -1757,7 +1771,13 @@ impl App {
     fn options_behavior(&self) -> OptionsBehavior {
         OptionsBehavior {
             dismiss_secs: self.config.options.card_dismiss_secs(),
-            claim_keys: self.config.options.claim_keys,
+            // Off under a CJK input method: its digits pick candidates, so
+            // the card must not eat them. Read on this thread, once, while
+            // the user's window is still in front.
+            claim_keys: options_keys::claim_enabled(
+                self.config.options.claim_keys,
+                foreground_keyboard_layout(),
+            ),
             key_runs_first: false,
         }
     }
@@ -1981,7 +2001,10 @@ impl App {
             self.options.as_ref(),
         );
         match decided {
-            OptionsChoiceAction::Ignore => {}
+            // The hook spent the claim taking this key, but the card is still
+            // up (stale generation, or the buttons were not there yet): put
+            // the claim back so the hint on the card stays true.
+            OptionsChoiceAction::Ignore => self.card.rearm_options_claim(),
             OptionsChoiceAction::Close => self.close_options_card(),
             OptionsChoiceAction::Run(id) => {
                 self.close_options_card();
@@ -7122,7 +7145,12 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
             match chosen {
                 Some(id) => id,
                 None => {
-                    unsafe { &mut *ptr }.finish_modal_deferrals();
+                    let app = unsafe { &mut *ptr };
+                    // #307: the menu cleared the options card's key claim and
+                    // closed without a choice, so the card (still up) gets it
+                    // back and its hint stays true.
+                    app.card.rearm_options_claim();
+                    app.finish_modal_deferrals();
                     return LRESULT(0);
                 }
             }
@@ -8095,6 +8123,42 @@ mod tests {
             src.contains("MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card("),
             "the tray item must open the options card"
         );
+    }
+
+    /// The claim is put back whenever the card stays up after the hook spent
+    /// it: an ignored choice, and a tray menu closed without a choice. And the
+    /// card's behavior reads the foreground layout.
+    #[test]
+    fn the_options_claim_is_put_back_where_the_card_stays_up() {
+        let src = lf(include_str!("app.rs"));
+        let choice = src
+            .split("fn on_options_choice(")
+            .nth(1)
+            .expect("no on_options_choice");
+        let ignore = choice
+            .split("OptionsChoiceAction::Ignore =>")
+            .nth(1)
+            .expect("no Ignore arm");
+        assert!(
+            ignore[..ignore.find('\n').unwrap()].contains("rearm_options_claim()"),
+            "an ignored choice must put the claim back"
+        );
+        let start = src
+            .find("\nfn handle_tray_message(")
+            .expect("no handle_tray_message");
+        let body = &src[start + 1..];
+        let body = &body[..body.find("\n}\n").expect("fn has no end")];
+        let none_arm = body
+            .split("None => {")
+            .nth(1)
+            .expect("no None arm for a menu closed without a choice");
+        let none_arm = &none_arm[..none_arm.find("return LRESULT(0)").unwrap()];
+        assert!(none_arm.contains("rearm_options_claim()"), "{none_arm}");
+        let behavior = src
+            .split("fn options_behavior(")
+            .nth(1)
+            .expect("no options_behavior");
+        assert!(behavior.contains("foreground_keyboard_layout()"));
     }
 
     /// The tray menu loop runs a nested message loop, and Esc closes a menu:

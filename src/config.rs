@@ -729,11 +729,13 @@ pub struct Forms {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Palette {
+    /// INERT until #308: nothing reads this at runtime (the palette no longer
+    /// asks the router, #805), so changing it has no effect today. It is kept
+    /// so existing configs keep parsing and #308 can wire it.
+    ///
     /// Minimum `RouterOption::confidence` (0.0..=1.0) for a router option to
-    /// be picked by a bare key press rather than by a click. The palette no
-    /// longer asks the router (#805), so nothing reads this until the key
-    /// picks an option (the options card's slice 3, #308). Kept as a plain `f64` rather than a clamped type: an out-of-range
-    /// hand-edit (`1.4`, `-1`) simply never clears (or always clears) the
+    /// be picked by a bare key press rather than by a click. Kept as a plain
+    /// `f64` rather than a clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never clears (or always clears) the
     /// threshold, which is a safe degradation, not a crash.
     pub router_threshold: f64,
 }

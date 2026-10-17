@@ -15,7 +15,7 @@
 //! Everything that decides is pure and tested here; `hotkey.rs` only reads the
 //! state of the modifier keys and posts the result.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
@@ -201,6 +201,56 @@ impl Default for ClaimSlot {
 /// The process-wide claim the keyboard hook reads.
 static CLAIM: ClaimSlot = ClaimSlot::new();
 
+/// The window that had the keyboard when the claim was armed (`HWND` as an
+/// integer, `0` = none). The card never takes focus, so this is the window the
+/// user is typing into: a digit typed after switching to another window is
+/// theirs, not the card's. Written by the main thread before the claim is
+/// armed, read by the hook.
+static ARMED_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
+
+/// Records the window the claim belongs to. Call before [`arm`].
+pub fn set_armed_foreground(hwnd: isize) {
+    ARMED_FOREGROUND.store(hwnd, Ordering::Relaxed);
+}
+
+/// The window recorded by [`set_armed_foreground`].
+pub fn armed_foreground() -> isize {
+    ARMED_FOREGROUND.load(Ordering::Relaxed)
+}
+
+/// Whether the key goes to the window the claim was armed for. Fail-safe: when
+/// either side is unknown (`0`: no foreground window, or the lookup failed) the
+/// answer is no, so the key passes through to the app.
+pub fn foreground_matches(armed: isize, now: isize) -> bool {
+    armed != 0 && armed == now
+}
+
+/// The claim to put back after something cleared it while the card stayed up
+/// (the tray menu closed without a choice, or a choice was ignored): the claim
+/// as it was armed, unless it has lapsed by `now`.
+pub fn rearm_plan(armed: Option<Claim>, now: u32) -> Option<Claim> {
+    armed.filter(|c| !tick_expired(now, c.expiry_tick))
+}
+
+/// Whether the foreground keyboard layout is a Chinese, Japanese or Korean
+/// one, from the layout handle's low word (the language id). With an input
+/// method editor active the digit keys compose or select candidates, so the
+/// claim defaults off for these layouts rather than eating a keystroke the
+/// editor needs. The primary language id is the low 10 bits of the language id.
+pub fn is_cjk_layout(hkl: usize) -> bool {
+    const LANG_CHINESE: usize = 0x04;
+    const LANG_JAPANESE: usize = 0x11;
+    const LANG_KOREAN: usize = 0x12;
+    matches!(hkl & 0x3FF, LANG_CHINESE | LANG_JAPANESE | LANG_KOREAN)
+}
+
+/// Whether the card claims digits and Esc: the `[options] claim_keys` setting,
+/// unless the foreground keyboard layout is a CJK one (see [`is_cjk_layout`]).
+/// Computed once when the card is shown, and the card's hint follows it.
+pub fn claim_enabled(setting: bool, foreground_hkl: usize) -> bool {
+    setting && !is_cjk_layout(foreground_hkl)
+}
+
 /// Starts claiming keys for the card showing `claim.generation`.
 pub fn arm(claim: Claim) {
     CLAIM.arm(claim);
@@ -209,6 +259,7 @@ pub fn arm(claim: Claim) {
 /// Stops claiming. Called on every path that hides or replaces the card.
 pub fn clear() {
     CLAIM.clear();
+    ARMED_FOREGROUND.store(0, Ordering::Relaxed);
 }
 
 /// The claim in force, if any. Test seam and diagnostics; the hook uses
@@ -417,6 +468,50 @@ mod tests {
         }
         assert_eq!(Choice::from_wparam(5), None);
         assert_eq!(Choice::from_wparam(usize::MAX), None);
+    }
+
+    #[test]
+    fn a_key_only_goes_to_the_card_while_the_armed_window_has_the_keyboard() {
+        assert!(foreground_matches(0x1234, 0x1234));
+        assert!(!foreground_matches(0x1234, 0x5678), "another window");
+        // Unknown on either side passes the key through.
+        assert!(!foreground_matches(0, 0));
+        assert!(!foreground_matches(0x1234, 0));
+        assert!(!foreground_matches(0, 0x1234));
+    }
+
+    #[test]
+    fn a_lapsed_claim_is_not_put_back() {
+        let c = Claim {
+            generation: 4,
+            count: 2,
+            expiry_tick: 21_000,
+        };
+        assert_eq!(rearm_plan(Some(c), 20_999), Some(c));
+        assert_eq!(rearm_plan(Some(c), 21_000), None);
+        assert_eq!(rearm_plan(None, 0), None);
+    }
+
+    #[test]
+    fn chinese_japanese_and_korean_layouts_are_told_apart_by_language() {
+        // Handle low word = language id: zh-CN, zh-TW, ja-JP, ko-KR.
+        for hkl in [0x0804usize, 0x0404, 0x0411, 0x0412] {
+            assert!(is_cjk_layout(hkl), "{hkl:#x}");
+            // The high word is the device handle and must not matter.
+            assert!(is_cjk_layout(0xE001_0000 | hkl), "{hkl:#x} with a device");
+        }
+        // en-US, de-DE, fr-FR, ru-RU, 0 (unknown).
+        for hkl in [0x0409usize, 0x0407, 0x040C, 0x0419, 0] {
+            assert!(!is_cjk_layout(hkl), "{hkl:#x}");
+        }
+    }
+
+    #[test]
+    fn the_claim_defaults_off_under_a_cjk_layout_and_never_overrides_the_setting() {
+        assert!(claim_enabled(true, 0x0409));
+        assert!(!claim_enabled(true, 0x0411), "Japanese IME");
+        assert!(!claim_enabled(false, 0x0409), "the setting still wins");
+        assert!(!claim_enabled(false, 0x0411));
     }
 
     #[test]

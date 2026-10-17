@@ -50,6 +50,9 @@ pub(super) struct OptionsUi {
     buttons: Vec<HWND>,
     generation: u32,
     behavior: OptionsBehavior,
+    /// The key claim as last armed, so it can be put back if something clears
+    /// it while the card stays up ([`Card::rearm_options_claim`]).
+    armed_claim: Option<Claim>,
 }
 
 /// First child-control id of the row buttons: row `n` (from 0) is
@@ -205,6 +208,22 @@ impl Card {
     pub fn options_generation(&self) -> Option<u32> {
         self.inner.options.as_ref().map(|o| o.generation)
     }
+
+    /// Puts the key claim back while the options card is still up. The claim
+    /// is spent by the hook the moment it takes a key, and cleared while the
+    /// tray menu runs, so when the app ignores the choice (or the menu closes
+    /// without one) the card would keep saying "Press 1" with nothing
+    /// listening. A no-op when no options card shows, the setting is off, or
+    /// the claim has lapsed. Never extends the card's own expiry.
+    pub fn rearm_options_claim(&mut self) {
+        self.inner.rearm_options_claim_state();
+    }
+}
+
+/// The window that has the keyboard now, as an integer (`0` when there is
+/// none): the window the options card's key claim is for.
+fn foreground_window() -> isize {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize
 }
 
 impl CardInner {
@@ -234,6 +253,7 @@ impl CardInner {
             buttons: Vec::new(),
             generation,
             behavior,
+            armed_claim: None,
         });
         self.state = CardState::Options;
         self.layout_options(true);
@@ -302,7 +322,7 @@ impl CardInner {
     /// claim for the buttons that exist now. Nothing runs between presses
     /// (rule 5): the timer is killed on every hide.
     fn arm_options_timer_and_claim(&mut self) {
-        let Some(ui) = self.options.as_ref() else {
+        let Some(ui) = self.options.as_mut() else {
             return;
         };
         let secs = ui.behavior.dismiss_secs;
@@ -316,11 +336,32 @@ impl CardInner {
         }
         if ui.behavior.claim_keys {
             let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
-            options_keys::arm(Claim {
+            let claim = Claim {
                 generation: ui.generation,
                 count: ui.buttons.len(),
                 expiry_tick: options_keys::expiry_after(now, secs),
-            });
+            };
+            ui.armed_claim = Some(claim);
+            // The card never takes focus: the window in front now is the one
+            // the user is typing into, and the claim follows it.
+            options_keys::set_armed_foreground(foreground_window());
+            options_keys::arm(claim);
+        }
+    }
+
+    /// Puts the key claim back after something cleared it while the card
+    /// stayed up (see [`Card::rearm_options_claim`]).
+    fn rearm_options_claim_state(&mut self) {
+        let Some(ui) = self.options.as_ref() else {
+            return;
+        };
+        if !ui.behavior.claim_keys {
+            return;
+        }
+        let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
+        if let Some(claim) = options_keys::rearm_plan(ui.armed_claim, now) {
+            options_keys::set_armed_foreground(foreground_window());
+            options_keys::arm(claim);
         }
     }
 
@@ -1174,6 +1215,36 @@ mod tests {
             "row 2 on generation 41"
         );
         assert_eq!(options_keys::current(), None, "a pick spends the claim");
+        card.hide();
+    }
+
+    #[test]
+    fn a_spent_claim_is_put_back_while_the_card_stays_up() {
+        let _g = lock();
+        let mut card = new_card();
+        card.show_options(8, "S", &rows(3), BEHAVIOR);
+        let armed = options_keys::current().expect("armed");
+        // The hook spent it, or the tray menu cleared it.
+        options_keys::clear();
+        card.rearm_options_claim();
+        assert_eq!(options_keys::current(), Some(armed), "same card, same rows");
+        card.hide();
+        // A hidden card has nothing to put back.
+        card.rearm_options_claim();
+        assert_eq!(options_keys::current(), None);
+    }
+
+    #[test]
+    fn a_switched_off_claim_is_never_put_back() {
+        let _g = lock();
+        let mut card = new_card();
+        let off = OptionsBehavior {
+            claim_keys: false,
+            ..BEHAVIOR
+        };
+        card.show_options(8, "S", &rows(3), off);
+        card.rearm_options_claim();
+        assert_eq!(options_keys::current(), None);
         card.hide();
     }
 
