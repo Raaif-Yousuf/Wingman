@@ -335,8 +335,8 @@ falls back to `IDI_APPLICATION`. Right-click opens a `TrackPopupMenu`:
   than dropping the other, so the fallback survives a switch
 - **Copy last answer** — headline + detail to the clipboard via `arboard`
 - separator
-- **Set Copilot key…** — learn mode for the primary binding
-- **Set secondary key…** — learn mode for the secondary binding
+- (Shortcuts are changed in Settings, not in the tray: #826 removed the
+  "Set Copilot key" and "Set secondary key" items.)
 - **Edit settings** — `ShellExecuteW("open", config.toml)`
 - **Reload settings** — re-read the TOML without restarting
 - separator

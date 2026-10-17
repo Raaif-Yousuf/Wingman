@@ -41,8 +41,8 @@ use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
-    apply_learned, chord_to_string, slot_name, Chord, HotkeyHook, LearnedVerdict, HK_PRIMARY,
-    HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
+    apply_learned, chord_to_string, Chord, HotkeyHook, LearnedVerdict, WM_APP_HOTKEY,
+    WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::keypress;
 use crate::mode::{self, Mode};
@@ -5642,27 +5642,6 @@ impl App {
         });
     }
 
-    fn start_learning(&mut self, which: usize) {
-        let Some(hook) = &self.hook else {
-            // Issue #356: same wording as the sibling install failure at
-            // app start (above, around line 379), so re-binding a key hits
-            // the same dead end with the same way out, instead of leaving
-            // the user stuck with no next step.
-            self.card.show_error(
-                "Hotkeys unavailable",
-                "The keyboard hook is not installed. Use Ask now from the tray menu instead.",
-            );
-            return;
-        };
-        hook.start_learning(which);
-        self.card.show_answer(
-            &format!("Press the {} now", slot_name(which)),
-            "Whatever you press next becomes the binding. Modifiers on their own are ignored. Times out in 10 seconds.",
-            11,
-            None,
-        );
-    }
-
     fn on_learned(&mut self, which: usize, chord: Chord) {
         // #576: the same judge Settings' Change buttons use (#345), so the
         // tray refuses the same keys with the same words: a bare typing key,
@@ -6227,21 +6206,25 @@ impl App {
     /// tray's own list, which is not necessarily the config's — it appends a
     /// hand-edited current model that is missing from `models` — so the name
     /// is resolved from the tray rather than re-indexed here.
-    fn pick_model(&mut self, openai: bool, index: usize) {
-        let picked = if openai {
-            self.tray.openai_model_at(index)
-        } else {
-            self.tray.anthropic_model_at(index)
+    fn pick_model(&mut self, provider: ActiveProvider, index: usize) {
+        let picked = match provider {
+            ActiveProvider::OpenAi => self.tray.openai_model_at(index),
+            ActiveProvider::Anthropic => self.tray.anthropic_model_at(index),
+            ActiveProvider::Gemini => self.tray.gemini_model_at(index),
+            // Ollama has its own pick (`pick_ollama_model`); never write
+            // another provider's slot for it.
+            ActiveProvider::Ollama => return,
         }
         .map(str::to_owned);
 
         let Some(model) = picked else { return };
 
         let before = self.config.clone();
-        let slot = if openai {
-            &mut self.config.providers.openai.model
-        } else {
-            &mut self.config.providers.anthropic.model
+        let slot = match provider {
+            ActiveProvider::OpenAi => &mut self.config.providers.openai.model,
+            ActiveProvider::Anthropic => &mut self.config.providers.anthropic.model,
+            ActiveProvider::Gemini => &mut self.config.providers.gemini.model,
+            ActiveProvider::Ollama => return,
         };
         if *slot == model {
             return;
@@ -6674,8 +6657,7 @@ impl App {
 
     fn refresh_tray_labels(&mut self) {
         let primary = chord_to_string(&self.config.hotkeys.primary);
-        let secondary = chord_to_string(&self.config.hotkeys.secondary);
-        self.tray.set_key_bindings(&primary, &secondary);
+        self.tray.set_key_label(&primary);
 
         let p = &self.config.providers;
         self.tray
@@ -6685,6 +6667,8 @@ impl App {
             &p.openai.model,
             &p.anthropic.models,
             &p.anthropic.model,
+            &p.gemini.models,
+            &p.gemini.model,
         );
         // #567: the Ollama submenu keeps its last pulled list; only the
         // checked model follows the config. A fresh list is fetched in the
@@ -8828,7 +8812,7 @@ enum DeferredMessage {
     /// rate limit when it is delivered, and only then may it show the card.
     ActivateDuringMenu,
     /// `WM_APP_LEARNED` (#1013) while a menu, a file dialog or Settings had
-    /// the loop. The hook swallowed that key for a tray "Set ... key", so it
+    /// the loop. The hook swallowed that key for a Settings Change, so it
     /// ends in a card (`learn_lost_card`).
     LearnLost,
     /// `WM_APP_NEED_SCREEN` (#709): the run it was posted for. Checked again
@@ -8839,12 +8823,12 @@ enum DeferredMessage {
 /// The card for a key the hook captured for a shortcut change that could not be
 /// applied because a menu, a dialog or Settings was up (#1013). The learn state
 /// is cleared by the hook the moment it captures, so `wnd_proc` cannot tell a
-/// tray "Set ... key" from a Settings Change that just ended (a timer race);
-/// the wording therefore fits both and names both ways to retry.
+/// Settings Change from one that just ended (a timer race);
+/// the wording therefore names the one way to retry.
 fn learn_lost_card() -> (&'static str, &'static str) {
     (
         "Shortcut unchanged",
-        "A key was pressed while a window was open, so it was not applied. Use Set key or Change to try again.",
+        "A key was pressed while a window was open, so it was not applied. Use Change in Settings to try again.",
     )
 }
 
@@ -9600,7 +9584,7 @@ fn settings_foreground_policy(msg: u32) -> ForegroundPolicy {
         // #709: the capture must not land on the window being typed in; it
         // waits, and `on_need_screen` checks the run again when it is let go.
         | WM_APP_NEED_SCREEN
-        // #1013: a chord the hook swallowed for a tray "Set ... key" while
+        // #1013: a chord the hook swallowed for a shortcut change while
         // Settings is in front. Settings takes its own Change's chord before
         // it gets here, so this one belongs to the tray; it ends in a card.
         | WM_APP_LEARNED
@@ -9713,22 +9697,17 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         app.finish_modal_deferrals();
     }
     app.password_manager_hint = menu_hint;
-    // Choosing anything other than a rebind disarms a learn mode
-    // left armed by an earlier "Set ... key" click; otherwise it
-    // would silently swallow the next key pressed anywhere.
-    if !matches!(
-        decode(id),
-        MenuChoice::Command(cmd::SET_PRIMARY) | MenuChoice::Command(cmd::SET_SECONDARY)
-    ) {
-        if let Some(h) = &app.hook {
-            h.cancel_learning();
-        }
+    // Choosing anything disarms a learn mode left armed by Settings;
+    // otherwise it would silently swallow the next key pressed anywhere.
+    if let Some(h) = &app.hook {
+        h.cancel_learning();
     }
     let _from_tray = TrayCommandScope::enter();
     app.run_trigger = Some(Trigger::Tray);
     match decode(id) {
-        MenuChoice::OpenAiModel(i) => app.pick_model(true, i),
-        MenuChoice::AnthropicModel(i) => app.pick_model(false, i),
+        MenuChoice::OpenAiModel(i) => app.pick_model(ActiveProvider::OpenAi, i),
+        MenuChoice::AnthropicModel(i) => app.pick_model(ActiveProvider::Anthropic, i),
+        MenuChoice::GeminiModel(i) => app.pick_model(ActiveProvider::Gemini, i),
         MenuChoice::OllamaModel(i) => app.pick_ollama_model(i),
         MenuChoice::ExportAction(i) => app.export_action(i),
         MenuChoice::Command(cmd::IMPORT_ACTION) => app.import_action(),
@@ -9743,8 +9722,6 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
         MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
         MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
-        MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
-        MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
         MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
         MenuChoice::Command(cmd::OPEN_KNOWLEDGE) => app.open_knowledge_folder(),
         MenuChoice::Command(cmd::RELOAD) => app.reload(),
@@ -10712,7 +10689,7 @@ mod tests {
             // #709: the screenshot a selection-first action asked for waits
             // until Settings is left, then is checked again.
             WM_APP_NEED_SCREEN,
-            // #1013: a chord the hook swallowed for a tray "Set ... key" must
+            // #1013: a chord the hook swallowed for a shortcut change must
             // end in a card, not vanish.
             WM_APP_LEARNED,
             // #845: an on-demand verdict is still owed a card.
@@ -10746,7 +10723,7 @@ mod tests {
         }
     }
 
-    /// #1013 item 2: a chord the hook swallowed for a tray "Set ... key" ends
+    /// #1013 item 2: a chord the hook swallowed for a shortcut change ends
     /// in a card whenever it arrives while a menu, a file dialog or Settings is
     /// up, and the card says the shortcut is unchanged.
     #[test]
@@ -10773,11 +10750,7 @@ mod tests {
         let (headline, detail) = learn_lost_card();
         assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
         assert!(headline.contains("unchanged"), "{headline}");
-        // Fits a tray "Set key" and a Settings "Change" alike.
-        assert!(
-            detail.contains("Set key") && detail.contains("Change"),
-            "{detail}"
-        );
+        assert!(detail.contains("Change in Settings"), "{detail}");
     }
 
     /// #1013: a lost-key card queued after a finished result must not replace
@@ -14545,6 +14518,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "GEMINI_MODEL_BASE",
             "ACTION_EXPORT_BASE",
         ];
         // Display-only items: added disabled (greyed), so no click can ever
