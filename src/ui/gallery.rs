@@ -73,6 +73,8 @@ pub fn follows_variants(state: GalleryState) -> bool {
         state,
         SettingsGeneral
             | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
             | SettingsPrivacy
             | SettingsActions
             | SettingsAdvanced
@@ -128,6 +130,8 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
         state,
         SettingsGeneral
             | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
             | SettingsPrivacy
             | SettingsActions
             | SettingsAdvanced
@@ -262,6 +266,8 @@ pub enum GalleryState {
     /// per page of the rail.
     SettingsGeneral,
     SettingsModels,
+    SettingsModelsClaude,
+    SettingsModelsMoreProviders,
     SettingsPrivacy,
     SettingsActions,
     /// The Advanced page with the Check my work prompt folded away.
@@ -315,6 +321,8 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteHover,
         SettingsGeneral,
         SettingsModels,
+        SettingsModelsClaude,
+        SettingsModelsMoreProviders,
         SettingsPrivacy,
         SettingsActions,
         SettingsAdvanced,
@@ -364,6 +372,8 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteHover => "palette-hover",
         SettingsGeneral => "settings-general",
         SettingsModels => "settings-models",
+        SettingsModelsClaude => "settings-models-claude",
+        SettingsModelsMoreProviders => "settings-models-more-providers",
         SettingsPrivacy => "settings-privacy",
         SettingsActions => "settings-actions",
         SettingsAdvanced => "settings-advanced",
@@ -828,7 +838,9 @@ mod driver {
     /// The Settings page a gallery state shows.
     fn settings_page(state: GalleryState) -> Page {
         match state {
-            GalleryState::SettingsModels => Page::Models,
+            GalleryState::SettingsModels
+            | GalleryState::SettingsModelsClaude
+            | GalleryState::SettingsModelsMoreProviders => Page::Models,
             GalleryState::SettingsPrivacy => Page::Privacy,
             GalleryState::SettingsActions => Page::Actions,
             GalleryState::SettingsAdvanced | GalleryState::SettingsAdvancedPromptOpen => {
@@ -1148,6 +1160,8 @@ mod driver {
             }
             SettingsGeneral
             | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
             | SettingsPrivacy
             | SettingsActions
             | SettingsAdvanced
@@ -1158,6 +1172,13 @@ mod driver {
                     .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
                 w.show_page(settings_page(state));
                 w.set_advanced(matches!(state, SettingsAdvancedPromptOpen));
+                match state {
+                    SettingsModelsClaude => {
+                        w.pick_provider(crate::config::ActiveProvider::Anthropic)
+                    }
+                    SettingsModelsMoreProviders => w.reveal_providers(),
+                    _ => {}
+                }
                 *settings = Some(w);
             }
         }
@@ -1170,6 +1191,8 @@ mod driver {
                 .ok_or_else(|| anyhow::anyhow!("no region overlay"))?,
             SettingsGeneral
             | SettingsModels
+            | SettingsModelsClaude
+            | SettingsModelsMoreProviders
             | SettingsPrivacy
             | SettingsActions
             | SettingsAdvanced
@@ -1794,8 +1817,10 @@ mod tests {
         // two long palettes (#883) = 33, + the tray menu with and without an
         // open submenu (#825) = 35, + the long action name (#1000) = 36, + the
         // key-rejected setup card (#1020) = 37, + the Settings states going
-        // from four to one per page and the prompt open (#872) = 39.
-        assert_eq!(states.len(), 39);
+        // from four to one per page and the prompt open (#872) = 39, + the
+        // Models page with Claude active and with every provider shown (#874)
+        // = 41.
+        assert_eq!(states.len(), 41);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1840,8 +1865,8 @@ mod tests {
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 1,
-            "the Advanced page has two states (prompt closed and open)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 3,
+            "the Advanced page has two states (prompt closed and open) and the Models page three (#874)"
         );
     }
 
