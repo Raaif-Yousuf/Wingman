@@ -176,8 +176,6 @@ const EMBEDDED_ICON_ID: u16 = 1;
 pub mod cmd {
     pub const ASK_NOW: u32 = 1001;
     pub const COPY_LAST: u32 = 1002;
-    pub const SET_PRIMARY: u32 = 1003;
-    pub const SET_SECONDARY: u32 = 1004;
     pub const EDIT_SETTINGS: u32 = 1005;
     pub const RELOAD: u32 = 1006;
     pub const QUIT: u32 = 1007;
@@ -302,6 +300,8 @@ pub mod cmd {
     pub const ANTHROPIC_MODEL_BASE: u32 = 2100;
     /// Base id for the Ollama model submenu (#567), same scheme.
     pub const OLLAMA_MODEL_BASE: u32 = 2200;
+    /// Base id for the Gemini model submenu (#826), same scheme.
+    pub const GEMINI_MODEL_BASE: u32 = 2600;
     /// Base id for the "Export action" submenu (#117), same scheme: the pick
     /// is `ACTION_EXPORT_BASE + index` into the list last passed to
     /// `set_export_actions`.
@@ -331,6 +331,8 @@ pub enum MenuChoice {
     AnthropicModel(usize),
     /// Index into the list last passed to `set_ollama_models` (#567).
     OllamaModel(usize),
+    /// Index into the `gemini` slice last passed to `set_models` (#826).
+    GeminiModel(usize),
     /// Index into the list last passed to `set_export_actions` (#117).
     ExportAction(usize),
 }
@@ -346,6 +348,8 @@ pub fn decode(id: u32) -> MenuChoice {
         MenuChoice::AnthropicModel((id - cmd::ANTHROPIC_MODEL_BASE) as usize)
     } else if (cmd::OLLAMA_MODEL_BASE..cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE).contains(&id) {
         MenuChoice::OllamaModel((id - cmd::OLLAMA_MODEL_BASE) as usize)
+    } else if (cmd::GEMINI_MODEL_BASE..cmd::GEMINI_MODEL_BASE + cmd::MODEL_RANGE).contains(&id) {
+        MenuChoice::GeminiModel((id - cmd::GEMINI_MODEL_BASE) as usize)
     } else if (cmd::ACTION_EXPORT_BASE..cmd::ACTION_EXPORT_BASE + cmd::MODEL_RANGE).contains(&id) {
         MenuChoice::ExportAction((id - cmd::ACTION_EXPORT_BASE) as usize)
     } else {
@@ -358,6 +362,7 @@ pub fn decode(id: u32) -> MenuChoice {
 struct ShownModels {
     openai: Vec<String>,
     anthropic: Vec<String>,
+    gemini: Vec<String>,
     ollama: Vec<String>,
     export_ids: Vec<String>,
 }
@@ -367,12 +372,10 @@ pub struct Tray {
     /// Kept so [`Tray::readd`] can reload the icon exactly as [`Tray::new`]
     /// did, without the caller having to thread it through again.
     instance: HINSTANCE,
-    /// Display strings for the current primary/secondary bindings (e.g.
-    /// `"Win+Shift+F23"`), shown in the "Set ... key" menu labels. Set via
-    /// [`Tray::set_key_bindings`]; empty until then, in which case the
-    /// parenthetical suffix is simply omitted.
+    /// Display string for the primary binding (e.g. `"Win+Shift+F23"`), the
+    /// right-aligned hint on "Ask now". Set via [`Tray::set_key_label`];
+    /// empty until then, in which case no hint shows.
     primary_label: String,
-    secondary_label: String,
     /// Model lists and current-selection index for the two submenus. Set
     /// via [`Tray::set_models`]; empty until then, in which case the
     /// submenu shows a single greyed-out "none configured" entry.
@@ -383,6 +386,8 @@ pub struct Tray {
     openai_current: Option<usize>,
     anthropic_models: Vec<String>,
     anthropic_current: Option<usize>,
+    gemini_models: Vec<String>,
+    gemini_current: Option<usize>,
     /// #567: the Ollama submenu. `ollama_pulled` is the last list Ollama
     /// reported (name, supports vision), empty until a background refresh
     /// lands; the rest is derived from it plus the configured model by
@@ -460,11 +465,12 @@ impl Tray {
             hwnd,
             instance,
             primary_label: String::new(),
-            secondary_label: String::new(),
             active_provider: Some(ActiveProvider::OpenAi),
             openai_models: Vec::new(),
             openai_current: None,
             anthropic_models: Vec::new(),
+            gemini_models: Vec::new(),
+            gemini_current: None,
             ollama_pulled: Vec::new(),
             ollama_models: Vec::new(),
             shown: ShownModels::default(),
@@ -490,12 +496,14 @@ impl Tray {
     #[cfg(debug_assertions)]
     pub(crate) fn for_gallery(hwnd: HWND, instance: HINSTANCE) -> Self {
         let mut tray = Self::with_icon(hwnd, instance, HICON::default());
-        tray.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K");
+        tray.set_key_label("Win+Shift+F23");
         tray.set_models(
             &["gpt-5".to_string(), "gpt-5-mini".to_string()],
             "gpt-5",
             &["claude-sonnet-5-5".to_string()],
             "claude-sonnet-5-5",
+            &["gemini-2.5-flash".to_string()],
+            "gemini-2.5-flash",
         );
         tray.set_knowledge(Some(128));
         tray.mode = crate::mode::Mode::Local;
@@ -629,13 +637,11 @@ impl Tray {
         let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
     }
 
-    /// Set the display strings shown in the "Set Copilot key…" / "Set
-    /// secondary key..." menu labels, e.g. `chord_to_string(&primary)`.
+    /// Set the hint shown beside "Ask now", e.g. `chord_to_string(&primary)`.
     /// Does not touch the shell icon; only affects the next menu built by
     /// [`Tray::on_tray_message`].
-    pub fn set_key_bindings(&mut self, primary: &str, secondary: &str) {
+    pub fn set_key_label(&mut self, primary: &str) {
         self.primary_label = primary.to_string();
-        self.secondary_label = secondary.to_string();
     }
 
     /// Populates the two model submenus. `*_current` marks which entry gets
@@ -658,6 +664,8 @@ impl Tray {
         openai_current: &str,
         anthropic: &[String],
         anthropic_current: &str,
+        gemini: &[String],
+        gemini_current: &str,
     ) {
         let (models, current) = clamp_model_list(openai, openai_current);
         self.openai_models = models;
@@ -666,6 +674,10 @@ impl Tray {
         let (models, current) = clamp_model_list(anthropic, anthropic_current);
         self.anthropic_models = models;
         self.anthropic_current = current;
+
+        let (models, current) = clamp_model_list(gemini, gemini_current);
+        self.gemini_models = models;
+        self.gemini_current = current;
     }
 
     /// #567: sets the Ollama submenu from the pulled models (name, supports
@@ -736,6 +748,12 @@ impl Tray {
         self.shown.anthropic.get(index).map(String::as_str)
     }
 
+    /// Resolve a [`MenuChoice::GeminiModel`] index back to a model id.
+    /// See [`Tray::openai_model_at`].
+    pub fn gemini_model_at(&self, index: usize) -> Option<&str> {
+        self.shown.gemini.get(index).map(String::as_str)
+    }
+
     /// Remembers the model names the menu about to open is built from, so a
     /// pick resolves to the entry the user clicked even if the lists change
     /// while the popup is open (a reload, a finished refresh).
@@ -743,6 +761,7 @@ impl Tray {
         self.shown = ShownModels {
             openai: self.openai_models.clone(),
             anthropic: self.anthropic_models.clone(),
+            gemini: self.gemini_models.clone(),
             ollama: self.ollama_models.clone(),
             export_ids: self
                 .export_actions
@@ -877,6 +896,20 @@ impl Tray {
             append_separator(actions)?;
             append_item(actions, cmd::OPEN_KNOWLEDGE, &knowledge_label(files))?;
         }
+        // #826: importing and exporting an action are about actions.
+        append_separator(actions)?;
+        append_item(actions, cmd::IMPORT_ACTION, "Import action from file...")?;
+        let export_labels: Vec<String> =
+            self.export_actions.iter().map(|(_, l)| l.clone()).collect();
+        let export_ids: Vec<String> = self.export_actions.iter().map(|(i, _)| i.clone()).collect();
+        append_model_submenu(
+            actions,
+            "Export action to file",
+            cmd::ACTION_EXPORT_BASE,
+            &export_ids,
+            &export_labels,
+            None,
+        )?;
 
         append_item_with(
             hmenu,
@@ -894,8 +927,9 @@ impl Tray {
         }
         append_mode_submenu(hmenu, self.mode)?;
 
-        // #348: providers, models and the key-learning items in one place.
-        let setup = append_group(hmenu, "Pro&viders and keys")?;
+        // #826: the provider and one model list per provider. Shortcuts are
+        // set in Settings, not here.
+        let setup = append_group(hmenu, "Mo&dels")?;
         append_provider_submenu(setup, self.active_provider)?;
         append_model_submenu(
             setup,
@@ -923,34 +957,23 @@ impl Tray {
         )?;
         append_model_submenu(
             setup,
+            "Gemini model",
+            cmd::GEMINI_MODEL_BASE,
+            &self.gemini_models,
+            &self
+                .gemini_models
+                .iter()
+                .map(|m| menu_label(m))
+                .collect::<Vec<_>>(),
+            self.gemini_current,
+        )?;
+        append_model_submenu(
+            setup,
             "Ollama model",
             cmd::OLLAMA_MODEL_BASE,
             &self.ollama_models,
             &self.ollama_labels,
             self.ollama_current,
-        )?;
-        append_separator(setup)?;
-        // #185: greyed out while paused. Arming learn mode can never
-        // capture while paused (the WH_KEYBOARD_LL hook passes every
-        // keydown straight through, per hotkey.rs's pause bypass), so
-        // offering it would show a "press now" prompt that can never
-        // succeed and leaves a stale armed deadline behind. Mirrors the
-        // Pause/Resume item swap above.
-        append_item_with(
-            setup,
-            cmd::SET_PRIMARY,
-            "Set Copilot key…",
-            &self.primary_label,
-            None,
-            !self.paused,
-        )?;
-        append_item_with(
-            setup,
-            cmd::SET_SECONDARY,
-            "Set secondary key…",
-            &self.secondary_label,
-            None,
-            !self.paused,
         )?;
 
         append_separator(hmenu)?;
@@ -964,18 +987,6 @@ impl Tray {
         )?;
         let help = append_group(hmenu, "&Help and diagnostics")?;
         append_item(help, cmd::EDIT_SETTINGS, "Open config.toml")?;
-        append_item(help, cmd::IMPORT_ACTION, "Import action from file...")?;
-        let export_labels: Vec<String> =
-            self.export_actions.iter().map(|(_, l)| l.clone()).collect();
-        let export_ids: Vec<String> = self.export_actions.iter().map(|(i, _)| i.clone()).collect();
-        append_model_submenu(
-            help,
-            "Export action to file",
-            cmd::ACTION_EXPORT_BASE,
-            &export_ids,
-            &export_labels,
-            None,
-        )?;
         append_item(help, cmd::RELOAD, "Reload settings")?;
         append_item(help, cmd::COPY_DIAGNOSTICS, "Copy diagnostics")?;
         append_item(help, cmd::COPY_EGRESS_LOG, "Copy egress log")?;
@@ -1858,79 +1869,6 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
-    // -- #185: SET_PRIMARY/SET_SECONDARY greyed while paused ---------------
-
-    #[test]
-    fn set_primary_and_secondary_are_greyed_out_only_while_paused() {
-        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, MFS_GRAYED,
-            WINDOW_EX_STYLE, WS_OVERLAPPED,
-        };
-
-        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
-        let instance = HINSTANCE(h.0);
-        let hwnd = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("STATIC"),
-                w!("Wingman tray menu test"),
-                WS_OVERLAPPED,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                0,
-                0,
-                None,
-                None,
-                Some(instance),
-                None,
-            )
-        }
-        .expect("CreateWindowExW");
-
-        let mut tray = Tray::new(hwnd, instance).expect("Tray::new should add the icon");
-
-        fn item_is_greyed(hmenu: HMENU, id: u32) -> bool {
-            let mut info = MENUITEMINFOW {
-                cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_STATE,
-                ..Default::default()
-            };
-            unsafe { GetMenuItemInfoW(hmenu, id, false, &mut info) }.expect("GetMenuItemInfoW");
-            (info.fState.0 & MFS_GRAYED.0) == MFS_GRAYED.0
-        }
-
-        let hmenu_running = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
-        tray.build_menu(hmenu_running)
-            .expect("build_menu while running");
-        assert!(
-            !item_is_greyed(hmenu_running, cmd::SET_PRIMARY),
-            "SET_PRIMARY must not be greyed while running"
-        );
-        assert!(
-            !item_is_greyed(hmenu_running, cmd::SET_SECONDARY),
-            "SET_SECONDARY must not be greyed while running"
-        );
-        let _ = unsafe { DestroyMenu(hmenu_running) };
-
-        tray.set_paused(true);
-        let hmenu_paused = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
-        tray.build_menu(hmenu_paused)
-            .expect("build_menu while paused");
-        assert!(
-            item_is_greyed(hmenu_paused, cmd::SET_PRIMARY),
-            "SET_PRIMARY must be greyed while paused -- arming learn mode can never capture"
-        );
-        assert!(
-            item_is_greyed(hmenu_paused, cmd::SET_SECONDARY),
-            "SET_SECONDARY must be greyed while paused"
-        );
-        let _ = unsafe { DestroyMenu(hmenu_paused) };
-
-        drop(tray);
-        let _ = unsafe { DestroyWindow(hwnd) };
-    }
-
     // -- #348: the menu tree --------------------------------------------------
 
     /// One node of a built menu, read back from the real `HMENU`.
@@ -2101,7 +2039,7 @@ mod tests {
             "Copy last answer".to_string(),
             "Pause".to_string(),
             "Mode".to_string(),
-            "Providers and keys".to_string(),
+            "Models".to_string(),
             "Settings...".to_string(),
             "Help and diagnostics".to_string(),
             "Quit".to_string(),
@@ -2127,6 +2065,7 @@ mod tests {
         let mut actions = direct_ids(find_sub(&tree, "Actions"));
         actions.sort_unstable();
         let mut want = vec![
+            cmd::IMPORT_ACTION,
             cmd::WHAT_CAN_I_DO,
             cmd::QUICK_ASK,
             cmd::EXTRACT_TEXT,
@@ -2145,7 +2084,6 @@ mod tests {
         help.sort_unstable();
         let mut want = vec![
             cmd::EDIT_SETTINGS,
-            cmd::IMPORT_ACTION,
             cmd::RELOAD,
             cmd::COPY_DIAGNOSTICS,
             cmd::COPY_EGRESS_LOG,
@@ -2154,13 +2092,18 @@ mod tests {
         want.sort_unstable();
         assert_eq!(help, want);
 
-        let setup = find_sub(&tree, "Providers and keys");
-        assert_eq!(direct_ids(setup), [cmd::SET_PRIMARY, cmd::SET_SECONDARY]);
+        // Models holds only submenus: the provider and one model list for
+        // every provider. No hotkey learners (those live in Settings).
+        let setup = find_sub(&tree, "Models");
+        assert!(direct_ids(setup).is_empty(), "{:?}", direct_ids(setup));
         let mut providers = Vec::new();
         ids_under(find_sub(setup, "Provider"), &mut providers);
         assert_eq!(providers.len(), ActiveProvider::ALL.len());
         find_sub(setup, "ChatGPT model");
         find_sub(setup, "Claude model");
+        find_sub(setup, "Gemini model");
+        find_sub(setup, "Ollama model");
+        find_sub(find_sub(&tree, "Actions"), "Export action to file");
 
         assert_eq!(
             direct_ids(find_sub(&tree, "Pause")),
@@ -2288,7 +2231,7 @@ mod tests {
     /// mnemonic, and no two rows of one menu share one.
     #[test]
     fn the_menu_has_a_unique_letter_per_usable_row() {
-        let rows = built_rows(|t| t.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K"));
+        let rows = built_rows(|t| t.set_key_label("Win+Shift+F23"));
         let top: Vec<&(usize, String, String)> = rows.iter().filter(|r| r.0 == 0).collect();
         assert!(top.len() > 5, "the top level of the menu was not read");
         // Everything but the greyed version line has a letter. That line is
@@ -2385,6 +2328,8 @@ mod tests {
             "gpt-5",
             &["claude-sonnet-5-5".to_string()],
             "claude-sonnet-5-5",
+            &["gemini-2.5-flash".to_string()],
+            "gemini-2.5-flash",
         );
         let hmenu = unsafe { CreatePopupMenu() }.expect("CreatePopupMenu");
         tray.build_menu(hmenu).expect("build_menu");
@@ -2403,7 +2348,7 @@ mod tests {
         let rows = built_rows(|t| {
             t.set_mode(crate::mode::Mode::Local);
             t.set_active_provider(Some(ActiveProvider::Anthropic));
-            t.set_key_bindings("Win+Shift+F23", "");
+            t.set_key_label("Win+Shift+F23");
         });
         let hint = |label: &str| {
             rows.iter()
@@ -2440,13 +2385,7 @@ mod tests {
         assert!(!grey(&running, cmd::WHAT_CAN_I_DO));
 
         let paused = built_menu_tree(|t| t.set_paused(true));
-        for id in [
-            cmd::SET_PRIMARY,
-            cmd::SET_SECONDARY,
-            cmd::QUICK_ASK,
-            cmd::WHAT_CAN_I_DO,
-            cmd::CALCULATE_SELECTION,
-        ] {
+        for id in [cmd::QUICK_ASK, cmd::WHAT_CAN_I_DO, cmd::CALCULATE_SELECTION] {
             assert!(grey(&paused, id), "{id} must be greyed while paused");
         }
         let top: Vec<&str> = paused.iter().filter_map(Node::label).collect();
@@ -2796,8 +2735,6 @@ mod tests {
     const ALL_FIXED_CMD_IDS: &[(&str, u32)] = &[
         ("ASK_NOW", cmd::ASK_NOW),
         ("COPY_LAST", cmd::COPY_LAST),
-        ("SET_PRIMARY", cmd::SET_PRIMARY),
-        ("SET_SECONDARY", cmd::SET_SECONDARY),
         ("EDIT_SETTINGS", cmd::EDIT_SETTINGS),
         ("RELOAD", cmd::RELOAD),
         ("QUIT", cmd::QUIT),
@@ -2925,6 +2862,7 @@ mod tests {
             "OPENAI_MODEL_BASE",
             "ANTHROPIC_MODEL_BASE",
             "OLLAMA_MODEL_BASE",
+            "GEMINI_MODEL_BASE",
             "ACTION_EXPORT_BASE",
         ];
 
@@ -2972,9 +2910,27 @@ mod tests {
             "OpenAI model range {openai_range:?} overlaps Anthropic model range {anthropic_range:?}"
         );
 
+        let gemini_range = cmd::GEMINI_MODEL_BASE..cmd::GEMINI_MODEL_BASE + cmd::MODEL_RANGE;
+        let ollama_range = cmd::OLLAMA_MODEL_BASE..cmd::OLLAMA_MODEL_BASE + cmd::MODEL_RANGE;
+        let export_range = cmd::ACTION_EXPORT_BASE..cmd::ACTION_EXPORT_BASE + cmd::MODEL_RANGE;
+        let ranges = [
+            &openai_range,
+            &anthropic_range,
+            &gemini_range,
+            &ollama_range,
+            &export_range,
+        ];
+        for (i, a) in ranges.iter().enumerate() {
+            for b in ranges.iter().skip(i + 1) {
+                assert!(a.end <= b.start || b.end <= a.start, "{a:?} overlaps {b:?}");
+            }
+        }
+
         for (name, id) in ALL_FIXED_CMD_IDS {
             assert!(
-                !openai_range.contains(id) && !anthropic_range.contains(id),
+                !openai_range.contains(id)
+                    && !anthropic_range.contains(id)
+                    && !gemini_range.contains(id),
                 "{name} ({id}) falls inside a model submenu's dynamic id range"
             );
         }
@@ -3059,6 +3015,34 @@ mod tests {
         );
     }
 
+    /// #826: a Gemini pick decodes to its own choice and resolves to the
+    /// model the open menu showed.
+    #[test]
+    fn decode_routes_the_gemini_range_to_its_own_choice() {
+        assert_eq!(
+            decode(cmd::GEMINI_MODEL_BASE + 1),
+            MenuChoice::GeminiModel(1)
+        );
+        assert_eq!(
+            decode(cmd::GEMINI_MODEL_BASE + cmd::MODEL_RANGE),
+            MenuChoice::Command(cmd::GEMINI_MODEL_BASE + cmd::MODEL_RANGE)
+        );
+        let tree = built_menu_tree(|t| {
+            t.set_models(
+                &[],
+                "",
+                &[],
+                "",
+                &["g-1".to_string(), "g-2".to_string()],
+                "g-2",
+            );
+        });
+        let sub = find_sub(find_sub(&tree, "Models"), "Gemini model");
+        let mut ids = Vec::new();
+        ids_under(sub, &mut ids);
+        assert_eq!(ids, [cmd::GEMINI_MODEL_BASE, cmd::GEMINI_MODEL_BASE + 1]);
+    }
+
     #[test]
     fn ollama_model_submenu_lists_pulled_models_and_checks_the_current_one() {
         let tree = built_menu_tree(|t| {
@@ -3067,7 +3051,7 @@ mod tests {
                 "qwen3:8b",
             );
         });
-        let sub = find_sub(find_sub(&tree, "Providers and keys"), "Ollama model");
+        let sub = find_sub(find_sub(&tree, "Models"), "Ollama model");
         let got: Vec<(u32, &str, bool)> = sub
             .iter()
             .filter_map(|n| match n {
