@@ -230,6 +230,16 @@ pub struct Hotkeys {
     /// and the id the first time the key is pressed; later presses show the
     /// options card. See [`Hotkeys::primary_target`].
     pub primary_action: String,
+    /// #393: what the key does when a card is showing: `"dynamic"` (the
+    /// default: picks an option if there is one, otherwise closes the card),
+    /// `"pick"` or `"close"`. Anything else is the default. See
+    /// [`crate::keypress::KeyMode`].
+    pub key_mode: String,
+    /// #393: how long, in milliseconds, a second press counts as a double
+    /// press (default 300, clamped to 150 to 600). `0` turns double press
+    /// off, so the first press always acts at once. See
+    /// [`crate::keypress::double_press_window_ms`].
+    pub double_press_ms: u32,
 }
 
 /// What a press of the Wingman key runs, from `hotkeys.primary_action`.
@@ -242,6 +252,16 @@ pub enum PrimaryAction {
 }
 
 impl Hotkeys {
+    /// `key_mode` read as a mode; an unknown value is the default.
+    pub fn key_mode_value(&self) -> crate::keypress::KeyMode {
+        crate::keypress::KeyMode::parse(&self.key_mode)
+    }
+
+    /// The double-press window in milliseconds, or `None` when it is off.
+    pub fn double_press_window_ms(&self) -> Option<u32> {
+        crate::keypress::double_press_window_ms(self.double_press_ms)
+    }
+
     /// `primary_action` read as a target. An empty value (or only spaces) is
     /// the default, `Options`, and the word is matched without regard to case
     /// or surrounding spaces; anything else is an action id, kept as typed.
@@ -275,6 +295,8 @@ impl Default for Hotkeys {
             pause: None,
             palette: None,
             primary_action: "options".to_string(),
+            key_mode: "dynamic".to_string(),
+            double_press_ms: 300,
         }
     }
 }
@@ -2445,6 +2467,47 @@ mod tests {
             pinned.hotkeys.primary_target(),
             PrimaryAction::Action("check-my-work".to_string())
         );
+    }
+
+    // -- hotkeys.key_mode and double_press_ms (issue #393) --------------------
+
+    #[test]
+    fn the_key_defaults_are_dynamic_with_a_300_ms_double_press_window() {
+        let h = Config::default().hotkeys;
+        assert_eq!(h.key_mode_value(), crate::keypress::KeyMode::Dynamic);
+        assert_eq!(h.double_press_window_ms(), Some(300));
+    }
+
+    #[test]
+    fn key_mode_and_double_press_ms_load_from_toml_and_bad_values_fall_back() {
+        let cfg: Config = toml::from_str(
+            "[hotkeys]
+key_mode = \"pick\"
+double_press_ms = 0
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.hotkeys.key_mode_value(), crate::keypress::KeyMode::Pick);
+        assert_eq!(cfg.hotkeys.double_press_window_ms(), None);
+        let bad: Config = toml::from_str(
+            "[hotkeys]
+key_mode = \"nope\"
+double_press_ms = 5000
+",
+        )
+        .unwrap();
+        assert_eq!(
+            bad.hotkeys.key_mode_value(),
+            crate::keypress::KeyMode::Dynamic
+        );
+        assert_eq!(bad.hotkeys.double_press_window_ms(), Some(600));
+        // An older config.toml has neither key.
+        let old: Config = toml::from_str(
+            "[hotkeys]
+",
+        )
+        .unwrap();
+        assert_eq!(old.hotkeys.double_press_window_ms(), Some(300));
     }
 
     // -- options.auto_dismiss_secs and claim_keys (issue #307) ----------------

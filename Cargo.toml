@@ -48,6 +48,12 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # the `img` feature only adds a second `image` coupling we do not use.
 rqrr = { version = "0.11", default-features = false }
 
+# card_uia.rs (#654): the `#[implement]` macro the windows crate re-exports
+# expands to paths in `windows_core`, so it must be a direct dependency. Same
+# version and licence (MIT OR Apache-2.0) as the copy `windows` already pulls in,
+# so no new code is built.
+windows-core = "0.62"
+
 [dependencies.windows]
 version = "0.62"
 features = [

@@ -73,9 +73,12 @@ text would fit. Render `before` from `origin/master` the same way when the
 change is visual and compare file by file. Name the states you looked at
 in the PR ("Manual check:" line) and attach before/after for the main one.
 
-Surfaces the gallery cannot show yet (tray menu, live palette at another
-scale, the real backdrop) need a screenshot of the running app: say so in
-the PR rather than claiming them checked.
+The tray menu is in the gallery as `tray-menu` and `tray-menu-submenu`: the
+real menu, built on a tray with no shell icon and captured from the screen,
+so another window in front of it spoils the picture (look at it). Use
+`--only tray-menu` to render one surface. Surfaces the gallery cannot show yet
+(live palette at another scale, the real backdrop) need a screenshot of the
+running app: say so in the PR rather than claiming them checked.
 
 ## Auditing a surface
 

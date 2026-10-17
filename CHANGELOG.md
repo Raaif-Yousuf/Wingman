@@ -13,16 +13,21 @@ tagged release.
   what is on screen) instead of running Check my work. This costs one small
   model call for the card, then one more for the choice you pick. To keep the
   old one-press flow, set `primary_action = "check-my-work"` under `[hotkeys]`
-  in `config.toml`. Pressing the key again while the card is up runs the first
-  choice (never one that writes the clipboard) or closes the card. A press
-  while an answer or error card is showing starts a new options card (and so
-  makes a new model call).
+  in `config.toml`. Pressing the key once while the card is up runs the first
+  choice, and twice quickly runs the second (never one that writes the
+  clipboard: the key closes the card instead). A press while an answer or
+  error card is showing closes it. `key_mode` and `double_press_ms` under
+  `[hotkeys]` change this (#393).
 - Starting Wingman a second time (the Start menu, the Copilot-key picker) shows
   the same card with only the choices that need no model, and sends nothing.
 
 ### Added
 
 - An error card has a "Report a problem" link. It opens a new GitHub issue in your browser with the version, mode, provider kinds and error class filled in. Nothing is sent by Wingman, and no error text, screen text, keys or paths are in the link (#373).
+
+### Accessibility
+
+- A screen reader now finds the links at the bottom of an expanded card (Copy details, Report a problem, Read aloud, Copy). Each has a name and a role, says when it has focus after Tab, and can be activated from the screen reader (#654).
 
 ## [0.2.0] - 2026-10-16
 

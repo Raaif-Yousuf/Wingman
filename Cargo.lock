@@ -2956,6 +2956,7 @@ dependencies = [
  "trybuild",
  "ureq",
  "windows",
+ "windows-core",
  "windows-future",
  "xcap",
 ]

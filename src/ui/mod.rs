@@ -1,6 +1,7 @@
 pub mod card;
 pub(crate) mod card_buttons;
 pub(crate) mod card_placement;
+pub(crate) mod card_uia;
 pub(crate) mod confirm;
 pub(crate) mod file_dialog;
 pub mod gallery;
@@ -14,3 +15,4 @@ pub mod settings;
 pub(crate) mod text;
 pub(crate) mod theme;
 pub mod tray;
+pub(crate) mod tray_menu;
