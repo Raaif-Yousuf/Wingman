@@ -134,11 +134,12 @@ the tray holds today. No "reset everything" (Open question 3).
   item. The status line is a plain, non-disabled static that raises
   `EVENT_OBJECT_LIVEREGIONCHANGED`, so "Saved: Card corner" and every error are
   announced (#781). The hotkey status line becomes non-disabled too (#824).
-- **Role of the owner-drawn rail is not assumed.** The dark spec measured that
-  owner-draw keeps a combo's role and drops a checkbox's; a listbox is
-  unmeasured. THEORY (unverified): it keeps ListBox and ListItem. Slice 2
-  measures it with UIA first; if the role is lost, the stock listbox is the
-  fallback in every theme.
+- **Role of the owner-drawn rail.** MEASURED 2026-10-17 (slice 2,
+  `rail_uia_role_is_a_list_of_named_list_items`, run by hand): the owner-drawn
+  list box keeps the List role and each item is a ListItem named for its page.
+  The list's own name is empty (a list box ignores its window text), so a
+  one pixel static before it carries "Settings pages", which UI Automation
+  reads as the list's name. The stock list box fallback is not needed.
 
 ## Instant apply
 

@@ -71,7 +71,12 @@ pub fn follows_variants(state: GalleryState) -> bool {
     use GalleryState::*;
     !matches!(
         state,
-        SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom
+        SettingsGeneral
+            | SettingsModels
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen
     )
 }
 
@@ -121,7 +126,12 @@ pub fn follows_dpi_only(state: GalleryState) -> bool {
     use GalleryState::*;
     matches!(
         state,
-        SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom
+        SettingsGeneral
+            | SettingsModels
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen
     )
 }
 
@@ -248,13 +258,16 @@ pub enum GalleryState {
     PaletteLongName,
     /// #882: the mouse over a row other than the selected one.
     PaletteHover,
-    /// Issue #560: the Settings window from a default config, Advanced
-    /// collapsed, scrolled to the top / bottom.
-    SettingsTop,
-    SettingsBottom,
-    /// Issue #560: the same with Advanced expanded.
-    SettingsAdvancedTop,
-    SettingsAdvancedBottom,
+    /// Issue #560, #872: the Settings window from a default config, one state
+    /// per page of the rail.
+    SettingsGeneral,
+    SettingsModels,
+    SettingsPrivacy,
+    SettingsActions,
+    /// The Advanced page with the Check my work prompt folded away.
+    SettingsAdvanced,
+    /// The same with the prompt open.
+    SettingsAdvancedPromptOpen,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -300,10 +313,12 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteLongScrolled,
         PaletteLongName,
         PaletteHover,
-        SettingsTop,
-        SettingsBottom,
-        SettingsAdvancedTop,
-        SettingsAdvancedBottom,
+        SettingsGeneral,
+        SettingsModels,
+        SettingsPrivacy,
+        SettingsActions,
+        SettingsAdvanced,
+        SettingsAdvancedPromptOpen,
         RegionOverlay,
         TrayMenu,
         TrayMenuSubmenu,
@@ -347,10 +362,12 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteLongScrolled => "palette-long-scrolled",
         PaletteLongName => "palette-long-name",
         PaletteHover => "palette-hover",
-        SettingsTop => "settings-top",
-        SettingsBottom => "settings-bottom",
-        SettingsAdvancedTop => "settings-advanced-top",
-        SettingsAdvancedBottom => "settings-advanced-bottom",
+        SettingsGeneral => "settings-general",
+        SettingsModels => "settings-models",
+        SettingsPrivacy => "settings-privacy",
+        SettingsActions => "settings-actions",
+        SettingsAdvanced => "settings-advanced",
+        SettingsAdvancedPromptOpen => "settings-advanced-prompt-open",
         RegionOverlay => "region-overlay",
         TrayMenu => "tray-menu",
         TrayMenuSubmenu => "tray-menu-submenu",
@@ -389,7 +406,7 @@ mod driver {
     use crate::ui::palette::Palette;
     use crate::ui::palette_model::PaletteAction;
     use crate::ui::region::Overlay;
-    use crate::ui::settings::GalleryWindow;
+    use crate::ui::settings::{GalleryWindow, Page};
     use std::time::Duration;
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::Graphics::Gdi::{
@@ -802,6 +819,19 @@ mod driver {
         ]
     }
 
+    /// The Settings page a gallery state shows.
+    fn settings_page(state: GalleryState) -> Page {
+        match state {
+            GalleryState::SettingsModels => Page::Models,
+            GalleryState::SettingsPrivacy => Page::Privacy,
+            GalleryState::SettingsActions => Page::Actions,
+            GalleryState::SettingsAdvanced | GalleryState::SettingsAdvancedPromptOpen => {
+                Page::Advanced
+            }
+            _ => Page::General,
+        }
+    }
+
     fn show_state(
         card: &mut Card,
         palette: &mut Palette,
@@ -1110,16 +1140,18 @@ mod driver {
                 // Interactive: the menu opens and stays until it is closed.
                 tray_menu_shot(variant, state, None)?;
             }
-            SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => {
+            SettingsGeneral
+            | SettingsModels
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen => {
                 card.hide();
                 palette.hide();
                 let mut w = GalleryWindow::open(instance, variant.dpi)
                     .ok_or_else(|| anyhow::anyhow!("could not open the Settings window"))?;
-                w.set_advanced(matches!(
-                    state,
-                    SettingsAdvancedTop | SettingsAdvancedBottom
-                ));
-                w.scroll_to_end(matches!(state, SettingsBottom | SettingsAdvancedBottom));
+                w.show_page(settings_page(state));
+                w.set_advanced(matches!(state, SettingsAdvancedPromptOpen));
                 *settings = Some(w);
             }
         }
@@ -1130,7 +1162,12 @@ mod driver {
                 .as_ref()
                 .map(|o| o.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no region overlay"))?,
-            SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom => settings
+            SettingsGeneral
+            | SettingsModels
+            | SettingsPrivacy
+            | SettingsActions
+            | SettingsAdvanced
+            | SettingsAdvancedPromptOpen => settings
                 .as_ref()
                 .map(|w| w.hwnd())
                 .ok_or_else(|| anyhow::anyhow!("no Settings window"))?,
@@ -1619,7 +1656,7 @@ mod tests {
         assert!(follows_variants(GalleryState::RegionOverlay));
         assert!(follows_variants(GalleryState::TrayMenu));
         assert!(follows_variants(GalleryState::TrayMenuSubmenu));
-        assert!(!follows_variants(GalleryState::SettingsTop));
+        assert!(!follows_variants(GalleryState::SettingsGeneral));
         for state in gallery_states() {
             let n = state_name(state);
             assert_eq!(follows_variants(state), !n.starts_with("settings-"), "{n}");
@@ -1653,7 +1690,7 @@ mod tests {
         );
         assert!(draws_with_direct2d(GalleryState::PaletteHover));
         assert!(!draws_with_direct2d(GalleryState::CardError));
-        assert!(!draws_with_direct2d(GalleryState::SettingsTop));
+        assert!(!draws_with_direct2d(GalleryState::SettingsGeneral));
     }
 
     #[test]
@@ -1749,8 +1786,10 @@ mod tests {
         // states + 4 settings states (#560) + the region overlay (#580) + the
         // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
         // two long palettes (#883) = 33, + the tray menu with and without an
-        // open submenu (#825) = 35, + the long action name (#1000) = 36, + the key-rejected setup card (#1020) = 37.
-        assert_eq!(states.len(), 37);
+        // open submenu (#825) = 35, + the long action name (#1000) = 36, + the
+        // key-rejected setup card (#1020) = 37, + the Settings states going
+        // from four to one per page and the prompt open (#872) = 39.
+        assert_eq!(states.len(), 39);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -1780,16 +1819,24 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_states_are_listed_in_scroll_and_advanced_pairs() {
+    fn every_settings_page_has_a_gallery_state() {
         let names: Vec<&str> = gallery_states().into_iter().map(state_name).collect();
         for want in [
-            "settings-top",
-            "settings-bottom",
-            "settings-advanced-top",
-            "settings-advanced-bottom",
+            "settings-general",
+            "settings-models",
+            "settings-privacy",
+            "settings-actions",
+            "settings-advanced",
+            "settings-advanced-prompt-open",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
+        // One state per page of the rail: a page added there needs a picture.
+        assert_eq!(
+            crate::ui::settings::page_labels().len(),
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 1,
+            "the Advanced page has two states (prompt closed and open)"
+        );
     }
 
     #[test]
