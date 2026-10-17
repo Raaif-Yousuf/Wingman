@@ -76,9 +76,15 @@ in the PR ("Manual check:" line) and attach before/after for the main one.
 The tray menu is in the gallery as `tray-menu` and `tray-menu-submenu`: the
 real menu, built on a tray with no shell icon and captured from the screen,
 so another window in front of it spoils the picture (look at it). Use
-`--only tray-menu` to render one surface. Surfaces the gallery cannot show yet
-(live palette at another scale, the real backdrop) need a screenshot of the
-running app: say so in the PR rather than claiming them checked.
+`--only tray-menu` to render one surface. The palette is drawn at every theme
+and scale twice: `palette-*--<theme>--<percent>.png` is the GDI paint (`WM_PRINT`)
+and `...--d2d.png` is the real Direct2D code painted into a bitmap. A screen grab
+and `PrintWindow` cannot read the palette's own Direct2D surface (MEASURED
+2026-10-17: a monitor `BitBlt` shows the windows underneath, `PrintWindow` with
+`PW_RENDERFULLCONTENT` is black apart from the query box), so never judge the
+palette from either. Surfaces the gallery cannot show yet (the real backdrop)
+need a screenshot of the running app: say so in the PR rather than claiming
+them checked.
 
 ## Auditing a surface
 
@@ -92,9 +98,10 @@ every finding so it can be checked again after the fix.
 
 ## Traps that already cost a session
 
-- `PrintWindow` on a layered window renders black (#626): the palette
-  gallery shots are black until that is fixed. Do not read a black picture
-  as "dark mode works".
+- The palette's Direct2D surface is invisible to `PrintWindow` and to a screen
+  capture (#626, #987). The gallery paints it through a DC render target
+  instead. A black or see-through palette picture is a capture problem until
+  the `--d2d` picture says otherwise.
 - Settings runs comctl32 v5 today; custom-drawn checkboxes need the v6
   manifest (#662 spec). Group boxes need a `WM_PAINT` subclass for dark.
 - `uxtheme` ordinal APIs (undocumented dark mode) are ruled out; use
