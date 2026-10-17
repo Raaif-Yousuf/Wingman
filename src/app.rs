@@ -15518,10 +15518,7 @@ mod tests {
 {restart}"
         );
         assert!(
-            app_src.contains(
-                "        restart_knowledge,
-"
-            ),
+            app_src.contains(concat!("        restart_knowledge", ",\n    );")),
             "the runner must be built with the restart function (#1201)"
         );
     }

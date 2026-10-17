@@ -10,6 +10,7 @@
 //! folder, so a burst of saves ends in one more start).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use super::ingest::ScanHandle;
 use super::watch::Watcher;
@@ -17,7 +18,21 @@ use super::watch::Watcher;
 /// What the runner keeps running, and whether its watch has ended on its own.
 pub trait Handles: Send + 'static {
     fn watch_ended(&self) -> bool;
+
+    /// Stops everything and waits up to `within` for it to be over. For the
+    /// worker thread. False when something was still running at the end.
+    fn finish(self, _within: Duration) -> bool
+    where
+        Self: Sized,
+    {
+        drop(self);
+        true
+    }
 }
+
+/// The longest the worker waits for the old watch and scan to end before it
+/// starts the new ones anyway (a slow or sleeping drive).
+const FINISH_WAIT: Duration = Duration::from_secs(5);
 
 /// The real handles: the folder watch and the start-up scan, either of which
 /// may be missing (no folder, or the thread could not start).
@@ -30,6 +45,24 @@ pub struct Live {
 impl Handles for Live {
     fn watch_ended(&self) -> bool {
         self.watch.as_ref().is_some_and(|w| !w.is_running())
+    }
+
+    fn finish(self, within: Duration) -> bool {
+        if let Some(scan) = &self.scan {
+            scan.request_stop();
+        }
+        let end = Instant::now() + within;
+        let mut done = true;
+        if let Some(watch) = &self.watch {
+            done &= watch.stop_and_wait(within);
+        }
+        if let Some(scan) = &self.scan {
+            while !scan.is_finished() && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            done &= scan.is_finished();
+        }
+        done
     }
 }
 
@@ -133,16 +166,30 @@ impl<H: Handles> Drop for Runner<H> {
 fn work<H: Handles>(state: &Mutex<State<H>>, start: &Starter<H>, old: Option<H>, target: String) {
     let (mut old, mut target) = (old, target);
     loop {
-        drop(old.take());
+        if let Some(old) = old.take() {
+            if !old.finish(FINISH_WAIT) {
+                super::notice::report(
+                    "The old knowledge folder was still being read when Wingman switched folders. Some files may be indexed twice until the next start.",
+                );
+            }
+        }
         // A panic in the start must not leave the runner busy for good.
         let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(&target)))
             .unwrap_or(None);
         let mut s = lock(state);
         if s.closed {
-            s.busy = false;
             drop(s);
+            // Dropped before `busy` clears, so "idle" means nothing is alive.
             drop(started);
+            lock(state).busy = false;
             return;
+        }
+        if started.is_none() && s.queued.is_none() {
+            // Nothing runs: forget the folder so the same Reload retries.
+            s.folder.clear();
+            super::notice::report(
+                "Wingman could not restart watching your knowledge folder. Choose Reload settings to try again.",
+            );
         }
         s.current = started;
         match s.queued.take() {
@@ -304,6 +351,34 @@ mod tests {
             0,
             "{:?}",
             rig.log.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_old_handles_are_finished_before_the_new_start_even_when_they_end_slowly() {
+        let (rig, runner) = rig(Duration::ZERO, Duration::from_millis(300));
+        runner.restart_if_needed("B", changed);
+        wait_idle(&runner);
+        let log = rig.log.lock().unwrap().clone();
+        assert_eq!(log, ["start A", "end A", "start B"], "{log:?}");
+    }
+
+    #[test]
+    fn a_failed_start_forgets_the_folder_so_the_same_reload_retries() {
+        let tries = Arc::new(AtomicUsize::new(0));
+        let for_start = Arc::clone(&tries);
+        let runner: Runner<Fake> = Runner::new(String::new(), None, move |_| {
+            for_start.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        runner.restart_if_needed("B", changed);
+        wait_idle(&runner);
+        runner.restart_if_needed("B", changed);
+        wait_idle(&runner);
+        assert_eq!(
+            tries.load(Ordering::SeqCst),
+            2,
+            "the second Reload must retry"
         );
     }
 
