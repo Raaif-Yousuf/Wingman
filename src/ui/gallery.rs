@@ -64,30 +64,21 @@ pub fn matrix_filename(state_name: &str, theme_name: &str, percent: u32) -> Stri
 }
 
 /// Whether a state can be drawn under a simulated theme and DPI. The card
-/// states, the region overlay and the tray menu can. The palette follows the theme only (see
-/// [`follows_theme_only`]) and Settings the DPI only (see [`follows_dpi_only`]).
+/// states, the palette, the region overlay and the tray menu can. Settings
+/// follows the DPI only (see [`follows_dpi_only`]).
 #[cfg(any(test, debug_assertions))]
 pub fn follows_variants(state: GalleryState) -> bool {
     use GalleryState::*;
     !matches!(
         state,
-        PaletteDefault
-            | PaletteNoMatches
-            | PaletteNoModel
-            | PaletteLong
-            | PaletteLongScrolled
-            | PaletteLongName
-            | PaletteHover
-            | SettingsTop
-            | SettingsBottom
-            | SettingsAdvancedTop
-            | SettingsAdvancedBottom
+        SettingsTop | SettingsBottom | SettingsAdvancedTop | SettingsAdvancedBottom
     )
 }
 
 /// Whether a state is captured by sending `WM_PRINT` instead of calling
 /// `PrintWindow`. The palette draws with a Direct2D window render target,
 /// which `PrintWindow` cannot read, so its pictures were a black page (#626).
+/// `WM_PRINT` gets the GDI paint.
 /// The card and Settings paint with GDI and `PrintWindow` is exact for them.
 #[cfg(any(test, debug_assertions))]
 pub fn prints_with_wm_print(state: GalleryState) -> bool {
@@ -104,23 +95,22 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
     )
 }
 
-/// Whether a state follows `--theme` but not `--dpi`: the palette can be drawn
-/// in any theme (it takes the shared theme tokens, #579), but it is laid out
-/// at the DPI of the monitor it opens on, so `--matrix` draws it once per theme
-/// as `<state>--<theme>--<percent>.png` at the DPI the window really has.
+/// Whether a state also gets a Direct2D picture. The palette draws with a
+/// Direct2D window render target that a screen capture and `PrintWindow` cannot
+/// read (#987), so its `WM_PRINT` picture is the GDI paint. The gallery
+/// therefore paints it a second time through the real Direct2D code into an
+/// off-screen target, saved next to the GDI one (see [`d2d_filename`]).
 #[cfg(any(test, debug_assertions))]
-pub fn follows_theme_only(state: GalleryState) -> bool {
-    use GalleryState::*;
-    matches!(
-        state,
-        PaletteDefault
-            | PaletteNoMatches
-            | PaletteNoModel
-            | PaletteHover
-            | PaletteLong
-            | PaletteLongScrolled
-            | PaletteLongName
-    )
+pub fn draws_with_direct2d(state: GalleryState) -> bool {
+    prints_with_wm_print(state)
+}
+
+/// The Direct2D picture's file for the GDI picture at `gdi`:
+/// `palette-default--dark--150.png` becomes `palette-default--dark--150--d2d.png`.
+#[cfg(any(test, debug_assertions))]
+pub fn d2d_filename(gdi: &std::path::Path) -> PathBuf {
+    let stem = gdi.file_stem().unwrap_or_default().to_string_lossy();
+    gdi.with_file_name(format!("{stem}--d2d.png"))
 }
 
 /// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
@@ -487,47 +477,32 @@ mod driver {
                         )?;
                     }
                 } else {
-                    // The window's own DPI: named for the DPI it really had,
-                    // found out once the window exists. The palette is drawn
-                    // in every theme, anything else once in the live one.
-                    let themes: &[&str] = if follows_theme_only(*state) {
-                        &MATRIX_THEMES
-                    } else {
-                        &["system"]
-                    };
-                    for theme_name in themes {
-                        let variant = Variant {
-                            theme: theme_from_arg(theme_name),
-                            dpi: None,
-                        };
-                        let path = dir.join("pending.png");
-                        let named = shoot(
-                            &mut card,
-                            &mut palette,
-                            &mut settings,
-                            &mut region,
-                            variant,
-                            *state,
-                            &path,
-                        )
-                        .and_then(|hwnd| {
-                            let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
-                            // 0 means the window is gone: a "0" file would lie.
-                            anyhow::ensure!(
-                                dpi > 0,
-                                "no DPI for the {} window",
-                                state_name(*state)
-                            );
-                            let name =
-                                matrix_filename(state_name(*state), theme_name, scale_percent(dpi));
-                            std::fs::rename(&path, dir.join(name))?;
-                            Ok(())
-                        });
-                        if named.is_err() {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                        named?;
+                    // Tray menus and the like: once, at the monitor's own DPI,
+                    // named for the DPI the window really had.
+                    let variant = Variant::default();
+                    let path = dir.join("pending.png");
+                    let named = shoot(
+                        &mut card,
+                        &mut palette,
+                        &mut settings,
+                        &mut region,
+                        variant,
+                        *state,
+                        &path,
+                    )
+                    .and_then(|hwnd| {
+                        let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+                        // 0 means the window is gone: a "0" file would lie.
+                        anyhow::ensure!(dpi > 0, "no DPI for the {} window", state_name(*state));
+                        let name =
+                            matrix_filename(state_name(*state), "system", scale_percent(dpi));
+                        std::fs::rename(&path, dir.join(name))?;
+                        Ok(())
+                    });
+                    if named.is_err() {
+                        let _ = std::fs::remove_file(&path);
                     }
+                    named?;
                 }
             }
             std::process::exit(0);
@@ -623,6 +598,7 @@ mod driver {
         }
         if let Some(dpi) = variant.dpi {
             card.force_dpi_for_gallery(dpi);
+            palette.force_dpi_for_gallery(dpi);
         }
     }
 
@@ -657,6 +633,9 @@ mod driver {
             palette.set_hover_for_test(Some(2));
         }
         print_window_png(hwnd, path, prints_with_wm_print(state))?;
+        if draws_with_direct2d(state) {
+            direct2d_png(palette, &d2d_filename(path))?;
+        }
         Ok(hwnd)
     }
 
@@ -1429,6 +1408,48 @@ mod driver {
     /// monitor (rule: this must never call anything from `capture.rs`, which
     /// grabs the screen for the real ask flow).
     fn print_window_png(hwnd: HWND, path: &std::path::Path, wm_print: bool) -> anyhow::Result<()> {
+        if wm_print
+            && !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) }.as_bool()
+        {
+            // A palette that hid itself (it hides when focus leaves it)
+            // would print as a black page: fail loudly instead.
+            anyhow::bail!("the window is hidden, so {path:?} would be a black page");
+        }
+        capture_client_png(hwnd, path, |dc| {
+            if wm_print {
+                // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_PRINT,
+                        Some(WPARAM(dc.0 as usize)),
+                        Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
+                    );
+                }
+                Ok(())
+            } else if unsafe { PrintWindow(hwnd, dc, PW_CLIENTONLY) }.as_bool() {
+                Ok(())
+            } else {
+                anyhow::bail!("PrintWindow failed for {path:?}")
+            }
+        })
+    }
+
+    /// Saves the palette as painted by the real Direct2D code (#987): the
+    /// paint list goes through `paint_ops_d2d` into a bitmap, with the query
+    /// box printed on top (see `paint_d2d_into_for_gallery`).
+    fn direct2d_png(palette: &mut Palette, path: &std::path::Path) -> anyhow::Result<()> {
+        let hwnd = palette.hwnd();
+        capture_client_png(hwnd, path, |dc| palette.paint_d2d_into_for_gallery(dc))
+    }
+
+    /// Makes a bitmap the size of `hwnd`'s client area, lets `fill` draw into
+    /// its device context, and saves the result as a PNG at `path`.
+    fn capture_client_png(
+        hwnd: HWND,
+        path: &std::path::Path,
+        fill: impl FnOnce(HDC) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         unsafe {
             let mut rect = windows::Win32::Foundation::RECT::default();
             GetClientRect(hwnd, &mut rect)?;
@@ -1440,24 +1461,7 @@ mod driver {
             let bitmap: HBITMAP = CreateCompatibleBitmap(screen_dc, width, height);
             let old = SelectObject(mem_dc, bitmap.into());
 
-            if wm_print && !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool()
-            {
-                // A palette that hid itself (it hides when focus leaves it)
-                // would print as a black page: fail loudly instead.
-                anyhow::bail!("the window is hidden, so {path:?} would be a black page");
-            }
-            let ok = if wm_print {
-                // PRF_CHECKVISIBLE | PRF_CHILDREN | PRF_CLIENT | PRF_ERASEBKGND
-                SendMessageW(
-                    hwnd,
-                    WM_PRINT,
-                    Some(WPARAM(mem_dc.0 as usize)),
-                    Some(LPARAM(0x1 | 0x4 | 0x8 | 0x10)),
-                );
-                windows::core::BOOL(1)
-            } else {
-                PrintWindow(hwnd, mem_dc, PW_CLIENTONLY)
-            };
+            let filled = fill(mem_dc);
 
             let mut buf = vec![0u8; (width as usize) * (height as usize) * 4];
             let mut bmi = windows::Win32::Graphics::Gdi::BITMAPINFO {
@@ -1488,9 +1492,7 @@ mod driver {
             let _ = DeleteDC(mem_dc);
             ReleaseDC(None, screen_dc);
 
-            if !ok.as_bool() {
-                anyhow::bail!("PrintWindow failed for {path:?}");
-            }
+            filled?;
 
             // BGRA -> RGBA for the `image` crate.
             for px in buf.chunks_exact_mut(4) {
@@ -1612,35 +1614,46 @@ mod tests {
     }
 
     #[test]
-    fn only_the_palette_and_settings_states_ignore_variants() {
+    fn only_the_settings_states_ignore_variants() {
         assert!(follows_variants(GalleryState::CardError));
         assert!(follows_variants(GalleryState::RegionOverlay));
         assert!(follows_variants(GalleryState::TrayMenu));
         assert!(follows_variants(GalleryState::TrayMenuSubmenu));
-        assert!(!follows_variants(GalleryState::PaletteDefault));
         assert!(!follows_variants(GalleryState::SettingsTop));
         for state in gallery_states() {
             let n = state_name(state);
-            assert_eq!(
-                follows_variants(state),
-                !(n.starts_with("palette-") || n.starts_with("settings-")),
-                "{n}"
-            );
+            assert_eq!(follows_variants(state), !n.starts_with("settings-"), "{n}");
         }
     }
 
+    /// #1007: the palette is drawn at every matrix theme and scale, so its
+    /// 100 and 150 percent pictures exist.
     #[test]
-    fn only_the_palette_states_follow_the_theme_alone() {
+    fn the_palette_states_follow_theme_and_scale() {
         let mut palette_states = 0;
         for state in gallery_states() {
             let n = state_name(state);
-            assert_eq!(follows_theme_only(state), n.starts_with("palette-"), "{n}");
-            if follows_theme_only(state) {
-                assert!(!follows_variants(state) && !follows_dpi_only(state), "{n}");
+            if n.starts_with("palette-") {
+                assert!(follows_variants(state) && !follows_dpi_only(state), "{n}");
                 palette_states += 1;
             }
         }
         assert_eq!(palette_states, 7, "the test must see every palette state");
+    }
+
+    /// #987: the Direct2D picture sits next to the GDI one, same name plus
+    /// `--d2d`, so the two can be compared file by file.
+    #[test]
+    fn the_direct2d_picture_is_named_after_the_gdi_one() {
+        let gdi = matrix_filename("palette-default", "dark", 150);
+        assert_eq!(gdi, "palette-default--dark--150.png");
+        assert_eq!(
+            d2d_filename(std::path::Path::new("out").join(&gdi).as_path()),
+            std::path::Path::new("out").join("palette-default--dark--150--d2d.png")
+        );
+        assert!(draws_with_direct2d(GalleryState::PaletteHover));
+        assert!(!draws_with_direct2d(GalleryState::CardError));
+        assert!(!draws_with_direct2d(GalleryState::SettingsTop));
     }
 
     #[test]

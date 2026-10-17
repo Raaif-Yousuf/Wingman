@@ -113,10 +113,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_ROUNDED_RECT,
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1RenderTarget,
+    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
@@ -483,6 +483,103 @@ impl Palette {
         self.inner.sys = crate::ui::theme::HC_BLACK;
         self.inner.theme_forced = true;
         self.inner.apply_colors();
+    }
+
+    /// The UI gallery's `--dpi` (#1007): lays the palette out at `dpi` whatever
+    /// monitor it is on, as Settings does. Window, query box font and Direct2D
+    /// target all follow, the same updates `WM_DPICHANGED` makes.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn force_dpi_for_gallery(&mut self, dpi: u32) {
+        self.inner.dpi = dpi.max(1);
+        self.inner.rebuild_font();
+        if let Some(renderer) = &self.inner.d2d {
+            renderer.set_dpi(self.inner.dpi);
+        }
+        self.inner.reposition_centered();
+    }
+
+    /// The UI gallery (#987): paints the window with the real Direct2D path
+    /// (the same paint list, text formats and `paint_ops_d2d` the live window
+    /// uses) into `hdc`, because a screen capture and `PrintWindow` cannot read
+    /// the window's own Direct2D surface. The target is a DC render target at
+    /// the window's DPI. The query box is a child window Direct2D never
+    /// draws, so it is printed on top with `WM_PRINT`.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn paint_d2d_into_for_gallery(&mut self, hdc: HDC) -> anyhow::Result<()> {
+        use windows::Win32::Graphics::Direct2D::{
+            ID2D1DCRenderTarget, D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
+        };
+        let inner = &mut *self.inner;
+        let (w, h) = (
+            scale(WINDOW_WIDTH, inner.dpi).max(1),
+            window_height(inner.dpi).max(1),
+        );
+        let hwnd = inner.hwnd;
+        let dpi = inner.dpi;
+        let renderer = inner
+            .d2d
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no Direct2D on this window"))?;
+        anyhow::ensure!(
+            renderer.ensure_target(hwnd, dpi, w as u32, h as u32),
+            "no Direct2D target or text format"
+        );
+        let body = renderer.text_format.clone().expect("ensure_target checked");
+        let caption = renderer
+            .caption_format
+            .clone()
+            .unwrap_or_else(|| body.clone());
+        let icon = renderer.icon_format.clone().unwrap_or_else(|| body.clone());
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode:
+                    windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: dpi as f32,
+            dpiY: dpi as f32,
+            usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
+            minLevel: Default::default(),
+        };
+        let target: ID2D1DCRenderTarget = unsafe { renderer.factory.CreateDCRenderTarget(&props)? };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        };
+        unsafe { target.BindDC(hdc, &rect)? };
+        let ops = build_ops(
+            96,
+            &PaintInput {
+                rows: &inner.state.rows,
+                offset: inner.state.offset,
+                selected: inner.state.selected,
+                hover: inner.hover,
+                footer: &inner.footer_text,
+                colors: &inner.colors,
+            },
+        );
+        unsafe { target.BeginDraw() };
+        paint_ops_d2d(&target, [&body, &caption, &icon], dpi, &ops);
+        unsafe { target.EndDraw(None, None)? };
+        // The query box: print it at its own spot in the picture.
+        let edit = query_edit_rect(dpi, font_text_height(inner.font, dpi));
+        unsafe {
+            use windows::Win32::Graphics::Gdi::SetViewportOrgEx;
+            use windows::Win32::UI::WindowsAndMessaging::WM_PRINT;
+            let _ = SetViewportOrgEx(hdc, edit.left, edit.top, None);
+            // PRF_CLIENT | PRF_ERASEBKGND
+            SendMessageW(
+                inner.edit_hwnd,
+                WM_PRINT,
+                Some(WPARAM(hdc.0 as usize)),
+                Some(LPARAM(0x4 | 0x8)),
+            );
+            let _ = SetViewportOrgEx(hdc, 0, 0, None);
+        }
+        Ok(())
     }
 
     /// The UI gallery (#919): the palette hides itself when its query box
@@ -1010,7 +1107,7 @@ fn icon_face() -> &'static str {
 /// wasted brush + draw call), not a crash guard -- `IDWriteFactory`/
 /// `ID2D1RenderTarget` do not share `DrawTextW`'s zero-length-buffer bug.
 fn draw_text_line_d2d(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     format: &IDWriteTextFormat,
     text: &str,
     rect: D2D_RECT_F,
@@ -1061,7 +1158,7 @@ fn snapped_rect_f(r: SnappedRect) -> D2D_RECT_F {
 /// text formats. A brush that cannot be made leaves that one shape out, so a
 /// single failure never blanks the window.
 fn paint_ops_d2d(
-    target: &ID2D1HwndRenderTarget,
+    target: &ID2D1RenderTarget,
     formats: [&IDWriteTextFormat; 3],
     dpi: u32,
     ops: &[Op],
@@ -2408,6 +2505,54 @@ mod tests {
         );
         assert_eq!(empty.0, p.inner.colors.background, "the palette background");
     }
+    /// #1007 and #987: the gallery lays the palette out at a forced scale and
+    /// paints it through the real Direct2D code into a bitmap. At 150 percent
+    /// the window is 1.5 times the size, and the Direct2D picture has the
+    /// selected row's fill and the background where the paint list puts them.
+    #[test]
+    fn the_gallery_paints_the_palette_through_direct2d_at_a_forced_scale() {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel, ReleaseDC,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.force_theme_for_gallery(Theme::Dark);
+        p.keep_open_for_gallery();
+        p.ignore_mouse_for_test();
+        p.force_dpi_for_gallery(144);
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        let dpi = 144;
+        let (w, h) = (scale(WINDOW_WIDTH, dpi), window_height(dpi));
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(p.hwnd(), &mut rc);
+        }
+        assert_eq!((rc.right - rc.left, rc.bottom - rc.top), (w, h));
+        let fill = row_fill(dpi, 1);
+        let empty_slot = row_slot(dpi, 8);
+        let (selected, empty, painted);
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(mem, bmp.into());
+            painted = p.paint_d2d_into_for_gallery(mem);
+            selected = GetPixel(
+                mem,
+                fill.right - scale(8, dpi),
+                (fill.top + fill.bottom) / 2,
+            );
+            empty = GetPixel(mem, w / 2, (empty_slot.top + empty_slot.bottom) / 2);
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+        painted.expect("Direct2D painted the palette");
+        assert_eq!(selected.0, p.inner.colors.selected_fill, "selected row");
+        assert_eq!(empty.0, p.inner.colors.background, "background");
+    }
+
     /// The colours of the window's pixels at `points`, read from a `WM_PRINT`
     /// of the palette (the GDI path, like the UI gallery's pictures).
     fn printed_pixels(p: &Palette, points: &[(i32, i32)]) -> Vec<u32> {
