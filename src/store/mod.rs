@@ -155,7 +155,8 @@ enum Heal {
     Fine,
     /// The file was never moved and is open again as it was.
     Reopened,
-    /// A fresh database replaced the damaged one; the notice for the user.
+    /// A fresh database replaced the damaged (or missing) one; the notice for
+    /// the user.
     Replaced(String),
     /// Could not finish. The text says why. Tried again after [`RETRY_GAP`].
     Stuck(String),
@@ -265,10 +266,16 @@ impl Store {
             if state.detached {
                 // `conn` is the empty stand-in, so a check would pass. Open
                 // the file as it is; only a damaged one is moved aside.
+                let existed = path.exists();
                 match Store::open_at(path) {
                     Ok(fresh) => {
                         *conn = fresh.conn.into_inner().unwrap_or_else(|e| e.into_inner());
-                        return Heal::Reopened;
+                        // A missing file was created empty: not the old data.
+                        return if existed {
+                            Heal::Reopened
+                        } else {
+                            Heal::Replaced(missing_file_notice())
+                        };
                     }
                     Err(StoreError::Corrupt(_)) => {}
                     Err(e) => return Heal::Stuck(e.to_string()),
@@ -345,6 +352,12 @@ fn reopen_original(conn: &mut Connection, path: &Path) -> bool {
 /// back without moving anything.
 fn reopened_notice() -> String {
     "Wingman's saved data could not be opened for a while and is open again. Usage and request history from that time may be missing.".into()
+}
+
+/// The card text after a store lost its file connection and the file was gone
+/// when it came back, so a new one was started.
+fn missing_file_notice() -> String {
+    "Wingman's saved data file was missing, so a new one was started. Usage and request history are lost, and your saved profile and indexed documents start empty.".into()
 }
 
 /// True if a `-wal` or `-shm` sits next to `path`.
@@ -1216,6 +1229,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The file is gone: opening it creates a new one, and the notice must say
+    /// so rather than claim the old data is back.
+    #[test]
+    fn a_detached_store_whose_file_is_gone_says_it_started_a_new_one() {
+        let dir = scratch("detached-gone");
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        detached_store(&s);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("wingman.db{suffix}")));
+        }
+
+        let mut conn = s.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = s.heal_state.lock().unwrap_or_else(|e| e.into_inner());
+        match s.heal(&mut conn, &mut state) {
+            Heal::Replaced(text) => {
+                assert!(text.contains("missing"), "{text}");
+                assert!(!text.contains("open again"), "{text}");
+                assert!(!text.contains('\u{2014}'), "{text}");
+            }
+            Heal::Reopened => panic!("a new file is not a reopen"),
+            _ => panic!("expected a replaced store"),
+        }
+        assert!(path.exists());
+        drop(state);
+        drop(conn);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the file cannot be opened, a detached store tries once per gap,
+    /// not on every lock.
+    #[test]
+    fn a_detached_store_opens_the_file_once_per_retry_gap() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = scratch("detached-gap");
+        let path = dir.join("wingman.db");
+        let s = Store::open_at(&path).unwrap();
+        s.record_usage("2026-10-15", "a", "m", Some(0.1), None)
+            .unwrap();
+        s.lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;")
+            .unwrap();
+        detached_store(&s);
+        // No sharing at all: opening the file fails until the hold is dropped.
+        let hold = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        drop(s.lock());
+        assert!(s.heal_state.lock().unwrap().detached);
+        assert!(s.heal_state.lock().unwrap().not_before.is_some());
+        drop(hold);
+        // The file is free now, but the gap has not passed: no attempt.
+        drop(s.lock());
+        drop(s.lock());
+        assert!(s.heal_state.lock().unwrap().detached, "the gap was ignored");
+        expire_retry_wait(&s);
+        drop(s.lock());
+        assert!(!s.heal_state.lock().unwrap().detached);
+        assert!(s.day_total("2026-10-15").unwrap().is_some());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo after a failed move reports whether a file connection is back.
+    #[test]
+    fn reopen_original_reports_whether_it_got_the_file_back() {
+        let dir = scratch("reopen-original");
+        let path = dir.join("wingman.db");
+        let mut conn = Connection::open_in_memory().unwrap();
+        assert!(
+            !reopen_original(&mut conn, &path),
+            "no file, nothing created"
+        );
+        assert!(!path.exists());
+        // A directory where the file should be cannot be opened as a database.
+        std::fs::create_dir(&path).unwrap();
+        assert!(!reopen_original(&mut conn, &path));
+        std::fs::remove_dir(&path).unwrap();
+        drop(Store::open_at(&path).unwrap());
+        assert!(reopen_original(&mut conn, &path));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_reopened_notice_is_plain() {
         let text = reopened_notice();
@@ -1256,6 +1357,8 @@ mod tests {
         assert!(s.day_total("2026-10-15").is_err());
         assert!(s.record_usage("2026-10-16", "a", "m", None, None).is_err());
         assert_eq!(damaged_copies(&dir), 0);
+        // The failed move was undone: the file is open again, not detached.
+        assert!(!s.heal_state.lock().unwrap().detached);
         drop(_hold);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
