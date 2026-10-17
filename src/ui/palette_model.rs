@@ -46,8 +46,27 @@ pub enum Effect {
 pub fn effect_for_executor(executor: &str) -> Effect {
     match executor {
         "none" => Effect::None,
-        "calendar_add" | "replace_text" | "fill_form" => Effect::Preview,
+        "calendar_add" | "replace_text" | "fill_form" | "contact_add" => Effect::Preview,
         _ => Effect::Clipboard,
+    }
+}
+
+/// #308, #859: whether the Wingman key may run an option by itself.
+///
+/// Only an option that cannot change anything without a further Enter and
+/// cannot overwrite the clipboard: a read-only answer or a preview. A
+/// clipboard-writing option is picked by click or by digit, never by the key.
+///
+/// The model's confidence is deliberately not an input. It comes from a model
+/// that reads the screen, so text on the screen can claim any confidence it
+/// likes (#859), and a habit press must never overwrite the clipboard with
+/// whatever the page said. The options card spec (resolved question 2) would
+/// allow a clipboard option above `palette.router_threshold`; this is the
+/// stricter rule the injection finding asked for.
+pub fn key_pickable(effect: Effect) -> bool {
+    match effect {
+        Effect::None | Effect::Preview => true,
+        Effect::Clipboard => false,
     }
 }
 
@@ -321,6 +340,29 @@ pub fn scroll_by(offset: usize, delta_rows: i32, total_rows: usize, visible_rows
     }
     let max_offset = (total_rows - visible_rows) as i32;
     (offset as i32 + delta_rows).clamp(0, max_offset) as usize
+}
+
+/// The scroll thumb for a list scrolled to `offset` (#883), in the pixels of a
+/// track `track_len` long: `(top, length)`, or `None` when every row fits and
+/// there is nothing to say. The thumb is the visible share of the track, never
+/// shorter than `min_len` (or the track, when that is shorter), and slides
+/// from the top at offset 0 to the bottom at the last page.
+pub fn scroll_thumb(
+    offset: usize,
+    total_rows: usize,
+    visible_rows: usize,
+    track_len: i32,
+    min_len: i32,
+) -> Option<(i32, i32)> {
+    if visible_rows == 0 || total_rows <= visible_rows || track_len <= 0 {
+        return None;
+    }
+    let max_offset = total_rows - visible_rows;
+    let offset = offset.min(max_offset);
+    let share = (track_len as i64 * visible_rows as i64 / total_rows as i64) as i32;
+    let len = share.max(min_len).min(track_len);
+    let top = ((track_len - len) as i64 * offset as i64 / max_offset as i64) as i32;
+    Some((top, len))
 }
 
 /// The palette's selection state over a built row list. Rebuilt (via
@@ -666,6 +708,57 @@ mod tests {
             requires_model,
             effect: Effect::None,
         }
+    }
+
+    // -- scroll_thumb (#883) ---------------------------------------------
+
+    #[test]
+    fn no_thumb_when_every_row_fits() {
+        assert_eq!(scroll_thumb(0, 12, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 3, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 0, 12, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 20, 0, 312, 24), None);
+        assert_eq!(scroll_thumb(0, 20, 12, 0, 24), None);
+    }
+
+    #[test]
+    fn the_thumb_is_the_visible_share_of_the_track() {
+        // 24 rows, 12 visible: half the track.
+        assert_eq!(scroll_thumb(0, 24, 12, 312, 24), Some((0, 156)));
+    }
+
+    #[test]
+    fn the_thumb_touches_the_top_at_offset_zero_and_the_bottom_at_the_end() {
+        let (top, len) = scroll_thumb(0, 30, 12, 312, 24).unwrap();
+        assert_eq!(top, 0);
+        let (top, len2) = scroll_thumb(18, 30, 12, 312, 24).unwrap();
+        assert_eq!(len, len2);
+        assert_eq!(top + len2, 312);
+        // Past the end is the end.
+        assert_eq!(
+            scroll_thumb(99, 30, 12, 312, 24),
+            scroll_thumb(18, 30, 12, 312, 24)
+        );
+    }
+
+    #[test]
+    fn the_thumb_moves_down_with_the_offset_and_stays_in_the_track() {
+        let mut last = 0;
+        for offset in 0..=88 {
+            let (top, len) = scroll_thumb(offset, 100, 12, 312, 24).unwrap();
+            assert!(top >= last, "offset {offset}");
+            assert!(top >= 0 && top + len <= 312, "offset {offset}");
+            last = top;
+        }
+    }
+
+    #[test]
+    fn a_very_long_list_still_gets_a_thumb_you_can_see() {
+        let (_, len) = scroll_thumb(0, 5000, 12, 312, 24).unwrap();
+        assert_eq!(len, 24);
+        // A track shorter than the minimum: the thumb is the whole track.
+        let (top, len) = scroll_thumb(0, 5000, 12, 10, 24).unwrap();
+        assert_eq!((top, len), (0, 10));
     }
 
     // -- fuzzy_score ---------------------------------------------------
@@ -1120,6 +1213,7 @@ mod tests {
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
             crate::actions::jargon::ACTION_ID,
+            crate::actions::contact::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
@@ -1294,12 +1388,43 @@ mod tests {
     }
 
     #[test]
+    fn a_clipboard_effect_is_never_key_pickable_and_the_others_are() {
+        assert!(key_pickable(Effect::None));
+        assert!(key_pickable(Effect::Preview));
+        assert!(!key_pickable(Effect::Clipboard));
+    }
+
+    /// #859: for every action in the catalogue, an option whose effect writes
+    /// the clipboard is never key-picked, whatever confidence a router reply
+    /// (or text on the screen) gave it. The built-ins and the two tray
+    /// utilities are all checked, and the set is not empty.
+    #[test]
+    fn no_clipboard_action_in_the_catalogue_is_key_pickable() {
+        let resolved = crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]);
+        let cat = catalogue(&resolved);
+        let clipboard: Vec<&PaletteAction> = cat
+            .iter()
+            .filter(|a| a.effect == Effect::Clipboard)
+            .collect();
+        assert!(clipboard.len() >= 3, "copy text, read QR, copy region");
+        for a in &clipboard {
+            assert!(!key_pickable(a.effect), "{}", a.id);
+        }
+        // And every non-clipboard action is, so the rule is the effect and
+        // nothing else.
+        for a in cat.iter().filter(|a| a.effect != Effect::Clipboard) {
+            assert!(key_pickable(a.effect), "{}", a.id);
+        }
+    }
+
+    #[test]
     fn effect_for_executor_never_calls_an_unknown_executor_key_pickable() {
         assert_eq!(effect_for_executor("none"), Effect::None);
         assert_eq!(effect_for_executor("clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("image_clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("replace_text"), Effect::Preview);
         assert_eq!(effect_for_executor("calendar_add"), Effect::Preview);
+        assert_eq!(effect_for_executor("contact_add"), Effect::Preview);
         assert_eq!(effect_for_executor("fill_form"), Effect::Preview);
         assert_eq!(effect_for_executor("typo"), Effect::Clipboard);
         assert_eq!(effect_for_executor(""), Effect::Clipboard);

@@ -7,6 +7,23 @@ tagged release.
 
 ## [Unreleased]
 
+### Changed
+
+- One press of the Wingman key now shows the options card (a few choices for
+  what is on screen) instead of running Check my work. This costs one small
+  model call for the card, then one more for the choice you pick. To keep the
+  old one-press flow, set `primary_action = "check-my-work"` under `[hotkeys]`
+  in `config.toml`. Pressing the key again while the card is up runs the first
+  choice (never one that writes the clipboard) or closes the card. A press
+  while an answer or error card is showing starts a new options card (and so
+  makes a new model call).
+- Starting Wingman a second time (the Start menu, the Copilot-key picker) shows
+  the same card with only the choices that need no model, and sends nothing.
+
+### Added
+
+- An error card has a "Report a problem" link. It opens a new GitHub issue in your browser with the version, mode, provider kinds and error class filled in. Nothing is sent by Wingman, and no error text, screen text, keys or paths are in the link (#373).
+
 ## [0.2.0] - 2026-10-16
 
 Changes since 0.1.0, grouped by what you notice. The release page has the download and its checksums.
@@ -20,7 +37,7 @@ Review this email, Fill this form (works with no model too), Action items to a
 checklist, Summarize this page, Summarize a link, Explain this error, Define
 this word, Translate selection, Describe image (alt text), Explain what's on
 screen, Table to CSV, Chart to data table, Receipt to expense row, Convert
-times to my time zone, Relative dates to real dates, Is this a scam?, Jargon to
+times to my time zone, Relative dates to real dates, Is this a scam?, Contact to address book, Jargon to
 plain English, Explain, fix and write tests for code, and three Rewrite for
 tone actions.
 
