@@ -40,6 +40,14 @@ use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 use crate::config::Config;
 use crate::mode::Mode;
 
+/// A `Config` as a `toml::Value`, through its TOML text. `Value::try_from(config)`
+/// would compile a second serializer for every `Config` type next to the one that
+/// saves the file; going through the text reuses it (#1095).
+fn config_value(config: &Config) -> Result<toml::Value> {
+    let text = toml::to_string(config)?;
+    Ok(toml::from_str::<toml::Value>(&text)?)
+}
+
 /// One key to change in `config.toml`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldChange {
@@ -309,8 +317,8 @@ fn to_value(v: &toml::Value) -> Value {
 /// and blanked inside any whole table or array that is set: keys go to
 /// Credential Manager, never to the file.
 pub fn diff(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
-    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
-    let mut after = toml::Value::try_from(after).context("could not read the new settings")?;
+    let mut before = config_value(before).context("could not read the old settings")?;
+    let mut after = config_value(after).context("could not read the new settings")?;
     blank_secrets(&mut before);
     blank_secrets(&mut after);
     let mut out = Vec::new();
@@ -367,8 +375,8 @@ fn push_set(path: &[String], value: &toml::Value, out: &mut Vec<FieldChange>) {
 /// it stays in the file and is imported on the next load rather than be lost.
 /// Comments and unknown keys, inside compat entries too, are untouched.
 pub fn blanked_key_changes(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
-    let tb = toml::Value::try_from(before).context("could not read the old settings")?;
-    let ta = toml::Value::try_from(after).context("could not read the new settings")?;
+    let tb = config_value(before).context("could not read the old settings")?;
+    let ta = config_value(after).context("could not read the new settings")?;
     let mut out = Vec::new();
     for provider in ["openai", "anthropic", "gemini"] {
         let path = vec![
@@ -458,7 +466,7 @@ fn write_batch(path: &Path, jobs: &[&[FieldChange]]) -> Vec<Result<(), String>> 
 /// silently revert them. Load-time notes that are not part of the file
 /// (`unreadable_secrets`, `keys_left_in_file`, `load_problem`) carry over.
 pub fn reapply(config: &Config, changes: &[FieldChange]) -> Result<Config> {
-    let mut value = toml::Value::try_from(config).context("could not read the settings")?;
+    let mut value = config_value(config).context("could not read the settings")?;
     for change in changes {
         change_value(&mut value, change)?;
     }
@@ -506,7 +514,7 @@ fn change_value(root: &mut toml::Value, change: &FieldChange) -> Result<()> {
 /// instead and says so. Leaf changes are left alone: a typed value wins over an
 /// older one.
 pub fn guard_whole_values(changes: Vec<FieldChange>, before: &Config) -> Result<Vec<FieldChange>> {
-    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
+    let mut before = config_value(before).context("could not read the old settings")?;
     blank_secrets(&mut before);
     Ok(changes
         .into_iter()
@@ -530,7 +538,7 @@ pub fn guard_whole_values(changes: Vec<FieldChange>, before: &Config) -> Result<
 /// rather than overwritten with the stale old one. A removal cannot be
 /// conditional and stays as it is.
 pub fn guard_every_value(changes: Vec<FieldChange>, before: &Config) -> Result<Vec<FieldChange>> {
-    let mut before = toml::Value::try_from(before).context("could not read the old settings")?;
+    let mut before = config_value(before).context("could not read the old settings")?;
     blank_secrets(&mut before);
     Ok(changes
         .into_iter()
@@ -604,7 +612,7 @@ fn effective_on_disk(text: &str, changes: &[FieldChange]) -> Option<toml::Value>
     {
         return None;
     }
-    let mut value = toml::Value::try_from(Config::parse_or_default(text)).ok()?;
+    let mut value = config_value(&Config::parse_or_default(text)).ok()?;
     blank_secrets(&mut value);
     Some(value)
 }
@@ -1019,6 +1027,23 @@ pub fn shutting_down() -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `config_value` (through text) must give the same tree as serializing the
+    /// config straight to a `toml::Value`, for the default config and for one with
+    /// a non-default `f32`, whose shortest form reads back as the same `f32`.
+    #[test]
+    fn config_value_matches_a_direct_value() {
+        let mut config = Config::default();
+        let direct = toml::Value::try_from(&config).unwrap();
+        assert_eq!(config_value(&config).unwrap(), direct);
+        config.ui.text_scale = 1.5;
+        let direct = toml::Value::try_from(&config).unwrap();
+        assert_eq!(config_value(&config).unwrap(), direct);
+        config.ui.text_scale = 1.1;
+        let via_text = config_value(&config).unwrap();
+        let scale = via_text["ui"]["text_scale"].as_float().unwrap();
+        assert_eq!(scale as f32, 1.1_f32);
+    }
 
     /// A hand-edited file: comments of every kind, an unknown key and table, an
     /// inline table, an array, and values in a non-default order.
