@@ -701,6 +701,7 @@ mod driver {
             card.hide();
             palette.hide();
             crate::ui::overlay::gallery_png(variant.theme, variant.dpi.unwrap_or(96), path)?;
+            return Ok(card.hwnd());
         } else if matches!(
             state,
             GalleryState::TrayMenu | GalleryState::TrayMenuSubmenu

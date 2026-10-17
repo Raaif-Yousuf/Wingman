@@ -60,24 +60,6 @@ fn is_empty(r: &ScreenRect) -> bool {
     r.left >= r.right || r.top >= r.bottom
 }
 
-/// The box around all of `rects`, ignoring empty ones. `None` if none count.
-fn bounds(rects: &[ScreenRect]) -> Option<ScreenRect> {
-    rects
-        .iter()
-        .filter(|r| !is_empty(r))
-        .fold(None, |acc: Option<ScreenRect>, r| {
-            Some(match acc {
-                None => *r,
-                Some(a) => ScreenRect {
-                    left: a.left.min(r.left),
-                    top: a.top.min(r.top),
-                    right: a.right.max(r.right),
-                    bottom: a.bottom.max(r.bottom),
-                },
-            })
-        })
-}
-
 /// A rect of `size` with its left edge at `left` and top edge at `top`.
 fn at(left: i32, top: i32, size: (i32, i32)) -> ScreenRect {
     ScreenRect {
@@ -99,6 +81,8 @@ fn clamp_span(v: i32, len: i32, lo: i32, hi: i32) -> i32 {
 }
 
 /// Places each label above, then right, then below, then left of its anchor.
+/// A mark that runs over a line break is placed at its first line, where the
+/// reader starts; every line still keeps labels off it.
 /// A candidate is taken if it is inside the monitor (moved inward along the
 /// anchor's edge first, so a label near a monitor edge is not lost), does not
 /// cover any annotation's anchor, and does not overlap a label already
@@ -115,7 +99,8 @@ pub fn place_labels(requests: &[Request], monitor: ScreenRect, gap: i32) -> Layo
     let mut dropped = Vec::new();
     for (index, req) in requests.iter().enumerate() {
         let size = req.size;
-        let Some(b) = bounds(&req.anchors).filter(|_| size.0 > 0 && size.1 > 0) else {
+        let first = req.anchors.iter().find(|r| !is_empty(r));
+        let Some(b) = first.copied().filter(|_| size.0 > 0 && size.1 > 0) else {
             dropped.push(index);
             continue;
         };
@@ -316,6 +301,30 @@ mod tests {
         };
         let l = place(&[two], MON);
         assert_eq!(l.placed[0].rect, r(100, 76, 150, 96));
+    }
+
+    #[test]
+    fn a_two_line_mark_gets_its_label_at_the_first_line() {
+        // The first line ends far to the right of where the second starts.
+        let first = r(500, 100, 700, 112);
+        let second = r(100, 116, 160, 128);
+        let two = Request {
+            anchors: vec![first, second],
+            size: (50, 20),
+        };
+        let l = place(&[two], MON);
+        assert_eq!(l.placed[0].side, Side::Above);
+        assert_eq!(l.placed[0].rect, r(500, 76, 550, 96));
+    }
+
+    #[test]
+    fn the_first_line_is_the_first_one_with_any_area() {
+        let two = Request {
+            anchors: vec![r(5, 5, 5, 9), r(300, 100, 400, 112), r(100, 116, 160, 128)],
+            size: (50, 20),
+        };
+        let l = place(&[two], MON);
+        assert_eq!(l.placed[0].rect, r(300, 76, 350, 96));
     }
 
     #[test]
