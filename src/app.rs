@@ -1034,13 +1034,18 @@ pub fn run() -> Result<()> {
         }
         _ => false,
     };
+    // Non-fatal: without it the card still auto-dismisses on its timer.
+    // Installed before the welcome card so that card can be armed (#906).
+    app.watcher = ClickWatcher::install(hwnd).ok();
+
     if welcome {
         let (headline, detail) = welcome_card(&chord_to_string(&app.config.hotkeys.secondary));
         app.card.show_settings_needed(&headline, &detail);
     }
-
-    // Non-fatal: without it the card still auto-dismisses on its timer.
-    app.watcher = ClickWatcher::install(hwnd).ok();
+    // Any startup card above (welcome or a key problem) persists until dismissed.
+    if !matches!(app.card.state(), crate::ui::card::CardState::Hidden) {
+        app.set_watch(true);
+    }
 
     // Hand the App to the window proc. It stays alive until WM_DESTROY.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize) };
@@ -2847,6 +2852,7 @@ impl App {
                     self.track_error("Couldn't open the region selector", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't open the region selector", &detail);
+                self.set_watch(true);
                 return;
             }
         };
@@ -2880,6 +2886,7 @@ impl App {
                 let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't copy the region", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -5188,6 +5195,7 @@ impl App {
     fn show_tray_restore_error(&mut self, error: Option<String>) {
         if let Some(e) = error {
             self.card.show_error("Couldn't restore the tray icon", &e);
+            self.set_watch(true);
         }
     }
 
@@ -5795,6 +5803,7 @@ impl App {
     fn on_taskbar_created(&mut self) {
         if let Some(e) = self.try_restore_tray_icon() {
             self.card.show_error("Couldn't restore the tray icon", &e);
+            self.set_watch(true);
         }
     }
 
@@ -5938,6 +5947,7 @@ impl App {
                 let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't import the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -5957,6 +5967,7 @@ impl App {
                 let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't import the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -6000,6 +6011,7 @@ impl App {
                 let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't export the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -14105,6 +14117,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #906: the persistent error cards outside the setup helper must also arm
+    /// click-away, and the startup cards (welcome, key problems) need the
+    /// watcher installed before they are shown, then an arm after them.
+    #[test]
+    fn persistent_error_cards_arm_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let names = [
+            "show_tray_restore_error",
+            "on_taskbar_created",
+            "copy_region",
+            "commit_import",
+            "export_action",
+        ];
+        for name in names {
+            let body = body_of(name);
+            assert!(body.contains(".show_error"), "{name}: no error card found");
+            assert!(
+                body.contains("set_watch(true)"),
+                "{name} shows a persistent error card without arming click-away"
+            );
+        }
+        // Startup: install, then the cards, then arm if any card is up.
+        let run_start = production.find("pub fn run()").expect("run not found");
+        let run = &production[run_start..];
+        let install = run.find("ClickWatcher::install").expect("no install");
+        let welcome = run.find("welcome_card(").expect("no welcome card");
+        let arm = run.find("app.set_watch(true)").expect("no startup arm");
+        assert!(
+            install < welcome,
+            "the watcher is installed after the welcome card"
+        );
+        assert!(
+            welcome < arm,
+            "the startup arm comes before the welcome card"
+        );
     }
 
     #[test]
