@@ -505,12 +505,12 @@ pub fn run() -> Result<()> {
     // safe side.
     let config_existed = Config::path().map(|p| p.exists()).unwrap_or(true);
     // #924: a load that failed (the first-run file could not be written) runs
-    // on defaults, and the card below says why. Env keys still apply.
+    // on default settings (Auto mode, stored and env keys still loaded) and the
+    // card below says why.
     let (config, create_failed) = match Config::load() {
         Ok(config) => (config, None),
         Err(e) => {
-            let mut config = Config::default();
-            config.apply_env_overrides();
+            let config = Config::defaults_after_failed_load();
             let folder = Config::path()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.display().to_string()))
@@ -891,7 +891,7 @@ fn settings_create_failed_card(folder: &str, error: &str) -> (String, String) {
         "Settings file not created".to_string(),
         format!(
             "Wingman could not create its settings file in {folder}{cause}. It is using default \
-             settings for this session, so a key you paste in Settings will not be kept. Fix the \
+             settings (Auto mode) for this session, so a key you paste in Settings will not be kept. Fix the \
              folder, then restart Wingman."
         ),
     )

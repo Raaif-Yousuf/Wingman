@@ -1068,6 +1068,24 @@ impl Config {
         }
     }
 
+    /// #924: the config used for a session when [`Config::load`] failed (the
+    /// first-run file could not be created). Default settings, so Mode is Auto,
+    /// but with the stored keys and the env keys read the way `load` reads
+    /// them: without them a later save would see empty key fields and delete
+    /// the user's stored credentials.
+    pub fn defaults_after_failed_load() -> Config {
+        Self::defaults_after_failed_load_with(&CredManagerStore, &|name| std::env::var(name).ok())
+    }
+
+    fn defaults_after_failed_load_with(
+        store: &dyn SecretStore,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Config {
+        let mut config = Config::default();
+        config.hydrate_secrets(store);
+        config.apply_overrides_from(lookup);
+        config
+    }
     /// Moves any non-empty `api_key` out of `self` and into `store` (target
     /// `Wingman/<provider>`), blanking the field here in memory. Returns
     /// whether anything was blanked, so the caller knows whether the file
@@ -3271,6 +3289,31 @@ structured = "prompt"
         );
     }
 
+    /// #924: the defaults used after a failed first-run load carry the stored
+    /// keys, and saving them never deletes a stored credential.
+    #[test]
+    fn defaults_after_a_failed_load_keep_stored_keys_and_a_save_never_deletes_them() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-stored").unwrap();
+        let config = Config::defaults_after_failed_load_with(&store, &|_| None);
+        assert_eq!(config.providers.openai.api_key, "sk-stored");
+        assert_eq!(config.mode, Mode::Auto);
+
+        let path = scratch_path("924-failed-load-save");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Whether this save is allowed or refused, the credential must stay.
+        let _ = config.save_with_store(&path, &store, &|_| false);
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-stored")
+        );
+        cleanup(&path);
+
+        let env = Config::defaults_after_failed_load_with(&store, &|n| {
+            (n == "ANTHROPIC_API_KEY").then(|| "sk-env".to_string())
+        });
+        assert_eq!(env.providers.anthropic.api_key, "sk-env");
+    }
     #[test]
     fn push_secrets_to_store_deletes_the_compat_credential_when_the_field_is_cleared() {
         let mut config = Config::default();
