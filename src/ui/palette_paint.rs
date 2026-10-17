@@ -50,6 +50,10 @@ const FOOTER_MARGIN_DP: i32 = SPACE_MD_DP;
 /// The scroll thumb is this wide, this far from the window's right edge and
 /// never shorter than this.
 const THUMB_WIDTH_DP: i32 = 4;
+/// The width while the pointer is over the strip: the thumb grows into the
+/// margin, its right edge fixed, and gets a track (#988). Eight dp reaches
+/// the rows' right edge and no further.
+const THUMB_HOT_WIDTH_DP: i32 = 8;
 const THUMB_EDGE_DP: i32 = SPACE_XS_DP;
 const THUMB_MIN_DP: i32 = 24;
 
@@ -87,6 +91,9 @@ pub(super) struct PaletteColors {
     pub(super) footer: u32,
     /// The scroll thumb shown when there are more rows than fit (#883).
     pub(super) thumb: u32,
+    /// The track behind a hot thumb (#988). `None` in high contrast, where a
+    /// tint would be a decoration.
+    pub(super) thumb_track: Option<u32>,
     /// The placeholder in an empty query box.
     pub(super) cue: u32,
     /// The fill of a row the mouse is over: quieter than the selection's.
@@ -120,6 +127,7 @@ pub(super) fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> Pale
             footer: t.text,
             cue: sys.gray_text,
             thumb: t.text,
+            thumb_track: None,
             hover_fill: t.surface,
             hover_outline: Some(t.text),
             selected_fill: sys.highlight,
@@ -142,6 +150,7 @@ pub(super) fn palette_colors(theme: Theme, sys: &SysColors, accent: u32) -> Pale
         footer: t.text_faint,
         cue: t.text_dim,
         thumb: t.text_faint,
+        thumb_track: Some(blend(t.surface, t.text, 7)),
         // Neutral tints of the text colour, as in a Windows 11 list: only the
         // bar carries the accent.
         hover_fill: blend(t.surface, t.text, 7),
@@ -290,7 +299,7 @@ pub(super) fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Optio
 /// list of `row_count` rows scrolled to `offset`. `None` when every row fits.
 /// It sits in the margin beside the rows, so it never covers a row's fill or
 /// text.
-pub(super) fn thumb_rect(dpi: u32, offset: usize, row_count: usize) -> Option<RECT> {
+pub(super) fn thumb_rect(dpi: u32, offset: usize, row_count: usize, hot: bool) -> Option<RECT> {
     let track = row_height(dpi) * MAX_VISIBLE_ROWS as i32;
     let (top, len) = crate::ui::palette_model::scroll_thumb(
         offset,
@@ -302,11 +311,33 @@ pub(super) fn thumb_rect(dpi: u32, offset: usize, row_count: usize) -> Option<RE
     let right = window_width(dpi) - px(THUMB_EDGE_DP, dpi);
     let top = list_top(dpi) + top;
     Some(rect(
-        right - px(THUMB_WIDTH_DP, dpi).max(2),
+        right
+            - px(
+                if hot {
+                    THUMB_HOT_WIDTH_DP
+                } else {
+                    THUMB_WIDTH_DP
+                },
+                dpi,
+            )
+            .max(2),
         top,
         right,
         top + len,
     ))
+}
+
+/// Whether the pointer at (`x`, `y`) is over the scroll thumb's strip (#988).
+/// It is the margin to the right of the rows, as tall as the list, and only
+/// when the list scrolls. Pure, so it is tested without a window.
+pub(super) fn thumb_hot_at(x: i32, y: i32, dpi: u32, row_count: usize) -> bool {
+    let top = list_top(dpi);
+    let bottom = top + row_height(dpi) * MAX_VISIBLE_ROWS as i32;
+    row_count > MAX_VISIBLE_ROWS
+        && x >= row_slot(dpi, 0).right
+        && x < window_width(dpi)
+        && y >= top
+        && y < bottom
 }
 
 /// Whether a line of text ends in an ellipsis when it is wider than its
@@ -437,6 +468,8 @@ pub(super) struct PaintInput<'a> {
     pub(super) offset: usize,
     pub(super) selected: usize,
     pub(super) hover: Option<usize>,
+    /// The pointer is over the scroll thumb's strip (#988).
+    pub(super) thumb_hot: bool,
     pub(super) footer: &'a str,
     pub(super) colors: &'a PaletteColors,
 }
@@ -555,7 +588,21 @@ pub(super) fn build_ops(dpi: u32, input: &PaintInput) -> Vec<Op> {
     }
 
     // #883: more rows than fit, so say where the viewport is.
-    if let Some(t) = thumb_rect(dpi, input.offset, input.rows.len()) {
+    if let Some(t) = thumb_rect(dpi, input.offset, input.rows.len(), input.thumb_hot) {
+        if let (true, Some(color)) = (input.thumb_hot, c.thumb_track) {
+            let top = list_top(dpi);
+            let track = rect(
+                t.left,
+                top,
+                t.right,
+                top + row_height(dpi) * MAX_VISIBLE_ROWS as i32,
+            );
+            ops.push(Op::FillRound {
+                rect: track,
+                radius: (t.right - t.left) / 2,
+                color,
+            });
+        }
         ops.push(Op::FillRound {
             rect: t,
             radius: (t.right - t.left) / 2,
@@ -611,6 +658,7 @@ mod tests {
                 offset,
                 selected,
                 hover,
+                thumb_hot: false,
                 footer: "Auto",
                 colors: &colors,
             },
@@ -845,13 +893,17 @@ mod tests {
     #[test]
     fn the_scroll_thumb_is_a_pill_inset_from_the_edge_and_clear_of_the_rows() {
         for dpi in DPIS {
-            let t = thumb_rect(dpi, 0, 40).unwrap();
+            let t = thumb_rect(dpi, 0, 40, false).unwrap();
             assert!(window_width(dpi) - t.right >= px(2, dpi), "dpi {dpi}");
             assert!(
                 t.left >= row_slot(dpi, 0).right,
                 "dpi {dpi}: clear of the rows"
             );
-            assert_eq!(thumb_rect(dpi, 0, MAX_VISIBLE_ROWS), None, "12 rows fit");
+            assert_eq!(
+                thumb_rect(dpi, 0, MAX_VISIBLE_ROWS, false),
+                None,
+                "12 rows fit"
+            );
             let rows = rows(40);
             let ops = ops_for(dpi, &rows, 0, 0, None);
             let pill = ops.iter().any(|op| {
@@ -860,6 +912,104 @@ mod tests {
             });
             assert!(pill, "dpi {dpi}: drawn rounded");
         }
+    }
+
+    #[test]
+    fn the_thumb_widens_into_the_margin_when_the_pointer_is_over_its_strip() {
+        for dpi in DPIS {
+            let rest = thumb_rect(dpi, 0, 40, false).unwrap();
+            let hot = thumb_rect(dpi, 0, 40, true).unwrap();
+            assert_eq!(hot.right, rest.right, "dpi {dpi}: the right edge stays put");
+            assert_eq!((hot.top, hot.bottom), (rest.top, rest.bottom), "dpi {dpi}");
+            assert!(
+                hot.right - hot.left > rest.right - rest.left,
+                "dpi {dpi}: wider"
+            );
+            assert!(
+                hot.left >= row_slot(dpi, 0).right,
+                "dpi {dpi}: still clear of the rows"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_margin_strip_beside_a_scrolling_list_is_hot() {
+        for dpi in DPIS {
+            let list = list_top(dpi) + row_height(dpi) * 3;
+            let strip_x = window_width(dpi) - px(2, dpi);
+            assert!(
+                thumb_hot_at(strip_x, list, dpi, 40),
+                "dpi {dpi}: in the strip"
+            );
+            assert!(
+                !thumb_hot_at(row_slot(dpi, 0).right - 1, list, dpi, 40),
+                "dpi {dpi}: a row is not the strip"
+            );
+            assert!(
+                !thumb_hot_at(strip_x, list_top(dpi) - 1, dpi, 40),
+                "dpi {dpi}: above the list"
+            );
+            assert!(
+                !thumb_hot_at(
+                    strip_x,
+                    list_top(dpi) + row_height(dpi) * MAX_VISIBLE_ROWS as i32,
+                    dpi,
+                    40
+                ),
+                "dpi {dpi}: below the list"
+            );
+            assert!(
+                !thumb_hot_at(strip_x, list, dpi, MAX_VISIBLE_ROWS),
+                "dpi {dpi}: nothing scrolls, so there is no thumb to widen"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hot_thumb_gets_a_track_behind_it_except_in_high_contrast() {
+        let rows = rows(40);
+        let build = |theme: Theme, hot: bool| {
+            let colors = colors(theme);
+            build_ops(
+                96,
+                &PaintInput {
+                    rows: &rows,
+                    offset: 0,
+                    selected: 0,
+                    hover: None,
+                    thumb_hot: hot,
+                    footer: "Auto",
+                    colors: &colors,
+                },
+            )
+        };
+        let track_of = |ops: &[Op], theme: Theme| {
+            let c = colors(theme);
+            ops.iter().any(|op| {
+                matches!(op, Op::FillRound { color, rect, .. }
+                    if Some(*color) == c.thumb_track && rect.bottom - rect.top > 200)
+            })
+        };
+        assert!(
+            !track_of(&build(Theme::Dark, false), Theme::Dark),
+            "not hot"
+        );
+        assert!(
+            track_of(&build(Theme::Dark, true), Theme::Dark),
+            "hot, dark"
+        );
+        assert!(
+            track_of(&build(Theme::Light, true), Theme::Light),
+            "hot, light"
+        );
+        let hc = build(Theme::HighContrast, true);
+        assert_eq!(colors(Theme::HighContrast).thumb_track, None);
+        let widened = thumb_rect(96, 0, 40, true).unwrap();
+        assert!(
+            hc.iter()
+                .any(|op| matches!(op, Op::FillRound { rect, .. } if *rect == widened)),
+            "high contrast still widens, without a track"
+        );
     }
 
     #[test]
@@ -926,6 +1076,7 @@ mod tests {
                     offset: 0,
                     selected: 2,
                     hover: Some(1),
+                    thumb_hot: false,
                     footer: "",
                     colors: &colors,
                 },
@@ -969,6 +1120,7 @@ mod tests {
                     offset: 0,
                     selected: 0,
                     hover: Some(1),
+                    thumb_hot: false,
                     footer: "x",
                     colors: &c,
                 },
@@ -1027,7 +1179,7 @@ mod tests {
             let long = "x".repeat(90);
             let mut list = vec![Row::Header(long.clone()), Row::Hint(long.clone())];
             list.extend((0..30).map(|i| action(&format!("{long} {i}"))));
-            let thumb = thumb_rect(dpi, 0, list.len()).expect("a thumb");
+            let thumb = thumb_rect(dpi, 0, list.len(), false).expect("a thumb");
             let ops = build_ops(
                 dpi,
                 &PaintInput {
@@ -1035,6 +1187,7 @@ mod tests {
                     offset: 0,
                     selected: 2,
                     hover: None,
+                    thumb_hot: false,
                     footer: &long,
                     colors: &c,
                 },

@@ -98,6 +98,7 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
             | PaletteHover
             | PaletteLong
             | PaletteLongScrolled
+            | PaletteLongThumbHot
             | PaletteLongName
     )
 }
@@ -257,6 +258,8 @@ pub enum GalleryState {
     PaletteLong,
     /// #883: the same list scrolled to the end: the thumb at the bottom.
     PaletteLongScrolled,
+    /// The scroll thumb widened, as with the pointer over its strip (#988).
+    PaletteLongThumbHot,
     /// #1000: an action name and a footer line far wider than the row: both
     /// end in an ellipsis, clear of the scroll thumb.
     PaletteLongName,
@@ -317,6 +320,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteNoModel,
         PaletteLong,
         PaletteLongScrolled,
+        PaletteLongThumbHot,
         PaletteLongName,
         PaletteHover,
         SettingsGeneral,
@@ -368,6 +372,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteNoModel => "palette-no-model",
         PaletteLong => "palette-long",
         PaletteLongScrolled => "palette-long-scrolled",
+        PaletteLongThumbHot => "palette-long-thumb-hot",
         PaletteLongName => "palette-long-name",
         PaletteHover => "palette-hover",
         SettingsGeneral => "settings-general",
@@ -1107,7 +1112,7 @@ mod driver {
                     crate::ui::palette_model::footer_line("Auto", Some("openai:gpt-5.5")),
                 );
             }
-            PaletteLong | PaletteLongScrolled => {
+            PaletteLong | PaletteLongScrolled | PaletteLongThumbHot => {
                 card.hide();
                 palette.hide();
                 palette.show(
@@ -1117,6 +1122,9 @@ mod driver {
                 );
                 if state == PaletteLongScrolled {
                     palette.scroll_for_test(i32::MAX);
+                }
+                if state == PaletteLongThumbHot {
+                    palette.set_thumb_hot_for_test(true);
                 }
             }
             PaletteLongName => {
@@ -1184,7 +1192,7 @@ mod driver {
         }
         Ok(match state {
             PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover | PaletteLong
-            | PaletteLongScrolled | PaletteLongName => palette.hwnd(),
+            | PaletteLongScrolled | PaletteLongThumbHot | PaletteLongName => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
                 .map(|o| o.hwnd())
@@ -1704,7 +1712,7 @@ mod tests {
                 palette_states += 1;
             }
         }
-        assert_eq!(palette_states, 7, "the test must see every palette state");
+        assert_eq!(palette_states, 8, "the test must see every palette state");
     }
 
     /// #987: the Direct2D picture sits next to the GDI one, same name plus
@@ -1734,7 +1742,7 @@ mod tests {
             );
             palette_states += usize::from(n.starts_with("palette-"));
         }
-        assert_eq!(palette_states, 7, "the test must see every palette state");
+        assert_eq!(palette_states, 8, "the test must see every palette state");
     }
 
     #[test]
@@ -1819,8 +1827,8 @@ mod tests {
         // key-rejected setup card (#1020) = 37, + the Settings states going
         // from four to one per page and the prompt open (#872) = 39, + the
         // Models page with Claude active and with every provider shown (#874)
-        // = 41.
-        assert_eq!(states.len(), 41);
+        // = 41, + the palette with a widened thumb (#988) = 42.
+        assert_eq!(states.len(), 42);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(

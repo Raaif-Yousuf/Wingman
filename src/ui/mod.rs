@@ -11,6 +11,7 @@ mod palette_paint;
 pub(crate) mod pending_status;
 pub(crate) mod preview;
 pub mod region;
+pub(crate) mod round_rect;
 pub(crate) mod send_gate;
 pub mod settings;
 mod settings_models;
