@@ -786,6 +786,7 @@ fn watch(
         }
     };
     let mut pending = Pending::default();
+    let mut resynced = false;
     let mut tries: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     loop {
         let timeout = wait_millis(pending.wait(Instant::now()));
@@ -855,6 +856,7 @@ fn watch(
             &stopped,
         ) {
             Ok(busy) => {
+                resynced = false;
                 // The tray shows this count; read here, off the UI thread.
                 if !stopped() {
                     ingest::publish_indexed_files(&store, &root);
@@ -875,10 +877,42 @@ fn watch(
                 }
             }
             Err(e) => {
+                // #1158: a store whose file went bad fails the work in flight
+                // (a corrupt read, or a root id that the fresh file does not
+                // have). That is the swap, not the end of the watch: take the
+                // swap path above (read the root again, rescan the folder).
+                // Once only: a store that stays broken must still end it.
+                if !resynced && (matches!(e, StoreError::Corrupt(_)) || swap_signalled(&swapped)) {
+                    resynced = true;
+                    #[cfg(test)]
+                    RESYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // SAFETY: the handle stays open while `swapped` lives.
+                    unsafe {
+                        let _ = SetEvent(swapped.0);
+                    }
+                    continue;
+                }
                 store::report(&e);
                 return;
             }
         }
+    }
+}
+
+/// Test-only: how many times a failed store call was turned into a resync.
+#[cfg(test)]
+static RESYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when the store has replaced its file since the swap path last ran. The
+/// event is auto-reset, so looking consumes it: it is set again for the loop.
+fn swap_signalled(swapped: &StopEvent) -> bool {
+    // SAFETY: the handle is a live event owned by the caller's `Arc`.
+    unsafe {
+        let signalled = WaitForSingleObject(swapped.0, 0) == WAIT_OBJECT_0;
+        if signalled {
+            let _ = SetEvent(swapped.0);
+        }
+        signalled
     }
 }
 
@@ -1545,6 +1579,53 @@ mod tests {
         wait_for("b.md indexed", Duration::from_secs(10), || {
             store.fts_hits("swapsecondword").unwrap_or(0) == 1
         });
+        drop(watcher);
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&db_dir);
+    }
+
+    /// #1158: the file goes bad while the watcher is idle, and the first thing
+    /// to read it is the watcher's own work on a changed file. That read fails
+    /// with a corrupt error (or, once the store has healed itself, with a
+    /// stale root id). Neither may end the watch: it must read its root again
+    /// and index the folder into the fresh file, including the new file.
+    #[test]
+    fn the_watcher_survives_its_own_read_hitting_the_damaged_store() {
+        let dir = scratch("live-hit");
+        let db_dir = scratch("live-hit-db");
+        let store = Arc::new(Store::open_for_test(&db_dir.join("wingman.db")).unwrap());
+        let for_thread = Arc::clone(&store);
+        let watcher = start_with(&dir.to_string_lossy(), move || Ok(for_thread))
+            .unwrap()
+            .expect("a thread starts for a set folder");
+
+        fs::write(dir.join("a.md"), "# A\nhitfirstword here\n").unwrap();
+        wait_for("a.md indexed", Duration::from_secs(10), || {
+            store.fts_hits("hitfirstword").unwrap_or(0) == 1
+        });
+        // Let the watcher finish what it was doing for a.md before the damage.
+        std::thread::sleep(Duration::from_millis(500));
+
+        store.damage_file_for_test();
+        // One read elsewhere (a card, an ask) meets the damage and records it;
+        // the heal itself waits for the next use of the store, which is the
+        // watcher's own work on b.md, so the swap lands in the middle of it.
+        assert!(store.fts_hits("hitfirstword").is_err());
+        fs::write(dir.join("b.md"), "# B\nhitsecondword here\n").unwrap();
+        // Do not touch the store from this thread (a poll would heal it first):
+        // the watcher acts after its quiet period and is the one to heal it.
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(1500));
+
+        wait_for("both files indexed again", Duration::from_secs(20), || {
+            store.fts_hits("hitfirstword").unwrap_or(0) == 1
+                && store.fts_hits("hitsecondword").unwrap_or(0) == 1
+        });
+        assert!(watcher.is_running(), "the watch must still be running");
+        assert!(
+            RESYNCS.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the watcher must have recovered through its own failed call"
+        );
         drop(watcher);
         drop(store);
         let _ = fs::remove_dir_all(&dir);
