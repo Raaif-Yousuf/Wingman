@@ -70,6 +70,7 @@ pub fn follows_variants(state: GalleryState) -> bool {
         PaletteDefault
             | PaletteNoMatches
             | PaletteNoModel
+            | PaletteHover
             | SettingsTop
             | SettingsBottom
             | SettingsAdvancedTop
@@ -84,7 +85,10 @@ pub fn follows_variants(state: GalleryState) -> bool {
 #[cfg(any(test, debug_assertions))]
 pub fn prints_with_wm_print(state: GalleryState) -> bool {
     use GalleryState::*;
-    matches!(state, PaletteDefault | PaletteNoMatches | PaletteNoModel)
+    matches!(
+        state,
+        PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover
+    )
 }
 
 /// Whether a state follows `--theme` but not `--dpi`: the palette can be drawn
@@ -94,7 +98,10 @@ pub fn prints_with_wm_print(state: GalleryState) -> bool {
 #[cfg(any(test, debug_assertions))]
 pub fn follows_theme_only(state: GalleryState) -> bool {
     use GalleryState::*;
-    matches!(state, PaletteDefault | PaletteNoMatches | PaletteNoModel)
+    matches!(
+        state,
+        PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover
+    )
 }
 
 /// Whether a state follows `--dpi` but not `--theme`: Settings can be laid out
@@ -215,6 +222,8 @@ pub enum GalleryState {
     PaletteDefault,
     PaletteNoMatches,
     PaletteNoModel,
+    /// #882: the mouse over a row other than the selected one.
+    PaletteHover,
     /// Issue #560: the Settings window from a default config, Advanced
     /// collapsed, scrolled to the top / bottom.
     SettingsTop,
@@ -258,6 +267,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         PaletteDefault,
         PaletteNoMatches,
         PaletteNoModel,
+        PaletteHover,
         SettingsTop,
         SettingsBottom,
         SettingsAdvancedTop,
@@ -298,6 +308,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         PaletteDefault => "palette-default",
         PaletteNoMatches => "palette-no-matches",
         PaletteNoModel => "palette-no-model",
+        PaletteHover => "palette-hover",
         SettingsTop => "settings-top",
         SettingsBottom => "settings-bottom",
         SettingsAdvancedTop => "settings-advanced-top",
@@ -922,6 +933,14 @@ mod driver {
                 palette.hide();
                 palette.show(free_palette_catalogue(), false, "mode: Auto".to_string());
             }
+            PaletteHover => {
+                card.hide();
+                palette.hide();
+                palette.show(free_palette_catalogue(), true, "mode: Auto".to_string());
+                // Row 0 is the "Answer" header, row 1 the selected action:
+                // the hovered one is the action under it.
+                palette.set_hover_for_test(Some(2));
+            }
             RegionOverlay => {
                 card.hide();
                 palette.hide();
@@ -945,7 +964,7 @@ mod driver {
             }
         }
         Ok(match state {
-            PaletteDefault | PaletteNoMatches | PaletteNoModel => palette.hwnd(),
+            PaletteDefault | PaletteNoMatches | PaletteNoModel | PaletteHover => palette.hwnd(),
             RegionOverlay => region
                 .as_ref()
                 .map(|o| o.hwnd())
@@ -1157,7 +1176,7 @@ mod tests {
                 palette_states += 1;
             }
         }
-        assert_eq!(palette_states, 3, "the test must see every palette state");
+        assert_eq!(palette_states, 4, "the test must see every palette state");
     }
 
     #[test]
@@ -1172,7 +1191,7 @@ mod tests {
             );
             palette_states += usize::from(n.starts_with("palette-"));
         }
-        assert_eq!(palette_states, 3, "the test must see every palette state");
+        assert_eq!(palette_states, 4, "the test must see every palette state");
     }
 
     #[test]
@@ -1251,8 +1270,9 @@ mod tests {
         // the error title) + the expanded answer, with and without link
         // focus = 15 card states, + 4 options card states (#307) + 3 palette
         // states + 4 settings states (#560) + the region overlay (#580) + the
-        // welcome card (#831) = 28, + the two setup cards (#885) = 30.
-        assert_eq!(states.len(), 30);
+        // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
+        // hovered palette (#882) = 31.
+        assert_eq!(states.len(), 31);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
