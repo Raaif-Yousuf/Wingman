@@ -674,6 +674,7 @@ mod tests {
             group: None,
             requires_model: true,
             effect: crate::ui::palette_model::Effect::None,
+            takes_text: false,
         }
     }
 

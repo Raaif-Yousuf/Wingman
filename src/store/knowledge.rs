@@ -41,39 +41,56 @@ pub struct ChunkHit {
     pub text: String,
     pub span: Option<String>,
     pub rel_path: String,
+    /// The chunk's text hash (hex), for the egress label.
+    pub text_hash: String,
 }
 
 impl Store {
     /// The best `limit` chunks for an FTS5 `MATCH` expression, best first
-    /// (`bm25`), from enabled roots only. The caller builds `fts_query` from
+    /// (`bm25`), from the enabled root at `root_path` only. The caller builds `fts_query` from
     /// quoted terms (`knowledge::retrieve::fts_query`), never from raw text.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn search_chunks(
         &self,
+        root_path: &str,
         fts_query: &str,
         limit: usize,
     ) -> Result<Vec<ChunkHit>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT c.doc_id, c.ordinal, c.text, c.span, d.rel_path
+            "SELECT c.doc_id, c.ordinal, c.text, c.span, d.rel_path, c.text_hash
              FROM chunk_fts
              JOIN chunk c ON c.id = chunk_fts.rowid
              JOIN document d ON d.id = c.doc_id
              JOIN knowledge_root r ON r.id = d.root_id
-             WHERE chunk_fts MATCH ?1 AND r.enabled = 1
+             WHERE chunk_fts MATCH ?1 AND r.enabled = 1 AND r.path = ?3
              ORDER BY bm25(chunk_fts), c.id
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |r| {
+        let rows = stmt.query_map(params![fts_query, limit as i64, root_path], |r| {
             Ok(ChunkHit {
                 doc_id: r.get(0)?,
                 ordinal: r.get(1)?,
                 text: r.get(2)?,
                 span: r.get(3)?,
                 rel_path: r.get(4)?,
+                text_hash: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether any chunk of the enabled root at `root_path` is indexed: the
+    /// difference between "nothing indexed yet" and "nothing matched your question".
+    pub fn has_indexed_chunks(&self, root_path: &str) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunk c
+                JOIN document d ON d.id = c.doc_id
+                JOIN knowledge_root r ON r.id = d.root_id
+                WHERE r.enabled = 1 AND r.path = ?1)",
+            [root_path],
+            |r| r.get(0),
+        )?)
     }
 
     /// The id of the root at `path`, creating it as a `default` root if new.
@@ -129,6 +146,48 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One document of a root, by its relative path.
+    pub fn document_row(
+        &self,
+        root_id: i64,
+        rel_path: &str,
+    ) -> Result<Option<DocumentRow>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT id, rel_path, size, mtime_unix, content_hash, parser_ver, status, ingested_unix
+                 FROM document WHERE root_id = ?1 AND rel_path = ?2",
+                params![root_id, rel_path],
+                |r| {
+                    Ok(DocumentRow {
+                        id: r.get(0)?,
+                        rel_path: r.get(1)?,
+                        size: r.get(2)?,
+                        mtime_unix: r.get(3)?,
+                        content_hash: r.get(4)?,
+                        parser_ver: r.get(5)?,
+                        status: r.get(6)?,
+                        ingested_unix: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Moves a document to a new relative path in place: same row, same
+    /// chunks. `false` when there is no row at `from`, or one already at `to`
+    /// (nothing is changed then).
+    pub fn rename_document(&self, root_id: i64, from: &str, to: &str) -> Result<bool, StoreError> {
+        let changed = self.lock().execute(
+            "UPDATE document SET rel_path = ?3
+             WHERE root_id = ?1 AND rel_path = ?2
+               AND NOT EXISTS (SELECT 1 FROM document WHERE root_id = ?1 AND rel_path = ?3)",
+            params![root_id, from, to],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Creates or finds the document row for `rel_path` and sets its status

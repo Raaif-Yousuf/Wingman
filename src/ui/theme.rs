@@ -482,6 +482,12 @@ pub(crate) const CONTROL_RADIUS_DP: i32 = 4;
 /// Thickness of the accent line under a focused text box, in dp (the
 /// Windows 11 text box underline).
 pub(crate) const FOCUS_LINE_DP: i32 = 2;
+/// Height of a button, in dp (Windows 11 controls are 32 tall).
+pub(crate) const CONTROL_HEIGHT_DP: i32 = 32;
+/// Gap between stacked rows of a form, in dp.
+pub(crate) const FORM_ROW_GAP_DP: i32 = SPACE_MD_DP;
+/// Gap between a form label and its value, in dp.
+pub(crate) const LABEL_VALUE_GAP_DP: i32 = SPACE_SM_DP;
 /// The icon font on Windows 11, and the one it replaced, which Windows 10
 /// still has. Use [`icon_font_face`] to pick one.
 pub(crate) const FLUENT_ICON_FONT_FACE: &str = "Segoe Fluent Icons";

@@ -7,8 +7,8 @@
 //!
 //! [`Tray::new`] switches the icon to `NOTIFYICON_VERSION_4` via
 //! `NIM_SETVERSION` immediately after `NIM_ADD`. Under that version the
-//! shell sends semantic notifications (`NIN_SELECT` for activation via mouse
-//! *or* keyboard, `WM_CONTEXTMENU` for the menu gesture via mouse *or*
+//! shell sends semantic notifications (`NIN_SELECT` for a mouse activation,
+//! `NIN_KEYSELECT` for Enter or Space, `WM_CONTEXTMENU` for the menu gesture via mouse *or*
 //! keyboard) rather than only raw mouse messages, which is the documented,
 //! more robust way to handle the callback.
 //!
@@ -74,6 +74,24 @@ const GLYPH_SETTINGS: char = '\u{E713}';
 const GLYPH_COPY: char = '\u{E8C8}';
 const GLYPH_PLAY: char = '\u{E768}';
 const GLYPH_QUIT: char = '\u{E7E8}';
+
+/// `NIN_SELECT | NINF_KEY`: Enter or Space on the focused icon. The `windows`
+/// crate does not export it; the value is fixed by `shellapi.h`.
+const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
+
+/// The notification event of a `WM_APP_TRAY` message: the low word of
+/// `lParam` under `NOTIFYICON_VERSION_4` (the high word is the icon id).
+fn event_of(lparam: LPARAM) -> u32 {
+    (lparam.0 as u32) & 0xFFFF
+}
+
+/// Whether `event` is an activation of the icon: a left click, or `NIN_SELECT`
+/// / `NIN_KEYSELECT` (Enter and Space on the focused icon, #827). A press can
+/// deliver more than one of these; opening Settings is idempotent, so a
+/// duplicate only refocuses the window.
+fn is_activation(event: u32) -> bool {
+    event == WM_LBUTTONUP || event == NIN_SELECT || event == NIN_KEYSELECT
+}
 
 /// What a tray message asks for. See [`Tray::on_tray_message`].
 pub enum TrayEvent {
@@ -198,9 +216,7 @@ pub mod cmd {
     /// needs to be unique among menu items.
     pub const VERSION_LABEL: u32 = 1029;
 
-    /// Issue #202: "Set pause key" learn-mode item, the third sibling of
-    /// `SET_PRIMARY`/`SET_SECONDARY`. See `App::start_learning` in `app.rs`.
-    pub const SET_PAUSE: u32 = 1030;
+    // 1030 was "Set pause key", which moved to Settings, General (#873).
 
     /// Issue #124: builds a plain-text diagnostics report and copies it to
     /// the clipboard. See `App::copy_diagnostics` in `app.rs`.
@@ -353,9 +369,6 @@ pub struct Tray {
     /// parenthetical suffix is simply omitted.
     primary_label: String,
     secondary_label: String,
-    /// Display string for the pause-toggle binding (issue #202), or "not
-    /// set". Set via [`Tray::set_pause_binding`].
-    pause_label: String,
     /// Model lists and current-selection index for the two submenus. Set
     /// via [`Tray::set_models`]; empty until then, in which case the
     /// submenu shows a single greyed-out "none configured" entry.
@@ -441,7 +454,6 @@ impl Tray {
             instance,
             primary_label: String::new(),
             secondary_label: String::new(),
-            pause_label: String::new(),
             active_provider: Some(ActiveProvider::OpenAi),
             openai_models: Vec::new(),
             openai_current: None,
@@ -471,7 +483,6 @@ impl Tray {
     pub(crate) fn for_gallery(hwnd: HWND, instance: HINSTANCE) -> Self {
         let mut tray = Self::with_icon(hwnd, instance, HICON::default());
         tray.set_key_bindings("Win+Shift+F23", "Ctrl+Alt+K");
-        tray.set_pause_binding("Not set");
         tray.set_models(
             &["gpt-5".to_string(), "gpt-5-mini".to_string()],
             "gpt-5",
@@ -618,12 +629,6 @@ impl Tray {
         self.secondary_label = secondary.to_string();
     }
 
-    /// Display string for the "Set pause key" label (issue #202), e.g.
-    /// `hotkey::pause_binding_label(config.hotkeys.pause.as_ref())`.
-    pub fn set_pause_binding(&mut self, pause: &str) {
-        self.pause_label = pause.to_string();
-    }
-
     /// Populates the two model submenus. `*_current` marks which entry gets
     /// the radio check; a current model that is not in its list is still
     /// shown, appended at the end, so a hand-edited config.toml value is
@@ -736,7 +741,7 @@ impl Tray {
     /// (see `show_menu`). The caller reads who was in front BEFORE
     /// `on_tray_message` runs (#339).
     pub fn opens_menu(lparam: LPARAM) -> bool {
-        let event = (lparam.0 as u32) & 0xFFFF;
+        let event = event_of(lparam);
         event == WM_CONTEXTMENU || event == WM_RBUTTONUP
     }
 
@@ -745,9 +750,9 @@ impl Tray {
     /// [`TrayEvent::Menu`], so the caller can drop its borrow of the app
     /// before [`PreparedMenu::track`] pumps messages.
     pub fn on_tray_message(&mut self, lparam: LPARAM) -> TrayEvent {
-        let event = (lparam.0 as u32) & 0xFFFF;
+        let event = event_of(lparam);
         match event {
-            e if e == WM_LBUTTONUP || e == NIN_SELECT => TrayEvent::Command(cmd::OPEN_SETTINGS),
+            e if is_activation(e) => TrayEvent::Command(cmd::OPEN_SETTINGS),
             e if e == WM_CONTEXTMENU || e == WM_RBUTTONUP => {
                 self.snapshot_models();
                 match self.prepare_menu() {
@@ -925,14 +930,6 @@ impl Tray {
             cmd::SET_SECONDARY,
             "Set secondary key…",
             &self.secondary_label,
-            None,
-            !self.paused,
-        )?;
-        append_item_with(
-            setup,
-            cmd::SET_PAUSE,
-            "Set pause key…",
-            &self.pause_label,
             None,
             !self.paused,
         )?;
@@ -1748,6 +1745,32 @@ mod tests {
 
     use super::*;
 
+    /// #827: under `NOTIFYICON_VERSION_4` Enter and Space on the focused icon
+    /// arrive as `NIN_KEYSELECT`, not `NIN_SELECT`. Both, and the plain left
+    /// click, open Settings; the menu gestures and noise do not.
+    #[test]
+    fn keyboard_and_mouse_activation_share_one_mapping() {
+        assert!(is_activation(WM_LBUTTONUP));
+        assert!(is_activation(NIN_SELECT));
+        assert!(is_activation(NIN_KEYSELECT));
+        assert_eq!(NIN_KEYSELECT, 0x401, "WM_USER + 1, per shellapi.h");
+        assert!(!is_activation(WM_CONTEXTMENU));
+        assert!(!is_activation(WM_RBUTTONUP));
+        assert!(!is_activation(0));
+    }
+
+    #[test]
+    fn keyselect_in_the_low_word_of_lparam_opens_settings() {
+        // Event in the low word, icon id in the high word (v4 packing).
+        let lparam = LPARAM((((7u32) << 16) | NIN_KEYSELECT) as isize);
+        assert_eq!(
+            event_of(lparam),
+            NIN_KEYSELECT,
+            "the high word must not leak into the event"
+        );
+        assert!(is_activation(event_of(lparam)));
+    }
+
     // -- Version label (#317) ------------------------------------------------
 
     #[test]
@@ -1860,10 +1883,6 @@ mod tests {
             !item_is_greyed(hmenu_running, cmd::SET_SECONDARY),
             "SET_SECONDARY must not be greyed while running"
         );
-        assert!(
-            !item_is_greyed(hmenu_running, cmd::SET_PAUSE),
-            "SET_PAUSE must not be greyed while running"
-        );
         let _ = unsafe { DestroyMenu(hmenu_running) };
 
         tray.set_paused(true);
@@ -1877,10 +1896,6 @@ mod tests {
         assert!(
             item_is_greyed(hmenu_paused, cmd::SET_SECONDARY),
             "SET_SECONDARY must be greyed while paused"
-        );
-        assert!(
-            item_is_greyed(hmenu_paused, cmd::SET_PAUSE),
-            "SET_PAUSE must be greyed while paused"
         );
         let _ = unsafe { DestroyMenu(hmenu_paused) };
 
@@ -2097,10 +2112,7 @@ mod tests {
         assert_eq!(help, want);
 
         let setup = find_sub(&tree, "Providers and keys");
-        assert_eq!(
-            direct_ids(setup),
-            [cmd::SET_PRIMARY, cmd::SET_SECONDARY, cmd::SET_PAUSE]
-        );
+        assert_eq!(direct_ids(setup), [cmd::SET_PRIMARY, cmd::SET_SECONDARY]);
         let mut providers = Vec::new();
         ids_under(find_sub(setup, "Provider"), &mut providers);
         assert_eq!(providers.len(), ActiveProvider::ALL.len());
@@ -2378,7 +2390,6 @@ mod tests {
         assert!(!checked(&running, cmd::MODE_CLOUD));
         assert!(checked(&running, cmd::USE_GEMINI));
         assert!(!checked(&running, cmd::USE_OPENAI));
-        assert!(!grey(&running, cmd::SET_PAUSE));
         assert!(!grey(&running, cmd::QUICK_ASK));
         assert!(!grey(&running, cmd::WHAT_CAN_I_DO));
 
@@ -2386,7 +2397,6 @@ mod tests {
         for id in [
             cmd::SET_PRIMARY,
             cmd::SET_SECONDARY,
-            cmd::SET_PAUSE,
             cmd::QUICK_ASK,
             cmd::WHAT_CAN_I_DO,
             cmd::CALCULATE_SELECTION,
@@ -2742,7 +2752,6 @@ mod tests {
         ("COPY_LAST", cmd::COPY_LAST),
         ("SET_PRIMARY", cmd::SET_PRIMARY),
         ("SET_SECONDARY", cmd::SET_SECONDARY),
-        ("SET_PAUSE", cmd::SET_PAUSE),
         ("EDIT_SETTINGS", cmd::EDIT_SETTINGS),
         ("RELOAD", cmd::RELOAD),
         ("QUIT", cmd::QUIT),

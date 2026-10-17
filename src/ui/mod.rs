@@ -13,6 +13,7 @@ pub(crate) mod preview;
 pub mod region;
 pub(crate) mod send_gate;
 pub mod settings;
+mod settings_models;
 pub(crate) mod text;
 pub(crate) mod theme;
 pub mod tray;
