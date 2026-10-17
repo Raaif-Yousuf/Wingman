@@ -10046,7 +10046,7 @@ fn env_var_is_set(var: &str) -> bool {
     if let Some(set) = ENV_KEYS_SET.with(|c| c.borrow().clone()) {
         return set.contains(&var);
     }
-    std::env::var(var).is_ok()
+    crate::config::env_var_usable(var)
 }
 
 /// The key fields whose environment variable is set (#778): the variable wins
