@@ -442,7 +442,7 @@ fn index_file(
                 root_id,
                 file,
                 &stamp,
-                "the file could not be opened, permission was refused",
+                "the file could not be opened or read (permission refused or damaged)",
             );
         }
         Err(OpenFailure::Busy) => {
@@ -554,8 +554,20 @@ fn read_capped(path: &Path) -> Result<Vec<u8>, OpenFailure> {
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| open_failure(&e))?;
+        .map_err(|e| read_failure(&e))?;
     Ok(bytes)
+}
+
+/// A read that failed after the file opened. Only a sharing or lock violation
+/// (or a file gone since it was listed) is worth retrying at the next scan;
+/// any other read error (a damaged or EFS file) would repeat, so it is
+/// recorded as failed once and retried when the file changes.
+fn read_failure(e: &std::io::Error) -> OpenFailure {
+    match e.raw_os_error() {
+        Some(32 | 33) => OpenFailure::Busy,
+        _ if e.kind() == std::io::ErrorKind::NotFound => OpenFailure::Busy,
+        _ => OpenFailure::Denied,
+    }
 }
 
 #[cfg(test)]
@@ -931,6 +943,29 @@ mod tests {
     }
 
     #[test]
+    fn a_read_error_is_retried_only_when_the_file_is_in_use_or_gone() {
+        use std::io::{Error, ErrorKind};
+        for busy in [
+            Error::from_raw_os_error(32),
+            Error::from_raw_os_error(33),
+            Error::from(ErrorKind::NotFound),
+        ] {
+            assert_eq!(read_failure(&busy), OpenFailure::Busy, "{busy:?}");
+        }
+        for permanent in [
+            Error::from_raw_os_error(23),
+            Error::from(ErrorKind::InvalidData),
+            Error::from(ErrorKind::UnexpectedEof),
+        ] {
+            assert_eq!(
+                read_failure(&permanent),
+                OpenFailure::Denied,
+                "{permanent:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_file_denied_access_is_reported_once_and_not_on_the_next_scan() {
         let dir = scratch("denied");
         // Opening a folder as a file is refused with "access denied".
@@ -948,7 +983,7 @@ mod tests {
         assert!(matches!(first, Outcome::Failed), "denied is a failure");
         let (status, why) = store.document_state(root, "locked.md").unwrap().unwrap();
         assert_eq!(status, "failed");
-        assert!(why.unwrap().contains("permission"));
+        assert!(why.unwrap().contains("permission refused"));
         let known = store.documents_in_root(root).unwrap();
         let again = index_file(&store, root, &file, known.first(), FUT).unwrap();
         assert!(
@@ -1001,6 +1036,8 @@ mod tests {
     fn a_panic_in_the_scan_body_is_caught_and_ends_in_a_notice() {
         // Tests build with unwind; a release build aborts and the crash note
         // (crash_note.rs) covers that instead.
+        // The notice queue is process-wide and the start_scan tests fill it.
+        let _one_at_a_time = GLOBAL_STORE.lock().unwrap_or_else(|e| e.into_inner());
         let _ = notice::take();
         guarded(|| panic!("boom in the scan"));
         let text = notice::take().expect("a panic must leave a notice");
