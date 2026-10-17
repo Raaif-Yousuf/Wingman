@@ -109,6 +109,11 @@ pub const NO_MODEL_HINT: &str = "Add a model in Settings to unlock more actions.
 /// query matches no action at all. No em dash (rule 11).
 pub const NO_MATCHES_HINT: &str = "No matching actions. Press Esc to clear.";
 
+/// Shown above the pinned text actions when the line matches no action name.
+/// No em dash (rule 11).
+pub const NO_ACTION_MATCH_HINT: &str =
+    "No action matches. Press Down to ask your documents with this line.";
+
 // ---------------------------------------------------------------------------
 // Fuzzy scoring
 // ---------------------------------------------------------------------------
@@ -256,6 +261,12 @@ fn flat_ranked_rows(actions: &[PaletteAction], query: &str) -> Vec<Row> {
         .filter(|a| a.takes_text && !scored.iter().any(|(_, s)| s.id == a.id))
         .collect();
     pinned.sort_by(|a, b| a.name.cmp(&b.name));
+    // With no name match the pinned rows are the whole list. A hint comes
+    // first and [`PaletteState::new`] leaves nothing selected, so a mistyped
+    // action name plus Enter sends nothing.
+    if rows.is_empty() && !pinned.is_empty() {
+        rows.push(Row::Hint(NO_ACTION_MATCH_HINT.to_string()));
+    }
     rows.extend(pinned.into_iter().map(|a| Row::Action {
         id: a.id.clone(),
         name: a.name.clone(),
@@ -403,7 +414,13 @@ fn is_selectable(row: &Row) -> bool {
 
 impl PaletteState {
     pub fn new(rows: Vec<Row>) -> Self {
-        let selected = rows.iter().position(is_selectable).unwrap_or(0);
+        // Rule: a pinned text row is never pre-selected when no name matched
+        // (the list then starts with the hint), so Enter does nothing until
+        // the user presses Down. Otherwise the first action is selected.
+        let selected = match rows.first() {
+            Some(Row::Hint(h)) if h == NO_ACTION_MATCH_HINT => 0,
+            _ => rows.iter().position(is_selectable).unwrap_or(0),
+        };
         let offset = clamp_offset_to_selection(0, selected, rows.len(), MAX_VISIBLE_ROWS);
         Self {
             rows,
@@ -431,10 +448,20 @@ impl PaletteState {
         if selectable.is_empty() {
             return;
         }
-        let current_pos = selectable
-            .iter()
-            .position(|&i| i == self.selected)
-            .unwrap_or(0);
+        // Nothing selected (the cursor rests on a hint): Down lands on the
+        // first action, Up stays put.
+        let Some(current_pos) = selectable.iter().position(|&i| i == self.selected) else {
+            if delta > 0 {
+                self.selected = selectable[0];
+                self.offset = clamp_offset_to_selection(
+                    self.offset,
+                    self.selected,
+                    self.rows.len(),
+                    MAX_VISIBLE_ROWS,
+                );
+            }
+            return;
+        };
         let new_pos = (current_pos as i32 + delta).clamp(0, selectable.len() as i32 - 1);
         self.selected = selectable[new_pos as usize];
         self.offset = clamp_offset_to_selection(
@@ -954,7 +981,44 @@ mod tests {
         ];
         let rows = build_rows(&actions, "when did I start at Acme?", true);
         assert_eq!(ids(&rows), ["t"]);
+        assert_eq!(rows[0], Row::Hint(NO_ACTION_MATCH_HINT.to_string()));
+        assert!(!NO_ACTION_MATCH_HINT.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn a_pinned_row_is_not_preselected_when_no_name_matches() {
+        let actions = [
+            action("a", "Check my work", None, true),
+            text_action("t", "Ask my documents"),
+        ];
+        let mut state = PaletteState::new(build_rows(&actions, "wire money to X", true));
+        assert_eq!(state.selected_action_id(), None);
+        // Enter with nothing selected runs nothing.
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::None
+        );
+        // Up stays put, Down selects the pinned row, then Enter runs it.
+        handle_key(&mut state, PaletteKey::Up);
+        assert_eq!(state.selected_action_id(), None);
+        handle_key(&mut state, PaletteKey::Down);
+        assert_eq!(state.selected_action_id(), Some("t"));
+        assert_eq!(
+            handle_key(&mut state, PaletteKey::Enter),
+            PaletteOutcome::Run("t".to_string())
+        );
+    }
+
+    #[test]
+    fn with_name_matches_the_first_match_is_selected_and_pinned_rows_follow() {
+        let actions = [
+            action("a", "Ask a friend", None, true),
+            text_action("z", "Zebra answers"),
+        ];
+        let rows = build_rows(&actions, "friend", true);
         assert!(!rows.iter().any(|r| matches!(r, Row::Hint(_))));
+        let state = PaletteState::new(rows);
+        assert_eq!(state.selected_action_id(), Some("a"));
     }
 
     #[test]

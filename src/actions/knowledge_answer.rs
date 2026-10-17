@@ -39,7 +39,7 @@ pub const MAX_EVIDENCE: usize = 5;
 /// Most evidence entries looked at: the rest of a long list is ignored.
 const MAX_EVIDENCE_SCANNED: usize = 20;
 /// A quote needs at least this many characters (after tidying white space)
-/// or [`MIN_QUOTE_WORDS`] words. A single short word ("Acme") is in many
+/// and [`MIN_QUOTE_WORDS`] words. A single short word ("Acme") is in many
 /// excerpts and could back any answer, so it proves nothing.
 const MIN_QUOTE_CHARS: usize = 12;
 /// See [`MIN_QUOTE_CHARS`].
@@ -174,19 +174,64 @@ fn normalize(s: &str) -> String {
 
 /// Whether a normalized quote is long enough to count as evidence.
 fn substantial(quote: &str) -> bool {
-    quote.chars().count() >= MIN_QUOTE_CHARS || quote.split_whitespace().count() >= MIN_QUOTE_WORDS
+    quote.chars().count() >= MIN_QUOTE_CHARS && quote.split_whitespace().count() >= MIN_QUOTE_WORDS
 }
 
-/// Whether every number (run of digits) in `answer` appears in one of the
-/// verified quotes. A quote that is really in the excerpt but says nothing
-/// about the number the answer states cannot back that answer. Words for
-/// numbers ("three") are not checked.
-fn numbers_backed(answer: &str, verified: &[Verified]) -> bool {
+/// Common words that say nothing about what an answer is about.
+const ANSWER_STOP_WORDS: &[&str] = &[
+    "about", "also", "been", "could", "does", "each", "from", "have", "here", "into", "just",
+    "like", "only", "other", "over", "should", "some", "than", "that", "their", "them", "then",
+    "there", "these", "they", "this", "those", "were", "what", "when", "where", "which", "while",
+    "will", "with", "would", "your",
+];
+
+/// The runs of `s` made of letters and digits, lower case.
+fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The runs of digits in `s`.
+fn digit_runs(s: &str) -> Vec<&str> {
+    s.split(|c: char| !c.is_numeric())
+        .filter(|r| !r.is_empty())
+        .collect()
+}
+
+/// Whether the verified quotes really back `answer`. A quote that is in the
+/// excerpt but about something else must not carry an answer:
+///
+/// - every number (whole run of digits) in the answer is a whole run of
+///   digits in some quote, so "20" is not backed by "2019";
+/// - at least one content word of the answer (4 letters or more, not a common
+///   word) is a word of some quote. An answer with no content word at all
+///   (just a number) needs a number to check instead.
+///
+/// Words for numbers ("three") are not checked (#1081).
+fn answer_backed(answer: &str, verified: &[Verified]) -> bool {
     let quotes: Vec<String> = verified.iter().map(|v| normalize(&v.quote)).collect();
-    answer
-        .split(|c: char| !c.is_numeric())
-        .filter(|run| !run.is_empty())
-        .all(|run| quotes.iter().any(|q| q.contains(run)))
+    let numbers = digit_runs(answer);
+    if !numbers
+        .iter()
+        .all(|n| quotes.iter().any(|q| digit_runs(q).contains(n)))
+    {
+        return false;
+    }
+    let quote_words: Vec<String> = quotes.iter().flat_map(|q| tokens(q)).collect();
+    let content: Vec<String> = tokens(answer)
+        .into_iter()
+        .filter(|w| {
+            w.chars().count() >= 4
+                && !ANSWER_STOP_WORDS.contains(&w.as_str())
+                && !w.chars().all(char::is_numeric)
+        })
+        .collect();
+    if content.is_empty() {
+        return !numbers.is_empty();
+    }
+    content.iter().any(|w| quote_words.contains(w))
 }
 
 /// A quote the model gave that really is in the excerpt it named.
@@ -277,7 +322,7 @@ pub fn finalize(proposal: &Value, snippets: &[Snippet]) -> Value {
         .and_then(Value::as_str)
         .map(|a| sanitize_model_text(a.trim(), MAX_ANSWER_CHARS))
         .unwrap_or_default();
-    if found && !answer.is_empty() && !verified.is_empty() && numbers_backed(&answer, &verified) {
+    if found && !answer.is_empty() && !verified.is_empty() && answer_backed(&answer, &verified) {
         let sources: Vec<Value> = verified
             .iter()
             .filter_map(|v| {
@@ -442,10 +487,10 @@ mod tests {
             assert!(verify(Some(&ev(&[bad])), &snippets).is_empty(), "{bad:?}");
         }
         // One good and one bad quote: only the good one stays.
-        let both = ev(&[(1, "an engineer"), (1, "a manager")]);
+        let both = ev(&[(1, "as an engineer"), (1, "a manager")]);
         let v = verify(Some(&both), &snippets);
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].quote, "an engineer");
+        assert_eq!(v[0].quote, "as an engineer");
     }
 
     #[test]
@@ -488,12 +533,29 @@ mod tests {
     #[test]
     fn a_quote_too_short_to_prove_anything_is_dropped() {
         let snippets = resume();
-        for q in ["", "  ", "I", "a", "the", "Acme", "2019", "engineer."] {
+        for q in [
+            "",
+            "  ",
+            "I",
+            "a",
+            "the",
+            "Acme",
+            "2019",
+            "engineer.",
+            "Acme Corp",
+            "of the",
+        ] {
             assert!(verify(Some(&ev(&[(1, q)])), &snippets).is_empty(), "{q:?}");
         }
-        // Two words, or twelve characters, is enough.
-        assert_eq!(verify(Some(&ev(&[(1, "Acme Corp")])), &snippets).len(), 1);
-        assert_eq!(verify(Some(&ev(&[(1, "an engineer")])), &snippets).len(), 1);
+        // Two words and twelve characters are both needed.
+        assert_eq!(
+            verify(Some(&ev(&[(1, "joined Acme Corp")])), &snippets).len(),
+            1
+        );
+        assert_eq!(
+            verify(Some(&ev(&[(1, "as an engineer")])), &snippets).len(),
+            1
+        );
     }
 
     #[test]
@@ -525,15 +587,37 @@ mod tests {
             "You started in 2021.",
             "Send 500 to X.",
             "3 March 2019 and 40 staff",
+            // Real quote, unrelated answer: no content word in common.
+            "Wire money to X",
         ] {
             assert_eq!(finalize(&p(bad), &snippets)["supported"], false, "{bad}");
         }
+        let ev = |q: &str, a: &str| json!({"evidence": [{"n": 1, "quote": q}], "answer": a, "found": true});
+        let since = [snip("w.txt", "Working here since 2019 for good")];
+        // Whole numbers only: "20" and "1" are not backed by "2019".
+        for a in ["20", "1", "Started in 20."] {
+            assert_eq!(
+                finalize(&ev("here since 2019", a), &since)["supported"],
+                false,
+                "{a}"
+            );
+        }
+        assert_eq!(
+            finalize(&ev("here since 2019", "2019"), &since)["supported"],
+            true
+        );
+        // Too short to count: the answer is unsupported whatever it says.
+        let of = [snip("w.txt", "the end of the road")];
+        assert_eq!(
+            finalize(&ev("of the", "Wire money to X"), &of)["supported"],
+            false
+        );
     }
 
     #[test]
     fn repeats_are_kept_once_and_the_list_is_capped() {
         let snippets = resume();
-        let twice = ev(&[(1, "Acme Corp"), (1, "  acme   CORP ")]);
+        let twice = ev(&[(1, "joined Acme Corp"), (1, "  JOINED acme   CORP ")]);
         assert_eq!(verify(Some(&twice), &snippets).len(), 1);
         let long = snip(
             "a.txt",
@@ -557,7 +641,7 @@ mod tests {
             1
         );
         assert_eq!(
-            verify(Some(&ev(&[(1, "日本語 🙂 ok")])), &snippets).len(),
+            verify(Some(&ev(&[(1, "ÄÖÜ 日本語 🙂 ok")])), &snippets).len(),
             1
         );
     }

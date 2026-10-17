@@ -2955,6 +2955,18 @@ mod tests {
         pump_pending(p.hwnd());
         p.set_query_for_test("When did I start at Acme?");
         pump_pending(p.hwnd());
+        // No name matched: nothing is selected, so Enter alone would send
+        // nothing. Down selects the text action.
+        assert_eq!(p.selected_action_id(), None);
+        unsafe {
+            SendMessageW(
+                p.edit_hwnd(),
+                WM_KEYDOWN,
+                Some(WPARAM(VK_DOWN.0 as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+        pump_pending(p.hwnd());
         assert_eq!(p.selected_action_id().as_deref(), Some("ask-my-documents"));
         unsafe {
             SendMessageW(
