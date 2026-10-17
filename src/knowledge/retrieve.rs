@@ -97,7 +97,6 @@ pub struct Snippet {
 /// The top snippets for `question`, best first, at most [`MAX_SNIPPETS`].
 /// Empty when the question has no usable word or nothing matches. Blocking
 /// (one SQLite query): call it from a worker, never the UI thread.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn search(store: &Store, question: &str) -> Result<Vec<Snippet>, StoreError> {
     let Some(query) = fts_query(&query_terms(question)) else {
         return Ok(Vec::new());
@@ -232,7 +231,6 @@ const END_MARK: &str = "[end of documents]";
 /// never exceeds it. A snippet that does not fit whole is cut at a character
 /// boundary if enough of it fits, and nothing follows it. Label and text are
 /// masked again here, the last step before the text can leave the store.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn format_context(snippets: &[Snippet], budget_tokens: usize) -> Context {
     let mut remaining = budget_tokens
         .saturating_mul(4)

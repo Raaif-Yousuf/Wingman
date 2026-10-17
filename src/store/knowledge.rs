@@ -47,7 +47,6 @@ impl Store {
     /// The best `limit` chunks for an FTS5 `MATCH` expression, best first
     /// (`bm25`), from enabled roots only. The caller builds `fts_query` from
     /// quoted terms (`knowledge::retrieve::fts_query`), never from raw text.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub fn search_chunks(
         &self,
         fts_query: &str,
@@ -74,6 +73,20 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether any chunk of an enabled root is indexed: the difference
+    /// between "nothing indexed yet" and "nothing matched your question".
+    pub fn has_indexed_chunks(&self) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunk c
+                JOIN document d ON d.id = c.doc_id
+                JOIN knowledge_root r ON r.id = d.root_id
+                WHERE r.enabled = 1)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// The id of the root at `path`, creating it as a `default` root if new.

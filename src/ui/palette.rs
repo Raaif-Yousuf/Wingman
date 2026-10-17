@@ -190,8 +190,8 @@ const ID_PALETTE_PAGE_DOWN: i32 = 9107;
 const PALETTE_SUBCLASS_ID: usize = 1;
 
 /// Posted to the palette's owner window when Enter selects a runnable
-/// action. `lparam` is `Box::into_raw(Box::new(String))` (the selected
-/// action id) -- the receiver takes ownership and must reconstruct the
+/// action. `lparam` is `Box::into_raw(Box::new(PaletteRun))` (the selected
+/// action id and the typed line, #92) -- the receiver takes ownership and must reconstruct the
 /// `Box` to free it, the same boxed-payload idiom [`crate::hotkey::WM_APP_LEARNED`]
 /// uses. Adding another `WM_APP_*` constant anywhere in the crate also means
 /// adding it to `app.rs`'s `tests::ALL_WM_APP_IDS` (issue #163).
@@ -1653,7 +1653,11 @@ impl PaletteInner {
             crate::ui::palette_model::PaletteOutcome::Hide => self.hide(),
             crate::ui::palette_model::PaletteOutcome::Run(action_id) => {
                 if let Some(owner) = self.owner {
-                    let boxed = Box::into_raw(Box::new(action_id));
+                    let run = crate::ui::palette_model::PaletteRun {
+                        id: action_id,
+                        line: self.current_query(),
+                    };
+                    let boxed = Box::into_raw(Box::new(run));
                     unsafe {
                         if PostMessageW(
                             Some(owner),
@@ -2053,6 +2057,7 @@ mod tests {
                 group: Some("Study".to_string()),
                 requires_model: true,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
             PaletteAction {
                 id: "extract-text-to-clipboard".to_string(),
@@ -2060,6 +2065,7 @@ mod tests {
                 group: Some("Work".to_string()),
                 requires_model: false,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             },
         ]
     }
@@ -2752,6 +2758,52 @@ mod tests {
         assert!(p.selected_action_id().is_some());
     }
 
+    /// #92: the line typed in the query box travels with the action id. A
+    /// question matches no action name, so the action that takes text is the
+    /// only row, and Enter posts it with the whole line. The box is freed by
+    /// the receiver here, as `App` does.
+    #[test]
+    fn real_win32_enter_posts_the_typed_line_with_the_text_action() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        let owner = create_test_owner_window(inst);
+        p.set_owner(owner);
+        let mut actions = free_actions();
+        actions.push(PaletteAction {
+            id: "ask-my-documents".to_string(),
+            name: "Ask my documents".to_string(),
+            group: Some("Work".to_string()),
+            requires_model: true,
+            effect: crate::ui::palette_model::Effect::None,
+            takes_text: true,
+        });
+        p.show(actions, true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        p.set_query_for_test("When did I start at Acme?");
+        pump_pending(p.hwnd());
+        assert_eq!(p.selected_action_id().as_deref(), Some("ask-my-documents"));
+        unsafe {
+            SendMessageW(
+                p.edit_hwnd(),
+                WM_KEYDOWN,
+                Some(WPARAM(VK_RETURN.0 as usize)),
+                Some(LPARAM(0)),
+            );
+        }
+        pump_pending(p.hwnd());
+        let mut msg = MSG::default();
+        let got = unsafe { GetMessageW(&mut msg, Some(owner), 0, 0) };
+        assert!(got.as_bool(), "expected WM_APP_PALETTE_RUN to be queued");
+        assert_eq!(msg.message, WM_APP_PALETTE_RUN);
+        let run =
+            unsafe { *Box::from_raw(msg.lParam.0 as *mut crate::ui::palette_model::PaletteRun) };
+        assert_eq!(run.id, "ask-my-documents");
+        assert_eq!(run.line, "When did I start at Acme?");
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
     /// Real Win32 test (per the task's Done-when): creates the palette with
     /// a test-only class name, sets filter text through the real EDIT
     /// control, sends real VK_DOWN/VK_RETURN through the real subclass, and
@@ -2798,8 +2850,9 @@ mod tests {
         let got = unsafe { GetMessageW(&mut msg, Some(owner), 0, 0) };
         assert!(got.as_bool(), "expected WM_APP_PALETTE_RUN to be queued");
         assert_eq!(msg.message, WM_APP_PALETTE_RUN);
-        let action_id = unsafe { *Box::from_raw(msg.lParam.0 as *mut String) };
-        assert_eq!(Some(action_id.as_str()), after_down.as_deref());
+        let run =
+            unsafe { *Box::from_raw(msg.lParam.0 as *mut crate::ui::palette_model::PaletteRun) };
+        assert_eq!(Some(run.id.as_str()), after_down.as_deref());
 
         // Enter also hides the palette.
         assert!(!p.is_visible());
@@ -2877,8 +2930,9 @@ mod tests {
             "expected WM_APP_PALETTE_RUN to be queued by the click"
         );
         assert_eq!(msg.message, WM_APP_PALETTE_RUN);
-        let action_id = unsafe { *Box::from_raw(msg.lParam.0 as *mut String) };
-        assert_eq!(Some(action_id), hovered_action_id);
+        let run =
+            unsafe { *Box::from_raw(msg.lParam.0 as *mut crate::ui::palette_model::PaletteRun) };
+        assert_eq!(Some(run.id), hovered_action_id);
 
         // Click also hides the palette, same as Enter.
         assert!(!p.is_visible());
@@ -2964,6 +3018,7 @@ mod tests {
                 group: None,
                 requires_model: false,
                 effect: crate::ui::palette_model::Effect::None,
+                takes_text: false,
             })
             .collect()
     }
