@@ -369,6 +369,28 @@ fn foreground_keyboard_layout() -> usize {
     unsafe { GetKeyboardLayout(thread) }.0 as usize
 }
 
+/// The foreground window as an integer (`0` = none) and whether it belongs to
+/// this process (the card, the palette, Settings): the claim cannot follow
+/// either of those.
+fn foreground_window_and_ownership() -> (isize, bool) {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return (0, false);
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    (fg.0 as isize, pid == unsafe { GetCurrentProcessId() })
+}
+
+/// Whether a choice leaves the card up with its claim spent, so the claim must
+/// be put back. A choice that closes the card or runs an action ends the card
+/// and needs nothing.
+fn rearm_after(decided: &OptionsChoiceAction) -> bool {
+    matches!(decided, OptionsChoiceAction::Ignore)
+}
+
 /// #307: the card's buttons for a ranked shortlist: the action id each runs and
 /// the label it shows.
 fn option_rows(options: &[router::RouterOption]) -> Vec<OptionRow> {
@@ -1769,6 +1791,8 @@ impl App {
     /// does not run option 1 yet (the bare key still runs Check my work), so
     /// no row is drawn as the default.
     fn options_behavior(&self) -> OptionsBehavior {
+        // Read once: the claim follows this window for the card's whole life.
+        let (fg, fg_is_own) = foreground_window_and_ownership();
         OptionsBehavior {
             dismiss_secs: self.config.options.card_dismiss_secs(),
             // Off under a CJK input method: its digits pick candidates, so
@@ -1777,8 +1801,10 @@ impl App {
             claim_keys: options_keys::claim_enabled(
                 self.config.options.claim_keys,
                 foreground_keyboard_layout(),
+                options_keys::foreground_usable(fg, fg_is_own),
             ),
             key_runs_first: false,
+            foreground: fg,
         }
     }
 
@@ -2004,7 +2030,11 @@ impl App {
             // The hook spent the claim taking this key, but the card is still
             // up (stale generation, or the buttons were not there yet): put
             // the claim back so the hint on the card stays true.
-            OptionsChoiceAction::Ignore => self.card.rearm_options_claim(),
+            OptionsChoiceAction::Ignore => {
+                if rearm_after(&decided) {
+                    self.card.rearm_options_claim();
+                }
+            }
             OptionsChoiceAction::Close => self.close_options_card(),
             OptionsChoiceAction::Run(id) => {
                 self.close_options_card();
@@ -7142,14 +7172,15 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
             let chosen = menu.track();
             TRAY_MENU_OPEN.with(|c| c.set(false));
             SETTINGS_OPEN.with(|c| c.set(false));
+            // #307: the menu cleared the options card's key claim. Whatever
+            // was chosen, the card (if it is still up) gets it back first, so
+            // its hint stays true; a command that hides the card clears it
+            // again. A no-op when the card is gone or the claim has lapsed.
+            unsafe { &mut *ptr }.card.rearm_options_claim();
             match chosen {
                 Some(id) => id,
                 None => {
                     let app = unsafe { &mut *ptr };
-                    // #307: the menu cleared the options card's key claim and
-                    // closed without a choice, so the card (still up) gets it
-                    // back and its hint stays true.
-                    app.card.rearm_options_claim();
                     app.finish_modal_deferrals();
                     return LRESULT(0);
                 }
@@ -8125,40 +8156,54 @@ mod tests {
         );
     }
 
-    /// The claim is put back whenever the card stays up after the hook spent
-    /// it: an ignored choice, and a tray menu closed without a choice. And the
-    /// card's behavior reads the foreground layout.
+    /// An ignored choice (stale generation, or no buttons yet) leaves the card
+    /// up with its claim spent, so it must be put back; a choice that closes
+    /// the card or runs an action must not be.
     #[test]
-    fn the_options_claim_is_put_back_where_the_card_stays_up() {
+    fn only_an_ignored_choice_puts_the_claim_back() {
+        use super::{options_choice_action, rearm_after, OptionsChoiceAction, OptionsSession};
+        let session = OptionsSession {
+            generation: 5,
+            ids: vec!["a".to_string(), "b".to_string()],
+            catalogue: Vec::new(),
+        };
+        // A digit made on an older card: ignored, card still up.
+        let stale = options_choice_action(1, 4, Some(5), Some(&session));
+        assert_eq!(stale, OptionsChoiceAction::Ignore);
+        assert!(rearm_after(&stale));
+        // A digit naming no button yet: ignored.
+        let none_yet = options_choice_action(3, 5, Some(5), Some(&session));
+        assert_eq!(none_yet, OptionsChoiceAction::Ignore);
+        assert!(rearm_after(&none_yet));
+        // A real pick and Esc end the card.
+        let pick = options_choice_action(2, 5, Some(5), Some(&session));
+        assert_eq!(pick, OptionsChoiceAction::Run("b".to_string()));
+        assert!(!rearm_after(&pick));
+        let esc = options_choice_action(0, 5, Some(5), Some(&session));
+        assert_eq!(esc, OptionsChoiceAction::Close);
+        assert!(!rearm_after(&esc));
+    }
+
+    /// The tray menu clears the claim; it is put back right after the menu
+    /// ends, before the chosen command is dispatched, and not only when
+    /// nothing was chosen. (The window procedure needs a live window, so this
+    /// one pins the order in the source; the card's own behaviour is tested in
+    /// `ui::card::options`.)
+    #[test]
+    fn the_tray_menu_puts_the_options_claim_back_before_dispatching() {
         let src = lf(include_str!("app.rs"));
-        let choice = src
-            .split("fn on_options_choice(")
-            .nth(1)
-            .expect("no on_options_choice");
-        let ignore = choice
-            .split("OptionsChoiceAction::Ignore =>")
-            .nth(1)
-            .expect("no Ignore arm");
-        assert!(
-            ignore[..ignore.find('\n').unwrap()].contains("rearm_options_claim()"),
-            "an ignored choice must put the claim back"
-        );
         let start = src
             .find("\nfn handle_tray_message(")
             .expect("no handle_tray_message");
         let body = &src[start + 1..];
         let body = &body[..body.find("\n}\n").expect("fn has no end")];
-        let none_arm = body
-            .split("None => {")
-            .nth(1)
-            .expect("no None arm for a menu closed without a choice");
-        let none_arm = &none_arm[..none_arm.find("return LRESULT(0)").unwrap()];
-        assert!(none_arm.contains("rearm_options_claim()"), "{none_arm}");
-        let behavior = src
-            .split("fn options_behavior(")
-            .nth(1)
-            .expect("no options_behavior");
-        assert!(behavior.contains("foreground_keyboard_layout()"));
+        let track = body.find(".track()").expect("the menu is never tracked");
+        let rearm = body
+            .find("rearm_options_claim()")
+            .expect("the claim is never put back");
+        let dispatch = body.find("match chosen {").expect("no dispatch on chosen");
+        assert!(track < rearm && rearm < dispatch, "wrong order");
+        assert_eq!(body.matches("rearm_options_claim()").count(), 1);
     }
 
     /// The tray menu loop runs a nested message loop, and Esc closes a menu:

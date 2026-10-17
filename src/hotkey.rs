@@ -811,7 +811,8 @@ fn claim_for_options_card_with(
     if post(choice, generation) {
         true
     } else {
-        crate::options_keys::arm(claim);
+        // Only while the card is still the one the claim was taken from.
+        crate::options_keys::restore_taken(claim);
         false
     }
 }
@@ -1213,6 +1214,26 @@ mod tests {
             "the card still shows, so its claim stays"
         );
         crate::options_keys::clear();
+    }
+
+    #[test]
+    fn a_failed_post_does_not_revive_a_claim_the_main_thread_cleared() {
+        let _g = options_lock();
+        arm_for_test(0xAAAA);
+        let claimed = claim_for_options_card_with(
+            0x31,
+            1_000,
+            NO_MODS,
+            false,
+            || 0xAAAA,
+            |_, _| {
+                // The card hid while the post was failing.
+                crate::options_keys::clear();
+                false
+            },
+        );
+        assert!(!claimed);
+        assert_eq!(crate::options_keys::current(), None, "must stay cleared");
     }
 
     #[test]

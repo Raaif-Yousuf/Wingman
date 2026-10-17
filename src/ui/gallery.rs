@@ -650,6 +650,7 @@ mod driver {
             dismiss_secs: 120,
             claim_keys: true,
             key_runs_first,
+            foreground: 0,
         }
     }
 

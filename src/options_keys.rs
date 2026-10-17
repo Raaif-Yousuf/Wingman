@@ -187,6 +187,15 @@ impl ClaimSlot {
         self.0.store(0, Ordering::Relaxed);
     }
 
+    /// Arms only if nothing is armed: a compare-and-set, so a claim the main
+    /// thread armed (or left cleared) in the meantime is never overwritten.
+    /// `true` if it armed.
+    pub fn arm_if_empty(&self, claim: Claim) -> bool {
+        self.0
+            .compare_exchange(0, pack(claim), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
     pub fn current(&self) -> Option<Claim> {
         unpack(self.0.load(Ordering::Relaxed))
     }
@@ -244,16 +253,34 @@ pub fn is_cjk_layout(hkl: usize) -> bool {
     matches!(hkl & 0x3FF, LANG_CHINESE | LANG_JAPANESE | LANG_KOREAN)
 }
 
-/// Whether the card claims digits and Esc: the `[options] claim_keys` setting,
-/// unless the foreground keyboard layout is a CJK one (see [`is_cjk_layout`]).
-/// Computed once when the card is shown, and the card's hint follows it.
-pub fn claim_enabled(setting: bool, foreground_hkl: usize) -> bool {
-    setting && !is_cjk_layout(foreground_hkl)
+/// Whether a window can be the one the claim follows: there is one (`0` is
+/// none) and it is not Wingman's own. With either, no key would ever match
+/// [`foreground_matches`], so the card must not promise keys.
+pub fn foreground_usable(hwnd: isize, is_own_window: bool) -> bool {
+    hwnd != 0 && !is_own_window
+}
+
+/// Whether the card claims keys 1 to 4 and Esc: the `[options] claim_keys`
+/// setting, unless the foreground keyboard layout is a CJK one (see
+/// [`is_cjk_layout`]) or there is no usable foreground window (see
+/// [`foreground_usable`]). Computed once when the card is shown, and the card's
+/// hint follows it, so the hint never says "Press 1" for a claim that would
+/// reject every key.
+pub fn claim_enabled(setting: bool, foreground_hkl: usize, foreground_usable: bool) -> bool {
+    setting && foreground_usable && !is_cjk_layout(foreground_hkl)
 }
 
 /// Starts claiming keys for the card showing `claim.generation`.
 pub fn arm(claim: Claim) {
     CLAIM.arm(claim);
+}
+
+/// The hook's undo after a failed post: puts back the claim it just took, but
+/// only while the card is still the one it took it from. If the main thread
+/// cleared the claim meanwhile (the card hid, which also zeroes the armed
+/// foreground) or armed a newer one, nothing is restored. `true` if restored.
+pub fn restore_taken(claim: Claim) -> bool {
+    armed_foreground() != 0 && CLAIM.arm_if_empty(claim)
 }
 
 /// Stops claiming. Called on every path that hides or replaces the card.
@@ -508,10 +535,48 @@ mod tests {
 
     #[test]
     fn the_claim_defaults_off_under_a_cjk_layout_and_never_overrides_the_setting() {
-        assert!(claim_enabled(true, 0x0409));
-        assert!(!claim_enabled(true, 0x0411), "Japanese IME");
-        assert!(!claim_enabled(false, 0x0409), "the setting still wins");
-        assert!(!claim_enabled(false, 0x0411));
+        assert!(claim_enabled(true, 0x0409, true));
+        assert!(!claim_enabled(true, 0x0411, true), "Japanese IME");
+        assert!(
+            !claim_enabled(false, 0x0409, true),
+            "the setting still wins"
+        );
+        assert!(!claim_enabled(false, 0x0411, true));
+    }
+
+    #[test]
+    fn no_usable_foreground_means_no_claim_and_so_no_hint() {
+        assert!(foreground_usable(0x1234, false));
+        assert!(!foreground_usable(0, false), "no foreground window");
+        assert!(!foreground_usable(0x1234, true), "Wingman's own window");
+        assert!(!claim_enabled(true, 0x0409, false));
+    }
+
+    #[test]
+    fn a_taken_claim_is_restored_only_into_an_empty_slot_of_a_live_card() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let taken = Claim {
+            generation: 3,
+            count: 2,
+            expiry_tick: 50_000,
+        };
+        // Live card, slot empty (the hook just took it): restored.
+        clear();
+        set_armed_foreground(0xAAAA);
+        assert!(restore_taken(taken));
+        assert_eq!(current(), Some(taken));
+        // A newer claim is in the slot: left alone.
+        let newer = Claim {
+            generation: 4,
+            ..taken
+        };
+        arm(newer);
+        assert!(!restore_taken(taken));
+        assert_eq!(current(), Some(newer));
+        // The main thread cleared the card meanwhile: nothing comes back.
+        clear();
+        assert!(!restore_taken(taken));
+        assert_eq!(current(), None);
     }
 
     #[test]

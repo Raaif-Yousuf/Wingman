@@ -40,6 +40,11 @@ pub struct OptionsBehavior {
     /// Whether one press of the Wingman key runs option 1. Only then is row 1
     /// drawn as the default (accent outline): the outline promises the key.
     pub key_runs_first: bool,
+    /// The window that had the keyboard when the card was shown (`HWND` as an
+    /// integer, `0` = none), read once by the caller. The key claim is bound
+    /// to it for the card's whole life, including every re-arm: the card never
+    /// takes focus, so this stays the window the user types into.
+    pub foreground: isize,
 }
 
 /// Live state for `CardState::Options`. `Some` for exactly as long as the
@@ -220,12 +225,6 @@ impl Card {
     }
 }
 
-/// The window that has the keyboard now, as an integer (`0` when there is
-/// none): the window the options card's key claim is for.
-fn foreground_window() -> isize {
-    unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() }.0 as isize
-}
-
 impl CardInner {
     fn show_options_state(
         &mut self,
@@ -344,7 +343,7 @@ impl CardInner {
             ui.armed_claim = Some(claim);
             // The card never takes focus: the window in front now is the one
             // the user is typing into, and the claim follows it.
-            options_keys::set_armed_foreground(foreground_window());
+            options_keys::set_armed_foreground(ui.behavior.foreground);
             options_keys::arm(claim);
         }
     }
@@ -360,7 +359,7 @@ impl CardInner {
         }
         let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount() };
         if let Some(claim) = options_keys::rearm_plan(ui.armed_claim, now) {
-            options_keys::set_armed_foreground(foreground_window());
+            options_keys::set_armed_foreground(ui.behavior.foreground);
             options_keys::arm(claim);
         }
     }
@@ -993,6 +992,7 @@ mod tests {
         dismiss_secs: 20,
         claim_keys: true,
         key_runs_first: false,
+        foreground: 0x1234,
     };
 
     fn new_card() -> Card {
@@ -1225,9 +1225,15 @@ mod tests {
         card.show_options(8, "S", &rows(3), BEHAVIOR);
         let armed = options_keys::current().expect("armed");
         // The hook spent it, or the tray menu cleared it.
+        assert_eq!(options_keys::armed_foreground(), 0x1234);
         options_keys::clear();
         card.rearm_options_claim();
         assert_eq!(options_keys::current(), Some(armed), "same card, same rows");
+        assert_eq!(
+            options_keys::armed_foreground(),
+            0x1234,
+            "bound to the user's window, never re-read (Wingman may be in front)"
+        );
         card.hide();
         // A hidden card has nothing to put back.
         card.rearm_options_claim();
