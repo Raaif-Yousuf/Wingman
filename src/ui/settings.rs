@@ -9350,6 +9350,43 @@ impl GalleryWindow {
         }
     }
 
+    /// Drops the list of the combo `id` open (what a click on it does), for the gallery.
+    pub(crate) fn open_combo_list(&mut self, id: i32) {
+        let inner = unsafe { &mut *self.raw };
+        if let Some(combo) = get_dlg_item(inner.hwnd, id) {
+            unsafe {
+                SendMessageW(
+                    combo,
+                    windows::Win32::UI::WindowsAndMessaging::CB_SHOWDROPDOWN,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(0)),
+                );
+            }
+        }
+    }
+
+    /// The window of the open drop list of the combo `id`, if it is showing.
+    pub(crate) fn combo_list_hwnd(&self, id: i32) -> Option<HWND> {
+        use windows::Win32::UI::Controls::COMBOBOXINFO;
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, CB_GETCOMBOBOXINFO};
+        let inner = unsafe { &*self.raw };
+        let combo = get_dlg_item(inner.hwnd, id)?;
+        let mut info = COMBOBOXINFO {
+            cbSize: std::mem::size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(
+                combo,
+                CB_GETCOMBOBOXINFO,
+                Some(WPARAM(0)),
+                Some(LPARAM(&mut info as *mut COMBOBOXINFO as isize)),
+            );
+            (!info.hwndList.is_invalid() && IsWindowVisible(info.hwndList).as_bool())
+                .then_some(info.hwndList)
+        }
+    }
+
     /// Shows every provider (what "Add another provider" does).
     pub(crate) fn reveal_providers(&mut self) {
         let inner = unsafe { &mut *self.raw };
