@@ -509,6 +509,27 @@ pub(crate) fn icon_font_face(fluent_installed: bool) -> &'static str {
 pub(crate) const WINDOW_RADIUS_DP: i32 = 8;
 
 // ---------------------------------------------------------------------------
+// The Settings navigation rail (#872)
+// ---------------------------------------------------------------------------
+
+/// Width of the left navigation rail, in dp.
+pub(crate) const RAIL_W_DP: i32 = 188;
+/// Height of one rail item, in dp. Five items need 200 dp, so the rail never
+/// scrolls where the window fits.
+pub(crate) const RAIL_ITEM_H_DP: i32 = 40;
+/// Space above the first item, in dp.
+pub(crate) const RAIL_TOP_PAD_DP: i32 = SPACE_SM_DP;
+/// Inset of an item's selection fill from the rail's sides, in dp.
+pub(crate) const RAIL_INSET_DP: i32 = SPACE_XS_DP;
+/// Width and height of the selected item's accent pill, in dp.
+pub(crate) const RAIL_PILL_W_DP: i32 = 3;
+pub(crate) const RAIL_PILL_H_DP: i32 = 16;
+/// Where an item's icon box starts, from the item's left edge, and where its
+/// text starts, in dp.
+pub(crate) const RAIL_ICON_X_DP: i32 = 16;
+pub(crate) const RAIL_TEXT_X_DP: i32 = 44;
+
+// ---------------------------------------------------------------------------
 // Menus (the tray menu, #825)
 // ---------------------------------------------------------------------------
 

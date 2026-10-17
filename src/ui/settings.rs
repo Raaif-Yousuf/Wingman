@@ -23,6 +23,14 @@
 //! is on disk now, so a hand edit made meanwhile survives, and then closes the
 //! window. This module never touches the disk or the network on the UI thread.
 //!
+//! The window has a left navigation rail and five pages (#872): General,
+//! Models, Privacy, Actions and Advanced. Every control is created once, tagged
+//! with its page, and the rail shows one page's controls and hides the rest, so
+//! a hidden page is out of the Tab order and the accessibility tree. Ctrl+1 to
+//! Ctrl+5, Ctrl+PageUp and Ctrl+PageDown change the page from anywhere, F6
+//! moves between the rail and the page. Save and Cancel are still pinned under
+//! the pages and still send every touched field at once.
+//!
 //! Notes for the integrating app:
 //! - If a settings window is already open, `open` brings it to the front and
 //!   returns `true` without opening a second one. The guard is a process-wide
@@ -94,9 +102,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetParent, GetScrollInfo, GetWindow, CBN_SELCHANGE, GW_CHILD, GW_HWNDNEXT,
-    SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS,
-    SM_CXVSCROLL, WM_MOUSEWHEEL, WM_VSCROLL,
+    GetClientRect, GetParent, GetScrollInfo, GetWindow, IsWindowVisible, CBN_SELCHANGE, GW_CHILD,
+    GW_HWNDNEXT, SB_VERT, SCROLLINFO, SIF_DISABLENOSCROLL, SIF_PAGE, SIF_POS, SIF_RANGE,
+    SIF_TRACKPOS, SM_CXVSCROLL, WM_CTLCOLORLISTBOX, WM_DRAWITEM, WM_MEASUREITEM, WM_MOUSEWHEEL,
+    WM_VSCROLL,
 };
 
 use crate::config::{ActiveProvider, CardCorner, Config, Hotkeys, OllamaConfig, RequireTickFor};
@@ -319,7 +328,8 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
             // wherever it happened to fall (reported as the Max edge box) --
             // pin it to the first field instead, so Tab order starts from the
             // top of the window every time it opens.
-            if let Some(first) = get_dlg_item(hwnd, ID_ACTIVE_PROVIDER) {
+            // #872: the rail, the first stop; the page is a Tab away.
+            if let Some(first) = get_dlg_item(hwnd, ID_RAIL) {
                 let _ = SetFocus(Some(first));
             }
         }
@@ -428,6 +438,29 @@ unsafe fn handle_key(hwnd: HWND, msg: &MSG, prompt_edit: HWND) -> bool {
             );
         }
         return true;
+    }
+    // #872: Ctrl+1 to Ctrl+5 and Ctrl+PageUp and PageDown change the page from
+    // anywhere in the window; F6 swaps focus between the rail and the page;
+    // Enter on the rail goes into the page instead of saving.
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyState, VK_CONTROL, VK_F6, VK_MENU,
+        };
+        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+        let alt = GetKeyState(VK_MENU.0 as i32) < 0;
+        let request = match page_key(vk, ctrl, alt) {
+            Some(PageKey::Pick(page)) => Some((PAGE_PICK, page.index() as isize)),
+            Some(PageKey::Step(by)) => Some((PAGE_STEP, by)),
+            None if vk == VK_F6.0 as u32 => Some((PAGE_SWAP_FOCUS, 0)),
+            None if vk == VK_RETURN.0 as u32 && GetDlgCtrlID(msg.hwnd) == ID_RAIL => {
+                Some((PAGE_ENTER, 0))
+            }
+            None => None,
+        };
+        if let Some((what, arg)) = request {
+            let _ = PostMessageW(Some(hwnd), WM_SETTINGS_PAGE, WPARAM(what), LPARAM(arg));
+            return true;
+        }
     }
     // Enter submits, except inside the multiline prompt box, where
     // ES_WANTRETURN means Enter should insert a newline instead, and on a
@@ -588,6 +621,12 @@ struct SettingsInner {
     content_top_dp: i32,
     win_h_dp: i32,
     prompt_edit: HWND,
+    /// #872: the navigation rail and the page it shows.
+    rail: HWND,
+    page: Page,
+    /// Each page's content height in dp, padding included, indexed by
+    /// [`Page::index`]. The Advanced entry is for the prompt closed.
+    page_content_dp: [i32; 5],
     /// #481: the scrolling body that holds every group above the footer.
     body: HWND,
     /// The dpi the body's scroll position is expressed in, so a dpi change
@@ -596,6 +635,9 @@ struct SettingsInner {
     /// #343: where the Ollama group's link button goes, if it has one. Set
     /// when the status probe reports (#527).
     ollama_link_url: Option<&'static str>,
+    /// Whether the Ollama group's button has something to offer (#343). It is
+    /// shown only then, and only while the Models page is.
+    ollama_link_shown: bool,
     /// #382: the button is "Fix it" (the Intel GPU fix) rather than a link.
     ollama_fix: bool,
     /// #527: the Ollama status probe's result, filled by its worker.
@@ -679,9 +721,13 @@ impl SettingsInner {
             content_top_dp: 0,
             win_h_dp: WIN_H_DP,
             prompt_edit: HWND(std::ptr::null_mut()),
+            rail: HWND(std::ptr::null_mut()),
+            page: Page::General,
+            page_content_dp: [0; 5],
             body: HWND(std::ptr::null_mut()),
             body_dpi: 96,
             ollama_link_url: None,
+            ollama_link_shown: false,
             ollama_fix: false,
             ollama_status: Default::default(),
             ollama_tags: Default::default(),
@@ -708,11 +754,15 @@ impl SettingsInner {
     /// the controls were laid out for it.
     fn adopt(&mut self, built: BuiltUi) {
         self.prompt_edit = built.prompt_edit;
+        self.rail = built.rail;
+        self.page_content_dp = built.page_content_dp;
         self.body = built.body;
         self.body_dpi = self.dpi;
         self.children = built.children;
         self.content_top_dp = built.content_top_dp;
         self.win_h_dp = built.win_h_dp;
+        // Only the first page shows.
+        unsafe { sync_visibility(self) };
     }
 }
 
@@ -744,6 +794,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_HSCROLL => {
             update_text_scale_label(hwnd);
+            LRESULT(0)
+        }
+        // #872: the rail draws itself through us.
+        WM_DRAWITEM => {
+            draw_rail_item(lparam);
+            LRESULT(1)
+        }
+        WM_MEASUREITEM => {
+            measure_rail_item(lparam, inner.dpi);
+            LRESULT(1)
+        }
+        // The rail's background is the window's, not the list box's white.
+        WM_CTLCOLORLISTBOX => LRESULT(
+            windows::Win32::Graphics::Gdi::GetSysColorBrush(
+                windows::Win32::Graphics::Gdi::COLOR_3DFACE,
+            )
+            .0 as isize,
+        ),
+        WM_SETTINGS_PAGE => {
+            handle_page_request(inner, wparam.0, lparam.0);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -909,7 +979,7 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
                 if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
                     set_text(msg, invalid.message());
                 }
-                focus_and_select_field(inner.hwnd, invalid.control_id());
+                focus_and_select_field(inner, invalid.control_id());
                 return;
             }
             if let Some(msg) = get_dlg_item(inner.hwnd, ID_VALIDATION_MESSAGE) {
@@ -958,6 +1028,13 @@ fn handle_command(inner: &mut SettingsInner, id: i32, notify: u32) {
             inner.result = None;
             unsafe {
                 let _ = DestroyWindow(inner.hwnd);
+            }
+        }
+        // #872: the rail picked a page (a click, an arrow key, Home or End).
+        ID_RAIL if notify == LBN_SELCHANGE => {
+            let picked = unsafe { SendMessageW(inner.rail, LB_GETCURSEL, None, None).0 };
+            if let Some(page) = Page::from_index(picked) {
+                unsafe { show_page(inner, page) };
             }
         }
         ID_OLLAMA_LINK if notify == BN_CLICKED && inner.ollama_fix => start_gpu_fix(inner),
@@ -1021,11 +1098,20 @@ fn toggle_password(hwnd: HWND, checkbox_id: i32, edit_id: i32) {
 /// from a direct unit-test call) -- `EM_SETSEL` on a `CBS_DROPDOWNLIST`
 /// combo with no editable text portion is simply a no-op, so no special case
 /// is needed here any more.
-fn focus_and_select_field(hwnd: HWND, id: i32) {
-    let Some(ctrl) = get_dlg_item(hwnd, id) else {
+fn focus_and_select_field(inner: &mut SettingsInner, id: i32) {
+    let Some(ctrl) = get_dlg_item(inner.hwnd, id) else {
         return;
     };
     unsafe {
+        // A control on a hidden page cannot take focus: show its page first.
+        if let Some(page) = inner
+            .children
+            .iter()
+            .find(|c| c.hwnd == ctrl)
+            .and_then(|c| c.page)
+        {
+            show_page(inner, page);
+        }
         let _ = SetFocus(Some(ctrl));
         SendMessageW(ctrl, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1isize)));
     }
@@ -1119,6 +1205,167 @@ const ID_OPEN_CONFIG: i32 = 145;
 /// under the redact checkbox.
 const ID_CAPTURE_DETAIL_HINT: i32 = 146;
 const ID_REDACT_HINT: i32 = 147;
+/// #872: the navigation rail (a list box), a direct child of the window.
+const ID_RAIL: i32 = 148;
+/// #872: the Actions page's explanation. That page has no setting yet.
+const ID_ACTIONS_NOTE: i32 = 149;
+
+/// #872: the five pages of the window, in rail order. Each existing control
+/// lives on exactly one (see [`PAGE_CONTROLS`]); the rail shows one page at a
+/// time and hides the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Page {
+    General,
+    Models,
+    Privacy,
+    Actions,
+    Advanced,
+}
+
+impl Page {
+    const ALL: [Page; 5] = [
+        Page::General,
+        Page::Models,
+        Page::Privacy,
+        Page::Actions,
+        Page::Advanced,
+    ];
+
+    /// The rail item's text, which is also the page's name for a screen reader.
+    fn label(self) -> &'static str {
+        match self {
+            Page::General => "General",
+            Page::Models => "Models",
+            Page::Privacy => "Privacy",
+            Page::Actions => "Actions",
+            Page::Advanced => "Advanced",
+        }
+    }
+
+    /// The rail item's Segoe Fluent Icons glyph.
+    fn glyph(self) -> char {
+        match self {
+            Page::General => '\u{E713}',
+            Page::Models => '\u{E9D9}',
+            Page::Privacy => '\u{E72E}',
+            Page::Actions => '\u{E945}',
+            Page::Advanced => '\u{E90F}',
+        }
+    }
+
+    fn index(self) -> usize {
+        Page::ALL.iter().position(|p| *p == self).unwrap_or(0)
+    }
+
+    /// The page at rail position `index`; `None` for a position past the list
+    /// (a list box answers `LB_ERR`, -1, for "nothing selected").
+    fn from_index(index: isize) -> Option<Page> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| Page::ALL.get(i).copied())
+    }
+
+    /// The page after (`+1`) or before (`-1`) this one, wrapping at the ends
+    /// (Ctrl+PageDown and Ctrl+PageUp).
+    fn step(self, by: isize) -> Page {
+        let n = Page::ALL.len() as isize;
+        let i = (self.index() as isize + by).rem_euclid(n);
+        Page::ALL[i as usize]
+    }
+
+    /// The page Ctrl plus this key picks: `1` to `5`, in rail order.
+    fn from_digit_key(vk: u32) -> Option<Page> {
+        let digit = vk.checked_sub('1' as u32)?;
+        Page::ALL.get(digit as usize).copied()
+    }
+}
+
+/// The rail's pages by name, in order: what the gallery checks it has a
+/// picture of every one of.
+#[cfg(test)]
+pub(crate) fn page_labels() -> Vec<&'static str> {
+    Page::ALL.iter().map(|p| p.label()).collect()
+}
+
+/// The rail's accessible name.
+const RAIL_NAME: &str = "Settings pages";
+
+/// The Actions page's note, in plain words. Import and export still live in
+/// the tray's Help group.
+const ACTIONS_NOTE: &str = "Actions are what Wingman does once you confirm: reply to an email, fill in a form, add a calendar event. Importing and exporting your own actions is in the tray menu, under Help.";
+
+/// Every control id on each page, for the test that nothing is lost or listed
+/// twice. The window builds its pages with the same grouping (`Ctx::page`),
+/// and a test compares the two.
+#[cfg(test)]
+const PAGE_CONTROLS: [(Page, &[i32]); 5] = [
+    (
+        Page::General,
+        &[
+            ID_PRIMARY_LABEL,
+            ID_CHANGE_PRIMARY,
+            ID_SECONDARY_LABEL,
+            ID_CHANGE_SECONDARY,
+            ID_HOTKEY_STATUS,
+            ID_AUTOSTART,
+            ID_CARD_SECONDS,
+            ID_TEXT_SCALE_TRACK,
+            ID_TEXT_SCALE_LABEL,
+            ID_CARD_CORNER,
+            ID_CARD_MONITOR_LABEL,
+            ID_CARD_MONITOR,
+        ],
+    ),
+    (
+        Page::Models,
+        &[
+            ID_ACTIVE_PROVIDER,
+            ID_OPENAI_KEY,
+            ID_OPENAI_SHOW_KEY,
+            ID_OPENAI_MODEL,
+            ID_OPENAI_EFFORT,
+            ID_ANTHROPIC_KEY,
+            ID_ANTHROPIC_SHOW_KEY,
+            ID_ANTHROPIC_MODEL,
+            ID_ANTHROPIC_EFFORT,
+            ID_GEMINI_KEY,
+            ID_GEMINI_SHOW_KEY,
+            ID_GEMINI_MODEL,
+            ID_GEMINI_EFFORT_LABEL,
+            ID_GEMINI_EFFORT,
+            ID_MODEL_LIST_HINT,
+            ID_OPEN_CONFIG,
+            ID_OLLAMA_MODEL,
+            ID_OLLAMA_STATUS,
+            ID_OLLAMA_LINK,
+            ID_PULL_NAME,
+            ID_PULL_BUTTON,
+            ID_PULL_STATUS,
+        ],
+    ),
+    (
+        Page::Privacy,
+        &[
+            ID_MAX_EDGE,
+            ID_MONITOR,
+            ID_CAPTURE_DETAIL_HINT,
+            ID_REDACT,
+            ID_REDACT_HINT,
+            ID_REQUIRE_TICK_FOR,
+        ],
+    ),
+    (Page::Actions, &[ID_ACTIONS_NOTE]),
+    (
+        Page::Advanced,
+        &[ID_PROMPT_TOGGLE, ID_PROMPT_EDIT, ID_RESET_PROMPT],
+    ),
+];
+
+/// The ids that belong to no page: the rail, the scrolling body that holds the
+/// pages, and the footer.
+#[cfg(test)]
+const CHROME_IDS: &[i32] = &[ID_RAIL, ID_BODY, ID_SAVE, ID_CANCEL, ID_VALIDATION_MESSAGE];
+
 /// #509: what capture.redact covers, in plain words. Three things: the
 /// screenshot (card numbers, keys, emails and password fields painted over),
 /// the text sent to a cloud or remote model, and the answer (real values put
@@ -1187,6 +1434,8 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_OPEN_CONFIG", ID_OPEN_CONFIG),
     ("ID_CAPTURE_DETAIL_HINT", ID_CAPTURE_DETAIL_HINT),
     ("ID_REDACT_HINT", ID_REDACT_HINT),
+    ("ID_RAIL", ID_RAIL),
+    ("ID_ACTIONS_NOTE", ID_ACTIONS_NOTE),
 ];
 
 // ---------------------------------------------------------------------------
@@ -1314,19 +1563,19 @@ fn clamp_suggested_to_work(
     (x, y, w, h)
 }
 
-const WIN_W_DP: i32 = 620;
-/// #403 review: raised from 820 by the Forms group's full height (68dp: see
-/// `CONTENT_TOP_DP`'s comment). #341 raised it again by 30dp (one more
-/// `ROW_H + ROW_GAP` row: the Capture group's new "higher reads small text
-/// better" hint line) so the default window still has room for the Prompt
-/// group at something close to its natural size instead of always falling
-/// back to `prompt_footer_layout`'s minimum -- `prompt_footer_layout` itself
-/// never overlaps regardless of this constant, but a taller default is nicer
-/// than always squeezing. #427 added one more row (the hint under the cloud
-/// model dropdowns), so it is raised by another `ROW_H + ROW_GAP`. #822 gave
-/// each Thinking dropdown (three) and the Capture Screen dropdown their own
-/// row, four more.
-const WIN_H_DP: i32 = 918 + 8 * (ROW_H + ROW_GAP);
+/// The width of one page, in dp: what the single column used to be.
+const PAGE_W_DP: i32 = 620;
+/// The navigation rail's width, in dp, and the size of its items.
+const RAIL_W_DP: i32 = crate::ui::theme::RAIL_W_DP;
+const RAIL_ITEM_H_DP: i32 = crate::ui::theme::RAIL_ITEM_H_DP;
+const RAIL_TOP_PAD_DP: i32 = crate::ui::theme::RAIL_TOP_PAD_DP;
+/// The client width: the rail and one page.
+const WIN_W_DP: i32 = RAIL_W_DP + PAGE_W_DP;
+/// The tallest the window is made, in dp, when the Check my work prompt is open
+/// (#342): the prompt box takes what is left. With it closed the window is as
+/// tall as the fullest page (`SettingsInner::tallest_page_dp`), never taller
+/// than this or the monitor allows.
+const WIN_H_DP: i32 = 760;
 
 /// The one-line hint under the model dropdowns (#427). Plain words, no dash.
 const MODEL_LIST_HINT: &str = "Missing a model? Add it in the config file.";
@@ -1370,8 +1619,11 @@ const FOOTER_H_DP: i32 = BTN_H + MARGIN * 2;
 const BODY_PAD_BOTTOM: i32 = MARGIN / 2;
 
 const MARGIN: i32 = 16;
+/// Where a page's first group starts, in dp from the top of the body (#872):
+/// level with the rail's first item.
+const PAGE_TOP_PAD_DP: i32 = crate::ui::theme::SPACE_SM_DP;
 const ROW_H: i32 = 22;
-const ROW_GAP: i32 = 8;
+const ROW_GAP: i32 = 6;
 const GROUP_GAP: i32 = 14;
 const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
 const LABEL_W: i32 = 140;
@@ -1501,14 +1753,15 @@ fn footer_layout(content_top: i32, win_h_dp: i32, expanded: bool) -> PromptFoote
 /// `fitted_dp` is what [`fitted_height_for_work_px`] allows on this monitor
 /// and `nc_dp` the title bar and borders. Expanded keeps the old behaviour
 /// (the full fitted height, the prompt box takes what is left). Collapsed is
-/// just tall enough for the whole body and the footer, and never taller than
-/// the fit; anything beyond the fit scrolls (#481).
-fn window_height_dp(content_top: i32, expanded: bool, fitted_dp: i32, nc_dp: i32) -> i32 {
+/// just tall enough for the fullest page (`tallest_page_dp`, its content with
+/// the prompt closed) and the footer, and never taller than the fit; anything
+/// beyond the fit scrolls (#481). The height is the same whichever page shows,
+/// so switching pages never resizes the window (#872).
+fn window_height_dp(tallest_page_dp: i32, expanded: bool, fitted_dp: i32, nc_dp: i32) -> i32 {
     if expanded {
         return fitted_dp;
     }
-    let client = footer_layout(content_top, 0, false).content_h() + FOOTER_H_DP;
-    (client + nc_dp).min(fitted_dp)
+    (tallest_page_dp + FOOTER_H_DP + nc_dp).min(fitted_dp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,6 +1856,9 @@ enum Anchor {
 /// A child control and the design (96dpi) rect it was created with.
 #[derive(Clone, Copy, Debug)]
 struct ChildLayout {
+    /// The page this control is on, or `None` for the footer, which every page
+    /// shares (#872).
+    page: Option<Page>,
     hwnd: HWND,
     x: i32,
     y: i32,
@@ -1698,7 +1954,8 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     // The body is the client area above the footer. Its scroll position
     // carries over a dpi change (rescaled) and is kept inside the new range.
     let view_px = (client_h_px - to_px(FOOTER_H_DP, dpi)).max(1);
-    let content_px = to_px(new.content_h(), dpi);
+    let content_px = to_px(page_content_dp(inner, &new), dpi);
+    let rail_px = to_px(RAIL_W_DP, dpi);
     let have_body = !inner.body.0.is_null();
     let old_pos = if have_body {
         body_scroll_info(inner.body).nPos
@@ -1720,12 +1977,15 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
         let _ = SetWindowPos(
             inner.body,
             None,
+            rail_px,
             0,
-            0,
-            client_w_px.max(1),
+            (client_w_px - rail_px).max(1),
             view_px,
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+    if !inner.rail.0.is_null() {
+        place_rail(inner.rail, dpi, new_font);
     }
     for c in &inner.children {
         let (x, y, w, h) = child_rect_px(c, &old, &new, dpi);
@@ -1763,20 +2023,59 @@ unsafe fn apply_dpi(inner: &mut SettingsInner) {
     );
 }
 
+/// The current page's content height in dp, padding included. Advanced follows
+/// the prompt's state through `layout`; every other page is fixed.
+fn page_content_dp(inner: &SettingsInner, layout: &PromptFooterLayout) -> i32 {
+    if inner.page == Page::Advanced {
+        layout.content_h()
+    } else {
+        inner.page_content_dp[inner.page.index()]
+    }
+}
+
+/// The height of the fullest page in dp, with the prompt closed: what the
+/// window is made tall enough for (#872).
+fn tallest_page_dp(inner: &SettingsInner) -> i32 {
+    inner.page_content_dp.iter().copied().max().unwrap_or(0)
+}
+
+/// Whether the child `c` should be visible: it is on the page that shows, and
+/// the few controls with a state of their own are in the state that shows them
+/// (the Ollama button only has something to offer sometimes, the prompt box is
+/// folded away until asked for). The footer is on every page.
+unsafe fn child_visible(inner: &SettingsInner, c: &ChildLayout) -> bool {
+    let Some(page) = c.page else {
+        return true;
+    };
+    if page != inner.page {
+        return false;
+    }
+    match GetDlgCtrlID(c.hwnd) {
+        ID_OLLAMA_LINK => inner.ollama_link_shown,
+        ID_PROMPT_EDIT | ID_RESET_PROMPT => inner.prompt_expanded,
+        _ => true,
+    }
+}
+
+/// Shows the controls of the current page and hides every other control, so a
+/// hidden page is out of the Tab order and the accessibility tree (#872).
+unsafe fn sync_visibility(inner: &SettingsInner) {
+    for c in &inner.children {
+        let cmd = if child_visible(inner, c) {
+            SW_SHOW
+        } else {
+            SW_HIDE
+        };
+        let _ = ShowWindow(c.hwnd, cmd);
+    }
+}
+
 /// #342: makes the window match `inner.prompt_expanded`: shows or hides the
 /// prompt box and its reset button, relabels the toggle, resizes the window
 /// (kept inside the monitor's work area) and re-lays-out the children.
 /// The prompt text stays in the hidden edit, so Save still reads it.
 unsafe fn show_prompt_state(inner: &mut SettingsInner) {
-    let cmd = if inner.prompt_expanded {
-        SW_SHOW
-    } else {
-        SW_HIDE
-    };
-    let _ = ShowWindow(inner.prompt_edit, cmd);
-    if let Some(reset) = get_dlg_item(inner.hwnd, ID_RESET_PROMPT) {
-        let _ = ShowWindow(reset, cmd);
-    }
+    sync_visibility(inner);
     if let Some(toggle) = get_dlg_item(inner.hwnd, ID_PROMPT_TOGGLE) {
         set_text(toggle, prompt_toggle_label(inner.prompt_expanded));
     }
@@ -1799,7 +2098,7 @@ unsafe fn show_prompt_state(inner: &mut SettingsInner) {
     }
     let nc_dp = ((wr.bottom - wr.top) - (cr.bottom - cr.top)) * 96 / dpi as i32;
     let h = to_px(
-        window_height_dp(inner.content_top_dp, inner.prompt_expanded, fitted, nc_dp),
+        window_height_dp(tallest_page_dp(inner), inner.prompt_expanded, fitted, nc_dp),
         dpi,
     );
     let mut y = wr.top;
@@ -2264,7 +2563,8 @@ unsafe extern "system" fn edit_subclass(
 /// body, so a row the scrolling body cuts off reads as an edge.
 fn footer_divider_rect(client_w_px: i32, client_h_px: i32, dpi: u32) -> (i32, i32, i32, i32) {
     let top = client_h_px - to_px(FOOTER_H_DP, dpi);
-    (0, top, client_w_px, top + 1)
+    // The footer sits under the pages, right of the rail (#872).
+    (to_px(RAIL_W_DP, dpi), top, client_w_px, top + 1)
 }
 
 /// #935: the divider's colour: the hairline token of the current theme, which
@@ -2765,6 +3065,8 @@ struct Ctx {
     /// Where [`Ctx::create`] puts the next control: the scrolling body, then
     /// the window itself for the pinned footer (#481).
     parent: std::cell::Cell<HWND>,
+    /// The page the next control belongs to (#872); `None` for the footer.
+    page: std::cell::Cell<Option<Page>>,
     instance: HINSTANCE,
     dpi: u32,
     font: HFONT,
@@ -2830,6 +3132,7 @@ impl Ctx {
                 }
             }
             self.children.borrow_mut().push(ChildLayout {
+                page: self.page.get(),
                 hwnd,
                 x,
                 y,
@@ -3367,15 +3670,9 @@ fn apply_ollama_section(inner: &mut SettingsInner, section: &OllamaSection) {
         } else if let Some((label, _)) = section.link {
             set_text(link, label);
         }
-        let cmd = if section.link.is_some() || section.fix {
-            SW_SHOW
-        } else {
-            SW_HIDE
-        };
-        unsafe {
-            let _ = ShowWindow(link, cmd);
-        }
     }
+    inner.ollama_link_shown = section.link.is_some() || section.fix;
+    unsafe { sync_visibility(inner) };
 }
 
 /// Posted to the Settings window when the pull worker has stored a new
@@ -3754,11 +4051,8 @@ fn with_gpu_fix(mut section: OllamaSection, offer: Option<String>) -> OllamaSect
 fn start_gpu_fix(inner: &mut SettingsInner) {
     inner.ollama_fix = false;
     // Hidden first, so a refusal below never leaves a dead "Fix it".
-    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
-        unsafe {
-            let _ = ShowWindow(link, SW_HIDE);
-        }
-    }
+    inner.ollama_link_shown = false;
+    unsafe { sync_visibility(inner) };
     let cfg = inner.original.providers.ollama.clone();
     // Refuse before touching anything, and say so inline (rule 7).
     let refusal = if !ollama_gpu_fix::is_loopback_base_url(&cfg.base_url) {
@@ -3777,11 +4071,6 @@ fn start_gpu_fix(inner: &mut SettingsInner) {
             set_text(status, msg);
         }
         return;
-    }
-    if let Some(link) = get_dlg_item(inner.hwnd, ID_OLLAMA_LINK) {
-        unsafe {
-            let _ = ShowWindow(link, SW_HIDE);
-        }
     }
     if let Some(status) = get_dlg_item(inner.hwnd, ID_OLLAMA_STATUS) {
         set_text(status, ollama_gpu_fix::RUNNING_TEXT);
@@ -4075,6 +4364,10 @@ fn build_ui(
 /// What [`build_ui`] built, plus what a later DPI change needs to redo it.
 struct BuiltUi {
     prompt_edit: HWND,
+    /// The navigation rail (#872).
+    rail: HWND,
+    /// See [`SettingsInner::page_content_dp`].
+    page_content_dp: [i32; 5],
     /// The scrolling window the groups live in (#481).
     body: HWND,
     children: Vec<ChildLayout>,
@@ -4092,22 +4385,30 @@ fn build_ui_recorded(
     config: &Config,
     win_h_dp: i32,
 ) -> BuiltUi {
-    // #481: created first, so it is first in tab order; the footer controls
-    // made last are the last stops.
+    // #872: the rail is the first tab stop, then the body (#481); the footer
+    // controls made last are the last stops.
+    let rail = create_rail(hwnd, instance, dpi, font);
     let body = create_body(hwnd, instance, dpi);
     let ctx = Ctx {
         parent: std::cell::Cell::new(if body.0.is_null() { hwnd } else { body }),
+        page: std::cell::Cell::new(None),
         instance,
         dpi,
         font,
         children: std::cell::RefCell::new(Vec::new()),
     };
     let content_x = MARGIN;
-    let content_w = WIN_W_DP - 2 * MARGIN;
+    let content_w = PAGE_W_DP - 2 * MARGIN;
 
-    let mut y = MARGIN;
+    // Every page stacks its groups from the top; these follow where the next
+    // group of each page starts and where its last one ended (dp).
+    let mut page_y = [PAGE_TOP_PAD_DP; 5];
+    let mut page_bottom = [0i32; 5];
+    let mut y;
 
-    // -- Providers ----------------------------------------------------
+    // -- Providers (Models) --------------------------------------------
+    ctx.page.set(Some(Page::Models));
+    y = page_y[Page::Models.index()];
     let providers_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4485,6 +4786,8 @@ fn build_ui_recorded(
     );
 
     y = providers_bottom + GROUP_GAP;
+    page_y[Page::Models.index()] = y;
+    page_bottom[Page::Models.index()] = providers_bottom;
 
     // -- Ollama status (#14, #15) ----------------------------------------
     // One read-only line: whether anything answers on the configured
@@ -4497,6 +4800,7 @@ fn build_ui_recorded(
     // Read-only: choosing Ollama as the active provider and its model is
     // done in the Providers group above (#183). `base_url` stays a
     // config.toml setting.
+    y = page_y[Page::Models.index()];
     let ollama_top = y;
     y += GROUP_LABEL_TOP;
     // The text is a placeholder until the worker reports (#527, #568), so the
@@ -4597,8 +4901,12 @@ fn build_ui_recorded(
         0,
     );
     y = ollama_bottom + GROUP_GAP;
+    page_y[Page::Models.index()] = y;
+    page_bottom[Page::Models.index()] = ollama_bottom;
 
-    // -- Hotkeys --------------------------------------------------------
+    // -- Hotkeys (General) --------------------------------------------------------
+    ctx.page.set(Some(Page::General));
+    y = page_y[Page::General.index()];
     let hotkeys_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4700,8 +5008,12 @@ fn build_ui_recorded(
         0,
     );
     y = hotkeys_bottom + GROUP_GAP;
+    page_y[Page::General.index()] = y;
+    page_bottom[Page::General.index()] = hotkeys_bottom;
 
-    // -- Capture ----------------------------------------------------------
+    // -- Capture (Privacy) ----------------------------------------------------------
+    ctx.page.set(Some(Page::Privacy));
+    y = page_y[Page::Privacy.index()];
     let capture_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4816,8 +5128,12 @@ fn build_ui_recorded(
         0,
     );
     y = capture_bottom + GROUP_GAP;
+    page_y[Page::Privacy.index()] = y;
+    page_bottom[Page::Privacy.index()] = capture_bottom;
 
-    // -- Card ---------------------------------------------------------
+    // -- Card (General) ---------------------------------------------------------
+    ctx.page.set(Some(Page::General));
+    y = page_y[Page::General.index()];
     let card_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -4968,8 +5284,12 @@ fn build_ui_recorded(
         0,
     );
     y = card_bottom + GROUP_GAP;
+    page_y[Page::General.index()] = y;
+    page_bottom[Page::General.index()] = card_bottom;
 
-    // -- Forms (#403) -------------------------------------------------
+    // -- Forms (#403, Privacy) -------------------------------------------------
+    ctx.page.set(Some(Page::Privacy));
+    y = page_y[Page::Privacy.index()];
     let forms_top = y;
     y += GROUP_LABEL_TOP;
     let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
@@ -5017,9 +5337,43 @@ fn build_ui_recorded(
         forms_bottom - forms_top,
         0,
     );
-    y = forms_bottom + GROUP_GAP;
+    page_bottom[Page::Privacy.index()] = forms_bottom;
 
-    // -- Prompt (grows to fill remaining space above the button row) ------
+    // -- Actions (#872): no setting yet, so one note, never an empty page ---
+    ctx.page.set(Some(Page::Actions));
+    y = page_y[Page::Actions.index()];
+    let actions_top = y;
+    y += GROUP_LABEL_TOP;
+    let note_h = ROW_H * 3;
+    ctx.create(
+        WC_STATIC,
+        ACTIONS_NOTE,
+        0,
+        0,
+        content_x + MARGIN,
+        y,
+        content_w - 2 * MARGIN,
+        note_h,
+        ID_ACTIONS_NOTE,
+    );
+    y += note_h;
+    let actions_bottom = y + 4;
+    ctx.create(
+        WC_BUTTON,
+        "Your actions",
+        BS_GROUPBOX as u32,
+        0,
+        content_x,
+        actions_top,
+        content_w,
+        actions_bottom - actions_top,
+        0,
+    );
+    page_bottom[Page::Actions.index()] = actions_bottom;
+
+    // -- Prompt (Advanced; grows to fill the space above the button row) ----
+    ctx.page.set(Some(Page::Advanced));
+    y = page_y[Page::Advanced.index()];
     let footer = footer_layout(y, win_h_dp, false);
     let prompt_top = footer.prompt_top;
     let prompt_bottom = footer.prompt_bottom;
@@ -5102,7 +5456,9 @@ fn build_ui_recorded(
 
     // -- Save / Cancel ------------------------------------------------
     // Pinned footer: a sibling of the body, not inside it, so it never scrolls.
+    // It belongs to no page and sits under the pages, right of the rail.
     ctx.parent.set(hwnd);
+    ctx.page.set(None);
     let buttons_y = footer.buttons_y;
     // #344: inline "that field is wrong" message, blank until a Save
     // attempt fails validation. Sits to the left of the Save/Cancel row so
@@ -5112,7 +5468,7 @@ fn build_ui_recorded(
         "",
         0x4000, // SS_ENDELLIPSIS
         0,
-        content_x + MARGIN,
+        RAIL_W_DP + content_x + MARGIN,
         buttons_y + (BTN_H - ROW_H) / 2,
         content_w - 2 * MARGIN - 2 * BTN_W - 12 - 12,
         ROW_H,
@@ -5202,12 +5558,480 @@ fn build_ui_recorded(
         }
     }
 
+    let mut page_content_dp = [0i32; 5];
+    for page in Page::ALL {
+        let i = page.index();
+        page_content_dp[i] = if page == Page::Advanced {
+            footer.content_h()
+        } else {
+            page_bottom[i] + BODY_PAD_BOTTOM
+        };
+    }
+
     BuiltUi {
         prompt_edit,
+        rail,
+        page_content_dp,
         body,
         children: ctx.children.into_inner(),
         content_top_dp,
         win_h_dp,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The navigation rail (#872)
+// ---------------------------------------------------------------------------
+// A single-select list box, owner-drawn so it looks like the Windows 11
+// Settings navigation: an icon and a name per page, the selected one on a
+// soft fill with a short accent pill. The list box keeps the arrow keys, Home,
+// End, type-ahead and the list and selection accessibility patterns; only the
+// painting is ours.
+
+const LB_ADDSTRING: u32 = 0x0180;
+const LB_SETCURSEL: u32 = 0x0186;
+const LB_GETCURSEL: u32 = 0x0188;
+const LB_SETITEMHEIGHT: u32 = 0x01A0;
+const LBN_SELCHANGE: u32 = 1;
+const LBS_NOTIFY: u32 = 0x0001;
+const LBS_OWNERDRAWFIXED: u32 = 0x0010;
+const LBS_HASSTRINGS: u32 = 0x0040;
+const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
+const ODS_SELECTED: u32 = 0x0001;
+const ODS_FOCUS: u32 = 0x0010;
+const ODS_NOFOCUSRECT: u32 = 0x0200;
+const WC_LISTBOX: &str = "LISTBOX";
+
+/// Posted to the window to change the page or move focus between the rail and
+/// the page. `wparam` says what (the `PAGE_*` codes), `lparam` is its argument.
+const WM_SETTINGS_PAGE: u32 = 0x8000 + 45; // WM_APP + 45
+/// `lparam` is the page's rail position.
+const PAGE_PICK: usize = 0;
+/// `lparam` is how many pages to move (negative goes back), wrapping.
+const PAGE_STEP: usize = 1;
+/// Focus goes into the page (Enter on the rail).
+const PAGE_ENTER: usize = 2;
+/// Focus goes to the rail, or into the page when it is already there (F6).
+const PAGE_SWAP_FOCUS: usize = 3;
+
+/// What a key does to the pages, apart from the rail's own arrow keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageKey {
+    Pick(Page),
+    Step(isize),
+}
+
+/// The page command for a key press: Ctrl+1 to Ctrl+5 pick a page, Ctrl+PageDown
+/// and Ctrl+PageUp move to the next and the previous. Nothing without Ctrl, so
+/// typing in a box is never taken. AltGr reads as Ctrl+Alt, so with Alt down
+/// the key is left alone: AltGr+2 and AltGr+3 type @ and # on some layouts.
+fn page_key(vk: u32, ctrl: bool, alt: bool) -> Option<PageKey> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_NEXT, VK_PRIOR};
+    if !ctrl || alt {
+        return None;
+    }
+    if vk == VK_NEXT.0 as u32 {
+        return Some(PageKey::Step(1));
+    }
+    if vk == VK_PRIOR.0 as u32 {
+        return Some(PageKey::Step(-1));
+    }
+    Page::from_digit_key(vk).map(PageKey::Pick)
+}
+
+/// Creates the rail, filled and with the first page selected.
+fn create_rail(parent: HWND, instance: HINSTANCE, dpi: u32, font: HFONT) -> HWND {
+    // A list box has no name of its own (MEASURED 2026-10-17, UI Automation:
+    // the window text is ignored), but the static before a control names it.
+    // This one is a pixel, so it takes no room and is read as the list's name.
+    let static_class = wide_z(WC_STATIC);
+    let name = wide_z(RAIL_NAME);
+    unsafe {
+        let _ = CreateWindowExW(
+            Default::default(),
+            PCWSTR(static_class.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            0,
+            0,
+            1,
+            1,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
+        );
+    }
+    let class = wide_z(WC_LISTBOX);
+    let title = wide_z(RAIL_NAME);
+    let style = WS_CHILD.0
+        | WS_VISIBLE.0
+        | WS_TABSTOP.0
+        | WS_GROUP.0
+        | LBS_NOTIFY
+        | LBS_OWNERDRAWFIXED
+        | LBS_HASSTRINGS
+        | LBS_NOINTEGRALHEIGHT;
+    let rail = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
+            0,
+            0,
+            to_px(RAIL_W_DP, dpi),
+            to_px(RAIL_ITEM_H_DP, dpi) * Page::ALL.len() as i32,
+            Some(parent),
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                ID_RAIL as *mut c_void,
+            )),
+            Some(instance),
+            None,
+        )
+    }
+    .unwrap_or(HWND(std::ptr::null_mut()));
+    if rail.0.is_null() {
+        return rail;
+    }
+    for page in Page::ALL {
+        let text = wide_z(page.label());
+        unsafe {
+            SendMessageW(
+                rail,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+        }
+    }
+    unsafe {
+        SendMessageW(
+            rail,
+            LB_SETCURSEL,
+            Some(WPARAM(Page::General.index())),
+            None,
+        );
+    }
+    place_rail(rail, dpi, font);
+    rail
+}
+
+/// Sizes and fonts the rail for `dpi`: the left edge of the window, a little
+/// below the top, exactly five items tall.
+fn place_rail(rail: HWND, dpi: u32, font: HFONT) {
+    let item_h = to_px(RAIL_ITEM_H_DP, dpi);
+    unsafe {
+        let _ = SetWindowPos(
+            rail,
+            None,
+            0,
+            to_px(RAIL_TOP_PAD_DP, dpi),
+            to_px(RAIL_W_DP, dpi),
+            item_h * Page::ALL.len() as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        SendMessageW(
+            rail,
+            LB_SETITEMHEIGHT,
+            Some(WPARAM(0)),
+            Some(LPARAM(item_h as isize)),
+        );
+        SendMessageW(
+            rail,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+    }
+}
+
+/// The colours of one rail item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RailColors {
+    /// The item's whole rectangle: the window's face colour.
+    face: u32,
+    /// The rounded selection fill, when the item is selected.
+    fill: Option<u32>,
+    /// The name and icon.
+    text: u32,
+    /// The accent pill, when the item is selected.
+    pill: Option<u32>,
+}
+
+/// The colours of an item. High contrast is system colours only: the selected
+/// item is `Highlight` with `HighlightText` on it, the pill the same text
+/// colour. Otherwise the selection is the 6 % tint every Windows 11 list uses
+/// and the pill is the user's accent (`accent`).
+fn rail_colors(
+    selected: bool,
+    high_contrast: bool,
+    face: u32,
+    tokens: &crate::ui::theme::Tokens,
+    sys: &crate::ui::theme::SysColors,
+    accent: u32,
+) -> RailColors {
+    if !selected {
+        return RailColors {
+            face,
+            fill: None,
+            text: tokens.text,
+            pill: None,
+        };
+    }
+    if high_contrast {
+        return RailColors {
+            face,
+            fill: Some(sys.highlight),
+            text: sys.highlight_text,
+            pill: Some(sys.highlight_text),
+        };
+    }
+    RailColors {
+        face,
+        fill: Some(crate::ui::card_buttons::blend(face, tokens.text, 6)),
+        text: tokens.text,
+        pill: Some(accent),
+    }
+}
+
+/// Whether Segoe Fluent Icons is installed; looked up once.
+fn fluent_icons_installed() -> bool {
+    static FLUENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLUENT.get_or_init(|| font_face_exists(crate::ui::theme::FLUENT_ICON_FONT_FACE))
+}
+
+/// An icon font `dp` tall at `dpi`. The caller deletes it.
+unsafe fn icon_font(dp: i32, dpi: u32) -> HFONT {
+    let mut lf = LOGFONTW {
+        lfHeight: -to_px(dp, dpi),
+        lfWeight: FW_NORMAL.0 as i32,
+        ..Default::default()
+    };
+    let face = crate::ui::theme::icon_font_face(fluent_icons_installed());
+    for (i, u) in face.encode_utf16().enumerate() {
+        if i < lf.lfFaceName.len() - 1 {
+            lf.lfFaceName[i] = u;
+        }
+    }
+    CreateFontIndirectW(&lf)
+}
+
+/// `WM_MEASUREITEM`: every rail item is the same height.
+unsafe fn measure_rail_item(lparam: LPARAM, dpi: u32) {
+    let mis = &mut *(lparam.0 as *mut windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+    if mis.CtlID == ID_RAIL as u32 {
+        mis.itemHeight = to_px(RAIL_ITEM_H_DP, dpi).max(1) as u32;
+    }
+}
+
+/// `WM_DRAWITEM` for the rail: one item.
+unsafe fn draw_rail_item(lparam: LPARAM) {
+    use crate::ui::theme::{
+        accent_fill, read_accent_shades, SysColors, Theme, Tokens, CONTROL_RADIUS_DP,
+        FOCUS_LINE_DP, ICON_FONT_DP, RAIL_ICON_X_DP, RAIL_INSET_DP, RAIL_PILL_H_DP, RAIL_PILL_W_DP,
+        RAIL_TEXT_X_DP,
+    };
+    use windows::Win32::Foundation::{COLORREF, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        CreateSolidBrush, FillRect, FrameRect, GetStockObject, GetSysColor, RoundRect,
+        SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, DT_END_ELLIPSIS, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, NULL_PEN, TRANSPARENT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    if di.CtlID != ID_RAIL as u32 {
+        return;
+    }
+    // An empty list asks for its focus rectangle with the item id -1.
+    let Some(page) = Page::from_index(di.itemID as i32 as isize) else {
+        return;
+    };
+    let hdc = di.hDC;
+    let rc: RECT = di.rcItem;
+    let dpi = dpi_for(di.hwndItem);
+    let selected = di.itemState.0 & ODS_SELECTED != 0;
+
+    let high_contrast = crate::ui::card_buttons::system_high_contrast().is_some();
+    let sys = SysColors::read();
+    let theme = Theme::resolve(true, high_contrast);
+    let tokens = Tokens::for_theme(theme, &sys);
+    let face = GetSysColor(COLOR_BTNFACE);
+    let accent = if selected && !high_contrast {
+        accent_fill(theme, read_accent_shades(), face)
+    } else {
+        face
+    };
+    let colors = rail_colors(selected, high_contrast, face, &tokens, &sys, accent);
+
+    let brush = CreateSolidBrush(COLORREF(colors.face));
+    FillRect(hdc, &rc, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+
+    let inset = to_px(RAIL_INSET_DP, dpi);
+    let pad_y = to_px(2, dpi);
+    let fill_rc = RECT {
+        left: rc.left + inset,
+        top: rc.top + pad_y,
+        right: rc.right - inset,
+        bottom: rc.bottom - pad_y,
+    };
+    let radius = to_px(CONTROL_RADIUS_DP, dpi);
+    let null_pen = GetStockObject(NULL_PEN);
+    if let Some(fill) = colors.fill {
+        let b = CreateSolidBrush(COLORREF(fill));
+        if high_contrast {
+            FillRect(hdc, &fill_rc, b);
+        } else {
+            let old_b = SelectObject(hdc, HGDIOBJ(b.0));
+            let old_p = SelectObject(hdc, null_pen);
+            let _ = RoundRect(
+                hdc,
+                fill_rc.left,
+                fill_rc.top,
+                fill_rc.right + 1,
+                fill_rc.bottom + 1,
+                radius * 2,
+                radius * 2,
+            );
+            SelectObject(hdc, old_b);
+            SelectObject(hdc, old_p);
+        }
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+    if let Some(pill) = colors.pill {
+        let b = CreateSolidBrush(COLORREF(pill));
+        let old_b = SelectObject(hdc, HGDIOBJ(b.0));
+        let old_p = SelectObject(hdc, null_pen);
+        let h = to_px(RAIL_PILL_H_DP, dpi);
+        let w = to_px(RAIL_PILL_W_DP, dpi);
+        let top = rc.top + (rc.bottom - rc.top - h) / 2;
+        let left = fill_rc.left;
+        let _ = RoundRect(hdc, left, top, left + w + 1, top + h + 1, w * 2, w * 2);
+        SelectObject(hdc, old_b);
+        SelectObject(hdc, old_p);
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(colors.text));
+    let flags = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS;
+    // The icon.
+    let icons = icon_font(ICON_FONT_DP, dpi);
+    let old_font = SelectObject(hdc, HGDIOBJ(icons.0));
+    let mut icon_rc = rc;
+    icon_rc.left += to_px(RAIL_ICON_X_DP, dpi);
+    icon_rc.right = rc.left + to_px(RAIL_TEXT_X_DP, dpi);
+    let mut glyph = [0u8; 4];
+    crate::ui::text::draw_text_line(hdc, page.glyph().encode_utf8(&mut glyph), icon_rc, flags);
+    // The name, in the window's own font.
+    let list_font = SendMessageW(di.hwndItem, WM_GETFONT, None, None).0;
+    if list_font != 0 {
+        SelectObject(hdc, HGDIOBJ(list_font as *mut c_void));
+    }
+    let mut text_rc = rc;
+    text_rc.left += to_px(RAIL_TEXT_X_DP, dpi);
+    text_rc.right -= inset;
+    crate::ui::text::draw_text_line(hdc, page.label(), text_rc, flags);
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(HGDIOBJ(icons.0));
+
+    // A focus ring only when Windows says to draw one (keyboard use).
+    if di.itemState.0 & ODS_FOCUS != 0 && di.itemState.0 & ODS_NOFOCUSRECT == 0 {
+        let ring = to_px(FOCUS_LINE_DP, dpi).max(1);
+        let b = CreateSolidBrush(COLORREF(tokens.text));
+        let mut r = fill_rc;
+        for _ in 0..ring {
+            FrameRect(hdc, &r, b);
+            r.left += 1;
+            r.top += 1;
+            r.right -= 1;
+            r.bottom -= 1;
+        }
+        let _ = DeleteObject(HGDIOBJ(b.0));
+    }
+}
+
+/// Shows `page`: scrolls the body to its top, shows its controls and hides
+/// the rest, resizes the scroll range to it and keeps the rail on it. Focus
+/// stays where it is, unless it was on a control that just went away, and then
+/// it goes to the rail.
+unsafe fn show_page(inner: &mut SettingsInner, page: Page) {
+    if page != inner.page {
+        // A shortcut being learned belongs to the General page, and the line
+        // that tells the user to press a key goes with it.
+        if inner.learning.is_some() {
+            stop_learning(inner);
+            set_hotkey_status(inner.hwnd, "Cancelled. The shortcut is unchanged.");
+        }
+        if !inner.body.0.is_null() {
+            scroll_body_to(inner.body, 0);
+        }
+        inner.page = page;
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
+        sync_visibility(inner);
+        apply_dpi(inner);
+        SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
+        let _ = RedrawWindow(
+            Some(inner.hwnd),
+            None,
+            None,
+            RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN,
+        );
+    }
+    if !inner.rail.0.is_null() {
+        let shown = SendMessageW(inner.rail, LB_GETCURSEL, None, None).0;
+        if shown != page.index() as isize {
+            SendMessageW(inner.rail, LB_SETCURSEL, Some(WPARAM(page.index())), None);
+        }
+        let focus = GetFocus();
+        if !focus.0.is_null()
+            && IsChild(inner.hwnd, focus).as_bool()
+            && !IsWindowVisible(focus).as_bool()
+        {
+            let _ = SetFocus(Some(inner.rail));
+        }
+    }
+}
+
+/// Moves focus to the first control of the current page that can take it.
+unsafe fn focus_into_page(inner: &SettingsInner) {
+    use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, WS_DISABLED};
+    for c in &inner.children {
+        if c.page != Some(inner.page) {
+            continue;
+        }
+        let style = GetWindowLongPtrW(c.hwnd, GWL_STYLE) as u32;
+        if IsWindowVisible(c.hwnd).as_bool()
+            && style & WS_TABSTOP.0 != 0
+            && style & WS_DISABLED.0 == 0
+        {
+            let _ = SetFocus(Some(c.hwnd));
+            return;
+        }
+    }
+    // A page with nothing to type in (Actions) leaves focus on the rail.
+}
+
+/// Runs one `WM_SETTINGS_PAGE` request.
+unsafe fn handle_page_request(inner: &mut SettingsInner, what: usize, arg: isize) {
+    match what {
+        PAGE_PICK => {
+            if let Some(page) = Page::from_index(arg) {
+                show_page(inner, page);
+            }
+        }
+        PAGE_STEP => show_page(inner, inner.page.step(arg)),
+        PAGE_ENTER => focus_into_page(inner),
+        PAGE_SWAP_FOCUS => {
+            if GetFocus() == inner.rail {
+                focus_into_page(inner);
+            } else {
+                let _ = SetFocus(Some(inner.rail));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -6305,31 +7129,18 @@ impl GalleryWindow {
         unsafe { (*self.raw).hwnd }
     }
 
+    /// Picks a page (what a click on the rail does).
+    pub(crate) fn show_page(&mut self, page: Page) {
+        let inner = unsafe { &mut *self.raw };
+        unsafe { show_page(inner, page) };
+    }
+
     /// Expands or collapses the Advanced group (what its toggle does).
     pub fn set_advanced(&mut self, expanded: bool) {
         let inner = unsafe { &mut *self.raw };
         if inner.prompt_expanded != expanded {
             inner.prompt_expanded = expanded;
             unsafe { show_prompt_state(inner) };
-        }
-    }
-
-    /// Scrolls the body to the top or the bottom (the scrollbar's Home and
-    /// End).
-    pub fn scroll_to_end(&mut self, bottom: bool) {
-        let inner = unsafe { &*self.raw };
-        let code = if bottom {
-            windows::Win32::UI::WindowsAndMessaging::SB_BOTTOM
-        } else {
-            windows::Win32::UI::WindowsAndMessaging::SB_TOP
-        };
-        unsafe {
-            SendMessageW(
-                inner.body,
-                WM_VSCROLL,
-                Some(WPARAM(code.0 as usize)),
-                Some(LPARAM(0)),
-            );
         }
     }
 }
@@ -6375,6 +7186,464 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- pages and the rail (#872) ----------------------------------------
+
+    /// The title bar and borders of the window, in dp, as the layout tests
+    /// assume (a measured window at 150 % is about 38).
+    const NC_HEIGHT_GUESS_DP: i32 = 40;
+
+    /// Whether the control `id` is shown (its own visible bit; the test
+    /// window itself is never shown).
+    fn is_shown(hwnd: HWND, id: i32) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+        let h = get_dlg_item(hwnd, id).expect("control exists");
+        unsafe { GetWindowLongPtrW(h, GWL_STYLE) as u32 & WS_VISIBLE.0 != 0 }
+    }
+
+    #[test]
+    fn every_control_is_on_exactly_one_page_or_is_chrome() {
+        for (name, id) in ALL_CONTROL_IDS {
+            let pages: Vec<Page> = PAGE_CONTROLS
+                .iter()
+                .filter(|(_, ids)| ids.contains(id))
+                .map(|(p, _)| *p)
+                .collect();
+            if CHROME_IDS.contains(id) {
+                assert!(pages.is_empty(), "{name} is chrome but is on {pages:?}");
+            } else {
+                assert_eq!(
+                    pages.len(),
+                    1,
+                    "{name} must be on exactly one page: {pages:?}"
+                );
+            }
+        }
+        // And the table names nothing the id list does not know.
+        let known: Vec<i32> = ALL_CONTROL_IDS.iter().map(|(_, id)| *id).collect();
+        for (page, ids) in PAGE_CONTROLS {
+            assert!(!ids.is_empty(), "{page:?} would be an empty page");
+            for id in ids {
+                assert!(known.contains(id), "{page:?} lists an unknown id {id}");
+            }
+        }
+        // One entry per page, in rail order.
+        let order: Vec<Page> = PAGE_CONTROLS.iter().map(|(p, _)| *p).collect();
+        assert_eq!(order, Page::ALL.to_vec());
+    }
+
+    #[test]
+    fn the_built_controls_sit_on_the_pages_the_table_names() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for (page, ids) in PAGE_CONTROLS {
+                for id in ids {
+                    let h = get_dlg_item(hwnd, *id).unwrap_or_else(|| panic!("id {id} missing"));
+                    let child = inner
+                        .children
+                        .iter()
+                        .find(|c| c.hwnd == h)
+                        .unwrap_or_else(|| panic!("id {id} was not recorded"));
+                    assert_eq!(child.page, Some(page), "control id {id}");
+                }
+            }
+            // The footer belongs to no page.
+            for id in [ID_SAVE, ID_CANCEL, ID_VALIDATION_MESSAGE] {
+                let h = get_dlg_item(hwnd, id).expect("footer control");
+                let child = inner
+                    .children
+                    .iter()
+                    .find(|c| c.hwnd == h)
+                    .expect("recorded");
+                assert_eq!(child.page, None, "footer control id {id}");
+            }
+            // Every recorded child is on a page or in the footer: a group box
+            // or a label made on no page would show on all of them.
+            let untagged = inner.children.iter().filter(|c| c.page.is_none()).count();
+            assert_eq!(untagged, 3, "only Save, Cancel and the message line");
+        });
+    }
+
+    #[test]
+    fn only_the_current_pages_controls_are_shown() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            assert_eq!(inner.page, Page::General);
+            assert!(is_shown(hwnd, ID_AUTOSTART));
+            assert!(!is_shown(hwnd, ID_REDACT), "Privacy is not showing");
+            assert!(!is_shown(hwnd, ID_OPENAI_KEY), "Models is not showing");
+            assert!(is_shown(hwnd, ID_SAVE), "the footer is on every page");
+
+            // Ctrl+3: Privacy.
+            unsafe { handle_page_request(inner, PAGE_PICK, 2) };
+            assert_eq!(inner.page, Page::Privacy);
+            assert!(is_shown(hwnd, ID_REDACT));
+            assert!(is_shown(hwnd, ID_MAX_EDGE));
+            assert!(!is_shown(hwnd, ID_AUTOSTART));
+            assert!(is_shown(hwnd, ID_SAVE));
+            let sel = unsafe { SendMessageW(inner.rail, LB_GETCURSEL, None, None).0 };
+            assert_eq!(sel, 2, "the rail follows a keyboard pick");
+
+            // Back to General: the redaction box goes again.
+            unsafe { handle_page_request(inner, PAGE_PICK, 0) };
+            assert!(!is_shown(hwnd, ID_REDACT));
+            assert!(is_shown(hwnd, ID_AUTOSTART));
+        });
+    }
+
+    /// A control with a state of its own stays hidden on its page until that
+    /// state says to show it, and never shows on another page.
+    #[test]
+    fn the_prompt_and_the_ollama_button_keep_their_own_visibility() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            // Advanced with the prompt folded: its toggle shows, the box not.
+            unsafe { handle_page_request(inner, PAGE_PICK, 4) };
+            assert!(is_shown(hwnd, ID_PROMPT_TOGGLE));
+            assert!(!is_shown(hwnd, ID_PROMPT_EDIT));
+            inner.prompt_expanded = true;
+            unsafe { show_prompt_state(inner) };
+            assert!(is_shown(hwnd, ID_PROMPT_EDIT));
+            assert!(is_shown(hwnd, ID_RESET_PROMPT));
+            // Leaving the page hides them; coming back shows the open box.
+            unsafe { handle_page_request(inner, PAGE_PICK, 0) };
+            assert!(!is_shown(hwnd, ID_PROMPT_EDIT));
+            unsafe { handle_page_request(inner, PAGE_PICK, 4) };
+            assert!(is_shown(hwnd, ID_PROMPT_EDIT));
+
+            // The Ollama button is on Models and only when it has an offer.
+            unsafe { handle_page_request(inner, PAGE_PICK, 1) };
+            assert!(!is_shown(hwnd, ID_OLLAMA_LINK), "nothing to offer yet");
+            inner.ollama_link_shown = true;
+            unsafe { sync_visibility(inner) };
+            assert!(is_shown(hwnd, ID_OLLAMA_LINK));
+            unsafe { handle_page_request(inner, PAGE_PICK, 2) };
+            assert!(!is_shown(hwnd, ID_OLLAMA_LINK), "not on the Privacy page");
+        });
+    }
+
+    /// The rail's own message: a click or an arrow key makes the list box
+    /// tell its parent `LBN_SELCHANGE`, and the window's `WM_COMMAND` arm picks
+    /// the page. Sent the way the list box sends it.
+    #[test]
+    fn a_rail_selection_change_picks_the_page() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            unsafe {
+                SendMessageW(inner.rail, LB_SETCURSEL, Some(WPARAM(3)), None);
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_RAIL as usize | ((LBN_SELCHANGE as usize) << 16))),
+                    Some(LPARAM(inner.rail.0 as isize)),
+                );
+            }
+            assert_eq!(unsafe { &*raw }.page, Page::Actions);
+            assert!(is_shown(hwnd, ID_ACTIONS_NOTE));
+            assert!(!is_shown(hwnd, ID_AUTOSTART));
+        });
+    }
+
+    /// The posted request the keys make arrives through the window procedure
+    /// (a page request that nothing handles would change no page).
+    #[test]
+    fn a_posted_page_request_reaches_the_window_procedure() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETTINGS_PAGE,
+                    Some(WPARAM(PAGE_STEP)),
+                    Some(LPARAM(-1)),
+                );
+            }
+            assert_eq!(unsafe { &*raw }.page, Page::Advanced, "Ctrl+PageUp wraps");
+        });
+    }
+
+    #[test]
+    fn the_rail_lists_the_five_pages_under_one_name() {
+        use windows::Win32::UI::WindowsAndMessaging::GWL_STYLE;
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            assert_eq!(get_text(inner.rail), RAIL_NAME);
+            assert_eq!(unsafe { GetDlgCtrlID(inner.rail) }, ID_RAIL);
+            let count = unsafe { SendMessageW(inner.rail, 0x018B, None, None).0 }; // LB_GETCOUNT
+            assert_eq!(count, 5);
+            for (i, page) in Page::ALL.iter().enumerate() {
+                let mut buf = [0u16; 32];
+                let n = unsafe {
+                    SendMessageW(
+                        inner.rail,
+                        0x0189, // LB_GETTEXT
+                        Some(WPARAM(i)),
+                        Some(LPARAM(buf.as_mut_ptr() as isize)),
+                    )
+                    .0
+                };
+                assert_eq!(
+                    String::from_utf16_lossy(&buf[..n.max(0) as usize]),
+                    page.label()
+                );
+            }
+            // It is one Tab stop, and the first.
+            let style = unsafe { GetWindowLongPtrW(inner.rail, GWL_STYLE) } as u32;
+            assert!(style & WS_TABSTOP.0 != 0 && style & WS_VISIBLE.0 != 0);
+            // Its name comes first, then the rail, then the pages.
+            let name = unsafe { GetWindow(hwnd, GW_CHILD) }.expect("first child");
+            assert_eq!(get_text(name), RAIL_NAME);
+            let next = unsafe { GetWindow(name, GW_HWNDNEXT) }.expect("second child");
+            assert_eq!(next, inner.rail, "the rail follows its name in z-order");
+        });
+    }
+
+    #[test]
+    fn page_keys_are_ctrl_only() {
+        assert_eq!(
+            page_key('1' as u32, true, false),
+            Some(PageKey::Pick(Page::General))
+        );
+        assert_eq!(
+            page_key('3' as u32, true, false),
+            Some(PageKey::Pick(Page::Privacy))
+        );
+        assert_eq!(
+            page_key('5' as u32, true, false),
+            Some(PageKey::Pick(Page::Advanced))
+        );
+        assert_eq!(page_key('6' as u32, true, false), None);
+        assert_eq!(page_key('0' as u32, true, false), None);
+        assert_eq!(
+            page_key('3' as u32, false, false),
+            None,
+            "typing a 3 is not a command"
+        );
+        assert_eq!(
+            page_key(0x22, true, false),
+            Some(PageKey::Step(1)),
+            "PageDown"
+        );
+        assert_eq!(
+            page_key(0x21, true, false),
+            Some(PageKey::Step(-1)),
+            "PageUp"
+        );
+        assert_eq!(page_key(0x22, false, false), None);
+        // AltGr is Ctrl+Alt: AltGr+3 and AltGr+PageDown are not commands.
+        assert_eq!(page_key('3' as u32, true, true), None);
+        assert_eq!(page_key(0x22, true, true), None);
+        assert_eq!(page_key(0x21, true, true), None);
+    }
+
+    /// Save on a bad field shows the page the field is on, then focuses it:
+    /// SetFocus on a hidden page's control does nothing.
+    #[test]
+    fn save_rejecting_a_field_shows_its_page_and_focuses_it() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        with_open_window(|hwnd, _owner| {
+            let inner =
+                unsafe { &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsInner) };
+            set_text(get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap(), "abc");
+            unsafe { show_page(inner, Page::Privacy) };
+            assert!(!is_shown(hwnd, ID_CARD_SECONDS));
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_COMMAND,
+                    Some(WPARAM(ID_SAVE as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+            assert_eq!(inner.page, Page::General);
+            assert!(is_shown(hwnd, ID_CARD_SECONDS));
+            assert!(
+                unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+                "Save was rejected"
+            );
+            assert_eq!(
+                unsafe { GetFocus() },
+                get_dlg_item(hwnd, ID_CARD_SECONDS).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn pages_step_round_the_ends() {
+        assert_eq!(Page::General.step(1), Page::Models);
+        assert_eq!(Page::Advanced.step(1), Page::General);
+        assert_eq!(Page::General.step(-1), Page::Advanced);
+        assert_eq!(Page::from_index(-1), None, "LB_ERR is no page");
+        assert_eq!(Page::from_index(5), None);
+        assert_eq!(Page::from_index(4), Some(Page::Advanced));
+        for (i, p) in Page::ALL.iter().enumerate() {
+            assert_eq!(p.index(), i);
+        }
+    }
+
+    #[test]
+    fn rail_colours_follow_the_theme_rules() {
+        use crate::ui::theme::{Theme, Tokens, HC_BLACK, HC_WHITE, LIGHT};
+        let face = 0x00F0_F0F0;
+        let accent = 0x00C0_6700;
+        // Not selected: just the face, the theme's text.
+        let idle = rail_colors(false, false, face, &LIGHT, &HC_BLACK, accent);
+        assert_eq!((idle.fill, idle.pill), (None, None));
+        assert_eq!(idle.text, LIGHT.text);
+        // Selected: a tint off the face and the accent pill.
+        let on = rail_colors(true, false, face, &LIGHT, &HC_BLACK, accent);
+        assert_ne!(on.fill, Some(face));
+        assert!(on.fill.is_some());
+        assert_eq!(on.pill, Some(accent));
+        // High contrast: system colours only, in both system themes, with the
+        // text on the selection readable.
+        for sys in [HC_BLACK, HC_WHITE] {
+            let tokens = Tokens::for_theme(Theme::HighContrast, &sys);
+            let c = rail_colors(true, true, sys.window, &tokens, &sys, accent);
+            assert_eq!(c.fill, Some(sys.highlight));
+            assert_eq!(c.text, sys.highlight_text);
+            assert_eq!(c.pill, Some(sys.highlight_text));
+            let ratio = crate::ui::theme::contrast_ratio(
+                crate::ui::theme::relative_luminance(c.text),
+                crate::ui::theme::relative_luminance(sys.highlight),
+            );
+            assert!(ratio >= 4.5, "selected item contrast {ratio}");
+            let idle = rail_colors(false, true, sys.window, &tokens, &sys, accent);
+            assert_eq!(idle.text, sys.window_text);
+        }
+    }
+
+    /// The rail is built from `theme.rs` tokens: five items fit under the top
+    /// pad in the height the window has at the smallest size it opens at, and
+    /// no literal pixel sizes sit in its code.
+    #[test]
+    fn the_rail_has_room_for_five_items() {
+        let rail_dp = crate::ui::theme::RAIL_TOP_PAD_DP + 5 * RAIL_ITEM_H_DP;
+        assert!(rail_dp <= MIN_WIN_H_DP.max(WIN_H_DP / 2), "{rail_dp}");
+        assert_eq!(WIN_W_DP, RAIL_W_DP + PAGE_W_DP);
+        // A page's width is what the one column used to be.
+        assert_eq!(PAGE_W_DP, 620);
+    }
+
+    /// #872's layout rule: no page scrolls at 100 % and 150 % on a 1080p
+    /// screen. The window is as tall as the fullest page (plus the footer and a
+    /// title bar of about 40 dp) when the monitor allows it.
+    #[test]
+    fn no_page_needs_scrolling_at_100_and_150_percent_on_1080p() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            // The work area of a 1080p screen with a taskbar: 1040 px.
+            for dpi in [96u32, 144] {
+                let fitted = fitted_height_for_work_px(1040, dpi);
+                for page in Page::ALL {
+                    let need =
+                        inner.page_content_dp[page.index()] + FOOTER_H_DP + NC_HEIGHT_GUESS_DP;
+                    assert!(
+                        need <= fitted,
+                        "{page:?} needs {need} dp at {dpi} dpi, the window gets {fitted}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// #872's measurement: what UI Automation reports for the owner-drawn rail.
+    /// Run by hand: `cargo test rail_uia -- --ignored --nocapture`. It prints
+    /// the list's control type, name and each item's type, name and selection.
+    #[test]
+    #[ignore = "live UI Automation measurement; run by hand"]
+    fn rail_uia_role_is_a_list_of_named_list_items() {
+        use windows::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomation, TreeScope_Children, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            let automation: IUIAutomation =
+                unsafe { crate::inputs::uia_automation::create_automation() }.expect("UIA");
+            let rail = unsafe { automation.ElementFromHandle(inner.rail) }.expect("rail element");
+            let ctype = unsafe { rail.CurrentControlType() }.expect("type");
+            let name = unsafe { rail.CurrentName() }.expect("name").to_string();
+            println!(
+                "rail: control type {} (List is {}), name {name:?}",
+                ctype.0, UIA_ListControlTypeId.0
+            );
+            let all = unsafe { automation.CreateTrueCondition() }.expect("condition");
+            let items = unsafe { rail.FindAll(TreeScope_Children, &all) }.expect("items");
+            let n = unsafe { items.Length() }.expect("len");
+            println!("rail children: {n}");
+            let mut names = Vec::new();
+            for i in 0..n {
+                let item = unsafe { items.GetElement(i) }.expect("item");
+                let t = unsafe { item.CurrentControlType() }.expect("t");
+                let nm = unsafe { item.CurrentName() }.expect("n").to_string();
+                println!(
+                    "  item {i}: type {} (ListItem is {}), name {nm:?}",
+                    t.0, UIA_ListItemControlTypeId.0
+                );
+                names.push((t, nm));
+            }
+            unsafe { CoUninitialize() };
+            assert_eq!(ctype, UIA_ListControlTypeId, "the rail keeps the List role");
+            assert_eq!(name, RAIL_NAME);
+            assert_eq!(names.len(), 5);
+            for (page, (t, nm)) in Page::ALL.iter().zip(&names) {
+                assert_eq!(*t, UIA_ListItemControlTypeId);
+                assert_eq!(nm, page.label());
+            }
+        });
+    }
+
+    /// The keys reach the window: `handle_key` turns Ctrl+digit, Ctrl+PageUp
+    /// and PageDown, F6 and Enter on the rail into the posted page request.
+    /// A source scan (CRLF-normalised, the body must be found), because a
+    /// real key needs a real message pump.
+    #[test]
+    fn handle_key_posts_the_page_requests() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let start = src
+            .find("unsafe fn handle_key(")
+            .expect("handle_key exists");
+        let end = start + src[start..].find("\n}\n").expect("handle_key ends");
+        let body = &src[start..end];
+        assert!(!body.is_empty());
+        for needle in [
+            "page_key(vk, ctrl, alt)",
+            "VK_F6",
+            "PAGE_ENTER",
+            "WM_SETTINGS_PAGE",
+        ] {
+            assert!(body.contains(needle), "handle_key lacks {needle}");
+        }
+    }
+
+    /// Tab goes from the rail into the shown page and skips the hidden ones:
+    /// the next stop after the rail is a control of the current page.
+    #[test]
+    fn tab_from_the_rail_lands_on_the_current_page() {
+        use windows::Win32::UI::WindowsAndMessaging::GetNextDlgTabItem;
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            for page in [Page::General, Page::Privacy, Page::Advanced] {
+                unsafe { show_page(inner, page) };
+                let next = unsafe { GetNextDlgTabItem(hwnd, Some(inner.rail), false) }
+                    .expect("a tab stop after the rail");
+                let on_page = inner
+                    .children
+                    .iter()
+                    .find(|c| c.hwnd == next)
+                    .map(|c| c.page);
+                assert_eq!(on_page, Some(Some(page)), "after the rail on {page:?}");
+            }
+        });
     }
 
     // -- font_face_exists (#346) -------------------------------------------
@@ -6778,6 +8047,9 @@ mod tests {
             inner.hwnd = hwnd;
             inner.font = font;
             inner.adopt(built);
+            // The Ollama group is on the Models page; its button only shows
+            // while that page does.
+            unsafe { show_page(inner, Page::Models) };
             inner.ollama_status.clone()
         };
         let alive = unsafe { &*raw }.alive.clone();
@@ -7157,7 +8429,19 @@ mod tests {
                 .collect();
             assert!(groups.len() >= 5, "found {} group boxes", groups.len());
             let mut checked = 0;
-            for name in ["Providers", "Ollama", "Capture"] {
+            for (name, page) in [
+                ("Providers", Page::Models),
+                ("Ollama", Page::Models),
+                ("Capture", Page::Privacy),
+            ] {
+                unsafe { show_page(&mut *raw, page) };
+                // The group's rect is read with its page showing.
+                let groups: Vec<(String, RECT)> = inner
+                    .children
+                    .iter()
+                    .filter(|c| unsafe { is_group_box(c.hwnd) })
+                    .map(|c| (get_text(c.hwnd), rect(c.hwnd)))
+                    .collect();
                 let (_, g) = groups.iter().find(|(t, _)| t == name).expect(name);
                 let last = inner
                     .children
@@ -7204,7 +8488,11 @@ mod tests {
                 "the line starts where the body ends ({dpi} dpi)"
             );
             assert_eq!(b - t, 1, "a hairline at every scale ({dpi} dpi)");
-            assert_eq!((l, r), (0, client_w), "the line spans the client width");
+            assert_eq!(
+                (l, r),
+                (to_px(RAIL_W_DP, dpi), client_w),
+                "the line spans the pages, not the rail"
+            );
         }
     }
 
@@ -9226,7 +10514,16 @@ mod tests {
     /// derived, so a change to those sections has to update this test
     /// deliberately rather than silently keep passing against a moving
     /// target.
-    const CONTENT_TOP_DP: i32 = 768;
+    ///
+    /// #872 put every page's first group at the top of the body, so the Prompt
+    /// group, alone on the Advanced page, starts at the page's top pad.
+    const CONTENT_TOP_DP: i32 = 8;
+
+    /// The Advanced page's content height with the prompt folded away, in dp:
+    /// what `window_height_dp` is given when that page is the tallest.
+    fn advanced_collapsed_content_dp() -> i32 {
+        footer_layout(CONTENT_TOP_DP, 0, false).content_h()
+    }
 
     /// #481 replaced the #340 invariant. The footer no longer has to stay
     /// clear of the Prompt group by arithmetic: it is pinned to the client
@@ -9251,8 +10548,10 @@ mod tests {
         // #481's screenshots. The content is taller than the view, so it
         // scrolls instead of being cut off.
         assert!(prompt_group_is_inside_the_scrolling_content(645));
-        let f = prompt_footer_layout(CONTENT_TOP_DP, 645);
-        assert!(f.content_h() > 645 - FOOTER_H_DP);
+        // The prompt group is alone on its page now (#872), so it only
+        // outgrows the view on a very short one.
+        let f = prompt_footer_layout(CONTENT_TOP_DP, 200);
+        assert!(f.content_h() > 200 - FOOTER_H_DP);
     }
 
     #[test]
@@ -9305,12 +10604,12 @@ mod tests {
         // Compare what each state needs, not the fitted window: the
         // expanded group's minimum already ran past `WIN_H_DP` (#481).
         let nc = 40;
-        let collapsed = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
+        let collapsed = window_height_dp(advanced_collapsed_content_dp(), false, 5000, nc);
         let e = footer_layout(CONTENT_TOP_DP, 0, true);
         let expanded_needed = e.content_h() + FOOTER_H_DP + nc;
         assert!(collapsed + MIN_PROMPT_EDIT_H <= expanded_needed);
         assert_eq!(
-            window_height_dp(CONTENT_TOP_DP, true, WIN_H_DP, nc),
+            window_height_dp(advanced_collapsed_content_dp(), true, WIN_H_DP, nc),
             WIN_H_DP
         );
     }
@@ -9356,13 +10655,14 @@ mod tests {
 
     #[test]
     fn collapsed_window_never_exceeds_the_screen_fit() {
-        assert_eq!(window_height_dp(CONTENT_TOP_DP, false, 500, 40), 500);
+        // The fullest page is taller than the fit: the fit wins.
+        assert_eq!(window_height_dp(900, false, 500, 40), 500);
     }
 
     #[test]
     fn collapsed_window_height_holds_exactly_the_body_and_the_footer() {
         let nc = 40;
-        let h = window_height_dp(CONTENT_TOP_DP, false, 5000, nc);
+        let h = window_height_dp(advanced_collapsed_content_dp(), false, 5000, nc);
         let f = footer_layout(CONTENT_TOP_DP, h - nc, false);
         // No scroll range when it fits: the content is exactly the view.
         assert_eq!(f.content_h() + FOOTER_H_DP, h - nc);
@@ -9474,8 +10774,8 @@ mod tests {
 
     #[test]
     fn content_is_taller_than_a_short_view_and_fills_a_tall_one_exactly() {
-        let short = footer_layout(CONTENT_TOP_DP, 600, true);
-        assert!(short.content_h() > 600 - FOOTER_H_DP, "must scroll");
+        let short = footer_layout(CONTENT_TOP_DP, 200, true);
+        assert!(short.content_h() > 200 - FOOTER_H_DP, "must scroll");
         let tall = footer_layout(CONTENT_TOP_DP, 1500, true);
         assert_eq!(tall.content_h(), 1500 - FOOTER_H_DP, "no needless scroll");
     }
@@ -9839,6 +11139,7 @@ mod tests {
 
     fn child(x: i32, y: i32, w: i32, h: i32, anchor: Anchor) -> ChildLayout {
         ChildLayout {
+            page: None,
             hwnd: HWND(std::ptr::null_mut()),
             x,
             y,
@@ -10102,7 +11403,8 @@ mod tests {
             inner.hwnd = hwnd;
             inner.font = font;
             inner.adopt(built);
-            unsafe { apply_dpi(inner) };
+            // The Models page is the longest, so it is the one to scroll.
+            unsafe { show_page(inner, Page::Models) };
         }
         let body = unsafe { &*raw }.body;
         let view_px = client_h_px - to_px(FOOTER_H_DP, 96);
@@ -10121,9 +11423,9 @@ mod tests {
         assert!(save_y >= view_px, "Save {save_y} overlaps the body");
         assert!(save_y + to_px(BTN_H, 96) <= client_h_px, "Save is cut off");
 
-        // The Advanced toggle starts below the view and a scroll to the
-        // bottom (what the scrollbar's End does) brings it into the view.
-        let toggle = get_dlg_item(hwnd, ID_PROMPT_TOGGLE).expect("toggle");
+        // The Pull button starts below the view and a scroll to the bottom
+        // (what the scrollbar's End does) brings it into the view.
+        let toggle = get_dlg_item(hwnd, ID_PULL_BUTTON).expect("pull button");
         assert!(top_in_parent_px(body, toggle) >= view_px, "starts in view");
         unsafe {
             SendMessageW(
@@ -10251,6 +11553,7 @@ mod tests {
         };
 
         // Collapsed at start: no prompt text on screen, the toggle is.
+        unsafe { show_page(&mut *raw, Page::Advanced) };
         unsafe { show_prompt_state(&mut *raw) };
         assert!(!visible(prompt) && !visible(reset));
         assert!(visible(toggle));
@@ -10298,7 +11601,8 @@ mod tests {
             .count();
         assert!(footer >= 3, "Save, Cancel and the validation line");
         assert!(!inner.body.0.is_null(), "no scrolling body");
-        assert_eq!(direct_child_count(hwnd), footer + 1);
+        // The footer, the body, the rail and the rail's name (#872).
+        assert_eq!(direct_child_count(hwnd), footer + 3);
         assert_eq!(direct_child_count(inner.body), child_count - footer);
     }
 
@@ -10523,7 +11827,7 @@ mod tests {
     #[test]
     fn clamp_leaves_a_suggestion_that_fits_untouched() {
         // 100% 1440p-ish work area is tall: nothing to clamp.
-        let pos = (100, 100, 620, 900);
+        let pos = (100, 100, WIN_W_DP, 700);
         assert_eq!(clamp_suggested_to_work(pos, &work(0, 1400), 96), pos);
     }
 
