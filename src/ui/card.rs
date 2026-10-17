@@ -4006,35 +4006,60 @@ impl CardInner {
         // cannot squeeze the value column away.
         let label_min_w = self.scale(PREVIEW_LABEL_W_DP).min(content_width / 2).max(1);
         let label_max_w = ((content_width as f32) * PREVIEW_LABEL_MAX_FRACTION) as i32;
+        let full_label_w: Vec<i32> = fields
+            .iter()
+            .map(|f| self.measure_label(self.fonts.body, &f.label).0)
+            .collect();
+        // A multi-line field, or a label too long for even the widest
+        // column, stacks (label above value) and so must not widen the
+        // label column of the other rows (#813).
         let measured_label_w: Vec<i32> = fields
             .iter()
-            .map(|f| {
-                // A multi-line field puts its label on its own line, so it
-                // must not widen the label column of the other rows.
-                if f.multiline {
-                    0
-                } else {
-                    self.measure_label(self.fonts.body, &f.label).0
-                }
-            })
+            .zip(full_label_w.iter())
+            .map(|(f, &w)| if f.multiline || w > label_max_w { 0 } else { w })
             .collect();
         let label_w = label_column_width(&measured_label_w, label_min_w, label_max_w);
         let value_x = content_left + label_w + self.scale(6);
         let value_w = (content_right - value_x).max(1);
-
+        // The text column of a read-only value: the same inset the paint
+        // applies, so "fits" here means "fits on screen".
+        let value_text_w = (value_w - self.scale(FIELD_PAD_X_DP)).max(1);
         let mut rows = Vec::with_capacity(fields.len());
-        for (field, &measured_w) in fields.iter().zip(measured_label_w.iter()) {
-            if field.multiline {
-                // #105: the label on its own line, then the value wrapped
-                // across the full width, capped so a long OCR dump cannot
-                // push the buttons off the screen (the last visible line
-                // ends in an ellipsis when the text is longer).
+        for (field, &full_w) in fields.iter().zip(full_label_w.iter()) {
+            let stacked = row_is_stacked(
+                field.multiline,
+                full_w,
+                label_max_w,
+                (!field.editable).then(|| self.measure_label(self.fonts.body, &field.value).0),
+                value_text_w,
+            );
+            if stacked {
+                // #105, #813: the label on its own line (wrapped when it is
+                // wider than the card), then the value across the full
+                // width. A multi-line or read-only value wraps, capped so a
+                // long OCR dump cannot push the buttons off the screen (the
+                // last visible line ends in an ellipsis when the text is
+                // longer); a one-line editable field keeps its one-line box.
                 let line_h = self.line_height(self.fonts.body).max(1);
-                let wrapped_h = self.measure_wrapped(self.fonts.body, &field.value, content_width);
+                let label_wrapped = full_w > content_width;
+                let label_h = if label_wrapped {
+                    // Top-aligned lines get the air a centred single line has.
+                    self.measure_wrapped(self.fonts.body, &field.label, content_width)
+                        + (row_h - line_h).max(0) / 2
+                } else {
+                    row_h
+                };
+                let wrapped_h = self.measure_wrapped(
+                    self.fonts.body,
+                    &field.value,
+                    content_width - self.scale(FIELD_PAD_X_DP) * 2,
+                );
                 let text_h = wrapped_h.clamp(line_h, line_h * PREVIEW_MULTILINE_MAX_LINES);
                 // An editable field is a framed box, so its text needs room
                 // inside the frame (#811).
-                let value_h = if field.editable {
+                let value_h = if field.editable && !field.multiline {
+                    row_h
+                } else if field.editable {
                     text_h + 2 * self.scale(FIELD_PAD_Y_DP)
                 } else {
                     text_h
@@ -4043,22 +4068,24 @@ impl CardInner {
                     left: content_left,
                     top: y,
                     right: content_right,
-                    bottom: y + row_h,
+                    bottom: y + label_h,
                 };
                 let value_rect = RECT {
                     left: content_left,
-                    top: y + row_h,
+                    top: y + label_h,
                     right: content_right,
-                    bottom: y + row_h + value_h,
+                    bottom: y + label_h + value_h,
                 };
                 rows.push(PreviewRowMetrics {
                     label_rect,
                     value_rect,
-                    label_wrapped: false,
+                    label_wrapped,
+                    value_stacked: true,
                 });
-                y += row_h + value_h + row_gap;
+                y += label_h + value_h + row_gap;
                 continue;
             }
+            let measured_w = full_w;
             // A label that still does not fit the (clamped) column wraps to
             // a second line rather than ellipsizing, per #355's "Done
             // when": the whole label must be visible, not just wider.
@@ -4089,6 +4116,7 @@ impl CardInner {
                 label_rect,
                 value_rect,
                 label_wrapped,
+                value_stacked: false,
             });
             y += row_content_h + row_gap;
         }
@@ -4268,12 +4296,12 @@ impl CardInner {
                 value_rect.left += self.scale(FIELD_PAD_X_DP);
                 SelectObject(hdc, HGDIOBJ(self.fonts.body.0));
                 SetTextColor(hdc, windows::Win32::Foundation::COLORREF(palette.headline));
-                let value_format = if field.multiline {
-                    DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
-                } else {
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
-                };
-                draw_text_line(hdc, &field.value, value_rect, value_format);
+                draw_text_line(
+                    hdc,
+                    &field.value,
+                    value_rect,
+                    value_draw_format(row.value_stacked),
+                );
             }
         }
 
@@ -4316,6 +4344,31 @@ const PREVIEW_LABEL_MAX_FRACTION: f32 = 0.45;
 /// text) may take before it ends in an ellipsis.
 const PREVIEW_MULTILINE_MAX_LINES: i32 = 10;
 
+/// How a read-only value is drawn (#813): a stacked value wraps from the top
+/// of its box (the box is as tall as the wrapped text), a beside-the-label
+/// value is one centred line.
+fn value_draw_format(stacked: bool) -> windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT {
+    if stacked {
+        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS
+    } else {
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS
+    }
+}
+
+/// Whether a preview row puts its label above its value instead of beside
+/// it (#813): a multi-line field always does, and so does a label too wide
+/// for even the widest label column, or a read-only one-line value
+/// (`value_w`, `None` for an editable field) wider than the value column,
+/// so the note the user needs to see ("(from profile)") is never cut off.
+fn row_is_stacked(
+    multiline: bool,
+    label_w: i32,
+    label_max_w: i32,
+    value_w: Option<i32>,
+    value_col_w: i32,
+) -> bool {
+    multiline || label_w > label_max_w || value_w.is_some_and(|w| w > value_col_w)
+}
 /// Sizes the preview label column from the widest measured label (#355),
 /// clamped between `min_w` (the old fixed 84dp floor) and `max_w` (45% of
 /// the content width). Pure and DPI-agnostic: callers scale `measured`,
@@ -4431,6 +4484,9 @@ struct PreviewRowMetrics {
     /// so it must be drawn wrapped (`DT_WORDBREAK`) instead of ellipsized
     /// on one line (#355).
     label_wrapped: bool,
+    /// The value sits under its label on the full width (#813), and is
+    /// drawn wrapped from the top, not on one centred line.
+    value_stacked: bool,
 }
 
 struct PreviewButtonMetrics {
@@ -7480,6 +7536,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn row_is_stacked_for_multiline_long_label_or_long_read_only_value() {
+        assert!(row_is_stacked(true, 10, 100, None, 100));
+        assert!(row_is_stacked(false, 101, 100, None, 100));
+        assert!(row_is_stacked(false, 10, 100, Some(101), 100));
+        assert!(!row_is_stacked(false, 100, 100, Some(100), 100));
+        // An editable field (no measured value) scrolls inside its box.
+        assert!(!row_is_stacked(false, 10, 100, None, 100));
+    }
+
+    #[test]
+    fn preview_long_read_only_value_is_shown_whole_below_its_label() {
+        // #813: "742 Evergreen Terrace, Apt 4B (from profile)" must not be
+        // cut to "742 Evergreen Terrace..." beside its label.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        for dpi in [96u32, 144] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let value = "742 Evergreen Terrace, Apt 4B (from profile)";
+            let fields = vec![Field {
+                name: "addr".to_string(),
+                label: "Mailing address, including apartment or unit number".to_string(),
+                value: value.to_string(),
+                editable: false,
+                required: false,
+                multiline: false,
+            }];
+            let m = card.inner.compute_preview_layout(&fields, false);
+            let row = &m.rows[0];
+            assert!(
+                row.value_rect.top >= row.label_rect.bottom,
+                "dpi {dpi}: value must sit below its label"
+            );
+            assert!(row.value_stacked, "dpi {dpi}");
+            let format = value_draw_format(row.value_stacked);
+            assert!(
+                format.0 & DT_WORDBREAK.0 != 0 && format.0 & DT_SINGLELINE.0 == 0,
+                "dpi {dpi}: the value must be drawn wrapped, not on one cut line"
+            );
+            assert!(format.0 & DT_VCENTER.0 == 0, "dpi {dpi}: top aligned");
+            // The box holds the wrapped text.
+            let box_w = row.value_rect.right - row.value_rect.left;
+            let wrapped = card
+                .inner
+                .measure_wrapped(card.inner.fonts.body, value, box_w);
+            assert!(row.value_rect.bottom - row.value_rect.top >= wrapped);
+        }
+    }
+
+    #[test]
+    fn preview_rows_keep_an_even_gap() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let mk = |name: &str, label: &str, value: &str, editable: bool| Field {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: value.to_string(),
+            editable,
+            required: false,
+            multiline: false,
+        };
+        for dpi in [96u32, 144] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let fields = vec![
+                mk(
+                    "a",
+                    "Employer-provided legal first and middle name",
+                    "Jordan Alexander (from profile)",
+                    false,
+                ),
+                mk(
+                    "b",
+                    "Mailing address, including apartment or unit number",
+                    "742 Evergreen Terrace, Apt 4B (from profile)",
+                    false,
+                ),
+                mk(
+                    "c",
+                    "Social security number (last four digits only) (sensitive, clear to skip)",
+                    "6789",
+                    true,
+                ),
+            ];
+            let m = card.inner.compute_preview_layout(&fields, false);
+            let gap = card.inner.scale(PREVIEW_ROW_GAP_DP);
+            for pair in m.rows.windows(2) {
+                let prev_bottom = pair[0].label_rect.bottom.max(pair[0].value_rect.bottom);
+                assert_eq!(pair[1].label_rect.top - prev_bottom, gap, "dpi {dpi}");
+            }
+        }
+    }
     #[test]
     fn preview_without_edit_keeps_do_it_right_aligned_with_no_cancel_slot() {
         // #392 supersedes #352's Cancel-placement Done-when: Cancel no
