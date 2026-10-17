@@ -579,10 +579,35 @@ pub(crate) fn escape_text(s: &str) -> String {
             ';' => out.push_str("\\;"),
             '\n' => out.push_str("\\n"),
             '\r' => {}
+            // #1214: the other line breaks a reader may honour (NEL, LS, PS)
+            // are line breaks too, never raw text in the file.
+            '\u{85}' | '\u{2028}' | '\u{2029}' => out.push_str("\\n"),
+            '\t' => out.push(' '),
+            // Controls and invisible direction/format marks: no value may
+            // start a new property or reorder what the reader sees. The
+            // vCard path already dropped these in its own cleaning.
+            c if c.is_control() || c == '\u{feff}' || is_hidden_format(c) => {}
             other => out.push(other),
         }
     }
     out
+}
+
+/// True for the format characters that reorder or hide text (bidi overrides,
+/// isolates, marks and zero-width or invisible operators). The joiners ZWJ
+/// and ZWNJ are not in it: scripts need them. Shared by the ICS escaping and
+/// the contact cleaning so both apply one rule.
+pub(crate) fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{061c}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Folds one unfolded content line to RFC 5545's 75-octet limit (§3.1):
@@ -1421,6 +1446,25 @@ END:VCALENDAR\r\n";
         for (input, expected) in cases {
             assert_eq!(escape_text(input), *expected, "failed for {input:?}");
         }
+    }
+
+    /// #1214: nothing that a calendar app might read as a line break or a
+    /// hidden control survives into the file, the same rule the vCard path
+    /// always had.
+    #[test]
+    fn escape_text_strips_controls_and_maps_unicode_line_breaks() {
+        assert_eq!(escape_text("a\u{2028}b"), "a\\nb");
+        assert_eq!(escape_text("a\u{2029}b"), "a\\nb");
+        assert_eq!(escape_text("a\u{85}b"), "a\\nb");
+        for c in [
+            '\u{b}', '\u{c}', '\u{8}', '\u{1b}', '\u{7f}', '\u{202e}', '\u{2066}', '\u{feff}',
+            '\u{200b}',
+        ] {
+            let out = escape_text(&format!("a{c}b"));
+            assert_eq!(out, "ab", "{c:?} must be dropped");
+        }
+        assert_eq!(escape_text("a\tb"), "a b");
+        assert_eq!(escape_text("caf\u{e9} \u{1F600}"), "caf\u{e9} \u{1F600}");
     }
 
     #[test]

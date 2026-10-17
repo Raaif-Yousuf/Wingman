@@ -249,6 +249,13 @@ pub struct UnicodeKeyEvent {
     pub key_up: bool,
 }
 
+/// Longest value the typed-input fallback will type, in characters (#1214).
+/// Each UTF-16 unit is two `SendInput` events in one batch and the field is
+/// typed into at keyboard speed, so a runaway model answer is refused rather
+/// than flooding the target. Generous: a form field or a paragraph is far
+/// below it, and a larger text is better pasted than typed.
+pub const MAX_TYPED_CHARS: usize = 10_000;
+
 /// Plans the `SendInput` Unicode key events that would type `text` into a
 /// focused control, one down/up pair per UTF-16 code unit, in order. Never
 /// plans an Enter, Tab or other control-key event: `\n`, `\r` and `\t` are
@@ -304,6 +311,22 @@ pub fn plan_typed_fallback(control_type: &str, new_text: &str) -> Result<TypedRe
     if new_text.contains(['\n', '\r', '\t']) {
         return Err(anyhow!(
             "the value has a line break or tab, which Wingman cannot type into this field without changing it. Nothing was written. Click the field and type the value yourself."
+        ));
+    }
+    // #1214: any other control character (Backspace, Escape, DEL, C1) or
+    // Unicode line separator would reach the control as a key event or a
+    // line break, so the field would not hold what the preview showed.
+    if new_text
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(anyhow!(
+            "the value has a control character, which Wingman cannot type into this field without changing it. Nothing was written. Click the field and type the value yourself."
+        ));
+    }
+    if new_text.chars().count() > MAX_TYPED_CHARS {
+        return Err(anyhow!(
+            "the value is too long to type into this field ({MAX_TYPED_CHARS} characters at most). Nothing was written. Click the field and paste the value yourself."
         ));
     }
     let text = plan_typed_input(new_text);
@@ -1225,6 +1248,33 @@ mod tests {
         assert!(!events[2].key_up && events[3].key_up);
         // The two surrogate halves are different code units.
         assert_ne!(events[0].code_unit, events[2].code_unit);
+    }
+
+    /// #1214: any other control character would reach the control as a
+    /// key event (U+0008 is Backspace in an Edit), so the value would differ
+    /// from the preview. Refused, never silently altered.
+    #[test]
+    fn plan_typed_fallback_refuses_other_control_characters() {
+        for c in [
+            '\u{8}', '\u{1b}', '\u{7f}', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
+        ] {
+            let v = format!("a{c}b");
+            let msg = plan_typed_fallback("Edit", &v).unwrap_err().to_string();
+            assert!(msg.contains("Nothing was written"), "{c:?}: {msg}");
+        }
+        assert!(plan_typed_fallback("Edit", "caf\u{e9} \u{1F600}").is_ok());
+    }
+
+    /// #1214: two SendInput events per UTF-16 unit go out in one batch, so a
+    /// runaway value is refused with a named error.
+    #[test]
+    fn plan_typed_fallback_caps_the_length() {
+        let ok = "x".repeat(MAX_TYPED_CHARS);
+        assert!(plan_typed_fallback("Edit", &ok).is_ok());
+        let long = "x".repeat(MAX_TYPED_CHARS + 1);
+        let msg = plan_typed_fallback("Edit", &long).unwrap_err().to_string();
+        assert!(msg.contains("too long"), "{msg}");
+        assert!(msg.contains("Nothing was written"), "{msg}");
     }
 
     // -- plan_typed_fallback (#592: the fallback replaces, never appends) ---
