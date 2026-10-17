@@ -64,6 +64,16 @@ pub fn card_text(address: &str) -> (String, String) {
     )
 }
 
+/// Whether this press can reach Ollama at all: never in Offline mode (the
+/// offline guard refuses a request to a non-loopback address, so there is no
+/// send to warn about), otherwise when `ollama` is in the selected chain.
+/// In Auto mode the chain assumes Ollama is up; whether it really is needs a
+/// network probe, so a press that ends up on a cloud provider can still show
+/// the card for an address that was not used. Pure.
+pub fn notice_applies(mode: crate::mode::Mode, selected: &[String]) -> bool {
+    mode != crate::mode::Mode::Offline && selected.iter().any(|n| n == "ollama")
+}
+
 /// The address the running session already warned about, so a file that
 /// cannot be written does not warn on every press.
 static SESSION_ACK: Mutex<Option<String>> = Mutex::new(None);
@@ -190,6 +200,18 @@ mod tests {
             warning_due("http://192.168.1.21:11434", Some("192.168.1.20")).as_deref(),
             Some("192.168.1.21")
         );
+    }
+
+    #[test]
+    fn the_notice_never_applies_offline_or_without_ollama_in_the_chain() {
+        use crate::mode::Mode;
+        let with = vec!["ollama".to_string(), "openai".to_string()];
+        let without = vec!["openai".to_string()];
+        assert!(notice_applies(Mode::Local, &with));
+        assert!(notice_applies(Mode::Auto, &with));
+        assert!(!notice_applies(Mode::Offline, &with));
+        assert!(!notice_applies(Mode::Local, &without));
+        assert!(!notice_applies(Mode::Local, &[]));
     }
 
     #[test]

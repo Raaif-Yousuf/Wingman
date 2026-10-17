@@ -1280,13 +1280,11 @@ impl App {
     /// Returns `true` when it did (the caller must stop). The address is
     /// remembered, so the next press goes through; 127.0.0.1 never shows it.
     fn show_remote_ollama_notice(&mut self) -> bool {
-        let ollama_in_chain = self
+        let selected = self
             .config
             .providers
-            .selected_order_for_mode(self.config.mode, true)
-            .iter()
-            .any(|n| n == "ollama");
-        if !ollama_in_chain {
+            .selected_order_for_mode(self.config.mode, true);
+        if !crate::remote_ollama::notice_applies(self.config.mode, &selected) {
             return false;
         }
         let Some((headline, detail)) =
