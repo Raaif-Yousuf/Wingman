@@ -12,10 +12,9 @@
 use crate::ui::theme::{accent_fill, read_accent_shades, Theme};
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, FillRect, GetStockObject, GetSysColor, RoundRect,
-    SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT,
-    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT,
-    HGDIOBJ, NULL_BRUSH, PS_SOLID, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, FillRect, GetSysColor, SelectObject, SetBkMode, SetTextColor,
+    COLOR_BTNFACE, COLOR_BTNTEXT, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, DT_CENTER,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HFONT, HGDIOBJ, TRANSPARENT,
 };
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
@@ -286,19 +285,8 @@ pub(crate) unsafe fn draw(
     FillRect(hdc, &rc, bg);
     let _ = DeleteObject(HGDIOBJ(bg.0));
 
-    let brush = CreateSolidBrush(COLORREF(look.fill));
-    let pen = CreatePen(PS_SOLID, 1, COLORREF(look.border));
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
-    let _ = RoundRect(
-        hdc,
-        rc.left,
-        rc.top,
-        rc.right,
-        rc.bottom,
-        corner * 2,
-        corner * 2,
-    );
+    // Smoothed corners: `RoundRect` has no anti-aliasing (#989).
+    crate::ui::round_rect::paint(hdc, rc, corner, Some(look.fill), Some((look.border, 1)));
 
     let old_font = SelectObject(hdc, HGDIOBJ(font.0));
     SetBkMode(hdc, TRANSPARENT);
@@ -314,28 +302,23 @@ pub(crate) unsafe fn draw(
     );
 
     if dis.itemState.0 & ODS_FOCUS != 0 && dis.itemState.0 & ODS_NOFOCUSRECT == 0 {
-        let focus_pen = CreatePen(PS_SOLID, ring.max(1), COLORREF(look.focus));
-        SelectObject(hdc, HGDIOBJ(focus_pen.0));
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
         let inset = ring + 2;
-        let _ = RoundRect(
+        let ring_rect = RECT {
+            left: rc.left + inset,
+            top: rc.top + inset,
+            right: rc.right - inset,
+            bottom: rc.bottom - inset,
+        };
+        crate::ui::round_rect::paint(
             hdc,
-            rc.left + inset,
-            rc.top + inset,
-            rc.right - inset,
-            rc.bottom - inset,
-            corner.max(2),
-            corner.max(2),
+            ring_rect,
+            corner.max(2) / 2,
+            None,
+            Some((look.focus, ring.max(1))),
         );
-        SelectObject(hdc, HGDIOBJ(pen.0));
-        let _ = DeleteObject(HGDIOBJ(focus_pen.0));
     }
 
     SelectObject(hdc, old_font);
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(HGDIOBJ(brush.0));
-    let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
 /// Maps a `DRAWITEMSTRUCT` to the state to draw, given the hover flag.
