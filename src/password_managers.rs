@@ -640,6 +640,8 @@ mod tests {
     const GUARDED: &[&str] = &[
         "begin_action",
         "run_model_free_screen_action",
+        // #709: reads the selection on its worker, so it refuses first.
+        "run_selection_first_action",
         "copy_region",
         "calculate_selection",
         // #307: captures a small image for the router before it shows the
@@ -684,6 +686,32 @@ mod tests {
         "router_non_vision_inputs",
         "ocr_text_of",
     ];
+
+    /// `app.rs` helpers that capture the screen but refuse nothing themselves:
+    /// every caller is a [`GUARDED`] entry point (or a handler that refuses
+    /// first), checked in `a_capture_helper_is_only_called_after_a_refusal`.
+    const CALLER_GUARDED: &[&str] = &["hide_card_and_capture"];
+
+    /// #709: `hide_card_and_capture` is reached from the model-free runner and
+    /// from the handler of the screen request, and both refuse before it.
+    #[test]
+    fn a_capture_helper_is_only_called_after_a_refusal() {
+        let fns = app_functions();
+        let mut callers = 0;
+        for helper in CALLER_GUARDED {
+            let call = format!("self.{helper}(");
+            for (name, body) in fns.iter().filter(|(n, _)| n != helper) {
+                if let Some(at) = body.find(&call) {
+                    callers += 1;
+                    let guard = body
+                        .find(guard_marker(name))
+                        .unwrap_or_else(|| panic!("{name} calls {helper} with no guard"));
+                    assert!(guard < at, "{name} calls {helper} before the guard");
+                }
+            }
+        }
+        assert!(callers >= 2, "scanner found {callers} callers");
+    }
 
     #[test]
     fn every_main_thread_entry_point_refuses_before_it_reads() {
@@ -784,7 +812,9 @@ mod tests {
         );
         let unguarded: Vec<&&str> = candidates
             .iter()
-            .filter(|n| !GUARDED.contains(*n) && !WORKER_SIDE.contains(*n))
+            .filter(|n| {
+                !GUARDED.contains(*n) && !WORKER_SIDE.contains(*n) && !CALLER_GUARDED.contains(*n)
+            })
             .collect();
         assert!(
             unguarded.is_empty(),
