@@ -4111,26 +4111,27 @@ impl App {
     /// the form and submits it, or closes it. A browser that will not open
     /// ends in a card (AGENTS.md rule 7), never a silent no-op.
     fn report_problem(&mut self) {
-        use crate::connectors::oauth::{BrowserOpener, ShellBrowser};
-        let Some(last_error) = self.last_error.as_ref() else {
-            self.card.show_answer(
+        use crate::report_problem::{open_report, Outcome};
+        let chain = self.last_error.as_ref().map(|e| e.chain.as_str());
+        let outcome = open_report(
+            chain,
+            self.config.mode.label(),
+            &self.config.providers.order,
+            &crate::connectors::oauth::ShellBrowser,
+        );
+        match outcome {
+            Outcome::Opened => {}
+            Outcome::NothingToReport => self.card.show_answer(
                 "Nothing to report",
                 "No error details are available.",
                 4,
                 None,
-            );
-            return;
-        };
-        let input = crate::report_problem::ReportInput::from_parts(
-            self.config.mode.label(),
-            &self.config.providers.order,
-            &last_error.chain,
-        );
-        let url = crate::report_problem::build_url(&input);
-        if let Err(e) = ShellBrowser.open(&url) {
-            let detail = self.track_error("Couldn't open the browser", &format!("{e}"));
-            self.card
-                .show_error_with_details("Couldn't open the browser", &detail);
+            ),
+            // Not `track_error`: the recorded error stays the one being
+            // reported, so Copy details and a second report still use it.
+            Outcome::OpenFailed(reason) => self
+                .card
+                .show_error("Couldn't open the browser", &human_error_detail(&reason)),
         }
     }
 

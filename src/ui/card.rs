@@ -157,7 +157,7 @@ pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 /// [`WM_APP_CARD_COPY_DETAILS`], the facts come from `App`, not the card.
 /// `App::report_problem` opens the browser at a prefilled new-issue page.
 /// Registered in `app.rs`'s `ALL_WM_APP_IDS` (issue #163).
-pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 24;
+pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 25;
 
 mod options;
 pub use options::{OptionRow, OptionsBehavior};

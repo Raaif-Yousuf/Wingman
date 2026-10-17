@@ -50,7 +50,7 @@ impl ErrorClass {
 /// `chain` is copied out.
 pub fn classify(chain: &str) -> ErrorClass {
     let c = chain.to_ascii_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| c.contains(w));
+    let has = |words: &[&str]| words.iter().any(|w| contains_token(&c, w));
     if has(&["offline mode", "offline guard"]) {
         ErrorClass::Offline
     } else if has(&["refus"]) {
@@ -69,6 +69,51 @@ pub fn classify(chain: &str) -> ErrorClass {
         ErrorClass::Network
     } else {
         ErrorClass::Other
+    }
+}
+
+/// `true` when `word` is in `text` and, for a number, is a whole number: a
+/// status code is not found inside "5000 ms" or "v4010". Words keep the plain
+/// substring rule ("refus" matches "refusal").
+fn contains_token(text: &str, word: &str) -> bool {
+    if !word.bytes().all(|b| b.is_ascii_digit()) {
+        return text.contains(word);
+    }
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// What [`open_report`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// No error has been recorded, so there is nothing to report.
+    NothingToReport,
+    Opened,
+    /// The browser would not open; carries the reason.
+    OpenFailed(String),
+}
+
+/// Builds the link from the recorded error chain and hands it to `opener`.
+/// Takes the chain by shared reference on purpose: reporting never changes
+/// the recorded error, so "Copy details" and a second report still describe
+/// the original failure after a browser that would not open.
+pub fn open_report(
+    chain: Option<&str>,
+    mode_label: &str,
+    order: &[String],
+    opener: &dyn crate::connectors::oauth::BrowserOpener,
+) -> Outcome {
+    let Some(chain) = chain else {
+        return Outcome::NothingToReport;
+    };
+    let url = build_url(&ReportInput::from_parts(mode_label, order, chain));
+    match opener.open(&url) {
+        Ok(()) => Outcome::Opened,
+        Err(e) => Outcome::OpenFailed(format!("{e}")),
     }
 }
 
@@ -243,6 +288,64 @@ mod tests {
         );
         assert_eq!(classify("something odd"), ErrorClass::Other);
         assert_eq!(classify(""), ErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_matches_whole_status_codes_only() {
+        assert_eq!(classify("waited 5000 ms for the model"), ErrorClass::Other);
+        assert_eq!(classify("took 4010ms"), ErrorClass::Other);
+        assert_eq!(classify("id 14290 failed"), ErrorClass::Other);
+        assert_eq!(classify("HTTP 500: boom"), ErrorClass::Server);
+        assert_eq!(classify("status=429"), ErrorClass::RateLimit);
+        assert_eq!(classify("(401)"), ErrorClass::Auth);
+        assert_eq!(classify("500"), ErrorClass::Server);
+    }
+
+    struct FakeOpener {
+        fail: bool,
+        seen: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl crate::connectors::oauth::BrowserOpener for FakeOpener {
+        fn open(&self, url: &str) -> anyhow::Result<()> {
+            self.seen.borrow_mut().push(url.to_string());
+            if self.fail {
+                anyhow::bail!("no browser")
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn open_report_with_a_failing_browser_reports_failure_and_leaves_the_chain_alone() {
+        let chain = String::from("HTTP 503 from somewhere");
+        let order = vec!["openai".to_string()];
+        let opener = FakeOpener {
+            fail: true,
+            seen: Default::default(),
+        };
+        let out = open_report(Some(&chain), "Auto", &order, &opener);
+        assert_eq!(out, Outcome::OpenFailed("no browser".into()));
+        assert_eq!(chain, "HTTP 503 from somewhere");
+        assert_eq!(opener.seen.borrow().len(), 1);
+        assert!(opener.seen.borrow()[0].starts_with(NEW_ISSUE_URL));
+    }
+
+    #[test]
+    fn open_report_opens_once_and_with_no_chain_opens_nothing() {
+        let opener = FakeOpener {
+            fail: false,
+            seen: Default::default(),
+        };
+        assert_eq!(
+            open_report(Some("x"), "Auto", &[], &opener),
+            Outcome::Opened
+        );
+        assert_eq!(
+            open_report(None, "Auto", &[], &opener),
+            Outcome::NothingToReport
+        );
+        assert_eq!(opener.seen.borrow().len(), 1);
     }
 
     #[test]
