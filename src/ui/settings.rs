@@ -821,6 +821,8 @@ struct KeySeams {
     check: fn(crate::provider::model_list::Vendor, &str) -> crate::provider::model_list::KeyCheck,
     /// The mode now.
     mode: fn() -> crate::mode::Mode,
+    /// The full model list, for a check whose first page was not all of it.
+    fetch_all: fn(crate::provider::model_list::Vendor, &str) -> anyhow::Result<Vec<String>>,
     /// Starts the check's worker thread (#1140: a test makes it fail).
     spawn: fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
 }
@@ -838,6 +840,7 @@ impl KeySeams {
     const REAL: KeySeams = KeySeams {
         check: crate::provider::model_list::check_key,
         mode: crate::mode::current,
+        fetch_all: crate::provider::model_list::fetch,
         spawn: spawn_key_check_thread,
     };
 
@@ -847,6 +850,7 @@ impl KeySeams {
     const REAL: KeySeams = KeySeams {
         check: |_, _| crate::provider::model_list::KeyCheck::Unchecked,
         mode: || crate::mode::Mode::Auto,
+        fetch_all: |_, _| Err(anyhow::anyhow!("no network in tests")),
         spawn: spawn_key_check_thread,
     };
 }
@@ -1619,6 +1623,7 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
     set_status(inner, commit::CHECKING_LINE, false);
     let vendor = CLOUD_VENDORS[index];
     let check = inner.key_seams.check;
+    let fetch_all = inner.key_seams.fetch_all;
     // The list that comes with the answer replaces a slower list fetch's.
     let mine = inner.cloud_sync.generation[index].fetch_add(1, Ordering::SeqCst) + 1;
     let slots = inner.cloud_models.clone();
@@ -1627,9 +1632,13 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
     let hwnd_raw = inner.hwnd.0 as isize;
     let job = move || {
         use crate::provider::model_list::KeyCheck;
+        let mut full_list_owed = false;
         let verdict = match check(vendor, &key) {
-            KeyCheck::Accepted(ids) => {
-                if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
+            KeyCheck::Accepted(ids, complete) => {
+                // A first page that is not the whole list is not stored: the
+                // dropdown would keep it, and the key would count as fetched.
+                full_list_owed = !complete;
+                if complete && store_fetched_list(&slots, &sync, index, mine, &key, ids) {
                     post_while_open(&alive, || unsafe {
                         let _ = PostMessageW(
                             Some(HWND(hwnd_raw as *mut c_void)),
@@ -1660,6 +1669,22 @@ fn start_key_check(inner: &mut SettingsInner, field: Field, index: usize, key: S
                 LPARAM(commit::encode_verdict(generation, verdict)),
             );
         });
+        // The verdict is out; now the rest of a list that goes on, which the
+        // check did not wait for (#1140).
+        if full_list_owed {
+            if let Ok(ids) = fetch_all(vendor, &key) {
+                if store_fetched_list(&slots, &sync, index, mine, &key, ids) {
+                    post_while_open(&alive, || unsafe {
+                        let _ = PostMessageW(
+                            Some(HWND(hwnd_raw as *mut c_void)),
+                            WM_CLOUD_MODELS,
+                            WPARAM(index),
+                            LPARAM(0),
+                        );
+                    });
+                }
+            }
+        }
     };
     if (inner.key_seams.spawn)(Box::new(job)).is_err() {
         // No worker, so no answer would ever come and the row would say
@@ -15636,11 +15661,14 @@ mod tests {
     static SHAPE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn accepts(_: Vendor, _: &str) -> KeyCheck {
-        KeyCheck::Accepted(vec!["gpt-5".to_string()])
+        KeyCheck::Accepted(vec!["gpt-5".to_string()], true)
     }
     fn accepts_and_counts(_: Vendor, _: &str) -> KeyCheck {
         ONCE_CALLS.fetch_add(1, Ordering::SeqCst);
-        KeyCheck::Accepted(vec!["claude-x".to_string()])
+        KeyCheck::Accepted(vec!["claude-x".to_string()], true)
+    }
+    fn accepts_first_page(_: Vendor, _: &str) -> KeyCheck {
+        KeyCheck::Accepted(vec!["page-one".to_string()], false)
     }
     fn rejects(_: Vendor, _: &str) -> KeyCheck {
         KeyCheck::Rejected
@@ -15671,8 +15699,36 @@ mod tests {
         unsafe { &mut *raw }.key_seams = KeySeams {
             check,
             mode,
+            fetch_all: KeySeams::REAL.fetch_all,
             spawn: spawn_key_check_thread,
         };
+    }
+
+    /// #1140: a check that read only the first page of a longer list leaves the
+    /// dropdown with the full list, not that page, and the key as not yet fetched.
+    #[test]
+    fn a_first_page_check_ends_with_the_full_list() {
+        with_window(Config::default(), |hwnd, raw| {
+            record_sink(raw);
+            with_vendor(raw, accepts_first_page, auto);
+            unsafe { &mut *raw }.key_seams.fetch_all =
+                |_, _| Ok(vec!["page-one".to_string(), "page-two".to_string()]);
+            set_text(get_dlg_item(hwnd, ID_OPENAI_KEY).unwrap(), "sk-a-whole-key");
+            leave(hwnd, ID_OPENAI_KEY);
+            settle_key_check(hwnd);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let got = unsafe { &*raw }.cloud_models.lock().unwrap()[0].clone();
+                if got.as_ref().is_some_and(|l| l.len() == 2) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no full list: {got:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
     }
 
     /// #1140: a worker thread that cannot start must not leave the row on
@@ -15868,6 +15924,7 @@ mod tests {
             set_text(key, "sk-second-draft");
             settle_key_check(hwnd);
             assert!(seen.borrow().is_empty(), "the stale answer stored a key");
+            assert_ne!(status(hwnd), "Checking key...");
             assert_eq!(unsafe { &*raw }.tracker.failed_count(), 0);
             assert_eq!(get_text(key), "sk-second-draft");
             // The new text commits and checks on its own.

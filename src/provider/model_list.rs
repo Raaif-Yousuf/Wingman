@@ -77,16 +77,17 @@ pub fn fetch(vendor: Vendor, api_key: &str) -> Result<Vec<String>> {
 type GetPage<'a> = &'a dyn Fn(&str, &[(&str, &str)]) -> Result<String>;
 
 fn fetch_with(vendor: Vendor, api_key: &str, get: GetPage) -> Result<Vec<String>> {
-    fetch_pages(vendor, api_key, get, MAX_PAGES)
+    fetch_pages(vendor, api_key, get, MAX_PAGES).map(|(ids, _)| ids)
 }
 
-/// [`fetch_with`], reading at most `max_pages` pages.
+/// [`fetch_with`], reading at most `max_pages` pages. The flag is true when the
+/// vendor had no further page to give, so the ids are the whole list.
 fn fetch_pages(
     vendor: Vendor,
     api_key: &str,
     get: GetPage,
     max_pages: usize,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, bool)> {
     let mut url = match vendor {
         Vendor::OpenAi => OPENAI_URL.to_string(),
         Vendor::Anthropic => ANTHROPIC_URL.to_string(),
@@ -95,6 +96,7 @@ fn fetch_pages(
     let auth = format!("Bearer {api_key}");
     let mut bodies: Vec<String> = Vec::new();
     let mut total_bytes = 0usize;
+    let mut complete = false;
     for _ in 0..max_pages {
         let body = match vendor {
             Vendor::OpenAi => get(&url, &[("Authorization", auth.as_str())]),
@@ -119,21 +121,25 @@ fn fetch_pages(
         bodies.push(body);
         match follow(&url, next, total_bytes) {
             Some(n) => url = n,
-            None => break,
+            None => {
+                complete = true;
+                break;
+            }
         }
     }
     let ids = parse_pages(vendor, &bodies)?;
     if ids.is_empty() {
         return Err(anyhow!("{}: the list had no usable models", vendor.tag()));
     }
-    Ok(ids)
+    Ok((ids, complete))
 }
 
 /// What asking the vendor's list endpoint with a typed key found out (#876).
 #[derive(Debug)]
 pub enum KeyCheck {
-    /// 2xx: the vendor knows the key. Its model list came with the answer.
-    Accepted(Vec<String>),
+    /// 2xx: the vendor knows the key. The first page of its model list came with
+    /// the answer; the flag says that page was the whole list.
+    Accepted(Vec<String>, bool),
     /// 401 or 403 (or Gemini's 400 `API_KEY_INVALID`): the vendor refused it.
     Rejected,
     /// No network, a timeout, 5xx, a rate limit, an answer that is not a list:
@@ -153,8 +159,8 @@ pub fn check_key(vendor: Vendor, api_key: &str) -> KeyCheck {
 
 /// #1140: one page answers "does the vendor know this key", so the check
 /// never waits on the rest of a paginated list (up to `MAX_PAGES` x
-/// `LIST_TIMEOUT`). The page read is also the list the dropdown gets.
-fn check_pages(vendor: Vendor, api_key: &str, get: GetPage) -> Result<Vec<String>> {
+/// `LIST_TIMEOUT`). A list that goes on is fetched in full afterwards.
+fn check_pages(vendor: Vendor, api_key: &str, get: GetPage) -> Result<(Vec<String>, bool)> {
     fetch_pages(vendor, api_key, get, 1)
 }
 
@@ -163,9 +169,9 @@ fn check_key_with(vendor: Vendor, api_key: &str, get: GetPage) -> KeyCheck {
     classify(check_pages(vendor, api_key, get))
 }
 
-fn classify(result: Result<Vec<String>>) -> KeyCheck {
+fn classify(result: Result<(Vec<String>, bool)>) -> KeyCheck {
     let err = match result {
-        Ok(ids) => return KeyCheck::Accepted(ids),
+        Ok((ids, complete)) => return KeyCheck::Accepted(ids, complete),
         Err(err) => err,
     };
     let refused = err
@@ -594,7 +600,7 @@ mod key_check_tests {
             Ok(body.clone())
         });
         match got {
-            KeyCheck::Accepted(ids) => assert!(ids.contains(&"gpt-5".to_string())),
+            KeyCheck::Accepted(ids, _) => assert!(ids.contains(&"gpt-5".to_string())),
             other => panic!("expected Accepted, got {other:?}"),
         }
         // One cheap read-only request, to the vendor's own list endpoint.
@@ -614,7 +620,10 @@ mod key_check_tests {
                 calls.set(calls.get() + 1);
                 Ok(body.to_string())
             });
-            assert!(matches!(got, KeyCheck::Accepted(_)), "{vendor:?}: {got:?}");
+            assert!(
+                matches!(got, KeyCheck::Accepted(_, false)),
+                "{vendor:?}: {got:?}"
+            );
             assert_eq!(calls.get(), 1, "{vendor:?} followed a next page");
         }
         // The full list fetch still follows pages.
