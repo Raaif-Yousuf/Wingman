@@ -2889,6 +2889,8 @@ impl App {
     /// Every path that hides the card goes through here, so the double-press
     /// wait never outlives the card it was waiting on (#393).
     fn hide_card(&mut self) {
+        // #1138: the marks belong to the card; they go with it.
+        self.drop_overlay();
         self.disarm_key_window();
         self.card.hide();
     }
@@ -12198,6 +12200,36 @@ mod tests {
             routed >= 10,
             "expected the hide sites to be routed: {routed}"
         );
+    }
+
+    /// #1138: the marks belong to the card, so every hide of the card (Pause,
+    /// a dialog, a click away) drops the overlay and its hooks with it.
+    #[test]
+    fn hiding_the_card_drops_the_overlay_too() {
+        let src = lf(include_str!("app.rs"));
+        let live = src
+            .split(
+                "
+#[cfg(test)]",
+            )
+            .next()
+            .unwrap();
+        let helper = live
+            .split("fn hide_card(&mut self)")
+            .nth(1)
+            .expect("no hide_card");
+        let helper = &helper[..helper
+            .find(
+                "
+    }
+",
+            )
+            .unwrap()];
+        let drop_at = helper
+            .find("self.drop_overlay()")
+            .expect("hide_card does not drop the overlay");
+        let hide_at = helper.find("self.card.hide()").expect("no card.hide()");
+        assert!(drop_at < hide_at, "drop first, while the card still shows");
     }
 
     /// #393: the press state machine. A second press inside the window for
