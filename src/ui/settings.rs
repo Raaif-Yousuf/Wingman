@@ -169,29 +169,13 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     inner.owner = owner;
     inner.owns_itself = true;
     let owner_raw = owner.0 as isize;
-    // What the FILE held when the window opened, defaults for keys it does not
-    // spell out. The running config is not that (a tray change not yet written,
-    // a default never written), and comparing with it refuses a save that
-    // touched nothing by hand. Tests do not read the real file (rule 9).
-    let file_baseline = if live {
-        crate::config::Config::path()
-            .ok()
-            .and_then(|p| crate::config_writer::file_baseline(&p))
-    } else {
-        None
-    };
-    // A list changed here replaces the whole list in the file, so it is written
-    // only if the file's list is still the one the window last saw (`baseline`);
-    // a hand edit of a sibling entry is not silently dropped.
-    if let Some(file) = file_baseline {
-        inner.baseline = file;
-    }
+    // What the FILE held when the window opened is read on a worker once the
+    // window exists (#1105, `start_open_read`): the running config is not that
+    // (a tray change not yet written, a default never written), and comparing
+    // with it refuses a save that touched nothing by hand. Tests do not read
+    // the real file (rule 9).
     if live {
         inner.file_path = crate::config::Config::path().ok();
-        inner.file_mtime = inner
-            .file_path
-            .as_deref()
-            .and_then(crate::config::file_mtime);
     }
     inner.save_sink = Some(Box::new(move |label, changes, original, edited| {
         crate::app::post_settings_save(
@@ -292,6 +276,16 @@ fn open_impl(instance: HINSTANCE, owner: HWND, config: &Config, class: &str, liv
     inner_ref.adopt(built);
     sync_card_display_enabled(hwnd);
     if live {
+        // #1105: the file's baseline and the Run key are read off the UI thread;
+        // the Start with Windows box is unchecked until its worker answers.
+        start_open_read(inner_ref);
+        // The box cannot be clicked until the Run key has been read.
+        if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
+            unsafe {
+                let _ = EnableWindow(box_, false);
+            }
+        }
+        start_autostart(inner_ref, AutostartJob::Read);
         // #527, #568: the Ollama status and button arrive later, off the UI
         // thread; the group says "Checking Ollama..." until then.
         spawn_ollama_status_probe(
@@ -795,6 +789,17 @@ struct SettingsInner {
     refreshing: bool,
     /// The worker's answer, taken by `WM_SETTINGS_REFRESH`.
     refresh_slot: RefreshSlot,
+    /// #1105: the open-time read of the file runs on a worker; its answer is
+    /// taken by `WM_SETTINGS_OPENED`.
+    open_slot: OpenSlot,
+    /// A commit or Undo has moved `baseline` since the window opened.
+    wrote: bool,
+    /// #1105: the Start with Windows worker. One job at a time; a click that
+    /// comes while one runs sets `autostart_again`.
+    autostart_busy: bool,
+    autostart_again: bool,
+    autostart_slot: AutostartSlot,
+    autostart_seams: AutostartSeams,
     /// #345: the hotkeys as edited in this window. Starts as the original's
     /// and is applied at once when a chord is learned.
     hotkeys: Hotkeys,
@@ -931,6 +936,12 @@ impl SettingsInner {
             file_mtime: None,
             refreshing: false,
             refresh_slot: Default::default(),
+            open_slot: Default::default(),
+            wrote: false,
+            autostart_busy: false,
+            autostart_again: false,
+            autostart_slot: Default::default(),
+            autostart_seams: AutostartSeams::REAL,
             learning: None,
             pending_conflict: None,
             original,
@@ -1013,6 +1024,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // #875: the worker re-read the file after the window was activated.
         WM_SETTINGS_REFRESH => {
             take_refresh(inner);
+            LRESULT(0)
+        }
+        // #1105: the Start with Windows worker answered.
+        WM_SETTINGS_AUTOSTART => {
+            take_autostart(inner);
+            LRESULT(0)
+        }
+        // #1105: the worker read the file the window opened on.
+        WM_SETTINGS_OPENED => {
+            take_open_read(inner);
             LRESULT(0)
         }
         // #872: the rail draws itself through us.
@@ -1794,6 +1815,7 @@ fn apply_field(inner: &mut SettingsInner, field: Field, raw: &RawForm, note: Opt
         fail_row(inner, field, &reason);
         return;
     }
+    inner.wrote = true;
     inner.tracker.begin(commit::InFlight {
         field,
         undoing: false,
@@ -1825,29 +1847,293 @@ fn apply_field(inner: &mut SettingsInner, field: Field, raw: &RawForm, note: Opt
 /// Why a Start with Windows change failed (#777): the registry would not take it.
 const AUTOSTART_FAILED: &str = "Windows did not allow the change.";
 
-/// Start with Windows is the registry's, not the file's: one small write on the
-/// click (what Save did before), and it is put back on a failure.
+/// What a Start with Windows worker is asked to do (#1105).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutostartJob {
+    /// Only read the Run key (the window just opened, or a row is shown again).
+    Read,
+    /// The user clicked the box: make the key say this.
+    Set(bool),
+    /// Undo: put the key back to this.
+    Undo(bool),
+}
+
+/// What the worker found. `now` is the key as it stands after the job, which is
+/// what the checkbox shows whatever happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AutostartAnswer {
+    was: bool,
+    now: bool,
+    failed: bool,
+    changed: bool,
+}
+
+struct AutostartDone {
+    job: AutostartJob,
+    answer: AutostartAnswer,
+}
+
+/// The Run key behind two function pointers, so the tests put a fake there
+/// (rule 9: no test touches the real key).
+#[derive(Clone, Copy)]
+struct AutostartSeams {
+    is_enabled: fn() -> bool,
+    set_enabled: fn(bool) -> anyhow::Result<()>,
+}
+
+impl AutostartSeams {
+    #[cfg(not(test))]
+    const REAL: AutostartSeams = AutostartSeams {
+        is_enabled: crate::autostart::is_enabled,
+        set_enabled: crate::autostart::set_enabled,
+    };
+
+    /// In a test build no window reaches the real Run key.
+    #[cfg(test)]
+    const REAL: AutostartSeams = AutostartSeams {
+        is_enabled: || false,
+        set_enabled: |_| Ok(()),
+    };
+}
+
+type AutostartSlot = std::sync::Arc<std::sync::Mutex<Option<AutostartDone>>>;
+
+/// The worker's whole job. A write that changes nothing is skipped. The answer
+/// carries the key as it stands afterwards, read back, so a refused or half
+/// applied write never leaves the box showing something untrue.
+fn run_autostart(job: AutostartJob, seams: AutostartSeams) -> AutostartAnswer {
+    let was = (seams.is_enabled)();
+    let want = match job {
+        AutostartJob::Read => None,
+        AutostartJob::Set(want) | AutostartJob::Undo(want) => Some(want),
+    };
+    let Some(want) = want.filter(|w| *w != was) else {
+        return AutostartAnswer {
+            was,
+            now: was,
+            failed: false,
+            changed: false,
+        };
+    };
+    let wrote = (seams.set_enabled)(want);
+    let now = (seams.is_enabled)();
+    let failed = wrote.is_err() || now != want;
+    AutostartAnswer {
+        was,
+        now,
+        failed,
+        changed: !failed,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AutostartVerdict {
+    /// Nothing to say: a read, or a click that changed nothing.
+    Quiet,
+    Saved {
+        was: bool,
+    },
+    Undone,
+    Failed,
+}
+
+fn autostart_verdict(job: AutostartJob, answer: &AutostartAnswer) -> AutostartVerdict {
+    match job {
+        AutostartJob::Read => AutostartVerdict::Quiet,
+        _ if answer.failed => AutostartVerdict::Failed,
+        AutostartJob::Set(_) if answer.changed => AutostartVerdict::Saved { was: answer.was },
+        AutostartJob::Undo(_) if answer.changed => AutostartVerdict::Undone,
+        _ => AutostartVerdict::Quiet,
+    }
+}
+
+/// Whether a job that arrives while another runs is remembered. Only a click
+/// is: it reads the box when its turn comes. A read is dropped (the running
+/// job's answer is as fresh), and it must never be run as a click, which
+/// would commit a placeholder box.
+fn queued_when_busy(job: AutostartJob) -> bool {
+    matches!(job, AutostartJob::Set(_))
+}
+
+/// Runs a Start with Windows job on a short worker and posts the answer back
+/// (#1105): the window's thread never touches the registry. One job runs at a
+/// time; a click that comes meanwhile is looked at when the answer lands.
+fn start_autostart(inner: &mut SettingsInner, job: AutostartJob) {
+    if inner.closing {
+        return;
+    }
+    if inner.autostart_busy {
+        if queued_when_busy(job) {
+            inner.autostart_again = true;
+        }
+        return;
+    }
+    inner.autostart_busy = true;
+    let slot = inner.autostart_slot.clone();
+    let alive = inner.alive.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let seams = inner.autostart_seams;
+    let spawned = std::thread::Builder::new()
+        .name("settings-autostart".into())
+        .spawn(move || {
+            let answer = run_autostart(job, seams);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(AutostartDone { job, answer });
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_SETTINGS_AUTOSTART,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        });
+    if spawned.is_err() {
+        inner.autostart_busy = false;
+        if job == AutostartJob::Read {
+            // No answer will come: do not leave the box dead.
+            if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+                if !crate::portable::is_portable() {
+                    unsafe {
+                        let _ = EnableWindow(box_, true);
+                    }
+                }
+            }
+        } else {
+            // Rule 7: not started is a failed row, not a silent no-op.
+            inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
+            set_status(
+                inner,
+                &commit::failed_line(Field::Autostart.label(), AUTOSTART_FAILED),
+                false,
+            );
+        }
+    }
+}
+
+/// Start with Windows is the registry's, not the file's: the click is handed to
+/// a worker, and the box shows what the key really says once it answers.
 fn commit_autostart(inner: &mut SettingsInner) {
     let want = checkbox_checked(inner.hwnd, ID_AUTOSTART);
-    let was = crate::autostart::is_enabled();
-    if want == was {
+    start_autostart(inner, AutostartJob::Set(want));
+}
+
+/// The worker's answer: the box follows the key, and the status line says what
+/// happened.
+fn take_autostart(inner: &mut SettingsInner) {
+    inner.autostart_busy = false;
+    let Some(done) = inner.autostart_slot.lock().ok().and_then(|mut g| g.take()) else {
         return;
+    };
+    if inner.closing {
+        return;
+    }
+    // The first answer makes the box real: it was disabled until the Run key
+    // was read (portable mode keeps it disabled for good).
+    if !crate::portable::is_portable() {
+        if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+            unsafe {
+                let _ = EnableWindow(box_, true);
+            }
+        }
+    }
+    // Clicked again while the job ran (this is the retry after a failed or
+    // finished job): the box holds the newer wish, so it is not overwritten
+    // with this answer, and that wish is sent now as a fresh job.
+    if std::mem::take(&mut inner.autostart_again) {
+        commit_autostart(inner);
+    } else if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
+        set_checkbox(box_, done.answer.now);
     }
     let label = Field::Autostart.label();
-    if crate::autostart::set_enabled(want).is_err() {
-        if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
-            set_checkbox(box_, crate::autostart::is_enabled());
+    match autostart_verdict(done.job, &done.answer) {
+        AutostartVerdict::Quiet => {}
+        AutostartVerdict::Failed => {
+            inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
+            set_status(inner, &commit::failed_line(label, AUTOSTART_FAILED), false);
         }
-        inner.tracker.fail(Field::Autostart, AUTOSTART_FAILED);
-        set_status(inner, &commit::failed_line(label, AUTOSTART_FAILED), false);
+        AutostartVerdict::Saved { was } => {
+            inner.tracker.clear_failed(Field::Autostart);
+            inner.tracker.undo = Some(commit::UndoSlot {
+                field: Field::Autostart,
+                what: commit::UndoWhat::Autostart { was },
+            });
+            set_status(inner, &commit::saved_line(label), true);
+        }
+        AutostartVerdict::Undone => {
+            set_status(inner, &commit::undone_line(label), false);
+        }
+    }
+}
+
+/// What reading the file at open found (#1105).
+struct Opened {
+    baseline: Option<Config>,
+    mtime: Option<std::time::SystemTime>,
+}
+
+type OpenSlot = std::sync::Arc<std::sync::Mutex<Option<Opened>>>;
+
+/// Whether what the open-time read found may still replace the baseline: only
+/// while it is the truth. A write already moved the baseline, a re-read already
+/// took the file, or the window is going away.
+fn open_read_applies(
+    wrote: bool,
+    writes_in_flight: usize,
+    file_already_read: bool,
+    closing: bool,
+) -> bool {
+    !wrote && writes_in_flight == 0 && !file_already_read && !closing
+}
+
+/// Reads the file's baseline and modified time on a worker (#1105); the answer
+/// is `WM_SETTINGS_OPENED`. When it cannot be used the window keeps the running
+/// config as its baseline and the next activation re-reads the file.
+fn start_open_read(inner: &mut SettingsInner) {
+    let Some(path) = inner.file_path.clone() else {
+        return;
+    };
+    let slot = inner.open_slot.clone();
+    let alive = inner.alive.clone();
+    let hwnd = inner.hwnd.0 as isize;
+    let _ = std::thread::Builder::new()
+        .name("settings-open-read".into())
+        .spawn(move || {
+            let opened = Opened {
+                baseline: crate::config_writer::file_baseline(&path),
+                mtime: crate::config::file_mtime(&path),
+            };
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(opened);
+            }
+            post_while_open(&alive, || unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut c_void)),
+                    WM_SETTINGS_OPENED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            });
+        });
+}
+
+fn take_open_read(inner: &mut SettingsInner) {
+    let Some(found) = inner.open_slot.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    if !open_read_applies(
+        inner.wrote,
+        inner.tracker.writes_in_flight(),
+        inner.file_mtime.is_some(),
+        inner.closing,
+    ) {
         return;
     }
-    inner.tracker.clear_failed(Field::Autostart);
-    inner.tracker.undo = Some(commit::UndoSlot {
-        field: Field::Autostart,
-        what: commit::UndoWhat::Autostart { was },
-    });
-    set_status(inner, &commit::saved_line(label), true);
+    if let Some(file) = found.baseline {
+        inner.baseline = file;
+    }
+    inner.file_mtime = found.mtime;
 }
 
 /// A field that could not be applied: the control goes back to what is applied,
@@ -1944,6 +2230,17 @@ fn on_write_result(inner: &mut SettingsInner, answer: &WriteAnswer) -> bool {
 /// Undo: the latest change goes back through the same writer, and the control
 /// shows the old value at once.
 fn undo_last(inner: &mut SettingsInner) {
+    // A Start with Windows job is still running: its answer comes first, and
+    // Undo stays on offer until then.
+    if inner.autostart_busy
+        && inner
+            .tracker
+            .undo
+            .as_ref()
+            .is_some_and(|u| u.field == Field::Autostart)
+    {
+        return;
+    }
     let Some(slot) = inner.tracker.undo.take() else {
         set_undo_shown(inner, false);
         return;
@@ -1952,20 +2249,7 @@ fn undo_last(inner: &mut SettingsInner) {
     let field = slot.field;
     match slot.what {
         commit::UndoWhat::Autostart { was } => {
-            let ok = crate::autostart::set_enabled(was).is_ok();
-            if let Some(box_) = get_dlg_item(inner.hwnd, ID_AUTOSTART) {
-                set_checkbox(box_, crate::autostart::is_enabled());
-            }
-            if ok {
-                set_status(inner, &commit::undone_line(field.label()), false);
-            } else {
-                inner.tracker.fail(field, AUTOSTART_FAILED);
-                set_status(
-                    inner,
-                    &commit::failed_line(field.label(), AUTOSTART_FAILED),
-                    false,
-                );
-            }
+            start_autostart(inner, AutostartJob::Undo(was));
         }
         commit::UndoWhat::Config { restore } => {
             let restored = crate::config_writer::reapply(&inner.original, &restore)
@@ -1984,6 +2268,7 @@ fn undo_last(inner: &mut SettingsInner) {
                 fail_row(inner, field, &reason);
                 return;
             }
+            inner.wrote = true;
             inner.tracker.begin(commit::InFlight {
                 field,
                 undoing: true,
@@ -2161,11 +2446,7 @@ fn show_field(inner: &mut SettingsInner, field: Field, cfg: &Config) {
             inner.hotkeys.pause = cfg.hotkeys.pause;
             set_hotkey_labels(hwnd, &inner.hotkeys);
         }
-        Field::Autostart => {
-            if let Some(box_) = get_dlg_item(hwnd, ID_AUTOSTART) {
-                set_checkbox(box_, crate::autostart::is_enabled());
-            }
-        }
+        Field::Autostart => start_autostart(inner, AutostartJob::Read),
         Field::CardSeconds => {
             if let Some(edit) = get_dlg_item(hwnd, ID_CARD_SECONDS) {
                 set_text(edit, &cfg.ui.card_seconds.to_string());
@@ -7000,10 +7281,10 @@ fn build_ui_recorded(
 
     r.ctl_w = CONTROL_W;
 
-    // Autostart state is owned by Windows, not by Config -- read the Run key
-    // itself so the box can never disagree with reality.
+    // Autostart state is owned by Windows, not by Config. The box starts
+    // unchecked: the Run key is read by a worker once the window exists (#1105),
+    // so the box can never disagree with reality for long.
     let autostart = ctx.check_row(&mut r, "Start with &Windows", ID_AUTOSTART, None, 0);
-    set_checkbox(autostart, crate::autostart::is_enabled());
     // Portable mode (#130) makes no registry writes, so the switch is greyed.
     if crate::portable::is_portable() {
         unsafe {
@@ -7479,6 +7760,12 @@ const WM_SETTINGS_WRITE_RESULT: u32 = 0x8000 + 46; // WM_APP + 46
 /// #875: the worker that re-reads the file after an activation has its answer
 /// ready in `refresh_slot`.
 const WM_SETTINGS_REFRESH: u32 = 0x8000 + 47; // WM_APP + 47
+
+/// Posted when the Start with Windows worker has stored its answer (#1105).
+const WM_SETTINGS_AUTOSTART: u32 = 0x8000 + 52; // WM_APP + 52
+
+/// Posted when the open-time read of the file has stored its answer (#1105).
+const WM_SETTINGS_OPENED: u32 = 0x8000 + 53; // WM_APP + 53
 /// `lparam` is the page's rail position.
 const PAGE_PICK: usize = 0;
 /// `lparam` is how many pages to move (negative goes back), wrapping.
@@ -16901,5 +17188,254 @@ mod tests {
             pause_label(&hk.pause),
             format!("Pause s&hortcut: {}", chord_to_string(&c))
         );
+    }
+
+    // ---- #1105: no registry or file work on the window's thread ----
+
+    thread_local! {
+        static FAKE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FAKE_SET_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static FAKE_SETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn fake_is_enabled() -> bool {
+        FAKE_ON.with(|c| c.get())
+    }
+    fn fake_set_enabled(on: bool) -> anyhow::Result<()> {
+        FAKE_SETS.with(|c| c.set(c.get() + 1));
+        if FAKE_SET_FAILS.with(|c| c.get()) {
+            anyhow::bail!("denied");
+        }
+        FAKE_ON.with(|c| c.set(on));
+        Ok(())
+    }
+    fn fake_seams(on: bool, fails: bool) -> AutostartSeams {
+        FAKE_ON.with(|c| c.set(on));
+        FAKE_SET_FAILS.with(|c| c.set(fails));
+        FAKE_SETS.with(|c| c.set(0));
+        AutostartSeams {
+            is_enabled: fake_is_enabled,
+            set_enabled: fake_set_enabled,
+        }
+    }
+
+    fn ans(was: bool, now: bool, failed: bool, changed: bool) -> AutostartAnswer {
+        AutostartAnswer {
+            was,
+            now,
+            failed,
+            changed,
+        }
+    }
+
+    #[test]
+    fn the_autostart_worker_reads_only_when_asked_to_read() {
+        let a = run_autostart(AutostartJob::Read, fake_seams(true, false));
+        assert!(a.now && !a.failed && !a.changed);
+        assert_eq!(FAKE_SETS.with(|c| c.get()), 0, "a read wrote");
+    }
+
+    #[test]
+    fn the_autostart_worker_skips_a_write_that_changes_nothing() {
+        let a = run_autostart(AutostartJob::Set(true), fake_seams(true, false));
+        assert!(a.now && !a.failed && !a.changed);
+        assert_eq!(FAKE_SETS.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn the_autostart_worker_reports_a_change_and_the_new_state() {
+        let a = run_autostart(AutostartJob::Set(true), fake_seams(false, false));
+        assert!(!a.was && a.now && a.changed && !a.failed);
+        let a = run_autostart(AutostartJob::Undo(false), fake_seams(true, false));
+        assert!(a.was && !a.now && a.changed && !a.failed);
+    }
+
+    #[test]
+    fn a_refused_autostart_write_reports_the_real_state_for_the_checkbox() {
+        let a = run_autostart(AutostartJob::Set(true), fake_seams(false, true));
+        assert!(a.failed && !a.changed);
+        assert!(!a.now, "the box must go back to what the registry holds");
+    }
+
+    #[test]
+    fn the_autostart_answer_decides_the_status_line() {
+        let ok = ans(false, true, false, true);
+        let bad = ans(false, false, true, false);
+        let same = ans(true, true, false, false);
+        let set = AutostartJob::Set(true);
+        assert_eq!(
+            autostart_verdict(set, &ok),
+            AutostartVerdict::Saved { was: false }
+        );
+        assert_eq!(
+            autostart_verdict(AutostartJob::Undo(false), &ok),
+            AutostartVerdict::Undone
+        );
+        assert_eq!(autostart_verdict(set, &bad), AutostartVerdict::Failed);
+        assert_eq!(
+            autostart_verdict(AutostartJob::Undo(true), &bad),
+            AutostartVerdict::Failed
+        );
+        assert_eq!(autostart_verdict(set, &same), AutostartVerdict::Quiet);
+        assert_eq!(
+            autostart_verdict(AutostartJob::Read, &ok),
+            AutostartVerdict::Quiet
+        );
+        assert_eq!(
+            autostart_verdict(AutostartJob::Read, &bad),
+            AutostartVerdict::Quiet
+        );
+    }
+
+    #[test]
+    fn only_a_click_is_queued_behind_a_running_autostart_job() {
+        assert!(queued_when_busy(AutostartJob::Set(true)));
+        assert!(
+            !queued_when_busy(AutostartJob::Read),
+            "a read would commit the placeholder"
+        );
+        assert!(!queued_when_busy(AutostartJob::Undo(true)));
+    }
+
+    #[test]
+    fn a_coalesced_read_does_not_ask_for_a_second_job() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            inner.autostart_busy = true;
+            start_autostart(inner, AutostartJob::Read);
+            assert!(!inner.autostart_again);
+            start_autostart(inner, AutostartJob::Set(true));
+            assert!(inner.autostart_again);
+        });
+    }
+
+    #[test]
+    fn the_open_time_read_replaces_the_baseline_only_when_it_applies() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let mut file = Config::default();
+            file.ui.card_seconds = 77;
+            let mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+            *inner.open_slot.lock().unwrap() = Some(Opened {
+                baseline: Some(file.clone()),
+                mtime,
+            });
+            inner.wrote = true;
+            take_open_read(inner);
+            assert_ne!(inner.baseline.ui.card_seconds, 77, "a write came first");
+            assert!(inner.file_mtime.is_none());
+            inner.wrote = false;
+            *inner.open_slot.lock().unwrap() = Some(Opened {
+                baseline: Some(file),
+                mtime,
+            });
+            take_open_read(inner);
+            assert_eq!(inner.baseline.ui.card_seconds, 77);
+            assert_eq!(inner.file_mtime, mtime);
+        });
+    }
+
+    #[test]
+    fn the_open_time_read_is_taken_only_while_it_is_still_true() {
+        assert!(open_read_applies(false, 0, false, false));
+        assert!(
+            !open_read_applies(true, 0, false, false),
+            "a write has moved the baseline"
+        );
+        assert!(!open_read_applies(false, 1, false, false));
+        assert!(
+            !open_read_applies(false, 0, true, false),
+            "a refresh already read the file"
+        );
+        assert!(!open_read_applies(false, 0, false, true), "closing");
+    }
+
+    #[test]
+    fn a_finished_autostart_job_updates_the_box_status_and_undo() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            let box_ = get_dlg_item(hwnd, ID_AUTOSTART).unwrap();
+            set_checkbox(box_, true);
+            inner.autostart_busy = true;
+            *inner.autostart_slot.lock().unwrap() = Some(AutostartDone {
+                job: AutostartJob::Set(true),
+                answer: ans(false, false, true, false),
+            });
+            take_autostart(inner);
+            assert!(
+                !checkbox_checked(hwnd, ID_AUTOSTART),
+                "a failure reverts the box"
+            );
+            assert!(!inner.autostart_busy);
+            assert!(status_is(
+                hwnd,
+                &commit::failed_line(Field::Autostart.label(), AUTOSTART_FAILED)
+            ));
+            inner.autostart_busy = true;
+            *inner.autostart_slot.lock().unwrap() = Some(AutostartDone {
+                job: AutostartJob::Set(true),
+                answer: ans(false, true, false, true),
+            });
+            take_autostart(inner);
+            assert!(checkbox_checked(hwnd, ID_AUTOSTART));
+            assert!(inner.tracker.undo.is_some(), "a saved change offers Undo");
+        });
+    }
+
+    /// Only a worker, or a seam a worker calls, touches the registry or the file.
+    #[test]
+    fn nothing_on_the_ui_thread_touches_the_registry_or_the_file() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        let lines: Vec<&str> = code.lines().collect();
+        let allowed = [
+            "fn start_refresh(",
+            "fn read_file_config(",
+            "fn start_open_read(",
+            "fn start_autostart(",
+            "const REAL: AutostartSeams",
+        ];
+        let mut found = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for banned in [
+                "crate::autostart::",
+                "file_baseline(",
+                "file_mtime(",
+                "read_to_string(",
+                "std::fs::",
+            ] {
+                if !line.contains(banned) {
+                    continue;
+                }
+                found += 1;
+                let owner = lines[..=i]
+                    .iter()
+                    .rev()
+                    .find(|l| {
+                        let t = l.trim_start();
+                        t.starts_with("fn ")
+                            || t.starts_with("pub fn ")
+                            || t.starts_with("unsafe fn ")
+                            || t.starts_with("const REAL")
+                    })
+                    .copied()
+                    .unwrap_or("");
+                assert!(
+                    allowed.iter().any(|a| owner.contains(a)),
+                    "`{banned}` on line {} is in `{}`, which runs on the window's thread",
+                    i + 1,
+                    owner.trim()
+                );
+            }
+        }
+        assert!(
+            found >= 4,
+            "the scan found only {found} candidates: it checks nothing"
+        );
+        for arm in ["WM_SETTINGS_AUTOSTART =>", "WM_SETTINGS_OPENED =>"] {
+            assert!(code.contains(arm), "no `{arm}` arm");
+        }
     }
 }
