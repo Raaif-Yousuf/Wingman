@@ -5695,6 +5695,7 @@ fn spawn_cloud_models_fetch(
             hwnd,
             index,
             key.clone(),
+            true,
             slots.clone(),
             sync.clone(),
             alive.clone(),
@@ -5796,16 +5797,63 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
         inner.hwnd,
         index,
         key,
+        false,
         inner.cloud_models.clone(),
         inner.cloud_sync.clone(),
         inner.alive.clone(),
     );
 }
 
+/// What to do with a vendor's saved list when Settings opens (#585).
+#[derive(Debug, PartialEq, Eq)]
+struct CachePlan {
+    /// Put the saved list in the dropdown now.
+    show: bool,
+    /// Still ask the vendor: there is no saved list, or it is a day old.
+    refresh: bool,
+}
+
+fn cache_plan(cached: Option<&crate::provider::model_cache::Cached>, now: u64) -> CachePlan {
+    match cached {
+        Some(c) => CachePlan {
+            show: true,
+            refresh: !c.is_fresh(now),
+        },
+        None => CachePlan {
+            show: false,
+            refresh: true,
+        },
+    }
+}
+
+/// Keeps a saved list for vendor `index` while nothing better is there: not
+/// over a fetched list, and not when a newer fetch has started. Does not mark
+/// a key as fetched, so a failed refresh is still retried. Returns whether it
+/// stored.
+fn store_cached_list(
+    slots: &CloudModels,
+    sync: &CloudSync,
+    index: usize,
+    mine: u64,
+    ids: Vec<String>,
+) -> bool {
+    let Ok(mut guard) = slots.lock() else {
+        return false;
+    };
+    if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine)
+        || guard[index].is_some()
+    {
+        return false;
+    }
+    guard[index] = Some(ids);
+    true
+}
+
 fn spawn_one_cloud_fetch(
     hwnd: HWND,
     index: usize,
     key: String,
+    use_cache: bool,
     slots: CloudModels,
     sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5816,6 +5864,29 @@ fn spawn_one_cloud_fetch(
     let _ = std::thread::Builder::new()
         .name("settings-cloud-models".into())
         .spawn(move || {
+            // #585: the saved list first, so the dropdown is full before the
+            // network answers. A list under a day old needs no refresh.
+            let mut refresh = true;
+            if use_cache {
+                let cached = crate::provider::model_cache::load(vendor);
+                let plan = cache_plan(cached.as_ref(), crate::provider::model_cache::now());
+                refresh = plan.refresh;
+                if let (true, Some(cached)) = (plan.show, cached) {
+                    if store_cached_list(&slots, &sync, index, mine, cached.ids) {
+                        post_while_open(&alive, || unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd_raw as *mut c_void)),
+                                WM_CLOUD_MODELS,
+                                WPARAM(index),
+                                LPARAM(0),
+                            );
+                        });
+                    }
+                }
+            }
+            if !refresh {
+                return;
+            }
             let ids = match crate::provider::model_list::fetch(vendor, &key) {
                 Ok(ids) => ids,
                 Err(_) => {
@@ -5829,6 +5900,9 @@ fn spawn_one_cloud_fetch(
                     return;
                 }
             };
+            // Only a good list is kept; a failed fetch returned above and
+            // left the last good one (the cache and the slot) as it was.
+            crate::provider::model_cache::store(vendor, &ids);
             if !store_fetched_list(&slots, &sync, index, mine, &key, ids) {
                 return;
             }
@@ -9906,6 +9980,66 @@ impl Drop for GalleryWindow {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
+
+    #[test]
+    fn a_saved_list_is_shown_and_only_an_old_or_missing_one_is_refreshed() {
+        use crate::provider::model_cache::{Cached, FRESH_FOR};
+        let c = Cached {
+            ids: vec!["a".into()],
+            saved_at: 100,
+        };
+        let day = FRESH_FOR.as_secs();
+        assert_eq!(
+            cache_plan(Some(&c), 100 + day - 1),
+            CachePlan {
+                show: true,
+                refresh: false
+            }
+        );
+        assert_eq!(
+            cache_plan(Some(&c), 100 + day),
+            CachePlan {
+                show: true,
+                refresh: true
+            }
+        );
+        assert_eq!(
+            cache_plan(None, 100),
+            CachePlan {
+                show: false,
+                refresh: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_saved_list_never_replaces_a_fetched_one_or_a_newer_fetch() {
+        let slots: CloudModels = Default::default();
+        let sync = CloudSync::default();
+        sync.generation[0].store(2, Ordering::SeqCst);
+        // An older worker's saved list is dropped.
+        assert!(!store_cached_list(&slots, &sync, 0, 1, vec!["old".into()]));
+        assert!(store_cached_list(&slots, &sync, 0, 2, vec!["saved".into()]));
+        // It does not mark the key as fetched, so a failed refresh retries.
+        assert_eq!(sync.fetched_keys.lock().unwrap()[0], "");
+        // A fetched list replaces it; a later saved list does not replace that.
+        assert!(store_fetched_list(
+            &slots,
+            &sync,
+            0,
+            2,
+            "k",
+            vec!["live".into()]
+        ));
+        assert!(!store_cached_list(
+            &slots,
+            &sync,
+            0,
+            2,
+            vec!["saved".into()]
+        ));
+        assert_eq!(slots.lock().unwrap()[0], Some(vec!["live".to_string()]));
+    }
 
     /// Test-only window class (rule 9): same `wndproc`, never the production
     /// class name.
