@@ -533,6 +533,10 @@ fn rebuild_fts_index(conn: &Connection) -> rusqlite::Result<()> {
 /// from the chunk table, in one savepoint: either the new index is complete
 /// or the old one is left as it was. `chunk_fts` holds only derived data; the
 /// chunk table it mirrors is never touched.
+///
+/// The `CREATE VIRTUAL TABLE` below copies the definition in
+/// `schema/v004.sql`. A later migration that changes `chunk_fts` must change
+/// it here too; `recreated_index_matches_the_migrated_definition` catches drift.
 fn recreate_fts_index(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "SAVEPOINT recreate_fts;
@@ -1777,6 +1781,36 @@ mod tests {
         assert_eq!(damaged_copies(&dir), 0, "the file stays where it is");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1189: the index created again has the same definition as the one the
+    /// migrations create, so the two copies of it cannot drift apart.
+    #[test]
+    fn recreated_index_matches_the_migrated_definition() {
+        fn definition(conn: &Connection) -> String {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            sql.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        let (fresh, dir_a) = knowledge_store("fts-def-fresh");
+        let (s, dir_b) = store_with_indexed_chunks("fts-def-recreated");
+        let wanted = definition(&fresh.lock());
+        assert!(wanted.contains("fts5"), "{wanted}");
+        {
+            let conn = s.lock();
+            recreate_fts_index(&conn).unwrap();
+            assert_eq!(definition(&conn), wanted);
+            assert_eq!(fts_hits(&conn, "ledgerword"), 3);
+        }
+        drop(fresh);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 
     /// #1189: damage outside the index still moves the whole file aside.
