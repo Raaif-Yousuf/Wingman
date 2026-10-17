@@ -5695,6 +5695,7 @@ fn spawn_cloud_models_fetch(
             hwnd,
             index,
             key.clone(),
+            true,
             slots.clone(),
             sync.clone(),
             alive.clone(),
@@ -5712,6 +5713,10 @@ struct CloudSync {
     /// key field with the same key does not fetch again, and a failed fetch
     /// is retried on the next focus-out.
     fetched_keys: std::sync::Mutex<[String; 3]>,
+    /// The newest fetch number each vendor's list was saved to disk for
+    /// (#585). Held while the file is written, so the newer list wins. The UI
+    /// thread never takes it, so a slow disk cannot stall it.
+    saved_generation: std::sync::Mutex<[u64; 3]>,
 }
 
 /// Whether a worker holding `mine` is still the newest for its vendor.
@@ -5796,16 +5801,41 @@ fn fetch_for_typed_key(inner: &mut SettingsInner, index: usize) {
         inner.hwnd,
         index,
         key,
+        false,
         inner.cloud_models.clone(),
         inner.cloud_sync.clone(),
         inner.alive.clone(),
     );
 }
 
+/// Keeps a saved list for vendor `index` while nothing better is there: not
+/// over a fetched list, and not when a newer fetch has started. Does not mark
+/// a key as fetched, so a failed refresh is still retried. Returns whether it
+/// stored.
+fn store_cached_list(
+    slots: &CloudModels,
+    sync: &CloudSync,
+    index: usize,
+    mine: u64,
+    ids: Vec<String>,
+) -> bool {
+    let Ok(mut guard) = slots.lock() else {
+        return false;
+    };
+    if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine)
+        || guard[index].is_some()
+    {
+        return false;
+    }
+    guard[index] = Some(ids);
+    true
+}
+
 fn spawn_one_cloud_fetch(
     hwnd: HWND,
     index: usize,
     key: String,
+    use_cache: bool,
     slots: CloudModels,
     sync: std::sync::Arc<CloudSync>,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5816,6 +5846,22 @@ fn spawn_one_cloud_fetch(
     let _ = std::thread::Builder::new()
         .name("settings-cloud-models".into())
         .spawn(move || {
+            // #585: the saved list first, so the dropdown is full before the
+            // network answers. The vendor is asked again either way.
+            if use_cache {
+                if let Some(ids) = crate::provider::model_cache::load(vendor) {
+                    if store_cached_list(&slots, &sync, index, mine, ids) {
+                        post_while_open(&alive, || unsafe {
+                            let _ = PostMessageW(
+                                Some(HWND(hwnd_raw as *mut c_void)),
+                                WM_CLOUD_MODELS,
+                                WPARAM(index),
+                                LPARAM(0),
+                            );
+                        });
+                    }
+                }
+            }
             let ids = match crate::provider::model_list::fetch(vendor, &key) {
                 Ok(ids) => ids,
                 Err(_) => {
@@ -5829,6 +5875,8 @@ fn spawn_one_cloud_fetch(
                     return;
                 }
             };
+            // A failed fetch returned above and left the last good list (the
+            // slot and the saved copy) as it was.
             if !store_fetched_list(&slots, &sync, index, mine, &key, ids) {
                 return;
             }
@@ -5847,6 +5895,9 @@ fn spawn_one_cloud_fetch(
 /// started while this one ran: its result wins, so this one is dropped. The check
 /// and the store happen under one lock, so an older worker cannot pass the check
 /// and then store after a newer one finished (#678). Returns whether it stored.
+///
+/// An accepted list is also saved to disk (#585), after the slots lock is
+/// released (the UI thread takes that lock). Called from worker threads only.
 fn store_fetched_list(
     slots: &CloudModels,
     sync: &CloudSync,
@@ -5855,19 +5906,36 @@ fn store_fetched_list(
     key: &str,
     ids: Vec<String>,
 ) -> bool {
-    let Ok(mut guard) = slots.lock() else {
-        return false;
-    };
-    if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
-        return false;
+    let saved = ids.clone();
+    {
+        let Ok(mut guard) = slots.lock() else {
+            return false;
+        };
+        if !is_current_generation(sync.generation[index].load(Ordering::SeqCst), mine) {
+            return false;
+        }
+        guard[index] = Some(ids);
+        // The fetched-key record is written under the same slots lock (always
+        // slots first, then keys), so it cannot go stale.
+        if let Ok(mut keys) = sync.fetched_keys.lock() {
+            keys[index] = key.trim().to_string();
+        }
     }
-    guard[index] = Some(ids);
-    // The fetched-key record is written under the same slots lock (always slots
-    // first, then keys), so it cannot go stale.
-    if let Ok(mut keys) = sync.fetched_keys.lock() {
-        keys[index] = key.trim().to_string();
-    }
+    save_accepted_list(sync, index, mine, &saved);
     true
+}
+
+/// Saves an accepted list to disk unless a newer fetch's list was saved
+/// already, so the newer list wins even when the workers finish out of order.
+fn save_accepted_list(sync: &CloudSync, index: usize, mine: u64, ids: &[String]) {
+    let Ok(mut saved) = sync.saved_generation.lock() else {
+        return;
+    };
+    if saved[index] > mine {
+        return;
+    }
+    crate::provider::model_cache::store(CLOUD_VENDORS[index], ids);
+    saved[index] = mine;
 }
 
 /// Runs `post` only while the Settings window is still open (#569). `alive`
@@ -9906,6 +9974,83 @@ impl Drop for GalleryWindow {
 mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
+
+    #[test]
+    fn an_older_accepted_list_never_overwrites_a_newer_saved_one() {
+        use crate::provider::model_list::Vendor;
+        let sync = CloudSync::default();
+        save_accepted_list(&sync, 2, 5, &["newer".to_string()]);
+        // Both were accepted in their time; the older one finishes writing last.
+        save_accepted_list(&sync, 2, 4, &["older".to_string()]);
+        assert_eq!(
+            crate::provider::model_cache::load(Vendor::Gemini),
+            Some(vec!["newer".to_string()])
+        );
+        save_accepted_list(&sync, 2, 6, &["newest".to_string()]);
+        assert_eq!(
+            crate::provider::model_cache::load(Vendor::Gemini),
+            Some(vec!["newest".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_superseded_worker_does_not_overwrite_the_saved_list() {
+        use crate::provider::model_list::Vendor;
+        let slots: CloudModels = Default::default();
+        let sync = CloudSync::default();
+        // Worker 1 started, then worker 2 replaced it.
+        sync.generation[1].store(2, Ordering::SeqCst);
+        assert!(store_fetched_list(
+            &slots,
+            &sync,
+            1,
+            2,
+            "k",
+            vec!["from-worker-2".into()]
+        ));
+        // Worker 1 returns last: dropped, and the saved copy stays worker 2's.
+        assert!(!store_fetched_list(
+            &slots,
+            &sync,
+            1,
+            1,
+            "k",
+            vec!["from-worker-1".into()]
+        ));
+        assert_eq!(
+            crate::provider::model_cache::load(Vendor::Anthropic),
+            Some(vec!["from-worker-2".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_saved_list_never_replaces_a_fetched_one_or_a_newer_fetch() {
+        let slots: CloudModels = Default::default();
+        let sync = CloudSync::default();
+        sync.generation[0].store(2, Ordering::SeqCst);
+        // An older worker's saved list is dropped.
+        assert!(!store_cached_list(&slots, &sync, 0, 1, vec!["old".into()]));
+        assert!(store_cached_list(&slots, &sync, 0, 2, vec!["saved".into()]));
+        // It does not mark the key as fetched, so a failed refresh retries.
+        assert_eq!(sync.fetched_keys.lock().unwrap()[0], "");
+        // A fetched list replaces it; a later saved list does not replace that.
+        assert!(store_fetched_list(
+            &slots,
+            &sync,
+            0,
+            2,
+            "k",
+            vec!["live".into()]
+        ));
+        assert!(!store_cached_list(
+            &slots,
+            &sync,
+            0,
+            2,
+            vec!["saved".into()]
+        ));
+        assert_eq!(slots.lock().unwrap()[0], Some(vec!["live".to_string()]));
+    }
 
     /// Test-only window class (rule 9): same `wndproc`, never the production
     /// class name.

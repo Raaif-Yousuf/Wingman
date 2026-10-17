@@ -185,6 +185,9 @@ struct HealState {
     not_before: Option<Instant>,
     /// Whether the user was already told the store is stuck.
     told: bool,
+    /// Whether the user was already told the search index is stuck. Separate
+    /// from `told`, so the milder index notice never hides the file notice.
+    index_told: bool,
     /// Set once the damaged file was moved here but no fresh database is open
     /// yet: the next try only has to open one.
     kept: Option<PathBuf>,
@@ -208,6 +211,9 @@ enum Heal {
     Replaced(String),
     /// Could not finish. The text says why. Tried again after [`RETRY_GAP`].
     Stuck(String),
+    /// Only the index rebuild could not finish; the file itself is fine and
+    /// history is still saved. Tried again after [`RETRY_GAP`].
+    IndexStuck(String),
 }
 
 /// Wait between tries after a heal failed, so a file that stays held does not
@@ -353,9 +359,14 @@ impl Store {
             Heal::Stuck(why) => {
                 // `seen` stays behind, so a later lock tries again.
                 state.not_before = Some(now + self.retry_gap);
-                if !state.told {
-                    state.told = true;
-                    note_recovery(runtime_recovery_notice(Err(&why)));
+                if let Some(text) = stuck_notice_once(&mut state, false, &why) {
+                    note_recovery(text);
+                }
+            }
+            Heal::IndexStuck(why) => {
+                state.not_before = Some(now + self.retry_gap);
+                if let Some(text) = stuck_notice_once(&mut state, true, &why) {
+                    note_recovery(text);
                 }
             }
         }
@@ -411,7 +422,7 @@ impl Store {
                         RebuildVerdict::Damaged => {}
                         // Busy or disk full: the index is still wrong, so
                         // try again later instead of calling it healthy.
-                        RebuildVerdict::Retry(why) => return Heal::Stuck(why),
+                        RebuildVerdict::Retry(why) => return Heal::IndexStuck(why),
                     }
                 }
                 // Closing the old connection first: Windows will not rename an open file.
@@ -555,6 +566,34 @@ fn runtime_recovery_notice(kept: Result<&Path, &str>) -> String {
             "Wingman's saved data was damaged while it was running and could not be replaced ({why}), so history is not being saved for now. Wingman will try again. The damaged file was not deleted."
         ),
     }
+}
+
+/// The card text when only the search index could not be rebuilt (#1182):
+/// history and documents are still saved.
+fn index_stuck_notice(why: &str) -> String {
+    format!(
+        "Wingman's search index could not be rebuilt ({why}), so searching saved data may miss results for now. Your history is still being saved. Wingman will try again."
+    )
+}
+
+/// The notice for a stuck heal, once per kind: the index one and the file one
+/// each have their own flag, so the milder index notice never hides the file
+/// one (#1182).
+fn stuck_notice_once(state: &mut HealState, index_only: bool, why: &str) -> Option<String> {
+    let told = if index_only {
+        &mut state.index_told
+    } else {
+        &mut state.told
+    };
+    if *told {
+        return None;
+    }
+    *told = true;
+    Some(if index_only {
+        index_stuck_notice(why)
+    } else {
+        runtime_recovery_notice(Err(why))
+    })
 }
 
 /// Pragmas set on every connection; the reasons are in the design spec.
@@ -1984,6 +2023,27 @@ mod tests {
         for t in [kept, stuck] {
             assert!(!t.contains('\u{2014}'), "{t}");
         }
+    }
+
+    #[test]
+    fn a_stuck_index_rebuild_does_not_claim_history_is_lost() {
+        // #1182: only the search index is affected, history is still saved.
+        let t = index_stuck_notice("disk full");
+        assert!(t.contains("disk full"), "{t}");
+        assert!(t.contains("search"), "{t}");
+        assert!(!t.contains("not being saved"), "{t}");
+        assert!(!t.contains('\u{2014}'), "{t}");
+    }
+
+    #[test]
+    fn the_index_notice_never_hides_the_file_notice() {
+        let mut state = HealState::default();
+        let index = stuck_notice_once(&mut state, true, "busy").unwrap();
+        assert!(index.contains("search"), "{index}");
+        assert!(stuck_notice_once(&mut state, true, "busy").is_none());
+        let file = stuck_notice_once(&mut state, false, "in use").unwrap();
+        assert!(file.contains("not being saved"), "{file}");
+        assert!(stuck_notice_once(&mut state, false, "in use").is_none());
     }
 
     #[test]
