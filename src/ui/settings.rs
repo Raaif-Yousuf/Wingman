@@ -1148,6 +1148,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_DESTROY => {
+            clear_accessible_names(hwnd);
             invalidate_edit_style();
             invalidate_rail_style();
             inner.closing = true;
@@ -2375,7 +2376,143 @@ const ID_UNDO: i32 = 157;
 const ID_APPLY_FOCUSED: i32 = 158;
 const ID_ESCAPE: i32 = 159;
 /// A trackbar's "the user let go" notification code.
+/// #877: the line of words under a row's title. Every description shares the
+/// id, which no code reads back: it only says "paint me as a helper line".
+const ID_ROW_DESC: i32 = 160;
+/// #877: the hairline above a row. Shared the same way.
+const ID_ROW_SEPARATOR: i32 = 161;
 const TB_ENDTRACK: u32 = 8;
+
+/// One cloud vendor's three rows on the Models page (#877): the ids of its
+/// controls and the titles, each carrying the vendor so a screen reader hears
+/// "OpenAI model" and not a third "Model" (#781). The `&` letters are unique on
+/// the page (a test checks).
+struct CloudRows {
+    slot: Slot,
+    key_title: &'static str,
+    model_title: &'static str,
+    effort_title: &'static str,
+    key_id: i32,
+    show_id: i32,
+    model_id: i32,
+    effort_id: i32,
+    /// The thinking row's title id, when something reads it back.
+    effort_title_id: i32,
+}
+
+const CLOUD_ROWS: [CloudRows; 3] = [
+    CloudRows {
+        slot: Slot::OpenAi,
+        key_title: "&OpenAI API key",
+        model_title: "OpenAI &model",
+        effort_title: "OpenAI &thinking time",
+        key_id: ID_OPENAI_KEY,
+        show_id: ID_OPENAI_SHOW_KEY,
+        model_id: ID_OPENAI_MODEL,
+        effort_id: ID_OPENAI_EFFORT,
+        effort_title_id: 0,
+    },
+    CloudRows {
+        slot: Slot::Anthropic,
+        key_title: "Anth&ropic API key",
+        model_title: "Anthropic mo&del",
+        effort_title: "Anthropic thin&king time",
+        key_id: ID_ANTHROPIC_KEY,
+        show_id: ID_ANTHROPIC_SHOW_KEY,
+        model_id: ID_ANTHROPIC_MODEL,
+        effort_id: ID_ANTHROPIC_EFFORT,
+        effort_title_id: 0,
+    },
+    CloudRows {
+        slot: Slot::Gemini,
+        key_title: "&Gemini API key",
+        model_title: "Gemini mode&l",
+        effort_title: "Gemini th&inking time",
+        key_id: ID_GEMINI_KEY,
+        show_id: ID_GEMINI_SHOW_KEY,
+        model_id: ID_GEMINI_MODEL,
+        effort_id: ID_GEMINI_EFFORT,
+        effort_title_id: ID_GEMINI_EFFORT_LABEL,
+    },
+];
+
+/// Buttons whose text alone repeats on a page get a longer accessible name, so
+/// a screen reader says which one it is (#781, #877). Their text stays short,
+/// as it sits in a narrow column. Everything else is named by its own text or,
+/// for a box, by the title before it.
+const ACCESSIBLE_NAMES: [(i32, &str); 6] = [
+    (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
+    (ID_ANTHROPIC_SHOW_KEY, "Show Anthropic key"),
+    (ID_GEMINI_SHOW_KEY, "Show Gemini key"),
+    (ID_CHANGE_PRIMARY, "Change Copilot key"),
+    (ID_CHANGE_SECONDARY, "Change shortcut for any keyboard"),
+    (ID_CHANGE_PAUSE, "Change pause shortcut"),
+];
+
+/// Gives the buttons of [`ACCESSIBLE_NAMES`] their names, through the system's
+/// accessibility annotation service, which keeps the button's text and role.
+/// Best effort: with no service the buttons keep their short text, and the
+/// window works the same. Runs once as the window is built, never on a paint.
+fn annotate_accessible_names(hwnd: HWND) {
+    use windows::Win32::UI::Accessibility::PROPID_ACC_NAME;
+    with_prop_service(|service| unsafe {
+        for (id, name) in ACCESSIBLE_NAMES {
+            if let Some(button) = get_dlg_item(hwnd, id) {
+                let name = wide_z(name);
+                let _ = service.SetHwndPropStr(
+                    button,
+                    ACC_OBJID_CLIENT,
+                    0,
+                    PROPID_ACC_NAME,
+                    PCWSTR(name.as_ptr()),
+                );
+            }
+        }
+    });
+}
+
+/// Takes the names of [`annotate_accessible_names`] back as the window goes:
+/// the service keeps them by window handle, and Windows recycles handles, so a
+/// later control must not inherit "Show OpenAI key".
+fn clear_accessible_names(hwnd: HWND) {
+    use windows::Win32::UI::Accessibility::PROPID_ACC_NAME;
+    with_prop_service(|service| unsafe {
+        for (id, _) in ACCESSIBLE_NAMES {
+            if let Some(button) = get_dlg_item(hwnd, id) {
+                let _ = service.ClearHwndProps(button, ACC_OBJID_CLIENT, 0, &[PROPID_ACC_NAME]);
+            }
+        }
+    });
+}
+
+const ACC_OBJID_CLIENT: u32 = 0xFFFF_FFFC;
+
+/// Runs `f` with the accessibility annotation service, when there is one.
+fn with_prop_service(f: impl FnOnce(&windows::Win32::UI::Accessibility::IAccPropServices)) {
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Accessibility::{CAccPropServices, IAccPropServices};
+    unsafe {
+        // Balanced below when it took: a thread that already has COM keeps it.
+        let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if let Ok(service) =
+            CoCreateInstance::<_, IAccPropServices>(&CAccPropServices, None, CLSCTX_INPROC_SERVER)
+        {
+            f(&service);
+        }
+        if init.is_ok() {
+            CoUninitialize();
+        }
+    }
+}
+
+/// The Mode row's words: where a screenshot can go in each mode.
+const MODE_DESC: &str = "Cloud and Auto may send screenshots to a cloud model. Local and Offline keep everything on this PC.";
+/// The Advanced page's heading.
+const PROMPT_TITLE: &str = "Check my work prompt";
+const PROMPT_NOTE: &str = "The instructions the model gets with every check.";
 
 /// #872: the five pages of the window, in rail order. Each existing control
 /// lives on exactly one (see [`PAGE_CONTROLS`]); the rail shows one page at a
@@ -2545,6 +2682,9 @@ const CHROME_IDS: &[i32] = &[
     ID_VALIDATION_MESSAGE,
     ID_APPLY_FOCUSED,
     ID_ESCAPE,
+    // Repeated on every page, so not one page's control (#877).
+    ID_ROW_DESC,
+    ID_ROW_SEPARATOR,
 ];
 
 /// #509: what capture.redact covers, in plain words. Three things: the
@@ -2625,6 +2765,8 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_UNDO", ID_UNDO),
     ("ID_APPLY_FOCUSED", ID_APPLY_FOCUSED),
     ("ID_ESCAPE", ID_ESCAPE),
+    ("ID_ROW_DESC", ID_ROW_DESC),
+    ("ID_ROW_SEPARATOR", ID_ROW_SEPARATOR),
 ];
 
 // ---------------------------------------------------------------------------
@@ -2671,7 +2813,6 @@ const ES_AUTOHSCROLL: i32 = 0x0080;
 #[cfg(test)]
 const WM_PASTE: u32 = 0x0302;
 const ES_NUMBER: i32 = 0x2000;
-const BS_GROUPBOX: i32 = 0x0007;
 const BS_AUTOCHECKBOX: i32 = 0x0003;
 const BS_PUSHBUTTON: i32 = 0x0000;
 const TBS_HORZ: i32 = 0x0000;
@@ -2807,17 +2948,33 @@ const STATUS_PAD_DP: i32 = 4;
 /// Space kept below the last group inside the scrolling body, in dp.
 const BODY_PAD_BOTTOM: i32 = MARGIN / 2;
 
-const MARGIN: i32 = 16;
-/// Where a page's first group starts, in dp from the top of the body (#872):
+const MARGIN: i32 = crate::ui::theme::MARGIN_DP;
+/// Where a page's first row starts, in dp from the top of the body (#872):
 /// level with the rail's first item.
 const PAGE_TOP_PAD_DP: i32 = crate::ui::theme::SPACE_SM_DP;
-const ROW_H: i32 = 22;
-const ROW_GAP: i32 = 6;
-const GROUP_GAP: i32 = 14;
-const GROUP_LABEL_TOP: i32 = 20; // room for the groupbox caption
-const LABEL_W: i32 = 140;
+/// The row measures (#877, #828): every one is a `theme.rs` token.
+const ROW_H: i32 = crate::ui::theme::ROW_CONTROL_H_DP;
+const ROW_PAD: i32 = crate::ui::theme::ROW_PAD_DP;
+const ROW_TITLE_H: i32 = crate::ui::theme::ROW_TITLE_H_DP;
+const DESC_LINE_H: i32 = crate::ui::theme::ROW_DESC_LINE_DP;
+const CONTROL_W: i32 = crate::ui::theme::ROW_CONTROL_W_DP;
+/// The gap between a row's text and its control column, and between two
+/// controls side by side (half of it).
+const COL_GAP: i32 = crate::ui::theme::SPACE_LG_DP;
+/// A one-line row: the control with its padding above and below.
+const ROW_PITCH: i32 = ROW_H + 2 * ROW_PAD;
+/// The gap between the prompt box and the button under it.
+const ROW_GAP: i32 = ROW_PAD;
+/// The Advanced page's heading: the title and one line of what it is for.
+const PROMPT_HEAD_H: i32 = 2 * ROW_PAD + ROW_TITLE_H + DESC_LINE_H;
 const BTN_W: i32 = 100;
 const BTN_H: i32 = 28;
+/// The width of a "Show" key toggle, and of the text scale's value.
+const SHOW_KEY_W: i32 = 62;
+const TEXT_SCALE_LABEL_W: i32 = 58;
+/// The Ollama status text (two lines) and the pull progress line.
+const OLLAMA_STATUS_H: i32 = 2 * DESC_LINE_H + 4;
+const PULL_STATUS_H: i32 = 2 * DESC_LINE_H;
 
 /// The DPI the Settings window lays out at: the window's real one, floored
 /// at 1. Every layout call goes through here so the UI gallery can simulate
@@ -2897,13 +3054,13 @@ impl PromptFooterLayout {
 fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
     let reset_btn_h = BTN_H;
     let prompt_top = content_top;
-    let prompt_label_bottom = prompt_top + GROUP_LABEL_TOP;
+    let prompt_label_bottom = prompt_top + PROMPT_HEAD_H;
 
     // The smallest the Prompt group can be and still hold a usable edit box
     // and the reset button: label, minimum edit height, the gap before the
     // reset button, the reset button itself, and a bottom margin before the
     // group's own border.
-    let min_prompt_group_h = GROUP_LABEL_TOP + MIN_PROMPT_EDIT_H + ROW_GAP + reset_btn_h + MARGIN;
+    let min_prompt_group_h = PROMPT_HEAD_H + MIN_PROMPT_EDIT_H + ROW_GAP + reset_btn_h + MARGIN;
 
     // With room to spare the group stretches to the viewport's bottom, so a
     // tall window shows no scrollbar range; without it the group takes its
@@ -2926,7 +3083,7 @@ fn prompt_footer_layout(content_top: i32, win_h_dp: i32) -> PromptFooterLayout {
 
 /// Height of the Advanced group while the prompt is hidden (#342): the
 /// caption, one button row (the show/hide toggle) and a bottom margin.
-const COLLAPSED_PROMPT_GROUP_H: i32 = GROUP_LABEL_TOP + BTN_H + MARGIN;
+const COLLAPSED_PROMPT_GROUP_H: i32 = PROMPT_HEAD_H + BTN_H + MARGIN;
 
 /// The footer layout for the Advanced group in either state (#342).
 /// Expanded is [`prompt_footer_layout`] unchanged. Collapsed has no edit box:
@@ -2939,7 +3096,7 @@ fn footer_layout(content_top: i32, win_h_dp: i32, expanded: bool) -> PromptFoote
         prompt_top: content_top,
         prompt_bottom: content_top + COLLAPSED_PROMPT_GROUP_H,
         prompt_edit_h: 0,
-        reset_btn_y: content_top + GROUP_LABEL_TOP,
+        reset_btn_y: content_top + PROMPT_HEAD_H,
         buttons_y: win_h_dp - BTN_H - MARGIN,
     }
 }
@@ -3042,8 +3199,9 @@ fn scroll_request_target(code: u32, pos: i32, track: i32, line: i32, page: i32, 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Anchor {
     Fixed,
+    /// A hairline between rows (#877): one physical pixel thick at any scale.
+    Hairline,
     PromptEdit,
-    PromptGroup,
     ResetBtn,
     Footer,
 }
@@ -3092,20 +3250,17 @@ fn child_rect_px(
 ) -> (i32, i32, i32, i32) {
     let (mut y, mut h) = (c.y, c.h);
     match c.anchor {
-        Anchor::Fixed => {}
+        Anchor::Fixed | Anchor::Hairline => {}
         Anchor::PromptEdit => h += new.prompt_edit_h - old.prompt_edit_h,
-        Anchor::PromptGroup => {
-            h += (new.prompt_bottom - new.prompt_top) - (old.prompt_bottom - old.prompt_top)
-        }
         Anchor::ResetBtn => y += new.reset_btn_y - old.reset_btn_y,
         Anchor::Footer => y += new.buttons_y - old.buttons_y,
     }
-    (
-        to_px(c.x, dpi),
-        to_px(y, dpi),
-        to_px(c.w, dpi),
-        to_px(h, dpi),
-    )
+    let h_px = if c.anchor == Anchor::Hairline {
+        1
+    } else {
+        to_px(h, dpi)
+    };
+    (to_px(c.x, dpi), to_px(y, dpi), to_px(c.w, dpi), h_px)
 }
 
 /// `WM_DPICHANGED`: the window moved to a monitor with a different scale.
@@ -3277,7 +3432,7 @@ fn tallest_page_dp(inner: &SettingsInner) -> i32 {
 fn page_max_dp(inner: &SettingsInner, page: Page) -> i32 {
     let full = inner.page_content_dp[page.index()];
     if page == Page::Models {
-        full - (ROW_H + ROW_GAP)
+        full - ROW_PITCH
     } else {
         full
     }
@@ -3335,27 +3490,35 @@ unsafe fn sync_models_flow(inner: &mut SettingsInner) {
     let add = settings_models::add_button_shown(shown, inner.models_revealed);
     inner.models_shown = shown;
     inner.models_add_shown = add;
-    let pitch = ROW_H + ROW_GAP;
+    let pitch = ROW_PITCH;
     for f in &inner.models_flow {
         let dy = settings_models::slot_dy(f.slot, shown, add, pitch);
         if let Some(c) = inner.children.iter_mut().find(|c| c.hwnd == f.hwnd) {
-            if f.slot == Slot::Frame {
-                c.h = f.h + dy;
-            } else {
-                c.y = f.y + dy;
-            }
+            c.y = f.y + dy;
         }
     }
-    // A hidden Ollama card also takes its own height off the page. Its group
-    // frame is the tallest control made under the slot.
-    let card_h = inner
+    // A hidden Ollama card also takes its own height off the page: from the
+    // hairline above its status to the bottom of its last line and the padding
+    // under it, which the page's end counts like any row's.
+    let card_top = inner
         .models_flow
         .iter()
         .filter(|f| f.slot == Slot::OllamaCard)
-        .map(|f| f.h)
+        .map(|f| f.y)
+        .min()
+        .unwrap_or(0);
+    let card_bottom = inner
+        .models_flow
+        .iter()
+        .filter(|f| f.slot == Slot::OllamaCard)
+        .map(|f| f.y + f.h)
         .max()
         .unwrap_or(0);
-    let card_gone = if shown[3] { 0 } else { card_h + GROUP_GAP };
+    let card_gone = if shown[3] {
+        0
+    } else {
+        card_bottom + ROW_PAD - card_top
+    };
     inner.models_shrink_dp = -settings_models::slot_dy(Slot::Frame, shown, add, pitch) + card_gone;
     if !inner.hwnd.0.is_null() {
         // One repaint for the whole change, as `show_page` does: the layout
@@ -3493,8 +3656,9 @@ fn nc_width_px(hwnd: HWND) -> i32 {
 const CARD_SECONDS_EDIT_W: i32 = 50;
 /// The Card group's first row (#823): a short title, the number box, then
 /// what the number means. 0 is explained in words, not as a code.
-const CARD_SECONDS_LABEL: &str = "Hide the card after:";
-const CARD_SECONDS_UNIT: &str = "seconds (0 keeps it open)";
+const CARD_SECONDS_LABEL: &str = "Hide the card &after";
+const CARD_SECONDS_UNIT: &str = "seconds";
+const CARD_SECONDS_NOTE: &str = "0 keeps the card open until you close it.";
 
 /// #597: whether the Card display choice has any effect for this Card
 /// position label. "Next to the mouse" follows the pointer's own monitor, so
@@ -3604,7 +3768,11 @@ const CHECKBOX_TEXT_INDENT_DP: i32 = 16;
 fn is_hint_id(id: i32) -> bool {
     matches!(
         id,
-        ID_HOTKEY_STATUS | ID_MODEL_LIST_HINT | ID_CAPTURE_DETAIL_HINT | ID_REDACT_HINT
+        ID_HOTKEY_STATUS
+            | ID_MODEL_LIST_HINT
+            | ID_CAPTURE_DETAIL_HINT
+            | ID_REDACT_HINT
+            | ID_ROW_DESC
     )
 }
 
@@ -3746,6 +3914,9 @@ struct EditStyle {
     colors: EditColors,
     brush: windows::Win32::Graphics::Gdi::HBRUSH,
     disabled_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// The line between rows (#877): the border token, or the system's window
+    /// text in high contrast.
+    hairline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 }
 
 thread_local! {
@@ -3767,6 +3938,7 @@ unsafe fn edit_style() -> EditStyle {
         colors,
         brush: solid(colors.fill),
         disabled_brush: solid(colors.disabled_fill),
+        hairline_brush: solid(colors.border),
     };
     EDIT_STYLE.set(Some(style));
     style
@@ -3778,6 +3950,7 @@ unsafe fn invalidate_edit_style() {
     if let Some(style) = EDIT_STYLE.take() {
         let _ = DeleteObject(HGDIOBJ(style.brush.0));
         let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
+        let _ = DeleteObject(HGDIOBJ(style.hairline_brush.0));
     }
 }
 
@@ -4105,6 +4278,12 @@ unsafe extern "system" fn body_wndproc(
             SetBkMode(hdc, TRANSPARENT);
             LRESULT(GetSysColorBrush(COLOR_3DFACE).0 as isize)
         }
+        // #877: a hairline is a one pixel static filled with the border token.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == ID_ROW_SEPARATOR =>
+        {
+            LRESULT(edit_style().hairline_brush.0 as isize)
+        }
         // #934: a text box is the token fill with the token text on it.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLOREDIT => answer_edit_colors(
             windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
@@ -4261,10 +4440,10 @@ unsafe fn ensure_visible(body: HWND, ctrl: HWND) {
     if !ScreenToClient(body, &mut top).as_bool() || !ScreenToClient(body, &mut bottom).as_bool() {
         return;
     }
-    // Room above for the group's caption (and the window's top margin for the
-    // first group), a little below.
+    // Room above for the row's title and its hairline (and the window's top
+    // margin for the first row), a little below.
     let dpi = dpi_for(body);
-    let pad_top = to_px(GROUP_LABEL_TOP + MARGIN, dpi);
+    let pad_top = to_px(ROW_PAD + MARGIN, dpi);
     let pad_bottom = to_px(ROW_GAP, dpi);
     let new = scroll_into_view(
         si.nPos,
@@ -4551,21 +4730,88 @@ unsafe fn build_hint_font(body: HFONT, dpi: u32) -> HFONT {
 // UI construction
 // ---------------------------------------------------------------------------
 
-/// A tiny cursor for stacking rows top-to-bottom inside one group's content
-/// area. All coordinates are logical (96dpi) units, scaled at creation time.
+/// A cursor for stacking rows top-to-bottom down a page. All coordinates are
+/// logical (96dpi) units, scaled at creation time.
 struct Rows {
     x: i32,
     y: i32,
     w: i32,
+    /// Whether the next row is the page's first: it has no hairline above it.
+    first: bool,
+    /// The width of the control column. Rows whose controls are small buttons
+    /// narrow it, so a long title (a key combination) has the room.
+    ctl_w: i32,
 }
 
 impl Rows {
     fn new(x: i32, y: i32, w: i32) -> Self {
-        Rows { x, y, w }
+        Rows {
+            x,
+            y,
+            w,
+            first: true,
+            ctl_w: CONTROL_W,
+        }
     }
 
-    fn advance(&mut self) {
-        self.y += ROW_H + ROW_GAP;
+    /// The width of the title and description column.
+    fn left_w(&self) -> i32 {
+        self.w - self.ctl_w - COL_GAP
+    }
+
+    /// Where the control column starts.
+    fn control_x(&self) -> i32 {
+        self.right() - self.ctl_w
+    }
+
+    /// The right edge of the rows: where the control column ends.
+    fn right(&self) -> i32 {
+        self.x + self.w
+    }
+}
+
+/// How tall a row is for `desc_lines` lines of description (#877). A wide row
+/// adds the height its control takes from the title's line.
+fn row_height(desc_lines: i32) -> i32 {
+    if desc_lines == 0 {
+        ROW_PITCH
+    } else {
+        2 * ROW_PAD + ROW_TITLE_H + desc_lines * DESC_LINE_H
+    }
+}
+
+/// A row that has been started: where it sits and how tall it is.
+struct RowGeom {
+    y: i32,
+    h: i32,
+    desc_lines: i32,
+    /// Whether the description runs the page's width, under the control, so
+    /// the control sits on the title's line instead of the row's middle.
+    wide: bool,
+}
+
+impl RowGeom {
+    /// The top of a control of height [`ROW_H`]: centred in the row, or level
+    /// with the title when the description runs under it.
+    fn control_y(&self) -> i32 {
+        if self.wide {
+            self.y + ROW_PAD
+        } else {
+            self.y + (self.h - ROW_H) / 2
+        }
+    }
+
+    /// The top of the description.
+    fn desc_y(&self) -> i32 {
+        self.y
+            + ROW_PAD
+            + if self.wide {
+                ROW_H
+            } else if self.desc_lines == 0 {
+                0
+            } else {
+                ROW_TITLE_H
+            }
     }
 }
 
@@ -4691,6 +4937,127 @@ impl Ctx {
 }
 
 impl Ctx {
+    /// A hairline across the row that starts at `r.y` (#877).
+    fn hairline(&self, r: &Rows) {
+        let h = self.create(WC_STATIC, "", 0, 0, r.x, r.y, r.w, 1, ID_ROW_SEPARATOR);
+        self.set_anchor(h, Anchor::Hairline);
+    }
+
+    /// Starts a row (#877): the hairline above it (all but a page's first
+    /// row), then its title at the left. The caller makes the control, then
+    /// calls [`Ctx::end_row`]. The title comes right before the control in
+    /// z-order, which is what makes a screen reader name the control by it.
+    fn begin_row(&self, r: &mut Rows, title: &str, title_id: i32, desc_lines: i32) -> RowGeom {
+        self.begin_row_as(r, title, title_id, desc_lines, false)
+    }
+
+    /// [`Ctx::begin_row`] for a row whose description runs the page's width.
+    fn begin_wide_row(&self, r: &mut Rows, title: &str, title_id: i32, desc_lines: i32) -> RowGeom {
+        self.begin_row_as(r, title, title_id, desc_lines, true)
+    }
+
+    fn begin_row_as(
+        &self,
+        r: &mut Rows,
+        title: &str,
+        title_id: i32,
+        desc_lines: i32,
+        wide: bool,
+    ) -> RowGeom {
+        if !r.first {
+            self.hairline(r);
+        }
+        r.first = false;
+        let h = row_height(desc_lines) + if wide { ROW_H - ROW_TITLE_H } else { 0 };
+        let title_h = if desc_lines == 0 || wide {
+            ROW_H
+        } else {
+            ROW_TITLE_H
+        };
+        self.create(
+            WC_STATIC,
+            title,
+            0,
+            0,
+            r.x,
+            r.y + ROW_PAD,
+            r.left_w(),
+            title_h,
+            title_id,
+        );
+        RowGeom {
+            y: r.y,
+            h,
+            desc_lines,
+            wide,
+        }
+    }
+
+    /// Ends a row: its description under the title, made after the control so
+    /// the control is named by the title and not by the description (`wide`
+    /// lets the line run under the control column too), then the cursor moves
+    /// to the next row.
+    fn end_row(&self, r: &mut Rows, g: &RowGeom, desc: Option<(&str, i32)>) {
+        if let Some((text, id)) = desc {
+            let w = if g.wide { r.w } else { r.left_w() };
+            self.create(
+                WC_STATIC,
+                text,
+                0,
+                0,
+                r.x,
+                g.desc_y(),
+                w,
+                g.desc_lines * DESC_LINE_H,
+                id,
+            );
+        }
+        r.y += g.h;
+    }
+
+    /// A row whose control is a check box that carries the title itself, with
+    /// the description under it, lined up with the box's text (#972).
+    fn check_row(
+        &self,
+        r: &mut Rows,
+        text: &str,
+        id: i32,
+        desc: Option<(&str, i32)>,
+        desc_lines: i32,
+    ) -> HWND {
+        if !r.first {
+            self.hairline(r);
+        }
+        r.first = false;
+        let h = 2 * ROW_PAD + ROW_H + desc_lines * DESC_LINE_H;
+        let check = self.create(
+            WC_BUTTON,
+            text,
+            BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
+            0,
+            r.x,
+            r.y + ROW_PAD,
+            r.w,
+            ROW_H,
+            id,
+        );
+        if let Some((text, id)) = desc {
+            self.create(
+                WC_STATIC,
+                text,
+                0,
+                0,
+                r.x + CHECKBOX_TEXT_INDENT_DP,
+                r.y + ROW_PAD + ROW_H,
+                r.w - CHECKBOX_TEXT_INDENT_DP,
+                desc_lines * DESC_LINE_H,
+                id,
+            );
+        }
+        r.y += h;
+        check
+    }
+
     /// Marks an already-created child as one of the elastic pieces of the
     /// Prompt/footer region (see [`Anchor`]).
     fn set_anchor(&self, hwnd: HWND, anchor: Anchor) {
@@ -5728,7 +6095,12 @@ fn ollama_installed() -> bool {
 /// The second shortcut's line (#823): named by what it is for, since the
 /// Copilot key line above it already says which key is the first.
 fn secondary_label(chord: &crate::hotkey::Chord) -> String {
-    format!("Shortcut for any keyboard: {}", chord_to_string(chord))
+    format!("&Shortcut for any keyboard: {}", chord_to_string(chord))
+}
+
+/// The Copilot key's line (#823).
+fn primary_label(chord: &crate::hotkey::Chord) -> String {
+    format!("Copilot &key: {}", chord_to_string(chord))
 }
 
 /// The Mode combo's rows: the tray submenu's four, in its order, labelled by
@@ -5776,9 +6148,9 @@ const PAUSE_MENU: [(crate::pause::PauseChoice, &str); 3] = [
 /// The pause shortcut's line; it may be unset (#873).
 fn pause_label(chord: &Option<crate::hotkey::Chord>) -> String {
     match chord {
-        Some(c) => format!("Pause shortcut: {}", chord_to_string(c)),
+        Some(c) => format!("Pause s&hortcut: {}", chord_to_string(c)),
         None => format!(
-            "Pause shortcut: {}",
+            "Pause s&hortcut: {}",
             crate::hotkey::pause_binding_label(None)
         ),
     }
@@ -6152,39 +6524,24 @@ fn build_ui_recorded(
     };
     let content_x = MARGIN;
     let content_w = PAGE_W_DP - 2 * MARGIN;
+    let combo_style = (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32;
 
-    // Every page stacks its groups from the top; these follow where the next
-    // group of each page starts and where its last one ended (dp).
-    let mut page_y = [PAGE_TOP_PAD_DP; 5];
+    // Where each page's last row ends (dp).
     let mut page_bottom = [0i32; 5];
-    let mut y;
 
-    // -- Providers (Models) --------------------------------------------
+    // -- Models ------------------------------------------------------------
     ctx.page.set(Some(Page::Models));
-    y = page_y[Page::Models.index()];
-    let providers_top = y;
-    y += GROUP_LABEL_TOP;
-    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
+    let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
 
-    ctx.create(
-        WC_STATIC,
-        "Active provider:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
+    let g = ctx.begin_row(&mut r, "Active &provider", 0, 0);
     let active_combo = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        combo_style,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
         ROW_H * 6,
         ID_ACTIVE_PROVIDER,
     );
@@ -6193,296 +6550,109 @@ fn build_ui_recorded(
     combo_add(active_combo, "Ollama (local)");
     combo_add(active_combo, "Gemini (Google)");
     combo_select_index(active_combo, combo_index_for_order(&config.providers.order));
-    r.advance();
+    ctx.end_row(&mut r, &g, None);
 
-    // OpenAI
-    ctx.slot.set(Some(Slot::OpenAi));
-    ctx.create(
-        WC_STATIC,
-        "OpenAI API key:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
-    ctx.create(
-        WC_EDIT,
-        &key_field_display(&config.providers.openai.api_key),
-        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_CLIENTEDGE,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W - 70,
-        ROW_H,
-        ID_OPENAI_KEY,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Show",
-        BS_AUTOCHECKBOX as u32,
-        0,
-        r.x + r.w - 62,
-        r.y,
-        62,
-        ROW_H,
-        ID_OPENAI_SHOW_KEY,
-    );
-    r.advance();
+    // The three cloud vendors: a key, a model and a thinking time each (#195).
+    // Every title names its vendor, so a screen reader hears "OpenAI model",
+    // not a third "Model" (#781).
+    let vendors = [
+        (
+            &CLOUD_ROWS[0],
+            key_field_display(&config.providers.openai.api_key),
+            &config.providers.openai.models[..],
+            &config.providers.openai.model[..],
+            effort_display(&config.providers.openai.effort).to_string(),
+        ),
+        (
+            &CLOUD_ROWS[1],
+            key_field_display(&config.providers.anthropic.api_key),
+            &config.providers.anthropic.models[..],
+            &config.providers.anthropic.model[..],
+            effort_display(&config.providers.anthropic.effort).to_string(),
+        ),
+        (
+            &CLOUD_ROWS[2],
+            key_field_display(&config.providers.gemini.api_key),
+            &config.providers.gemini.models[..],
+            &config.providers.gemini.model[..],
+            effort_display(&config.providers.gemini.effort).to_string(),
+        ),
+    ];
+    for (rows, key, models, model, effort) in vendors {
+        ctx.slot.set(Some(rows.slot));
+        let g = ctx.begin_row(&mut r, rows.key_title, 0, 0);
+        ctx.create(
+            WC_EDIT,
+            &key,
+            (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
+            WS_EX_CLIENTEDGE,
+            r.control_x(),
+            g.control_y(),
+            CONTROL_W - SHOW_KEY_W - COL_GAP / 2,
+            ROW_H,
+            rows.key_id,
+        );
+        ctx.create(
+            WC_BUTTON,
+            "Show",
+            BS_AUTOCHECKBOX as u32,
+            0,
+            r.right() - SHOW_KEY_W,
+            g.control_y(),
+            SHOW_KEY_W,
+            ROW_H,
+            rows.show_id,
+        );
+        ctx.end_row(&mut r, &g, None);
 
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
-    let openai_model = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 8,
-        ID_OPENAI_MODEL,
-    );
-    fill_model_combo(
-        openai_model,
-        &config.providers.openai.models,
-        &config.providers.openai.model,
-    );
-    r.advance();
+        let g = ctx.begin_row(&mut r, rows.model_title, 0, 0);
+        let model_combo = ctx.create(
+            WC_COMBOBOX,
+            "",
+            combo_style,
+            0,
+            r.control_x(),
+            g.control_y(),
+            CONTROL_W,
+            ROW_H * 8,
+            rows.model_id,
+        );
+        fill_model_combo(model_combo, models, model);
+        ctx.end_row(&mut r, &g, None);
 
-    ctx.create(
-        WC_STATIC,
-        "Thinking time:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
-    let openai_effort = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 4,
-        ID_OPENAI_EFFORT,
-    );
-    for e in EFFORT_LABELS {
-        combo_add(openai_effort, e);
+        let g = ctx.begin_row(&mut r, rows.effort_title, rows.effort_title_id, 0);
+        let effort_combo = ctx.create(
+            WC_COMBOBOX,
+            "",
+            combo_style,
+            0,
+            r.control_x(),
+            g.control_y(),
+            CONTROL_W,
+            ROW_H * 4,
+            rows.effort_id,
+        );
+        for e in EFFORT_LABELS {
+            combo_add(effort_combo, e);
+        }
+        combo_select_with_custom(effort_combo, &EFFORT_LABELS, &effort);
+        ctx.end_row(&mut r, &g, None);
     }
-    combo_select_with_custom(
-        openai_effort,
-        &EFFORT_LABELS,
-        &effort_display(&config.providers.openai.effort),
-    );
-    r.advance();
-
-    // Anthropic
-    ctx.slot.set(Some(Slot::Anthropic));
-    ctx.create(
-        WC_STATIC,
-        "Anthropic API key:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
-    ctx.create(
-        WC_EDIT,
-        &key_field_display(&config.providers.anthropic.api_key),
-        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_CLIENTEDGE,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W - 70,
-        ROW_H,
-        ID_ANTHROPIC_KEY,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Show",
-        BS_AUTOCHECKBOX as u32,
-        0,
-        r.x + r.w - 62,
-        r.y,
-        62,
-        ROW_H,
-        ID_ANTHROPIC_SHOW_KEY,
-    );
-    r.advance();
-
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
-    let anthropic_model = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 8,
-        ID_ANTHROPIC_MODEL,
-    );
-    fill_model_combo(
-        anthropic_model,
-        &config.providers.anthropic.models,
-        &config.providers.anthropic.model,
-    );
-    r.advance();
-
-    ctx.create(
-        WC_STATIC,
-        "Thinking time:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
-    let anthropic_effort = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 4,
-        ID_ANTHROPIC_EFFORT,
-    );
-    for e in EFFORT_LABELS {
-        combo_add(anthropic_effort, e);
-    }
-    combo_select_with_custom(
-        anthropic_effort,
-        &EFFORT_LABELS,
-        &effort_display(&config.providers.anthropic.effort),
-    );
-    r.advance();
-
-    // Gemini (#195): same three rows as the other cloud providers.
-    ctx.slot.set(Some(Slot::Gemini));
-    ctx.create(
-        WC_STATIC,
-        "Gemini API key:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
-    ctx.create(
-        WC_EDIT,
-        &key_field_display(&config.providers.gemini.api_key),
-        (ES_PASSWORD | ES_AUTOHSCROLL) as u32,
-        WS_EX_CLIENTEDGE,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W - 70,
-        ROW_H,
-        ID_GEMINI_KEY,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Show",
-        BS_AUTOCHECKBOX as u32,
-        0,
-        r.x + r.w - 62,
-        r.y,
-        62,
-        ROW_H,
-        ID_GEMINI_SHOW_KEY,
-    );
-    r.advance();
-
-    ctx.create(WC_STATIC, "Model:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
-    let gemini_model = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 8,
-        ID_GEMINI_MODEL,
-    );
-    fill_model_combo(
-        gemini_model,
-        &config.providers.gemini.models,
-        &config.providers.gemini.model,
-    );
-    r.advance();
-
-    ctx.create(
-        WC_STATIC,
-        "Thinking time:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        ID_GEMINI_EFFORT_LABEL,
-    );
-    let gemini_effort = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 4,
-        ID_GEMINI_EFFORT,
-    );
-    for e in EFFORT_LABELS {
-        combo_add(gemini_effort, e);
-    }
-    combo_select_with_custom(
-        gemini_effort,
-        &EFFORT_LABELS,
-        &effort_display(&config.providers.gemini.effort),
-    );
     sync_gemini_thinking_enabled(hwnd);
-    r.advance();
 
     // Ollama (#183): no key, only which pulled model to use. The combo starts
     // with the configured model alone; the pulled models are added when the
     // background fetch reports in (see `spawn_ollama_models_fetch`).
     ctx.slot.set(Some(Slot::Ollama));
-    ctx.create(
-        WC_STATIC,
-        "Ollama model:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
+    let g = ctx.begin_row(&mut r, "Oll&ama model", 0, 0);
     let ollama_model = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        combo_style,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
         ROW_H * 8,
         ID_OLLAMA_MODEL,
     );
@@ -6493,79 +6663,46 @@ fn build_ui_recorded(
     if !labels.is_empty() {
         combo_select_index(ollama_model, selected as i32);
     }
-    r.advance();
+    ctx.end_row(&mut r, &g, None);
 
     // #874: shows the providers that are hidden. Under the blocks it
     // reveals, so a reader reaches it after the rows they can already see.
     ctx.slot.set(Some(Slot::AddButton));
+    let g = ctx.begin_row(&mut r, "Other providers", 0, 0);
     ctx.create(
         WC_BUTTON,
         "Add another provider",
         BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
-        r.x + LABEL_W,
-        r.y,
+        r.control_x(),
+        g.control_y(),
         ADD_PROVIDER_W,
         ROW_H,
         ID_ADD_PROVIDER,
     );
-    r.advance();
+    ctx.end_row(&mut r, &g, None);
 
     // #427: the cloud model dropdowns list what the provider offers (or
     // what is in config.toml), so say where to add one that is missing.
     ctx.slot.set(Some(Slot::Hint));
-    ctx.create(
-        WC_STATIC,
+    let g = ctx.begin_row(
+        &mut r,
         model_list_hint_for(config.mode),
-        0,
-        0,
-        r.x,
-        r.y,
-        r.w - OPEN_CONFIG_W - 8,
-        ROW_H,
         ID_MODEL_LIST_HINT,
+        0,
     );
     ctx.create(
         WC_BUTTON,
         "Open config file",
         BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
-        r.x + r.w - OPEN_CONFIG_W,
-        r.y,
+        r.control_x(),
+        g.control_y(),
         OPEN_CONFIG_W,
         ROW_H,
         ID_OPEN_CONFIG,
     );
-    r.advance();
-    ctx.slot.set(None);
-
-    // `r` already moved past the last row and its gap (#785).
-    let providers_bottom = r.y + 4;
-    // Created last, once the real extent of what it should enclose is
-    // known, so its height doesn't need to be precomputed by hand. This
-    // does put it on top in z-order, but a BS_GROUPBOX only ever paints its
-    // frame outline and caption text (its interior is left untouched, not
-    // filled), and this layout keeps that outline/caption clear of every
-    // field it encloses, so nothing ends up visually covered.
-    ctx.slot.set(Some(Slot::Frame));
-    ctx.create(
-        WC_BUTTON,
-        "Providers",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        providers_top,
-        content_w,
-        providers_bottom - providers_top,
-        0,
-    );
-    // The Ollama card under the frame shows with the Ollama block and moves
-    // up with the frame (#874).
-    ctx.slot.set(Some(Slot::OllamaCard));
-
-    y = providers_bottom + GROUP_GAP;
-    page_y[Page::Models.index()] = y;
-    page_bottom[Page::Models.index()] = providers_bottom;
+    ctx.end_row(&mut r, &g, None);
 
     // -- Ollama status (#14, #15) ----------------------------------------
     // One read-only line: whether anything answers on the configured
@@ -6576,26 +6713,26 @@ fn build_ui_recorded(
     // local models support vision. See `ollama_status_line`.
     //
     // Read-only: choosing Ollama as the active provider and its model is
-    // done in the Providers group above (#183). `base_url` stays a
-    // config.toml setting.
-    y = page_y[Page::Models.index()];
-    let ollama_top = y;
-    y += GROUP_LABEL_TOP;
+    // done in the rows above (#183). `base_url` stays a config.toml setting.
+    // It shows with the Ollama block and moves up with the rows above it
+    // (#874).
+    ctx.slot.set(Some(Slot::OllamaCard));
+    ctx.hairline(&r);
     // The text is a placeholder until the worker reports (#527, #568), so the
     // window never waits on Ollama or the disk. The link button sits at the
-    // right of the two text rows, so it adds no height to the window (#481);
-    // it is created hidden and shown when the result says it has a link, so
-    // the text is always laid out narrower to leave room for it.
-    let link_w = OLLAMA_LINK_W + 12;
+    // right of the two text rows; it is created hidden and shown when the
+    // result says it has a link, so the text is always laid out narrower to
+    // leave room for it.
+    let link_w = OLLAMA_LINK_W + COL_GAP;
     ctx.create(
         WC_STATIC,
         OLLAMA_CHECKING_TEXT,
         0,
         0,
-        content_x + MARGIN,
-        y,
-        content_w - 2 * MARGIN - link_w,
-        ROW_H * 2,
+        r.x,
+        r.y + ROW_PAD,
+        r.w - link_w,
+        OLLAMA_STATUS_H,
         ID_OLLAMA_STATUS,
     );
     ctx.create(
@@ -6603,8 +6740,8 @@ fn build_ui_recorded(
         "Local models",
         BS_PUSHBUTTON as u32,
         0,
-        content_x + content_w - MARGIN - OLLAMA_LINK_W,
-        y + (ROW_H * 2 - BTN_H) / 2,
+        r.x + r.w - OLLAMA_LINK_W,
+        r.y + ROW_PAD + (OLLAMA_STATUS_H - BTN_H) / 2,
         OLLAMA_LINK_W,
         BTN_H,
         ID_OLLAMA_LINK,
@@ -6614,32 +6751,20 @@ fn build_ui_recorded(
             let _ = ShowWindow(link, SW_HIDE);
         }
     }
-    y += ROW_H * 2;
+    r.y += 2 * ROW_PAD + OLLAMA_STATUS_H;
     // #566: pull a model by name. The name box, a Pull/Stop button, and one
     // line for progress or the reason it failed. No list of suggested
     // models: the user types the name (see docs/providers.md).
-    let pull_x = content_x + MARGIN;
-    let pull_inner_w = content_w - 2 * MARGIN;
-    ctx.create(
-        WC_STATIC,
-        "Pull model:",
-        0,
-        0,
-        pull_x,
-        y + 3,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
+    let g = ctx.begin_row(&mut r, "P&ull model", 0, 0);
     ctx.create(
         WC_EDIT,
         "",
         ES_AUTOHSCROLL as u32,
         WS_EX_CLIENTEDGE,
-        pull_x + LABEL_W,
-        y,
-        pull_inner_w - LABEL_W - OLLAMA_PULL_BTN_W - 8,
-        ROW_H + 4,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W - OLLAMA_PULL_BTN_W - COL_GAP / 2,
+        ROW_H,
         ID_PULL_NAME,
     );
     ctx.create(
@@ -6647,60 +6772,44 @@ fn build_ui_recorded(
         "Pull",
         BS_PUSHBUTTON as u32,
         0,
-        pull_x + pull_inner_w - OLLAMA_PULL_BTN_W,
-        y - 1,
+        r.right() - OLLAMA_PULL_BTN_W,
+        g.control_y(),
         OLLAMA_PULL_BTN_W,
-        BTN_H,
+        ROW_H,
         ID_PULL_BUTTON,
     );
-    y += BTN_H + 4;
+    // Progress or the reason it failed, the width of the page: it is a
+    // result, not a hint, so it keeps the label colour.
+    ctx.end_row(&mut r, &g, None);
     ctx.create(
         WC_STATIC,
         "",
         0,
         0,
-        pull_x,
-        y,
-        pull_inner_w,
-        ROW_H * 2,
+        r.x,
+        r.y - ROW_PAD,
+        r.w,
+        PULL_STATUS_H,
         ID_PULL_STATUS,
     );
-    y += ROW_H * 2;
-    let ollama_bottom = y + 4;
-    ctx.create(
-        WC_BUTTON,
-        "Ollama",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        ollama_top,
-        content_w,
-        ollama_bottom - ollama_top,
-        0,
-    );
-    y = ollama_bottom + GROUP_GAP;
-    page_y[Page::Models.index()] = y;
-    page_bottom[Page::Models.index()] = ollama_bottom;
+    r.y += PULL_STATUS_H;
     ctx.slot.set(None);
+    page_bottom[Page::Models.index()] = r.y;
 
-    // -- Hotkeys (General) --------------------------------------------------------
+    // -- General -------------------------------------------------------------
     ctx.page.set(Some(Page::General));
-    y = page_y[Page::General.index()];
-    let hotkeys_top = y;
-    y += GROUP_LABEL_TOP;
-    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
+    let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
     let change_w = 90;
-    let label_w = r.w - change_w - 12;
     // #873: Mode and Pause act at once, through the tray's own handlers.
-    ctx.create(WC_STATIC, "Mode:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    let g = ctx.begin_row(&mut r, "&Mode", 0, 2);
     let mode_combo = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        combo_style,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
         ROW_H * 5,
         ID_MODE,
     );
@@ -6708,38 +6817,36 @@ fn build_ui_recorded(
         combo_add(mode_combo, m.label());
     }
     combo_select(mode_combo, config.mode.label());
-    r.advance();
+    ctx.end_row(&mut r, &g, Some((MODE_DESC, ID_ROW_DESC)));
+
+    // The rows with only small buttons give their title the room.
+    r.ctl_w = 2 * change_w + COL_GAP / 2;
     let paused_now = crate::pause::is_paused_now();
     let (can_pause, can_resume) = pause_buttons_enabled(paused_now);
-    ctx.create(
-        WC_STATIC,
+    let g = ctx.begin_row(
+        &mut r,
         &pause_status_line(paused_now.then_some("Paused")),
-        0,
-        0,
-        r.x,
-        r.y,
-        label_w - change_w - 8,
-        ROW_H,
         ID_PAUSE_STATUS,
+        0,
     );
     let pause_button = ctx.create(
         WC_BUTTON,
-        "Pause...",
+        "&Pause...",
         BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
-        r.x + r.w - 2 * change_w - 8,
-        r.y,
+        r.right() - 2 * change_w - COL_GAP / 2,
+        g.control_y(),
         change_w,
         ROW_H,
         ID_PAUSE_BUTTON,
     );
     let resume_button = ctx.create(
         WC_BUTTON,
-        "Resume",
+        "&Resume",
         BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
-        r.x + r.w - change_w,
-        r.y,
+        r.right() - change_w,
+        g.control_y(),
         change_w,
         ROW_H,
         ID_RESUME_BUTTON,
@@ -6748,105 +6855,66 @@ fn build_ui_recorded(
         let _ = EnableWindow(pause_button, can_pause);
         let _ = EnableWindow(resume_button, can_resume);
     }
-    r.advance();
-    ctx.create(
-        WC_STATIC,
-        &format!("Copilot key: {}", chord_to_string(&config.hotkeys.primary)),
-        0,
-        0,
-        r.x,
-        r.y,
-        label_w,
-        ROW_H,
-        ID_PRIMARY_LABEL,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Change...",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
-        0,
-        r.x + r.w - change_w,
-        r.y,
-        change_w,
-        ROW_H,
-        ID_CHANGE_PRIMARY,
-    );
-    r.advance();
-    ctx.create(
-        WC_STATIC,
-        &secondary_label(&config.hotkeys.secondary),
-        0,
-        0,
-        r.x,
-        r.y,
-        label_w,
-        ROW_H,
-        ID_SECONDARY_LABEL,
-    );
-    ctx.create(
-        WC_BUTTON,
-        "Change...",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
-        0,
-        r.x + r.w - change_w,
-        r.y,
-        change_w,
-        ROW_H,
-        ID_CHANGE_SECONDARY,
-    );
-    r.advance();
-    // #873: the pause shortcut, moved here from the tray menu.
-    ctx.create(
-        WC_STATIC,
+    ctx.end_row(&mut r, &g, None);
+
+    // The three key rows: what it is, and the button that changes it.
+    for (label, id_label, button) in [
+        (
+            primary_label(&config.hotkeys.primary),
+            ID_PRIMARY_LABEL,
+            ID_CHANGE_PRIMARY,
+        ),
+        (
+            secondary_label(&config.hotkeys.secondary),
+            ID_SECONDARY_LABEL,
+            ID_CHANGE_SECONDARY,
+        ),
+    ] {
+        let g = ctx.begin_row(&mut r, &label, id_label, 0);
+        ctx.create(
+            WC_BUTTON,
+            "Change...",
+            BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+            0,
+            r.right() - change_w,
+            g.control_y(),
+            change_w,
+            ROW_H,
+            button,
+        );
+        ctx.end_row(&mut r, &g, None);
+    }
+    // #873: the pause shortcut, moved here from the tray menu. The learn
+    // flow's whole conversation happens on the line under it, inline: never a
+    // dialog and never a card (rule 7).
+    let g = ctx.begin_wide_row(
+        &mut r,
         &pause_label(&config.hotkeys.pause),
-        0,
-        0,
-        r.x,
-        r.y,
-        label_w,
-        ROW_H,
         ID_PAUSE_LABEL,
+        1,
     );
     ctx.create(
         WC_BUTTON,
         "Change...",
         BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         0,
-        r.x + r.w - change_w,
-        r.y,
+        r.right() - change_w,
+        g.control_y(),
         change_w,
         ROW_H,
         ID_CHANGE_PAUSE,
     );
-    r.advance();
-    // The learn flow's whole conversation happens on this one line, inline:
-    // never a dialog and never a card (rule 7).
-    ctx.create(
-        WC_STATIC,
-        "Click Change, then press the new key.",
-        0,
-        0,
-        r.x,
-        r.y,
-        r.w,
-        ROW_H,
-        ID_HOTKEY_STATUS,
+    ctx.end_row(
+        &mut r,
+        &g,
+        Some(("Click Change, then press the new key.", ID_HOTKEY_STATUS)),
     );
-    r.advance();
+
+    r.ctl_w = CONTROL_W;
 
     // Autostart state is owned by Windows, not by Config -- read the Run key
     // itself so the box can never disagree with reality.
-    let autostart = ctx.create(
-        WC_BUTTON,
-        "Start with Windows",
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
-        0,
-        r.x,
-        r.y,
-        r.w,
-        ROW_H,
-        ID_AUTOSTART,
-    );
+    let autostart = ctx.check_row(&mut r, "Start with &Windows", ID_AUTOSTART, None, 0);
     set_checkbox(autostart, crate::autostart::is_enabled());
     // Portable mode (#130) makes no registry writes, so the switch is greyed.
     if crate::portable::is_portable() {
@@ -6854,169 +6922,16 @@ fn build_ui_recorded(
             let _ = EnableWindow(autostart, false);
         }
     }
-    r.advance();
-
-    let hotkeys_bottom = r.y + 4;
-    ctx.create(
-        WC_BUTTON,
-        "General",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        hotkeys_top,
-        content_w,
-        hotkeys_bottom - hotkeys_top,
-        0,
-    );
-    y = hotkeys_bottom + GROUP_GAP;
-    page_y[Page::General.index()] = y;
-    page_bottom[Page::General.index()] = hotkeys_bottom;
-
-    // -- Capture (Privacy) ----------------------------------------------------------
-    ctx.page.set(Some(Page::Privacy));
-    y = page_y[Page::Privacy.index()];
-    let capture_top = y;
-    y += GROUP_LABEL_TOP;
-    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
-    ctx.create(
-        WC_STATIC,
-        "Screenshot detail:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
-    let max_edge = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 6,
-        ID_MAX_EDGE,
-    );
-    for v in MAX_EDGE_LABELS {
-        combo_add(max_edge, v);
-    }
-    combo_select_with_custom(
-        max_edge,
-        &MAX_EDGE_LABELS,
-        &max_edge_display(config.capture.max_edge),
-    );
-
-    r.advance();
-
-    ctx.create(WC_STATIC, "Screen:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
-    let monitor = ctx.create(
-        WC_COMBOBOX,
-        "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
-        0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
-        ROW_H * 4,
-        ID_MONITOR,
-    );
-    for v in MONITOR_LABELS {
-        combo_add(monitor, v);
-    }
-    combo_select_with_custom(
-        monitor,
-        &MONITOR_LABELS,
-        &monitor_display(&config.capture.monitor),
-    );
-    r.advance();
-
-    // #341: a one-line hint, since "screenshot detail" alone doesn't say
-    // what changes or why it costs more.
-    ctx.create(
-        WC_STATIC,
-        "Higher reads small text better, costs more.",
-        0,
-        0,
-        r.x,
-        r.y,
-        r.w,
-        ROW_H,
-        ID_CAPTURE_DETAIL_HINT,
-    );
-    r.advance();
-
-    // #509: capture.redact. The hint is two rows tall so it wraps in words
-    // rather than running off the group.
-    let redact = ctx.create(
-        WC_BUTTON,
-        REDACT_LABEL,
-        BS_AUTOCHECKBOX as u32 | WS_TABSTOP.0,
-        0,
-        r.x,
-        r.y,
-        r.w,
-        ROW_H,
-        ID_REDACT,
-    );
-    set_checkbox(redact, config.capture.redact);
-    r.advance();
-    ctx.create(
-        WC_STATIC,
-        REDACT_HINT,
-        0,
-        0,
-        r.x + CHECKBOX_TEXT_INDENT_DP,
-        r.y,
-        r.w - CHECKBOX_TEXT_INDENT_DP,
-        ROW_H * 2,
-        ID_REDACT_HINT,
-    );
-    // The note's own two rows, then the group's usual bottom padding (#785).
-    r.y += ROW_H * 2;
-    let capture_bottom = r.y + 4;
-    ctx.create(
-        WC_BUTTON,
-        "Capture",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        capture_top,
-        content_w,
-        capture_bottom - capture_top,
-        0,
-    );
-    y = capture_bottom + GROUP_GAP;
-    page_y[Page::Privacy.index()] = y;
-    page_bottom[Page::Privacy.index()] = capture_bottom;
 
     // -- Card (General) ---------------------------------------------------------
-    ctx.page.set(Some(Page::General));
-    y = page_y[Page::General.index()];
-    let card_top = y;
-    y += GROUP_LABEL_TOP;
-    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
-
-    ctx.create(
-        WC_STATIC,
-        CARD_SECONDS_LABEL,
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
-    );
+    let g = ctx.begin_row(&mut r, CARD_SECONDS_LABEL, 0, 1);
     ctx.create(
         WC_EDIT,
         &config.ui.card_seconds.to_string(),
         (ES_NUMBER | ES_AUTOHSCROLL) as u32,
         WS_EX_CLIENTEDGE,
-        r.x + LABEL_W,
-        r.y,
+        r.control_x(),
+        g.control_y(),
         CARD_SECONDS_EDIT_W,
         ROW_H,
         ID_CARD_SECONDS,
@@ -7026,23 +6941,23 @@ fn build_ui_recorded(
         CARD_SECONDS_UNIT,
         0,
         0,
-        r.x + LABEL_W + CARD_SECONDS_EDIT_W + 8,
-        r.y,
-        r.w - LABEL_W - CARD_SECONDS_EDIT_W - 8,
+        r.control_x() + CARD_SECONDS_EDIT_W + COL_GAP / 2,
+        g.control_y(),
+        CONTROL_W - CARD_SECONDS_EDIT_W - COL_GAP / 2,
         ROW_H,
         0,
     );
-    r.advance();
+    ctx.end_row(&mut r, &g, Some((CARD_SECONDS_NOTE, ID_ROW_DESC)));
 
-    ctx.create(WC_STATIC, "Text scale:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    let g = ctx.begin_row(&mut r, "&Text scale", 0, 0);
     let track = ctx.create(
         TRACKBAR_CLASS_STR,
         "",
         TBS_HORZ as u32,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W - 60,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W - TEXT_SCALE_LABEL_W,
         ROW_H,
         ID_TEXT_SCALE_TRACK,
     );
@@ -7063,31 +6978,30 @@ fn build_ui_recorded(
             Some(LPARAM(pos as isize)),
         );
     }
-    let scale_label = ctx.create(
+    ctx.create(
         WC_STATIC,
         &format!("{:.2}x", clamp_text_scale(config.ui.text_scale)),
         0,
         0,
-        r.x + r.w - 55,
-        r.y,
-        55,
+        r.right() - TEXT_SCALE_LABEL_W + COL_GAP / 2,
+        g.control_y(),
+        TEXT_SCALE_LABEL_W - COL_GAP / 2,
         ROW_H,
         ID_TEXT_SCALE_LABEL,
     );
-    let _ = scale_label;
-    r.advance();
+    ctx.end_row(&mut r, &g, None);
 
     // #498: where the card appears. The monitor list is read when Settings
     // opens, so a display plugged in afterwards shows up next time.
-    ctx.create(WC_STATIC, "Card corner:", 0, 0, r.x, r.y, LABEL_W, ROW_H, 0);
+    let g = ctx.begin_row(&mut r, "Card &corner", 0, 0);
     let corner = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        combo_style,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
         ROW_H * 7,
         ID_CARD_CORNER,
     );
@@ -7095,27 +7009,17 @@ fn build_ui_recorded(
         combo_add(corner, label);
     }
     combo_select(corner, card_corner_label(config.ui.card_corner));
-    r.advance();
+    ctx.end_row(&mut r, &g, None);
 
-    ctx.create(
-        WC_STATIC,
-        "Card monitor:",
-        0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        ID_CARD_MONITOR_LABEL,
-    );
+    let g = ctx.begin_row(&mut r, "Card m&onitor", ID_CARD_MONITOR_LABEL, 0);
     let card_monitor = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        combo_style,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
         ROW_H * 8,
         ID_CARD_MONITOR,
     );
@@ -7130,50 +7034,86 @@ fn build_ui_recorded(
         &monitor_presets,
         &card_monitor_display(&config.ui.card_monitor, monitors),
     );
-    r.advance();
+    ctx.end_row(&mut r, &g, None);
+    page_bottom[Page::General.index()] = r.y;
 
-    let card_bottom = r.y + 4;
-    ctx.create(
-        WC_BUTTON,
-        "Card",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        card_top,
-        content_w,
-        card_bottom - card_top,
-        0,
-    );
-    y = card_bottom + GROUP_GAP;
-    page_y[Page::General.index()] = y;
-    page_bottom[Page::General.index()] = card_bottom;
-
-    // -- Forms (#403, Privacy) -------------------------------------------------
+    // -- Privacy -------------------------------------------------------------
     ctx.page.set(Some(Page::Privacy));
-    y = page_y[Page::Privacy.index()];
-    let forms_top = y;
-    y += GROUP_LABEL_TOP;
-    let mut r = Rows::new(content_x + MARGIN, y, content_w - 2 * MARGIN);
-
-    ctx.create(
-        WC_STATIC,
-        "Review before filling:",
+    let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
+    // #341: a one-line note, since "screenshot detail" alone doesn't say what
+    // changes or why it costs more.
+    let g = ctx.begin_row(&mut r, "Screenshot &detail", 0, 1);
+    let max_edge = ctx.create(
+        WC_COMBOBOX,
+        "",
+        combo_style,
         0,
-        0,
-        r.x,
-        r.y,
-        LABEL_W,
-        ROW_H,
-        0,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
+        ROW_H * 6,
+        ID_MAX_EDGE,
     );
+    for v in MAX_EDGE_LABELS {
+        combo_add(max_edge, v);
+    }
+    combo_select_with_custom(
+        max_edge,
+        &MAX_EDGE_LABELS,
+        &max_edge_display(config.capture.max_edge),
+    );
+    ctx.end_row(
+        &mut r,
+        &g,
+        Some((
+            "Higher reads small text better, costs more.",
+            ID_CAPTURE_DETAIL_HINT,
+        )),
+    );
+
+    let g = ctx.begin_row(&mut r, "Sc&reen", 0, 0);
+    let monitor = ctx.create(
+        WC_COMBOBOX,
+        "",
+        combo_style,
+        0,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
+        ROW_H * 4,
+        ID_MONITOR,
+    );
+    for v in MONITOR_LABELS {
+        combo_add(monitor, v);
+    }
+    combo_select_with_custom(
+        monitor,
+        &MONITOR_LABELS,
+        &monitor_display(&config.capture.monitor),
+    );
+    ctx.end_row(&mut r, &g, None);
+
+    // #509: capture.redact. The note is two lines so it wraps in words rather
+    // than running off the page.
+    let redact = ctx.check_row(
+        &mut r,
+        REDACT_LABEL,
+        ID_REDACT,
+        Some((REDACT_HINT, ID_REDACT_HINT)),
+        2,
+    );
+    set_checkbox(redact, config.capture.redact);
+
+    // -- Forms (#403) --------------------------------------------------------
+    let g = ctx.begin_row(&mut r, "Review &before filling", 0, 0);
     let require_tick_for = ctx.create(
         WC_COMBOBOX,
         "",
-        (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32,
+        combo_style,
         0,
-        r.x + LABEL_W,
-        r.y,
-        r.w - LABEL_W,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
         ROW_H * 4,
         ID_REQUIRE_TICK_FOR,
     );
@@ -7184,73 +7124,53 @@ fn build_ui_recorded(
         require_tick_for,
         require_tick_for_label(config.forms.require_tick_for),
     );
-    r.advance();
-
-    let forms_bottom = r.y + 4;
-    ctx.create(
-        WC_BUTTON,
-        "Fill forms",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        forms_top,
-        content_w,
-        forms_bottom - forms_top,
-        0,
-    );
-    page_bottom[Page::Privacy.index()] = forms_bottom;
+    ctx.end_row(&mut r, &g, None);
+    page_bottom[Page::Privacy.index()] = r.y;
 
     // -- Actions (#872): no setting yet, so one note, never an empty page ---
     ctx.page.set(Some(Page::Actions));
-    y = page_y[Page::Actions.index()];
-    let actions_top = y;
-    y += GROUP_LABEL_TOP;
+    let r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
     let note_h = ROW_H * 3;
     ctx.create(
         WC_STATIC,
         ACTIONS_NOTE,
         0,
         0,
-        content_x + MARGIN,
-        y,
-        content_w - 2 * MARGIN,
+        r.x,
+        r.y + ROW_PAD,
+        r.w,
         note_h,
         ID_ACTIONS_NOTE,
     );
-    y += note_h;
-    let actions_bottom = y + 4;
-    ctx.create(
-        WC_BUTTON,
-        "Your actions",
-        BS_GROUPBOX as u32,
-        0,
-        content_x,
-        actions_top,
-        content_w,
-        actions_bottom - actions_top,
-        0,
-    );
-    page_bottom[Page::Actions.index()] = actions_bottom;
+    page_bottom[Page::Actions.index()] = r.y + 2 * ROW_PAD + note_h;
 
     // -- Prompt (Advanced; grows to fill the space above the button row) ----
     ctx.page.set(Some(Page::Advanced));
-    y = page_y[Page::Advanced.index()];
-    let footer = footer_layout(y, win_h_dp, false);
+    let footer = footer_layout(PAGE_TOP_PAD_DP, win_h_dp, false);
     let prompt_top = footer.prompt_top;
-    let prompt_bottom = footer.prompt_bottom;
-    y = prompt_top + GROUP_LABEL_TOP;
-
+    let content_top_dp = footer.prompt_top;
+    // The title first, so the box that follows is named by it.
+    ctx.create(
+        WC_STATIC,
+        PROMPT_TITLE,
+        0,
+        0,
+        content_x,
+        prompt_top + ROW_PAD,
+        content_w,
+        ROW_TITLE_H,
+        0,
+    );
     let reset_btn_h = BTN_H;
     let prompt_edit_h = footer.prompt_edit_h;
-    let content_top_dp = footer.prompt_top;
     let prompt_edit = ctx.create(
         WC_EDIT,
         &prompt_to_edit(&config.ui.prompt),
         (ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL) as u32,
         WS_EX_CLIENTEDGE,
-        content_x + MARGIN,
-        y,
-        content_w - 2 * MARGIN,
+        content_x,
+        prompt_top + PROMPT_HEAD_H,
+        content_w,
         prompt_edit_h,
         ID_PROMPT_EDIT,
     );
@@ -7279,7 +7199,7 @@ fn build_ui_recorded(
         prompt_toggle_label(false),
         BS_PUSHBUTTON as u32,
         0,
-        content_x + MARGIN,
+        content_x,
         footer.reset_btn_y,
         PROMPT_TOGGLE_W,
         reset_btn_h,
@@ -7288,10 +7208,10 @@ fn build_ui_recorded(
     ctx.set_anchor(toggle_btn, Anchor::ResetBtn);
     let reset_btn = ctx.create(
         WC_BUTTON,
-        "Reset prompt to default",
+        "&Reset prompt to default",
         BS_PUSHBUTTON as u32,
         0,
-        content_x + MARGIN + PROMPT_TOGGLE_W + 12,
+        content_x + PROMPT_TOGGLE_W + COL_GAP,
         footer.reset_btn_y,
         200,
         reset_btn_h,
@@ -7301,19 +7221,19 @@ fn build_ui_recorded(
     unsafe {
         let _ = ShowWindow(reset_btn, SW_HIDE);
     }
-
-    let prompt_group = ctx.create(
-        WC_BUTTON,
-        "Advanced",
-        BS_GROUPBOX as u32,
+    // What the prompt is for, under the title. Made after the box so the box
+    // is named by the title and not by this line.
+    ctx.create(
+        WC_STATIC,
+        PROMPT_NOTE,
+        0,
         0,
         content_x,
-        prompt_top,
+        prompt_top + ROW_PAD + ROW_TITLE_H,
         content_w,
-        prompt_bottom - prompt_top,
-        0,
+        DESC_LINE_H,
+        ID_ROW_DESC,
     );
-    ctx.set_anchor(prompt_group, Anchor::PromptGroup);
 
     // -- Status line and Undo ------------------------------------------
     // Pinned footer: a sibling of the body, not inside it, so it never scrolls.
@@ -7411,6 +7331,8 @@ fn build_ui_recorded(
             add_style(h, WS_TABSTOP.0);
         }
     }
+
+    annotate_accessible_names(hwnd);
 
     let mut page_content_dp = [0i32; 5];
     for page in Page::ALL {
@@ -8395,10 +8317,7 @@ fn set_hotkey_status(hwnd: HWND, text: &str) {
 /// Points the two shortcut labels at `hotkeys`.
 fn set_hotkey_labels(hwnd: HWND, hotkeys: &Hotkeys) {
     if let Some(l) = get_dlg_item(hwnd, ID_PRIMARY_LABEL) {
-        set_text(
-            l,
-            &format!("Copilot key: {}", chord_to_string(&hotkeys.primary)),
-        );
+        set_text(l, &primary_label(&hotkeys.primary));
     }
     if let Some(l) = get_dlg_item(hwnd, ID_SECONDARY_LABEL) {
         set_text(l, &secondary_label(&hotkeys.secondary));
@@ -9837,6 +9756,421 @@ mod tests {
         });
     }
 
+    // -- rows, names and mnemonics (#877) -----------------------------------
+
+    /// The Alt letter a text declares (`&x`, lower case), if any. `&&` is a
+    /// literal ampersand.
+    fn mnemonic_of(text: &str) -> Option<char> {
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '&' {
+                match chars.next() {
+                    Some('&') | None => {}
+                    Some(m) => return Some(m.to_ascii_lowercase()),
+                }
+            }
+        }
+        None
+    }
+
+    /// The words a screen reader says for a text: without the mnemonic mark
+    /// and the colon a title used to end in.
+    fn spoken(text: &str) -> String {
+        text.replace("&&", "\u{1}")
+            .replace('&', "")
+            .replace('\u{1}', "&")
+            .trim_end_matches(':')
+            .to_string()
+    }
+
+    unsafe fn class_of(hwnd: HWND) -> String {
+        use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+        let mut name = [0u16; 32];
+        let n = GetClassNameW(hwnd, &mut name) as usize;
+        String::from_utf16_lossy(&name[..n])
+    }
+
+    #[test]
+    fn the_mnemonic_helpers_read_the_ampersand() {
+        assert_eq!(mnemonic_of("&Mode"), Some('m'));
+        assert_eq!(mnemonic_of("Card m&onitor"), Some('o'));
+        assert_eq!(mnemonic_of("Fish && &Chips"), Some('c'));
+        assert_eq!(mnemonic_of("No mark"), None);
+        assert_eq!(mnemonic_of("Trailing &"), None);
+        assert_eq!(spoken("OpenAI &model"), "OpenAI model");
+        assert_eq!(spoken("Fish && Chips:"), "Fish & Chips");
+    }
+
+    /// No two labels on a page share an Alt letter (a letter may repeat across
+    /// pages: a hidden page is unreachable), and every page with settings has
+    /// some. A repeated letter makes Alt+letter cycle instead of going to the
+    /// row asked for.
+    #[test]
+    fn mnemonics_are_unique_within_each_page() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for page in Page::ALL {
+                let mut seen: Vec<(char, String)> = Vec::new();
+                for c in inner.children.iter().filter(|c| c.page == Some(page)) {
+                    let text = get_text(c.hwnd);
+                    let Some(m) = mnemonic_of(&text) else {
+                        continue;
+                    };
+                    if let Some((_, other)) = seen.iter().find(|(k, _)| *k == m) {
+                        panic!("{page:?}: Alt+{m} is on both {other:?} and {text:?}");
+                    }
+                    seen.push((m, text));
+                }
+                if page != Page::Actions {
+                    assert!(!seen.is_empty(), "{page:?} has no mnemonics");
+                }
+            }
+        });
+    }
+
+    /// The Gemini thinking row is greyed for a 2.5 model. Its Alt letter then
+    /// goes nowhere: the focus stays where it was, it never lands on whatever
+    /// control sits next to the greyed row.
+    #[test]
+    fn the_alt_letter_of_a_greyed_row_does_not_move_focus_to_a_neighbour() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{IsWindowEnabled, SetFocus};
+        use windows::Win32::UI::WindowsAndMessaging::{IsDialogMessageW, MSG, WM_SYSCHAR};
+        let mut cfg = Config::default();
+        cfg.providers.order = vec!["gemini".to_string()];
+        cfg.providers.gemini.model = "gemini-2.5-pro".to_string();
+        with_window(cfg, |hwnd, raw| {
+            unsafe { show_page(&mut *raw, Page::Models) };
+            sync_gemini_thinking_enabled(hwnd);
+            let label = get_dlg_item(hwnd, ID_GEMINI_EFFORT_LABEL).expect("label");
+            let m = mnemonic_of(&get_text(label)).expect("the label has a mnemonic");
+            let combo = get_dlg_item(hwnd, ID_GEMINI_MODEL).expect("combo");
+            assert!(!unsafe { IsWindowEnabled(label) }.as_bool(), "row greyed");
+            unsafe {
+                let _ = SetFocus(Some(combo));
+                let before = GetFocus();
+                assert_eq!(before, combo, "the test needs a real focus to compare");
+                let msg = MSG {
+                    hwnd: combo,
+                    message: WM_SYSCHAR,
+                    wParam: WPARAM(m as usize),
+                    lParam: LPARAM(0),
+                    ..Default::default()
+                };
+                let _ = IsDialogMessageW(hwnd, &msg);
+                assert_eq!(GetFocus(), before, "Alt+{m} moved the focus");
+            }
+        });
+    }
+
+    /// A box (a combo, a text box or a slider) is named by the static title
+    /// right before it in z-order, and a button by its text or its assigned
+    /// name. On a page no two share a name, so a screen reader never says the
+    /// same thing for two controls (#781). The Models page holds the hidden
+    /// providers too: all three are checked.
+    #[test]
+    fn controls_are_named_by_the_title_before_them_and_no_name_repeats_on_a_page() {
+        use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for page in Page::ALL {
+                let mut names: Vec<String> = Vec::new();
+                let mut boxes = 0;
+                for c in inner.children.iter().filter(|c| c.page == Some(page)) {
+                    let id = unsafe { GetDlgCtrlID(c.hwnd) };
+                    let class = unsafe { class_of(c.hwnd) };
+                    let name = match class.as_str() {
+                        "ComboBox" | "Edit" | "msctls_trackbar32" => {
+                            boxes += 1;
+                            let before = unsafe { GetWindow(c.hwnd, GW_HWNDPREV) }
+                                .unwrap_or_else(|_| panic!("id {id} has nothing before it"));
+                            assert_eq!(
+                                unsafe { class_of(before) },
+                                "Static",
+                                "id {id} on {page:?} is not named by a title"
+                            );
+                            let before_id = unsafe { GetDlgCtrlID(before) };
+                            assert!(
+                                before_id != ID_ROW_DESC && before_id != ID_ROW_SEPARATOR,
+                                "id {id} on {page:?} would be named by a description or a line"
+                            );
+                            let title = spoken(&get_text(before));
+                            assert!(!title.is_empty(), "id {id} on {page:?} has an empty title");
+                            title
+                        }
+                        "Button" => ACCESSIBLE_NAMES
+                            .iter()
+                            .find(|(i, _)| *i == id)
+                            .map(|(_, n)| n.to_string())
+                            .unwrap_or_else(|| spoken(&get_text(c.hwnd))),
+                        _ => continue,
+                    };
+                    assert!(
+                        !names.contains(&name),
+                        "{page:?}: two controls are named {name:?}"
+                    );
+                    names.push(name);
+                }
+                if page != Page::Actions {
+                    assert!(boxes > 0, "{page:?} was scanned and had no boxes");
+                }
+            }
+        });
+    }
+
+    /// The observable of #877: Narrator reads "OpenAI model" and then the combo.
+    /// The title is the static before the combo, so its text is the name.
+    #[test]
+    fn the_openai_model_combo_is_named_openai_model() {
+        use windows::Win32::UI::WindowsAndMessaging::GW_HWNDPREV;
+        with_window(Config::default(), |hwnd, _raw| {
+            for (id, want) in [
+                (ID_OPENAI_KEY, "OpenAI API key"),
+                (ID_OPENAI_MODEL, "OpenAI model"),
+                (ID_OPENAI_EFFORT, "OpenAI thinking time"),
+                (ID_ANTHROPIC_MODEL, "Anthropic model"),
+                (ID_GEMINI_MODEL, "Gemini model"),
+                (ID_OLLAMA_MODEL, "Ollama model"),
+            ] {
+                let control = get_dlg_item(hwnd, id).expect("control");
+                let before = unsafe { GetWindow(control, GW_HWNDPREV) }.expect("a title");
+                assert_eq!(spoken(&get_text(before)), want);
+            }
+        });
+    }
+
+    /// What the accessibility system reports for a control (MSAA, which UI
+    /// Automation reads through its proxy), or `None` when it has no name.
+    fn msaa_name(hwnd: HWND) -> Option<String> {
+        use windows::core::Interface;
+        use windows::Win32::System::Variant::VARIANT;
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+        const OBJID_CLIENT: u32 = 0xFFFF_FFFC;
+        unsafe {
+            let mut out: *mut c_void = std::ptr::null_mut();
+            AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, &IAccessible::IID, &mut out).ok()?;
+            let acc = IAccessible::from_raw(out);
+            let name = acc.get_accName(&VARIANT::from(0i32)).ok()?;
+            Some(name.to_string())
+        }
+    }
+
+    /// What UI Automation (which Narrator uses) reports as the control's name.
+    fn uia_name(hwnd: HWND) -> Option<String> {
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation};
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+            let uia: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let element = uia.ElementFromHandle(hwnd).ok()?;
+            Some(element.CurrentName().ok()?.to_string())
+        }
+    }
+
+    /// A window's names are taken back as it goes, so a recycled handle does
+    /// not carry "Show OpenAI key" into some other control.
+    #[test]
+    fn clearing_the_names_gives_the_button_its_own_text_back() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe { show_page(&mut *raw, Page::Models) };
+            let button = get_dlg_item(hwnd, ID_OPENAI_SHOW_KEY).expect("button");
+            assert_eq!(msaa_name(button).as_deref(), Some("Show OpenAI key"));
+            clear_accessible_names(hwnd);
+            assert_eq!(msaa_name(button).as_deref(), Some("Show"));
+        });
+    }
+
+    /// #877: Narrator reads UI Automation, not MSAA. The long names must come
+    /// through that path too, or "Show" is all a screen reader says.
+    #[test]
+    fn ui_automation_reports_the_vendor_names() {
+        with_window(Config::default(), |hwnd, raw| {
+            unsafe {
+                show_page(&mut *raw, Page::Models);
+                reveal_providers(&mut *raw);
+            }
+            for (id, want) in [
+                (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
+                (ID_OPENAI_MODEL, "OpenAI model"),
+            ] {
+                let control = get_dlg_item(hwnd, id).expect("control");
+                let name = uia_name(control)
+                    .unwrap_or_else(|| panic!("UI Automation gave no name for {id}"));
+                assert_eq!(name, want, "control id {id}");
+            }
+        });
+    }
+
+    /// The readback: what Narrator would be told, asked of the real controls.
+    /// The window is hidden, so this is the system's answer for a control and
+    /// not a speech test; run by hand with Narrator for that.
+    #[test]
+    fn the_accessibility_system_reports_the_vendor_names() {
+        with_window(Config::default(), |hwnd, raw| {
+            // Show the Models page with every provider so the controls exist.
+            unsafe {
+                show_page(&mut *raw, Page::Models);
+                reveal_providers(&mut *raw);
+            }
+            let mut answered = 0;
+            for (id, want) in [
+                (ID_OPENAI_SHOW_KEY, "Show OpenAI key"),
+                (ID_ANTHROPIC_SHOW_KEY, "Show Anthropic key"),
+                (ID_GEMINI_SHOW_KEY, "Show Gemini key"),
+                (ID_CHANGE_PRIMARY, "Change Copilot key"),
+                (ID_CHANGE_SECONDARY, "Change shortcut for any keyboard"),
+                (ID_CHANGE_PAUSE, "Change pause shortcut"),
+                (ID_OPENAI_MODEL, "OpenAI model"),
+                (ID_ANTHROPIC_MODEL, "Anthropic model"),
+            ] {
+                let control = get_dlg_item(hwnd, id).expect("control");
+                let name = msaa_name(control)
+                    .unwrap_or_else(|| panic!("the accessibility system gave no name for {id}"));
+                answered += 1;
+                assert_eq!(name, want, "control id {id}");
+            }
+            assert_eq!(answered, 8);
+        });
+    }
+
+    /// Every title and description fits the room its row gives it, so nothing
+    /// is cut off at the row's edge. Measured with the real fonts at 100, 150
+    /// and 250 %, where the wrapped lines grow with the type but the rows grow
+    /// with the same scale. The two-line descriptions are named, so a text that
+    /// stops being measured cannot make the test pass.
+    #[test]
+    fn titles_and_descriptions_fit_their_rows() {
+        use windows::Win32::Graphics::Gdi::{
+            DrawTextW, GetDC, ReleaseDC, SelectObject, DT_CALCRECT, DT_LEFT, DT_WORDBREAK,
+        };
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let dc = unsafe { GetDC(Some(hwnd)) };
+            for dpi in [96u32, 144, 240] {
+                let font = build_font(dpi);
+                let hint_font = unsafe { build_hint_font(font, dpi) };
+                assert!(!font.0.is_null() && !hint_font.0.is_null());
+                let mut checked = 0;
+                let mut long_ones = 0;
+                for c in &inner.children {
+                    if unsafe { class_of(c.hwnd) } != "Static" {
+                        continue;
+                    }
+                    let id = unsafe { GetDlgCtrlID(c.hwnd) };
+                    let text = get_text(c.hwnd);
+                    if text.is_empty() || id == ID_OLLAMA_STATUS || id == ID_PULL_STATUS {
+                        continue;
+                    }
+                    let used = if is_hint_id(id) { hint_font } else { font };
+                    let old = unsafe { SelectObject(dc, HGDIOBJ(used.0)) };
+                    let mut rect = windows::Win32::Foundation::RECT {
+                        left: 0,
+                        top: 0,
+                        right: to_px(c.w, dpi),
+                        bottom: 0,
+                    };
+                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                    unsafe {
+                        DrawTextW(
+                            dc,
+                            &mut wide,
+                            &mut rect,
+                            DT_CALCRECT | DT_LEFT | DT_WORDBREAK,
+                        );
+                        SelectObject(dc, old);
+                    }
+                    assert!(
+                        rect.bottom <= to_px(c.h, dpi),
+                        "{dpi} dpi: {text:?} needs {} px of {} in {} px width",
+                        rect.bottom,
+                        to_px(c.h, dpi),
+                        to_px(c.w, dpi)
+                    );
+                    if text == MODE_DESC || text == REDACT_HINT {
+                        long_ones += 1;
+                    }
+                    checked += 1;
+                }
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(hint_font.0));
+                    let _ = DeleteObject(HGDIOBJ(font.0));
+                }
+                assert!(
+                    checked > 20,
+                    "{dpi} dpi: only {checked} texts were measured"
+                );
+                assert_eq!(long_ones, 2, "{dpi} dpi: Mode and Redact descriptions");
+            }
+            unsafe { ReleaseDC(Some(hwnd), dc) };
+        });
+    }
+    /// A hairline sits above every row but a page's first, and none is left
+    /// loose: each one is a 1 dp tall control made on a page, so it hides with
+    /// its page and, on Models, with its block.
+    #[test]
+    fn rows_are_separated_by_hairlines_and_the_first_row_has_none() {
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            for page in [Page::General, Page::Models, Page::Privacy] {
+                let lines: Vec<&ChildLayout> = inner
+                    .children
+                    .iter()
+                    .filter(|c| c.page == Some(page))
+                    .filter(|c| unsafe { GetDlgCtrlID(c.hwnd) } == ID_ROW_SEPARATOR)
+                    .collect();
+                assert!(lines.len() >= 3, "{page:?} has {} hairlines", lines.len());
+                let top = inner
+                    .children
+                    .iter()
+                    .filter(|c| c.page == Some(page))
+                    .map(|c| c.y)
+                    .min()
+                    .unwrap();
+                for line in &lines {
+                    assert_eq!(line.anchor, Anchor::Hairline);
+                    assert_eq!(line.h, 1);
+                    assert!(line.y > top, "{page:?}: a hairline above the first row");
+                }
+            }
+        });
+    }
+
+    /// The hairline answers its colour request with its own brush (the border
+    /// token), through the body's real window procedure: a different brush
+    /// from the face, and the same one on the next ask (cached, not made per
+    /// paint).
+    #[test]
+    fn the_hairline_is_painted_with_a_cached_border_brush() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC;
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let line = inner
+                .children
+                .iter()
+                .find(|c| unsafe { GetDlgCtrlID(c.hwnd) } == ID_ROW_SEPARATOR)
+                .expect("a hairline")
+                .hwnd;
+            let dc = unsafe { windows::Win32::Graphics::Gdi::GetDC(Some(inner.body)) };
+            let ask = || unsafe {
+                SendMessageW(
+                    inner.body,
+                    WM_CTLCOLORSTATIC,
+                    Some(WPARAM(dc.0 as usize)),
+                    Some(LPARAM(line.0 as isize)),
+                )
+                .0
+            };
+            let (a, b) = (ask(), ask());
+            unsafe { windows::Win32::Graphics::Gdi::ReleaseDC(Some(inner.body), dc) };
+            assert_ne!(a, 0, "the hairline got a brush");
+            assert_eq!(a, b, "the brush is cached, not made per ask");
+            assert_eq!(a, unsafe { edit_style() }.hairline_brush.0 as isize);
+        });
+    }
+
     // -- font_face_exists (#346) -------------------------------------------
 
     #[test]
@@ -10213,6 +10547,35 @@ mod tests {
             assert!(design_y(inner, ID_OPEN_CONFIG) > hint_y_one_vendor);
         });
     }
+    /// With the Ollama card hidden, the Models page ends where every other page
+    /// does: a row's padding and the body's under its lowest visible control.
+    #[test]
+    fn a_hidden_ollama_card_leaves_the_page_ending_where_other_pages_end() {
+        with_window(Config::default(), |hwnd, raw| {
+            let inner = unsafe { &mut *raw };
+            unsafe { show_page(inner, Page::Models) };
+            let lowest = inner
+                .children
+                .iter()
+                .filter(|c| c.page == Some(Page::Models))
+                .filter(|c| unsafe { IsWindowVisible(c.hwnd) }.as_bool())
+                // A combo's design height is its drop-down list: the box is a row.
+                .map(|c| {
+                    c.y + if unsafe { class_of(c.hwnd) } == "ComboBox" {
+                        ROW_H
+                    } else {
+                        c.h
+                    }
+                })
+                .max()
+                .expect("a visible control");
+            assert!(!shows(hwnd, ID_PULL_STATUS), "the card is hidden");
+            let content = inner.page_content_dp[Page::Models.index()] - inner.models_shrink_dp;
+            // The last row's own padding, then the body's: as every other page.
+            assert_eq!(content, lowest + ROW_PAD + BODY_PAD_BOTTOM);
+        });
+    }
+
     #[test]
     fn gemini_thinking_applies_only_to_the_3_line() {
         assert!(gemini_thinking_applies("gemini-3.8-flash"));
@@ -10639,8 +11002,10 @@ mod tests {
                     "two names for one thing: {t}"
                 );
             }
-            assert!(texts.iter().any(|t| t.starts_with("Hide the card after")));
-            assert!(texts
+            // The `&` marks a mnemonic (#877); the words are what is checked.
+            let words: Vec<String> = texts.iter().map(|t| t.replace('&', "")).collect();
+            assert!(words.iter().any(|t| t.starts_with("Hide the card after")));
+            assert!(words
                 .iter()
                 .any(|t| t.starts_with("Shortcut for any keyboard")));
         });
@@ -10750,90 +11115,42 @@ mod tests {
         });
     }
 
-    /// #785: a group ends a small step below its last control, not a blank
-    /// band. Measured from each group box to the lowest visible control inside
-    /// it, in dp at the test window's DPI.
+    /// #877: the group boxes are gone: rows and hairlines instead. Two checks,
+    /// because a source scan alone passes while a box is still made by number
+    /// and a window scan alone passes while the constant is still declared:
+    /// no `BS_GROUPBOX` anywhere in this file outside tests, and no button in
+    /// the built window has that style.
     #[test]
-    fn groups_end_close_below_their_last_control() {
-        use windows::Win32::Foundation::RECT;
-        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-        with_window(Config::default(), |hwnd, raw| {
+    fn settings_has_no_group_box() {
+        let src = include_str!("settings.rs").replace('\r', "");
+        let code = src.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        assert!(
+            code.contains("fn build_ui_recorded"),
+            "scanned the real code"
+        );
+        let needle = ["BS_", "GROUPBOX"].concat();
+        assert!(!code.contains(&needle), "{needle} is still in settings.rs");
+        with_window(Config::default(), |_hwnd, raw| {
             let inner = unsafe { &*raw };
-            let dpi = dpi_for(hwnd);
-            // The control's top and its closed height: a combo's window rect
-            // also holds its dropped list.
-            let rect = |h: HWND| {
-                let (mut r, mut c) = (RECT::default(), RECT::default());
-                unsafe {
-                    let _ = GetWindowRect(h, &mut r);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(h, &mut c);
-                }
-                RECT {
-                    bottom: r.top + (c.bottom - c.top),
-                    ..r
-                }
-            };
-            let shown = |h: HWND| unsafe {
-                windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                    h,
-                    windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-                ) as u32
-                    & WS_VISIBLE.0
-                    != 0
-            };
-            let groups: Vec<(String, RECT)> = inner
+            assert!(!inner.children.is_empty());
+            let boxes = inner
                 .children
                 .iter()
-                .filter(|c| unsafe { is_group_box(c.hwnd) })
-                .map(|c| (get_text(c.hwnd), rect(c.hwnd)))
-                .collect();
-            assert!(groups.len() >= 5, "found {} group boxes", groups.len());
-            let mut checked = 0;
-            for (name, page) in [
-                ("Providers", Page::Models),
-                ("Ollama", Page::Models),
-                ("Capture", Page::Privacy),
-            ] {
-                unsafe { show_page(&mut *raw, page) };
-                // Every provider shows, so both groups are at full height.
-                unsafe { reveal_providers(&mut *raw) };
-                // The group's rect is read with its page showing.
-                let groups: Vec<(String, RECT)> = inner
-                    .children
-                    .iter()
-                    .filter(|c| unsafe { is_group_box(c.hwnd) })
-                    .map(|c| (get_text(c.hwnd), rect(c.hwnd)))
-                    .collect();
-                let (_, g) = groups.iter().find(|(t, _)| t == name).expect(name);
-                let last = inner
-                    .children
-                    .iter()
-                    .filter(|c| unsafe { !is_group_box(c.hwnd) && shown(c.hwnd) })
-                    .map(|c| rect(c.hwnd))
-                    .filter(|r| r.top >= g.top && r.bottom <= g.bottom)
-                    .map(|r| r.bottom)
-                    .max()
-                    .expect("controls inside the group");
-                let slack = g.bottom - last;
-                assert!(
-                    slack <= to_px(16, dpi),
-                    "{name} group ends {slack} px below its last control"
-                );
-                checked += 1;
-            }
-            assert_eq!(checked, 3);
+                .filter(|c| unsafe { is_button_with_style(c.hwnd, 0x0007) })
+                .count();
+            assert_eq!(boxes, 0, "a group box is still built");
         });
     }
 
-    /// Whether `hwnd` is a group box (a button with `BS_GROUPBOX`).
-    unsafe fn is_group_box(hwnd: HWND) -> bool {
+    /// Whether `hwnd` is a button whose style (the low four bits) is `style`.
+    unsafe fn is_button_with_style(hwnd: HWND, style: i32) -> bool {
         use windows::Win32::UI::WindowsAndMessaging::{
             GetClassNameW, GetWindowLongPtrW, GWL_STYLE,
         };
         let mut name = [0u16; 16];
         let n = GetClassNameW(hwnd, &mut name) as usize;
         String::from_utf16_lossy(&name[..n]) == "Button"
-            && (GetWindowLongPtrW(hwnd, GWL_STYLE) as i32 & 0xF) == BS_GROUPBOX
+            && (GetWindowLongPtrW(hwnd, GWL_STYLE) as i32 & 0xF) == style
     }
 
     /// #935: a 1 px line sits on the first row of the footer, directly under
@@ -13325,7 +13642,7 @@ mod tests {
     #[test]
     fn collapsed_toggle_row_sits_inside_the_group_and_above_the_footer() {
         let c = footer_layout(CONTENT_TOP_DP, WIN_H_DP, false);
-        assert!(c.reset_btn_y >= c.prompt_top + GROUP_LABEL_TOP);
+        assert!(c.reset_btn_y >= c.prompt_top + PROMPT_HEAD_H);
         assert!(c.reset_btn_y + BTN_H <= c.prompt_bottom);
         assert!(c.content_h() <= WIN_H_DP - FOOTER_H_DP);
     }
@@ -13954,6 +14271,19 @@ mod tests {
         assert_eq!(child_rect_px(&c, &l, &l, 144), (24, 60, 150, 33));
     }
 
+    /// #877: a hairline is one physical pixel thick at every scale, where a
+    /// 1 dp rect would be two pixels at 150 %.
+    #[test]
+    fn a_hairline_is_one_pixel_at_every_scale() {
+        let l = prompt_footer_layout(700, 918);
+        let c = child(16, 40, 588, 1, Anchor::Hairline);
+        for dpi in [96u32, 144, 192, 240] {
+            let (x, y, w, h) = child_rect_px(&c, &l, &l, dpi);
+            assert_eq!(h, 1, "{dpi} dpi");
+            assert_eq!((x, y, w), (to_px(16, dpi), to_px(40, dpi), to_px(588, dpi)));
+        }
+    }
+
     #[test]
     fn child_rect_px_moves_the_footer_with_a_shorter_window() {
         let old = prompt_footer_layout(700, 918);
@@ -13965,22 +14295,11 @@ mod tests {
     }
 
     #[test]
-    fn child_rect_px_stretches_the_prompt_group_edit_and_reset_row() {
+    fn child_rect_px_stretches_the_prompt_edit_and_moves_the_reset_row() {
         let old = prompt_footer_layout(700, 918);
         let new = prompt_footer_layout(700, 1000);
-        let group = child(
-            16,
-            old.prompt_top,
-            588,
-            old.prompt_bottom - old.prompt_top,
-            Anchor::PromptGroup,
-        );
         let edit = child(32, 720, 556, old.prompt_edit_h, Anchor::PromptEdit);
         let reset = child(32, old.reset_btn_y, 200, 28, Anchor::ResetBtn);
-        assert_eq!(
-            child_rect_px(&group, &old, &new, 96).3,
-            new.prompt_bottom - new.prompt_top
-        );
         assert_eq!(child_rect_px(&edit, &old, &new, 96).3, new.prompt_edit_h);
         assert_eq!(child_rect_px(&reset, &old, &new, 96).1, new.reset_btn_y);
     }
@@ -14511,7 +14830,7 @@ mod tests {
         pt.x
     }
 
-    /// #625: Cancel's right edge lines up with the group boxes' (one margin
+    /// #625: Undo's right edge lines up with the rows' (one margin
     /// before the scrollbar column), and the client is exactly as wide as the
     /// design says. The window used to be too narrow by its frame width and
     /// the footer was pushed over the scrollbar column, so Cancel sat a few
@@ -14528,7 +14847,7 @@ mod tests {
             to_px(MARGIN, 96) + scrollbar_width_px(96),
             "Cancel margin"
         );
-        // The group boxes end one margin before the scrollbar column.
+        // The rows end one margin before the scrollbar column.
         let group_right = to_px(WIN_W_DP - MARGIN, 96);
         assert_eq!(right, group_right, "footer edge vs group edge");
     }
@@ -14562,9 +14881,20 @@ mod tests {
             "label is {label_w}px wide, its text needs {}px",
             size.cx
         );
-        // The edit starts right of the label, not under it.
+        // The edit sits in the label's row, to its right, not under it. The
+        // row is two lines tall (the title and a note), so the box is centred
+        // in it and only overlaps the title's own height.
+        let (label_top, edit_top) = (
+            top_in_parent_px(body, label),
+            top_in_parent_px(body, seconds),
+        );
+        let label_h = {
+            let mut r = windows::Win32::Foundation::RECT::default();
+            unsafe { GetClientRect(label, &mut r) }.expect("label rect");
+            r.bottom - r.top
+        };
         assert!(
-            top_in_parent_px(body, label) == top_in_parent_px(body, seconds),
+            edit_top >= label_top && edit_top < label_top + label_h,
             "same row"
         );
     }
@@ -16058,7 +16388,7 @@ mod tests {
             assert!(get_dlg_item(hwnd, id).is_some(), "Change button {id}");
         }
         let primary = get_dlg_item(hwnd, ID_PRIMARY_LABEL).expect("primary label");
-        assert!(get_text(primary).starts_with("Copilot key: "));
+        assert!(get_text(primary).starts_with("Copilot &key: "));
         let status = get_dlg_item(hwnd, ID_HOTKEY_STATUS).expect("status line");
         assert!(
             !get_text(status).contains("tray menu"),
@@ -16074,7 +16404,7 @@ mod tests {
         set_hotkey_labels(hwnd, &staged);
         assert_eq!(
             get_text(primary),
-            format!("Copilot key: {}", chord_to_string(&staged.primary))
+            format!("Copilot &key: {}", chord_to_string(&staged.primary))
         );
         assert!(get_text(primary).contains("W"));
 
@@ -16278,12 +16608,12 @@ mod tests {
     fn the_pause_shortcut_label_shows_the_staged_chord_or_not_set() {
         let mut hk = Config::default().hotkeys;
         hk.pause = None;
-        assert_eq!(pause_label(&hk.pause), "Pause shortcut: not set");
+        assert_eq!(pause_label(&hk.pause), "Pause s&hortcut: not set");
         let c = chord(b'P' as u32, true, false, true, false);
         hk.pause = Some(c);
         assert_eq!(
             pause_label(&hk.pause),
-            format!("Pause shortcut: {}", chord_to_string(&c))
+            format!("Pause s&hortcut: {}", chord_to_string(&c))
         );
     }
 }

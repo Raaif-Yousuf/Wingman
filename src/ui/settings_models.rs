@@ -20,10 +20,11 @@ pub(crate) enum Slot {
     AddButton,
     /// The line about adding a missing model, with Open config file.
     Hint,
-    /// The Providers group frame: only its height changes.
+    /// No control is made under it: `slot_dy(Frame)` is how far the page
+    /// shrinks in all, which the rows under the blocks move by.
     Frame,
-    /// The Ollama card under the frame (status, Pull, link): shows with the
-    /// Ollama block, and its top moves with the frame's height.
+    /// The Ollama card under the rows (status, Pull, link): shows with the
+    /// Ollama block, and its top moves up with every hidden row.
     OllamaCard,
 }
 
