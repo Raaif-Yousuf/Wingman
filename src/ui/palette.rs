@@ -598,7 +598,7 @@ impl Palette {
 
     /// The UI gallery's scroll: moves the viewport by `delta_rows`, clamped,
     /// like the mouse wheel.
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(debug_assertions)]
     pub(crate) fn scroll_for_test(&mut self, delta_rows: i32) {
         self.inner.state.offset = crate::ui::palette_model::scroll_by(
             self.inner.state.offset,
