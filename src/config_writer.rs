@@ -341,6 +341,48 @@ fn push_set(path: &[String], value: &toml::Value, out: &mut Vec<FieldChange>) {
     });
 }
 
+/// The changes that blank, in the file, the keys a load just moved into
+/// Credential Manager (#899): efore is the config as the file read it, fter
+/// the same once the import ran. A named provider whose key went from set to
+/// empty is one pi_key = "". The compat list cannot be addressed entry by
+/// entry, so it is one guarded change, and only when every entry's key is now
+/// empty: if one key could not be stored it stays in the file (and is imported
+/// on the next load) rather than be blanked and lost. A key the file changed
+/// meanwhile makes the guarded change fail, which leaves the file as it is.
+pub fn blanked_key_changes(before: &Config, after: &Config) -> Result<Vec<FieldChange>> {
+    let tb = toml::Value::try_from(before).context("could not read the old settings")?;
+    let ta = toml::Value::try_from(after).context("could not read the new settings")?;
+    let mut out = Vec::new();
+    for provider in ["openai", "anthropic", "gemini"] {
+        let path = vec![
+            "providers".to_string(),
+            provider.to_string(),
+            "api_key".to_string(),
+        ];
+        let was = value_at(&tb, &path).is_some_and(|v| !is_blank_string(v));
+        let now = !value_at(&ta, &path).is_some_and(|v| !is_blank_string(v));
+        if was && now {
+            out.push(FieldChange::Set {
+                path,
+                value: toml::Value::String(String::new()),
+            });
+        }
+    }
+    let path = vec!["providers".to_string(), "compat".to_string()];
+    if let (Some(was), Some(now)) = (value_at(&tb, &path), value_at(&ta, &path)) {
+        if holds_secret(was) && !holds_secret(now) {
+            let mut expected = was.clone();
+            blank_secrets(&mut expected);
+            out.push(FieldChange::SetIfUnchanged {
+                path,
+                expected: Some(expected),
+                value: now.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Drops every change whose key is changed again later, keeping the later one
 /// ("latest wins") and the order of the survivors.
 pub fn coalesce(changes: Vec<FieldChange>) -> Vec<FieldChange> {

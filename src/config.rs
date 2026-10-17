@@ -1057,6 +1057,18 @@ pub(crate) fn describe_error_span(contents: &str, span: Option<std::ops::Range<u
     format!("config.toml has an error at line {line}, column {column}")
 }
 
+/// A load's own repair or key blanking (#899), written as field changes so the
+/// user's comments and hand edits survive. The file counts as read by this
+/// process afterwards, as it did when the load wrote the whole file.
+fn write_back_fields(path: &Path, changes: &[crate::config_writer::FieldChange]) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    crate::config_writer::write_changes(path, changes)?;
+    note_mtime(path, file_mtime(path));
+    Ok(())
+}
+
 /// The one atomic write of `config.toml`, shared by [`Config::save_to`] and the
 /// field-level writer (`config_writer`, #870): temp file, owner-only ACL on the
 /// temp file, one-generation backup, rename, then note the new mtime.
@@ -1218,11 +1230,7 @@ impl Config {
         };
 
         let store = CredManagerStore;
-        if config.import_secrets_and_blank(&store) {
-            // Best effort, same as the "repaired" write-back below: the
-            // in-memory value is already correct even if this fails.
-            let _ = config.save_to(&path);
-        }
+        config.import_keys_and_write_back(&path, &store);
         config.hydrate_secrets(&store);
         config.apply_env_overrides();
         Ok(config)
@@ -1299,7 +1307,12 @@ impl Config {
                     if repaired {
                         // Best effort: the in-memory value is already correct, so a
                         // failed write here is not worth failing the load over.
-                        let _ = cfg.save_to(path);
+                        // #899: only the repaired fields are written, so comments
+                        // and hand edits stay.
+                        let _ = toml::from_str::<Config>(&contents)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|read| crate::config_writer::diff(&read, &cfg))
+                            .and_then(|changes| write_back_fields(path, &changes));
                     }
                     Ok(cfg)
                 }
@@ -1368,6 +1381,23 @@ impl Config {
         changed
     }
 
+    /// Moves the file's plaintext keys into `store` and blanks them in the file.
+    /// Best effort, same as the repair write-back in `load_from_file`: the
+    /// in-memory value is already correct even if the write fails, and the next
+    /// load imports again.
+    fn import_keys_and_write_back(&mut self, path: &Path, store: &dyn SecretStore) {
+        let before = self.clone();
+        if self.import_secrets_and_blank(store) {
+            // #899: blank only the keys, so comments and hand edits stay. If
+            // that cannot be done, the whole-file save still must not leave a
+            // key in the file.
+            let wrote = crate::config_writer::blanked_key_changes(&before, self)
+                .and_then(|changes| write_back_fields(path, &changes));
+            if wrote.is_err() {
+                let _ = self.save_to(path);
+            }
+        }
+    }
     /// Fills any still-empty `api_key` field from `store`. Called after
     /// [`Config::import_secrets_and_blank`] so a freshly imported key
     /// round-trips straight back in, and on every load so a key that lives
@@ -4836,6 +4866,59 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
         cleanup(&path);
     }
 
+    #[test]
+    fn a_repair_write_back_keeps_comments_and_unknown_keys() {
+        // #899: the load's own repair changed one field, not the whole file.
+        let path = scratch_path("repair-keeps-comments");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# my notes\nmystery = 1\n[providers.openai]\nmodel = \"gpt-5.5\" # mine\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from_with(&path, &|_| None).unwrap();
+        assert!(!loaded.providers.openai.models.is_empty());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# my notes"), "{on_disk}");
+        assert!(on_disk.contains("mystery = 1"), "{on_disk}");
+        assert!(on_disk.contains("model = \"gpt-5.5\" # mine"), "{on_disk}");
+        assert!(
+            on_disk.contains("models"),
+            "the repair must be written: {on_disk}"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_key_import_write_back_keeps_comments_and_blanks_the_keys() {
+        // #899: only the keys change; a hand-edited file keeps the rest.
+        let path = scratch_path("import-keeps-comments");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "# my notes\nmystery = 1\n[providers.openai]\napi_key = \"sk-in-file\" # old\n\n[[providers.compat]]\nname = \"lab\"\nbase_url = \"http://127.0.0.1:1/v1\"\nmodel = \"m\"\napi_key = \"ck-in-file\"\n",
+        )
+        .unwrap();
+        let mut config = Config::load_from_with(&path, &|_| None).unwrap();
+        assert_eq!(
+            config.providers.compat.len(),
+            1,
+            "fixture must parse a compat entry"
+        );
+        let store = InMemoryStore::default();
+        config.import_keys_and_write_back(&path, &store);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-in-file"), "{on_disk}");
+        assert!(!on_disk.contains("ck-in-file"), "{on_disk}");
+        assert!(on_disk.contains("# my notes"), "{on_disk}");
+        assert!(on_disk.contains("mystery = 1"), "{on_disk}");
+        assert!(on_disk.contains("# old"), "{on_disk}");
+        // The keys went to the store, not nowhere.
+        let mut again = Config::load_from_with(&path, &|_| None).unwrap();
+        again.hydrate_secrets(&store);
+        assert_eq!(again.providers.openai.api_key, "sk-in-file");
+        cleanup(&path);
+    }
     #[test]
     fn import_and_blank_is_a_no_op_once_the_field_is_already_blank() {
         let mut config = Config::default(); // api_key fields start empty
