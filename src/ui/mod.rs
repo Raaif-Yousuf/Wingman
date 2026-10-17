@@ -1,6 +1,7 @@
 pub mod card;
 pub(crate) mod card_buttons;
 pub(crate) mod card_placement;
+pub(crate) mod card_uia;
 pub(crate) mod confirm;
 pub(crate) mod file_dialog;
 pub mod gallery;

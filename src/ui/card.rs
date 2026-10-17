@@ -113,10 +113,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETNONCLIENTMETRICS, SPI_GETWORKAREA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
-    WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD, WS_DISABLED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    WM_GETOBJECT, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
+    WM_SHOWWINDOW, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_TIMER, WM_USER, WNDCLASSEXW, WS_CHILD,
+    WS_DISABLED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 /// Posted to the card's owner window (see [`Card::set_owner`]) whenever the
@@ -160,12 +161,19 @@ pub const WM_APP_CARD_COPY_DETAILS: u32 = WM_APP + 17;
 pub const WM_APP_CARD_REPORT_PROBLEM: u32 = WM_APP + 25;
 
 mod options;
+#[cfg(test)]
+mod uia_tests;
 pub use options::{OptionRow, OptionsBehavior};
 
 use crate::provider::Difficulty;
+use crate::ui::card_uia::{self, LinkRole};
 pub use crate::ui::pending_status::PendingStage;
 use crate::ui::pending_status::{pending_glyph_should_spin, pending_status_text};
 use crate::ui::preview::{Field, PreviewModel};
+use windows::Win32::UI::Accessibility::{
+    IRawElementProviderSimple, UIA_AutomationFocusChangedEventId, UiaClientsAreListening,
+    UiaDisconnectProvider, UiaRaiseAutomationEvent, UiaReturnRawElementProvider, UiaRootObjectId,
+};
 
 // ---------------------------------------------------------------------------
 // Public state
@@ -260,6 +268,7 @@ impl Card {
             report_rect: None,
             copy_available: false,
             focus_link: None,
+            uia: None,
             copy_rect: None,
             copy_feedback: CopyFeedback::None,
             read_aloud_available: false,
@@ -739,7 +748,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut CardInner;
     if !ptr.is_null() {
         let inner = &mut *ptr;
-        if let Some(result) = inner.handle_message(msg, wparam, lparam) {
+        let result = inner.handle_message(msg, wparam, lparam);
+        // #654: every change to the links repaints or shows or hides the
+        // window, so this is where UI Automation catches up.
+        if msg == WM_PAINT || msg == WM_SHOWWINDOW {
+            inner.sync_uia();
+        }
+        if let Some(result) = result {
             return result;
         }
     }
@@ -1185,6 +1200,47 @@ enum FooterLink {
     Copy,
 }
 
+impl FooterLink {
+    /// The id this link has in the UI Automation tree (#654). Stable.
+    fn uia_id(self) -> i32 {
+        match self {
+            FooterLink::CopyDetails => 1,
+            FooterLink::Report => 2,
+            FooterLink::ReadAloud => 3,
+            FooterLink::Copy => 4,
+        }
+    }
+
+    fn from_uia_id(id: i32) -> Option<FooterLink> {
+        [
+            FooterLink::CopyDetails,
+            FooterLink::Report,
+            FooterLink::ReadAloud,
+            FooterLink::Copy,
+        ]
+        .into_iter()
+        .find(|l| l.uia_id() == id)
+    }
+
+    /// "Report a problem" opens the browser, so it is a link; the others act
+    /// on the card, so a screen reader announces them as buttons.
+    fn uia_role(self) -> LinkRole {
+        match self {
+            FooterLink::Report => LinkRole::Hyperlink,
+            _ => LinkRole::Button,
+        }
+    }
+}
+
+/// The card's UI Automation state (#654).
+struct UiaState {
+    shared: card_uia::Shared,
+    /// Kept so the window can disconnect it on destroy.
+    root: IRawElementProviderSimple,
+    /// The focus the last event announced, so a repaint does not repeat it.
+    announced_focus: Option<i32>,
+}
+
 /// Where Tab (or Shift+Tab with `backwards`) moves the focus among `links`.
 /// Wraps around; a `current` that is not in `links` starts from the end the
 /// direction came from; no links means no focus.
@@ -1539,6 +1595,9 @@ struct CardInner {
     /// #606: the footer link Tab has moved to, drawn with a focus rectangle
     /// and run by Enter or Space. `None` until Tab is pressed.
     focus_link: Option<FooterLink>,
+    /// #654: the UI Automation tree for the footer links; `None` until a
+    /// screen reader (or any UIA client) first asks the window for it.
+    uia: Option<UiaState>,
     /// The "Copy" link's hit-test rect while Expanded, same coordinates as
     /// `read_aloud_rect`.
     copy_rect: Option<RECT>,
@@ -2177,6 +2236,120 @@ impl CardInner {
         .into_iter()
         .filter_map(|(link, rect)| rect.map(|_| link))
         .collect()
+    }
+
+    /// The visible label of a footer link now; also its accessible name.
+    fn link_label(&self, link: FooterLink) -> &'static str {
+        match link {
+            FooterLink::CopyDetails => "Copy details",
+            FooterLink::Report => "Report a problem",
+            FooterLink::ReadAloud => self.read_aloud_label(),
+            FooterLink::Copy => self.copy_label(),
+        }
+    }
+
+    /// What UI Automation should show now: the links on an expanded, visible
+    /// card (#654). Empty in every other state.
+    fn uia_snapshot(&self) -> card_uia::Snapshot {
+        if self.state != CardState::Expanded || !card_uia::window_visible(self.hwnd) {
+            return card_uia::Snapshot::default();
+        }
+        let links = self
+            .footer_links()
+            .into_iter()
+            .filter_map(|l| {
+                Some(card_uia::LinkInfo {
+                    id: l.uia_id(),
+                    name: self.link_label(l).to_string(),
+                    role: l.uia_role(),
+                    rect: self.link_rect(l)?,
+                })
+            })
+            .collect();
+        card_uia::Snapshot {
+            links,
+            focus: self.focus_link.map(FooterLink::uia_id),
+        }
+    }
+
+    /// Refreshes what UI Automation sees and announces a focus change.
+    /// Cheap and a no-op until a client has asked for the tree.
+    fn sync_uia(&mut self) {
+        let snap = self.uia_snapshot();
+        let hwnd = self.hwnd;
+        let Some(uia) = self.uia.as_mut() else {
+            return;
+        };
+        let focus = snap.focus;
+        {
+            let mut guard = uia.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard != snap {
+                *guard = snap;
+            }
+        }
+        if focus != uia.announced_focus {
+            uia.announced_focus = focus;
+            if let Some(id) = focus {
+                if unsafe { UiaClientsAreListening() }.as_bool() {
+                    let el = card_uia::link_provider(hwnd, &uia.shared, id);
+                    unsafe {
+                        let _ = UiaRaiseAutomationEvent(&el, UIA_AutomationFocusChangedEventId);
+                    }
+                }
+            }
+        }
+    }
+
+    /// #654: a screen reader's Invoke or SetFocus on a link, posted from
+    /// the UIA thread. Runs only a link that is on the card now.
+    fn uia_link_requested(&mut self, id: i32, how: isize) {
+        if self.state != CardState::Expanded {
+            return;
+        }
+        let Some(link) = FooterLink::from_uia_id(id).filter(|l| self.footer_links().contains(l))
+        else {
+            return;
+        };
+        self.focus_link = Some(link);
+        if how == card_uia::LINK_INVOKE {
+            self.activate_focused_link();
+        }
+        self.invalidate();
+        self.sync_uia();
+    }
+
+    /// #654: answers `WM_GETOBJECT` for the card's UIA tree.
+    fn uia_get_object(&mut self, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        if lparam.0 as i32 != UiaRootObjectId {
+            return None;
+        }
+        if self.uia.is_none() {
+            let shared = card_uia::Shared::default();
+            let root = card_uia::new_root(self.hwnd, &shared);
+            self.uia = Some(UiaState {
+                shared,
+                root,
+                announced_focus: None,
+            });
+            self.sync_uia();
+        }
+        let root = self.uia.as_ref()?.root.clone();
+        Some(unsafe { UiaReturnRawElementProvider(self.hwnd, wparam, lparam, &root) })
+    }
+
+    /// #654: detaches the tree from UIA when the window goes away.
+    fn uia_disconnect(&mut self) {
+        if let Some(uia) = self.uia.take() {
+            unsafe {
+                let _ = UiaReturnRawElementProvider(
+                    self.hwnd,
+                    WPARAM(0),
+                    LPARAM(0),
+                    None::<&IRawElementProviderSimple>,
+                );
+                let _ = UiaDisconnectProvider(&uia.root);
+            }
+        }
     }
 
     /// #606: Tab or Shift+Tab. The card never takes focus by itself; this
@@ -3491,7 +3664,13 @@ impl CardInner {
                 self.relayout_current_state();
                 Some(LRESULT(0))
             }
+            WM_GETOBJECT => self.uia_get_object(wparam, lparam),
+            card_uia::WM_CARD_UIA_LINK => {
+                self.uia_link_requested(wparam.0 as i32, lparam.0);
+                Some(LRESULT(0))
+            }
             WM_NCDESTROY => {
+                self.uia_disconnect();
                 self.fonts.delete();
                 self.fonts = Fonts::null();
                 if !self.edit_bg_brush.0.is_null() {
