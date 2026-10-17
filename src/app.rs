@@ -4894,6 +4894,14 @@ impl App {
                 DeferredMessage::SettingsLeft => self.on_settings_left(),
                 DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
+                DeferredMessage::RouterResult(generation, result) => {
+                    self.on_router_result(generation, *result)
+                }
+                DeferredMessage::MachineCheck(facts) => self.on_machine_check_result(&facts),
+                DeferredMessage::KeyDuringMenu => {
+                    self.card
+                        .show_answer("The tray menu was open", "Press the key again.", 3, None)
+                }
             }
         }
     }
@@ -7340,6 +7348,18 @@ enum DeferredMessage {
     /// is not, so no "Paused" card lands on the window being typed in. Nothing
     /// can start a request meanwhile (`settings_hold_card`).
     PauseToggle,
+    /// `WM_APP_ROUTER_RESULT` (#1011), tray menu only: the options card the
+    /// answer belongs to is still up when the menu closes, and a stale one is
+    /// dropped by `on_router_result`'s generation check.
+    RouterResult(u64, Box<std::result::Result<router::RouterResult, String>>),
+    /// `WM_APP_MACHINE_CHECK_RESULT` (#1011), tray menu only: the "Working"
+    /// card from "Check this PC" turns into its verdict once the menu is gone.
+    MachineCheck(Box<crate::machine::MachineFacts>),
+    /// `WM_APP_HOTKEY` or `WM_APP_ACTIVATE` (#1011) during the tray menu. The
+    /// hook has already swallowed the key, so it must not vanish; it is not
+    /// run later either (that would bill a request for a screen the user has
+    /// moved on from), so it ends in a card that says to press it again.
+    KeyDuringMenu,
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -7515,12 +7535,22 @@ enum SettingsReentrancy {
 /// before it opens, so it can drop a send preview, a first-run answer and a
 /// pending-stage update; the tray menu does not, so those are deferred and
 /// delivered when the menu closes (a send preview must not be cancelled just
-/// because the tray was opened). `WM_APP_DISMISS` stays dropped: the click
-/// that closes the menu is the user's dismissal, and the menu took that
-/// click, so there is no card click left to act on.
+/// because the tray was opened). #1011: the same goes for the router's answer
+/// and the machine check's verdict (their cards are still up), a Pause
+/// toggle, and a press of the Wingman key (which ends in a card, never a
+/// silent drop). `WM_APP_DISMISS` stays dropped: the click that closes the
+/// menu is the user's dismissal, and the menu took that click, so there is
+/// no card click left to act on.
 fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
     match msg {
-        WM_APP_SEND_PREVIEW | WM_APP_FIRST_RUN | WM_APP_PENDING_STAGE => SettingsReentrancy::Defer,
+        WM_APP_SEND_PREVIEW
+        | WM_APP_FIRST_RUN
+        | WM_APP_PENDING_STAGE
+        | WM_APP_ROUTER_RESULT
+        | WM_APP_MACHINE_CHECK_RESULT
+        | WM_APP_PAUSE_TOGGLE
+        | WM_APP_HOTKEY
+        | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
         _ => settings_reentrancy_policy(msg, taskbar_created_msg),
     }
 }
@@ -7697,7 +7727,8 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
         }),
         WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
-        // #722: only `tray_menu_policy` defers these three.
+        // #722: only `tray_menu_policy` defers these three (and, #1011, the
+        // arms further down).
         WM_APP_SEND_PREVIEW => DeferredMessage::SendPreview(unsafe {
             *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
         }),
@@ -7724,6 +7755,19 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             DeferredMessage::SettingsSave(unsafe { Box::from_raw(lparam.0 as *mut SettingsSave) })
         }
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
+        // #1011: tray menu only; see `tray_menu_policy`.
+        WM_APP_ROUTER_RESULT => {
+            let (generation, result) = unsafe {
+                *Box::from_raw(
+                    lparam.0 as *mut (u64, std::result::Result<router::RouterResult, String>),
+                )
+            };
+            DeferredMessage::RouterResult(generation, Box::new(result))
+        }
+        WM_APP_MACHINE_CHECK_RESULT => DeferredMessage::MachineCheck(unsafe {
+            Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts)
+        }),
+        WM_APP_HOTKEY | WM_APP_ACTIVATE => DeferredMessage::KeyDuringMenu,
         _ => return None,
     })
 }
@@ -11517,6 +11561,74 @@ mod tests {
         );
     }
 
+    /// #1011: what `tray_menu_policy` does with every `WM_APP_*` id. The tray
+    /// menu does not hide the card, so every id whose card can be up while it
+    /// is open must be delivered afterwards, never dropped. Keyed on
+    /// `ALL_WM_APP_IDS` so a new id cannot be forgotten.
+    #[test]
+    fn tray_menu_policy_covers_every_wm_app_id() {
+        use super::tray_menu_policy;
+        // The ids the menu itself makes moot: it took the click or the key
+        // claim, or the surface they act on (palette, card buttons) is not
+        // reachable while a menu has the mouse.
+        const DROPPED: &[u32] = &[
+            WM_APP_TRAY,
+            WM_APP_DISMISS,
+            WM_APP_LEARNED,
+            WM_APP_PALETTE_TOGGLE,
+            WM_APP_PALETTE_RUN,
+            WM_APP_CARD_OPEN_SETTINGS,
+            WM_APP_CARD_COPY_DETAILS,
+            WM_APP_CARD_REPORT_PROBLEM,
+            WM_APP_OPTIONS_CHOICE,
+        ];
+        let mut ignored = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            let got = tray_menu_policy(*id, FAKE_TASKBAR_CREATED_MSG);
+            if DROPPED.contains(id) {
+                ignored += 1;
+                assert_eq!(got, SettingsReentrancy::Ignore, "{name}");
+            } else {
+                assert_eq!(
+                    got,
+                    SettingsReentrancy::Defer,
+                    "{name} can have a card up while the tray menu is open, so it must be \
+                     deferred and delivered when the menu closes"
+                );
+            }
+        }
+        assert_eq!(
+            ignored,
+            DROPPED.len(),
+            "an id in DROPPED is not in the registry"
+        );
+    }
+
+    /// #1011: every id the menu defers has a form `take_deferred` can hold, or
+    /// `wnd_proc` would free the payload and the answer would be lost anyway.
+    #[test]
+    fn every_id_the_tray_menu_defers_can_be_held() {
+        use super::{take_deferred, tray_menu_policy};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        let src = lf(include_str!("app.rs"));
+        let take = body_between(&src, "fn take_deferred(", "\n}\n");
+        let mut checked = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            if tray_menu_policy(*id, FAKE_TASKBAR_CREATED_MSG) == SettingsReentrancy::Defer {
+                checked += 1;
+                assert!(take.contains(name), "{name} is deferred but has no arm");
+            }
+        }
+        assert!(
+            checked >= 18,
+            "the scan found {checked} ids: the list moved"
+        );
+        // The payload-free ones can be taken without a box.
+        for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE, WM_APP_PAUSE_TOGGLE] {
+            assert!(take_deferred(id, WPARAM(0), LPARAM(0)).is_some(), "{id}");
+        }
+    }
+
     /// #722: the tray menu defers what Settings drops, so opening the menu
     /// never cancels a send waiting on its preview.
     #[test]
@@ -11529,7 +11641,7 @@ mod tests {
             );
         }
         // Everything else matches the Settings policy.
-        for msg in [WM_APP_RESULT, WM_APP_HOTKEY, WM_APP_DISMISS, WM_APP_TRAY, 0] {
+        for msg in [WM_APP_RESULT, WM_APP_DISMISS, WM_APP_TRAY, 0] {
             assert_eq!(
                 super::tray_menu_policy(msg, 0),
                 settings_reentrancy_policy(msg, 0)
