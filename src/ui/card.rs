@@ -5337,6 +5337,8 @@ fn preview_confirm_key_allowed(
     if arm_ms == 0 {
         return true;
     }
+    // The i32 view of the wrapped difference reads negative once the preview
+    // has been open about 24.8 days; accepted, a preview never stays that long.
     msg_time.wrapping_sub(shown_tick) as i32 >= arm_ms as i32
 }
 
@@ -5464,7 +5466,7 @@ unsafe extern "system" fn preview_control_subclass(
         && is_owner_drawn_button(hwnd)
     {
         if let Some((shown, arm_ms)) = live_preview_key_gate(parent) {
-            if !preview_confirm_key_allowed(GetMessageTime() as u32, shown, arm_ms, 0) {
+            if !preview_confirm_key_allowed(GetMessageTime() as u32, shown, arm_ms, lparam.0) {
                 return LRESULT(0);
             }
         }
@@ -9491,6 +9493,86 @@ mod tests {
         );
         assert_eq!(msg.message, WM_CARD_PREVIEW_COMMAND);
         assert_eq!((msg.wParam.0 & 0xFFFF) as i32, ID_PREVIEW_DO_IT);
+    }
+
+    /// #1212: the child-control subclass is where Enter and Space actually
+    /// arrive while a field or button has focus, so the delay must hold there.
+    #[test]
+    fn the_subclass_holds_back_early_and_repeating_confirm_keys() {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE};
+
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        let card_hwnd = card.hwnd();
+        let (do_it, start) = {
+            let p = card.inner.preview.as_ref().unwrap();
+            let start = p.edits.iter().find(|(n, _)| n == "start").unwrap().1;
+            (p.do_it_btn, start)
+        };
+        let send = |hwnd: HWND, msg: u32, vk: u16, lparam: isize| unsafe {
+            let _ = preview_control_subclass(
+                hwnd,
+                msg,
+                WPARAM(vk as usize),
+                LPARAM(lparam),
+                PREVIEW_SUBCLASS_ID,
+                card_hwnd.0 as usize,
+            );
+        };
+        let posted = || {
+            let mut m = MSG::default();
+            // Ranged peeks only: an unfiltered discard could loop on WM_PAINT.
+            let command = unsafe {
+                PeekMessageW(
+                    &mut m,
+                    Some(card_hwnd),
+                    WM_CARD_PREVIEW_COMMAND,
+                    WM_CARD_PREVIEW_COMMAND,
+                    PM_REMOVE,
+                )
+                .as_bool()
+            };
+            let click = unsafe {
+                PeekMessageW(&mut m, Some(card_hwnd), WM_COMMAND, WM_COMMAND, PM_REMOVE).as_bool()
+            };
+            command || click
+        };
+
+        // Inside the delay: Enter on a field, Enter and Space on the button.
+        card.inner.preview.as_mut().unwrap().key_arm_ms = 1_000_000;
+        send(start, WM_KEYDOWN, VK_RETURN.0, 0);
+        send(do_it, WM_KEYDOWN, VK_RETURN.0, 0);
+        send(do_it, WM_KEYDOWN, VK_SPACE.0, 0);
+        send(do_it, WM_KEYUP, VK_SPACE.0, 0);
+        assert!(!posted(), "an early key reached the Do it button");
+
+        // Past the delay: a repeating Space or Enter is still held back...
+        {
+            let p = card.inner.preview.as_mut().unwrap();
+            p.key_arm_ms = 1;
+            p.shown_tick = (unsafe { GetMessageTime() } as u32).wrapping_sub(10_000);
+        }
+        send(do_it, WM_KEYDOWN, VK_SPACE.0, 1 << 30);
+        send(do_it, WM_KEYDOWN, VK_RETURN.0, 1 << 30);
+        assert!(!posted(), "a repeating key reached the Do it button");
+
+        // ...and a fresh Enter is not (the gate is not a blanket refusal).
+        send(start, WM_KEYDOWN, VK_RETURN.0, 0);
+        assert!(posted(), "a fresh Enter past the delay must confirm");
+    }
+
+    #[test]
+    fn live_preview_key_gate_reads_the_showing_preview() {
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        assert_eq!(unsafe { live_preview_key_gate(card.hwnd()) }, None);
+        let (schema, value) = calendar_schema_and_value();
+        card.inner
+            .show_preview("Add to calendar", &schema, &value, false);
+        card.inner.preview.as_mut().unwrap().key_arm_ms = 321;
+        let gate = unsafe { live_preview_key_gate(card.hwnd()) };
+        assert_eq!(gate.map(|g| g.1), Some(321));
     }
 
     // -- stale preview command must not hijack a later preview (#255) -----
