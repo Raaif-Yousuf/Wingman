@@ -366,6 +366,22 @@ pub fn format_compact(fields: &[FieldSnapshot]) -> String {
         .join("\n")
 }
 
+/// The line appended when a field list hit the element limit, so the model
+/// does not read a partial list as the whole form.
+pub const TRUNCATED_NOTE: &str =
+    "Note: this field list was cut short, so some fields are not shown.";
+
+/// [`format_compact`] for a prompt: the same lines, then [`TRUNCATED_NOTE`]
+/// when the snapshot was cut short.
+pub fn format_for_prompt(snapshot: &Snapshot) -> String {
+    let text = format_compact(&snapshot.fields);
+    match (snapshot.truncated, text.is_empty()) {
+        (false, _) => text,
+        (true, true) => TRUNCATED_NOTE.to_string(),
+        (true, false) => format!("{text}\n{TRUNCATED_NOTE}"),
+    }
+}
+
 #[allow(dead_code)] // some items have no caller outside tests
 fn format_line(field: &FieldSnapshot) -> String {
     let mut line = field.control_type.as_str().to_string();
@@ -1462,6 +1478,27 @@ mod tests {
     #[test]
     fn empty_field_list_formats_as_the_empty_string() {
         assert_eq!(format_compact(&[]), "");
+    }
+
+    #[test]
+    fn prompt_text_says_when_the_field_list_was_cut_short() {
+        let snap = |truncated| Snapshot {
+            fields: vec![field("First name", FieldValue::Text("Jane".to_string()))],
+            truncated,
+        };
+        let whole = format_for_prompt(&snap(false));
+        assert_eq!(whole, "Edit \"First name\": Jane");
+        let cut = format_for_prompt(&snap(true));
+        assert!(cut.starts_with(&whole), "{cut}");
+        let note = cut.strip_prefix(&whole).unwrap().trim();
+        assert_eq!(note, TRUNCATED_NOTE);
+        assert!(!note.contains('\u{2014}'));
+        // No fields and not cut: still empty, so the prompt adds nothing.
+        let none = Snapshot {
+            fields: Vec::new(),
+            truncated: false,
+        };
+        assert_eq!(format_for_prompt(&none), "");
     }
 
     // -- real Win32 window: label resolution and password redaction, for
