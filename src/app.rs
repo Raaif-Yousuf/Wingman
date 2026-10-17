@@ -1179,6 +1179,12 @@ fn mode_allowed(mode: Mode, load_problem: Option<&str>) -> bool {
 /// replace a setup card: the user must be told which file to open.
 fn broken_file_card(problem: &str, config_path: &str) -> (String, String) {
     let (headline, detail) = config_problem_card(problem);
+    // #1036: a copy from the copilot-ask folder that failed leaves no file at
+    // `config_path`; "the file is here" would point at nothing. That problem
+    // text already names the folder that does hold the settings.
+    if !std::path::Path::new(config_path).exists() {
+        return (headline, detail);
+    }
     (
         headline,
         format!(
@@ -11257,9 +11263,26 @@ mod tests {
     /// providers; the setup card must name the file, not tell the user to
     /// edit `providers.order` in the file Wingman could not read.
     #[test]
+    fn a_failed_copy_card_does_not_point_at_a_file_that_is_not_there() {
+        // #1036: nothing exists at the new path after a failed migration.
+        let missing = std::env::temp_dir()
+            .join("wingman-test-1036-no-such-dir")
+            .join("config.toml");
+        let (_, detail) = super::broken_file_card("a problem", &missing.display().to_string());
+        assert!(!detail.contains("The file is here"), "{detail}");
+        assert!(detail.contains("a problem"), "{detail}");
+        // A file that exists is still named.
+        let exe = std::env::current_exe().unwrap();
+        let (_, detail) = super::broken_file_card("a problem", &exe.display().to_string());
+        assert!(detail.contains("The file is here"), "{detail}");
+    }
+
+    #[test]
     fn a_file_that_did_not_parse_is_named_by_the_gate_and_the_empty_chain_card() {
         let problem = Some("config.toml has an error at line 3, column 1");
-        let path = "C:\\Users\\me\\config.toml";
+        // A file that exists (#1036: a path with no file gets no "file is here" line).
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let path = exe.as_str();
         let providers = nothing_configured_providers();
         let cards = [
             super::setup_gate(Mode::Offline, &providers, path, problem).expect("blocked"),
