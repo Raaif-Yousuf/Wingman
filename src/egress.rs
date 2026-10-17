@@ -118,7 +118,7 @@ pub struct EgressEntry {
     /// usage (shown as "unknown"), and on failures and non-model requests.
     pub cost: Option<f64>,
     /// What started the ask this request belongs to (`hotkey`, `activation`,
-    /// `tray`, `palette`, see `activation::Trigger`), so "forty of these were
+    /// `tray`, `palette`, `options`, see `activation::Trigger`), so "forty of these were
     /// activations" can be told apart from key presses (#236). `None` for
     /// requests not started by an ask, and for rows written before this
     /// field existed.

@@ -41,9 +41,8 @@ use crate::connectors::civil_time::{CivilDate, CivilDateTime};
 use crate::dismiss::{unpack_point, ClickWatcher, WM_APP_DISMISS};
 use crate::executors;
 use crate::hotkey::{
-    apply_learned, chord_to_string, pause_binding_label, slot_name, Chord, HotkeyHook,
-    LearnedVerdict, HK_PAUSE, HK_PRIMARY, HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED,
-    WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
+    apply_learned, chord_to_string, slot_name, Chord, HotkeyHook, LearnedVerdict, HK_PRIMARY,
+    HK_SECONDARY, WM_APP_HOTKEY, WM_APP_LEARNED, WM_APP_PALETTE_TOGGLE, WM_APP_PAUSE_TOGGLE,
 };
 use crate::keypress;
 use crate::mode::{self, Mode};
@@ -185,6 +184,12 @@ pub const WM_APP_SETTINGS_LEFT: u32 = WM_APP + 26;
 /// every tray change takes (`App::persist_changes_with`), so the count of writes
 /// in flight, the reload and the cards are all kept in one place. `WM_APP + 27`.
 pub const WM_APP_SETTINGS_SAVE: u32 = WM_APP + 27;
+
+/// #873: posted by the Settings window when the Mode row or the Pause or Resume
+/// button is used. `wparam` is a [`SettingsCommand`] code. The handler runs the
+/// tray's own `set_mode`, `pause_for` and `resume`, so the window and the tray
+/// menu share one path. `WM_APP + 28`.
+pub const WM_APP_SETTINGS_COMMAND: u32 = WM_APP + 28;
 
 /// #328: posted by the "Check this PC for local models" worker thread when
 /// its reads finish. `lparam` is
@@ -875,7 +880,13 @@ pub fn run() -> Result<()> {
     crate::ocr::set_preferred_language(&config.capture.ocr_language);
     // #81: index the knowledge folder once, on a background thread that ends
     // with the scan. An empty setting starts nothing.
-    let _ = crate::knowledge::ingest::start_scan(&config.knowledge.folder);
+    // #1054: a setting that cannot work and a thread that cannot start are known
+    // here, so they end on the start-up card below; a folder that is missing
+    // is only known on the scan thread and waits in its own notice queue.
+    let knowledge_setting_problem =
+        crate::knowledge::ingest::startup_problem(&config.knowledge.folder);
+    let knowledge_spawn_problem =
+        crate::knowledge::ingest::start_scan(&config.knowledge.folder).err();
     let chain = Arc::new(config.build_chain());
 
     // #105: every `Chain` built from here on asks the owner window to show
@@ -941,7 +952,13 @@ pub fn run() -> Result<()> {
         create_failed
             .as_ref()
             .map(|(folder, error)| (folder.as_str(), error.as_str())),
-        degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
+        merge_cards(
+            degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
+            knowledge_start_card(
+                knowledge_setting_problem.as_deref(),
+                knowledge_spawn_problem.as_deref(),
+            ),
+        ),
     ) {
         card.show_error(&headline, &detail);
     }
@@ -1073,13 +1090,18 @@ pub fn run() -> Result<()> {
         }
         _ => false,
     };
+    // Non-fatal: without it the card still auto-dismisses on its timer.
+    // Installed before the welcome card so that card can be armed (#906).
+    app.watcher = ClickWatcher::install(hwnd).ok();
+
     if welcome {
         let (headline, detail) = welcome_card(&chord_to_string(&app.config.hotkeys.secondary));
         app.card.show_settings_needed(&headline, &detail);
     }
-
-    // Non-fatal: without it the card still auto-dismisses on its timer.
-    app.watcher = ClickWatcher::install(hwnd).ok();
+    // Any startup card above (welcome or a key problem) persists until dismissed.
+    if !matches!(app.card.state(), crate::ui::card::CardState::Hidden) {
+        app.set_watch(true);
+    }
 
     // Hand the App to the window proc. It stays alive until WM_DESTROY.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize) };
@@ -1143,6 +1165,38 @@ fn startup_card(
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
+}
+
+/// #1054: the start-up card for a knowledge folder that will not be indexed
+/// this run for a reason known without reading the disk: the setting itself is
+/// unusable, or the scan's thread could not be created. `None` when both are
+/// fine. Pure. No em dash (rule 11).
+fn knowledge_start_card(
+    setting_problem: Option<&str>,
+    spawn_problem: Option<&str>,
+) -> Option<(String, String)> {
+    let detail = [setting_problem, spawn_problem]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if detail.is_empty() {
+        None
+    } else {
+        Some(("Knowledge folder not indexed".to_string(), detail))
+    }
+}
+
+/// Two optional start-up cards as one: the first leads, the second is joined
+/// under it, so neither is dropped. Pure.
+fn merge_cards(
+    first: Option<(String, String)>,
+    second: Option<(String, String)>,
+) -> Option<(String, String)> {
+    match (first, second) {
+        (Some((h, d)), Some((h2, d2))) => Some((h, format!("{d}\n\n{h2}. {d2}"))),
+        (one, None) | (None, one) => one,
+    }
 }
 
 /// #1019: the card for a start that went ahead without its tray icon or its
@@ -2949,6 +3003,7 @@ impl App {
                     self.track_error("Couldn't open the region selector", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't open the region selector", &detail);
+                self.set_watch(true);
                 return;
             }
         };
@@ -2982,6 +3037,7 @@ impl App {
                 let detail = self.track_error("Couldn't copy the region", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't copy the region", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -3460,7 +3516,10 @@ impl App {
                 .and_then(Value::as_str)
                 .and_then(|url| crate::inputs::web_page::parse_target(url).ok())
                 .map_or_else(|| "this link".to_string(), |t| t.host);
-            self.pending_preview = Some(PendingPreview::FetchLink(action.id.clone()));
+            self.pending_preview = Some(PendingPreview::FetchLink(
+                action.id.clone(),
+                self.run_trigger,
+            ));
             self.pending_preview_generation = self.card.show_preview(
                 &actions::link_summary::confirm_title(&host),
                 &schema,
@@ -3677,7 +3736,7 @@ impl App {
             Some(PendingPreview::GenericReplace(action, plan)) => {
                 self.run_confirmed_generic_replace(&action, plan, confirmed);
             }
-            Some(PendingPreview::FetchLink(action_id)) => {
+            Some(PendingPreview::FetchLink(action_id, trigger)) => {
                 // #127: the user confirmed the address on the card, so this
                 // is the one place a linked page is fetched.
                 let url = confirmed
@@ -3686,7 +3745,13 @@ impl App {
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 match url {
-                    Some(url) => self.run_generic_action_with(&action_id, Some(url)),
+                    Some(url) => {
+                        // #964: the click that confirmed is not the entry
+                        // point; the run keeps the one that opened the card.
+                        self.run_trigger = trigger;
+                        self.run_generic_action_with(&action_id, Some(url));
+                        self.run_trigger = None;
+                    }
                     None => {
                         let detail = self.track_error(
                             "Couldn't fetch the link",
@@ -5007,11 +5072,9 @@ impl App {
         let before = self.config.clone();
         apply_learned(&mut self.config.hotkeys, which, chord);
         if let Some(hook) = &self.hook {
-            if which == HK_PAUSE {
-                hook.set_pause_chord(self.config.hotkeys.pause);
-            } else {
-                hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
-            }
+            // Only the two tray-armed slots reach here; the pause key is changed
+            // in Settings (#873).
+            hook.set_bindings(self.config.hotkeys.primary, self.config.hotkeys.secondary);
         }
         self.refresh_tray_labels();
 
@@ -5098,7 +5161,10 @@ impl App {
                 "Couldn't open settings",
                 "Windows would not create the settings window. Try again, or open config.toml (tray menu, Help and diagnostics, Open config.toml).",
             );
+            return;
         }
+        // The window builds with the mode in `config` and no pause time.
+        self.sync_settings_window();
     }
 
     /// Settings lost the foreground or closed (#871): show what waited for it,
@@ -5235,6 +5301,7 @@ impl App {
                 DeferredMessage::ConfigWritten(reply) => self.on_config_written(reply),
                 DeferredMessage::SettingsLeft => self.on_settings_left(),
                 DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
+                DeferredMessage::SettingsCommand(command) => self.on_settings_command(command),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
                 DeferredMessage::RouterResult(generation, result) => {
                     self.on_router_result(generation, *result)
@@ -5308,6 +5375,7 @@ impl App {
     fn show_tray_restore_error(&mut self, error: Option<String>) {
         if let Some(e) = error {
             self.card.show_error("Couldn't restore the tray icon", &e);
+            self.set_watch(true);
         }
     }
 
@@ -5350,6 +5418,7 @@ impl App {
             hook.set_palette_chord(self.config.hotkeys.palette);
         }
         self.refresh_tray_labels();
+        self.sync_settings_window();
     }
 
     /// #174: `edit_settings` only needs to save when the file did not exist
@@ -5495,6 +5564,12 @@ impl App {
     /// `config.toml` stay, and no file work runs on this thread. The outcome
     /// comes back as `WM_APP_CONFIG_WRITTEN` (`on_config_written`).
     fn set_mode(&mut self, mode: Mode) {
+        self.set_mode_with(mode, false);
+    }
+
+    /// [`App::set_mode`]. `quiet`: the change came from the Settings window, so no
+    /// "saved" card goes over it (a failed write still gets its card).
+    fn set_mode_with(&mut self, mode: Mode, quiet: bool) {
         if self.config.mode == mode {
             return;
         }
@@ -5504,6 +5579,7 @@ impl App {
                 config_problem_card(self.config.load_problem.as_deref().unwrap_or_default());
             self.card.show_error(&headline, &detail);
             self.tray.set_mode(self.config.mode);
+            self.sync_settings_window();
             self.set_watch(true);
             return;
         }
@@ -5511,16 +5587,40 @@ impl App {
         mode::set_current(mode);
         self.tray.set_mode(mode);
         self.update_tooltip();
-        self.persist_field(mode.label(), crate::config_writer::FieldChange::mode(mode));
+        self.sync_settings_window();
+        let outcome = if quiet {
+            crate::config_writer::Outcome::quiet(mode.label())
+        } else {
+            crate::config_writer::Outcome::simple(mode.label())
+        };
+        self.persist_changes(outcome, vec![crate::config_writer::FieldChange::mode(mode)]);
         self.set_watch(true);
     }
 
-    /// Hands one field change to the writer thread. `label` names it in the
-    /// card that reports the outcome. Never blocks and never touches the disk
-    /// here; if the writer cannot even be reached the failure is posted back
-    /// like any other, so it still ends in a card (rule 7).
-    fn persist_field(&mut self, label: &str, change: crate::config_writer::FieldChange) {
-        self.persist_changes(crate::config_writer::Outcome::simple(label), vec![change]);
+    /// The Settings window's Mode row and Pause or Resume button (#873). Each
+    /// runs the handler the tray menu item runs, so there is one path.
+    fn on_settings_command(&mut self, command: SettingsCommand) {
+        match command {
+            SettingsCommand::Mode(mode) => self.set_mode_with(mode, true),
+            SettingsCommand::Pause(choice) => self.pause_for(choice),
+            SettingsCommand::Resume => self.resume(),
+        }
+    }
+
+    /// Shows the current mode and pause state in an open Settings window (#873),
+    /// so it follows a change made from the tray, the pause key, an expired
+    /// pause or a reload. A no-op when no window is open.
+    fn sync_settings_window(&self) {
+        if !settings::is_open() {
+            return;
+        }
+        let paused = match self.pause {
+            PauseState::Paused { choice, until } if self.pause.is_paused(SystemTime::now()) => {
+                Some(pause::tooltip_text(choice, until.and_then(local_hour_min)))
+            }
+            _ => None,
+        };
+        settings::sync_live(self.config.mode, paused.as_deref());
     }
 
     /// Writes whatever differs between `before` (the config before this tray
@@ -5678,6 +5778,8 @@ impl App {
                     } else if shown == SavedCard::Keep {
                         // An answer that waited for Settings is on screen now;
                         // "Settings saved" must not replace it (#213).
+                    } else if outcome.quiet_ok {
+                        // Settings shows the change itself (#873).
                     } else if outcome.ok_setup {
                         self.show_setup_card(&outcome.ok_headline, &outcome.ok_detail);
                     } else {
@@ -5740,8 +5842,6 @@ impl App {
         let primary = chord_to_string(&self.config.hotkeys.primary);
         let secondary = chord_to_string(&self.config.hotkeys.secondary);
         self.tray.set_key_bindings(&primary, &secondary);
-        self.tray
-            .set_pause_binding(&pause_binding_label(self.config.hotkeys.pause.as_ref()));
 
         let p = &self.config.providers;
         self.tray
@@ -5836,6 +5936,7 @@ impl App {
         self.hide_card();
         self.set_watch(false);
         self.update_tooltip();
+        self.sync_settings_window();
     }
 
     /// Leave Pause (issue #20), whether from the "Resume" menu item or
@@ -5849,6 +5950,7 @@ impl App {
         }
         self.tray.set_paused(false);
         self.update_tooltip();
+        self.sync_settings_window();
     }
 
     /// #181: flips Pause on a pause-toggle-chord press -- resume if
@@ -5915,6 +6017,7 @@ impl App {
     fn on_taskbar_created(&mut self) {
         if let Some(e) = self.try_restore_tray_icon() {
             self.card.show_error("Couldn't restore the tray icon", &e);
+            self.set_watch(true);
         }
     }
 
@@ -6072,6 +6175,7 @@ impl App {
                 let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't import the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -6091,6 +6195,7 @@ impl App {
                 let detail = self.track_error("Couldn't import the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't import the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -6134,6 +6239,7 @@ impl App {
                 let detail = self.track_error("Couldn't export the action", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't export the action", &detail);
+                self.set_watch(true);
             }
         }
     }
@@ -6614,6 +6720,9 @@ fn with_pending_notices(detail: &str) -> String {
         detail,
         [
             crate::store::take_notice(),
+            // #1054: the knowledge scan's own queue, so a scan notice never
+            // uses up the store's one-per-run slot.
+            crate::knowledge::notice::take(),
             crate::usage::take_budget_notice(),
             crate::config::take_backup_warning(),
             crate::actions::take_skipped_notice(),
@@ -7749,6 +7858,10 @@ enum DeferredMessage {
     /// `WM_APP_SETTINGS_SAVE` (#871), when it arrives during a tray menu or a
     /// file dialog: the save is handed to the writer once that loop has ended.
     SettingsSave(Box<SettingsSave>),
+    /// `WM_APP_SETTINGS_COMMAND` (#873), when it arrives during a tray menu or a
+    /// file dialog: run once that loop has ended, so the tray's own handler never
+    /// runs under a menu.
+    SettingsCommand(SettingsCommand),
     /// `WM_APP_PAUSE_TOGGLE` pressed while Settings is in front: applied when it
     /// is not, so no "Paused" card lands on the window being typed in. Nothing
     /// can start a request meanwhile (`settings_hold_card`).
@@ -7985,7 +8098,7 @@ enum PendingPreview {
     ),
     /// #127: a linked-page action's confirmation card. Carries the action's
     /// id; "Do it" starts the fetch step with the address on the card.
-    FetchLink(String),
+    FetchLink(String, Option<Trigger>),
     /// #105: a worker is blocked before a request that leaves the machine,
     /// waiting for this preview's answer. Holds the channel back to it:
     /// "Send" answers it (`ui::send_gate::decide`), and every other way the
@@ -8106,6 +8219,7 @@ fn settings_reentrancy_policy(msg: u32, taskbar_created_msg: u32) -> SettingsRee
         | WM_APP_CONFIG_WRITTEN
         | WM_APP_SETTINGS_LEFT
         | WM_APP_SETTINGS_SAVE
+        | WM_APP_SETTINGS_COMMAND
         // #1013: the hook swallowed the key, so it ends in a card.
         | WM_APP_LEARNED
         // #845: the verdict the user asked for is shown once Settings is gone,
@@ -8227,6 +8341,61 @@ pub(crate) fn post_settings_save(owner: isize, save: SettingsSave) -> Result<(),
     Ok(())
 }
 
+/// What the Settings window asks of the app (#873): the same three things the
+/// tray menu offers, so each runs through the tray's own handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsCommand {
+    Mode(Mode),
+    Pause(PauseChoice),
+    Resume,
+}
+
+impl SettingsCommand {
+    /// The code that travels in `wparam`.
+    pub(crate) fn to_wparam(self) -> usize {
+        match self {
+            SettingsCommand::Mode(Mode::Cloud) => 0,
+            SettingsCommand::Mode(Mode::Local) => 1,
+            SettingsCommand::Mode(Mode::Auto) => 2,
+            SettingsCommand::Mode(Mode::Offline) => 3,
+            SettingsCommand::Pause(PauseChoice::OneHour) => 10,
+            SettingsCommand::Pause(PauseChoice::UntilTomorrow) => 11,
+            SettingsCommand::Pause(PauseChoice::UntilResumed) => 12,
+            SettingsCommand::Resume => 20,
+        }
+    }
+
+    /// The command for a code; `None` for a number nobody sends, so a stray
+    /// message is dropped instead of acted on.
+    pub(crate) fn from_wparam(code: usize) -> Option<SettingsCommand> {
+        Some(match code {
+            0 => SettingsCommand::Mode(Mode::Cloud),
+            1 => SettingsCommand::Mode(Mode::Local),
+            2 => SettingsCommand::Mode(Mode::Auto),
+            3 => SettingsCommand::Mode(Mode::Offline),
+            10 => SettingsCommand::Pause(PauseChoice::OneHour),
+            11 => SettingsCommand::Pause(PauseChoice::UntilTomorrow),
+            12 => SettingsCommand::Pause(PauseChoice::UntilResumed),
+            20 => SettingsCommand::Resume,
+            _ => return None,
+        })
+    }
+}
+
+/// Posts `command` to the owner window `owner`. Never waits. `false` when the
+/// owner is gone, which the caller says on the window's own status line.
+pub(crate) fn post_settings_command(owner: isize, command: SettingsCommand) -> bool {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(HWND(owner as *mut _)),
+            WM_APP_SETTINGS_COMMAND,
+            WPARAM(command.to_wparam()),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
 /// Takes ownership of the payload a deferrable message carries and returns it
 /// as a [`DeferredMessage`]. `None` for an id that cannot be deferred, whose
 /// payload (if any) the caller frees: never a panic, this runs in the window
@@ -8278,6 +8447,9 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
         WM_APP_SETTINGS_LEFT => DeferredMessage::SettingsLeft,
         WM_APP_SETTINGS_SAVE => {
             DeferredMessage::SettingsSave(unsafe { Box::from_raw(lparam.0 as *mut SettingsSave) })
+        }
+        WM_APP_SETTINGS_COMMAND => {
+            DeferredMessage::SettingsCommand(SettingsCommand::from_wparam(wparam.0)?)
         }
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
         // #1011: tray menu only; see `tray_menu_policy`.
@@ -8523,9 +8695,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
     // would silently swallow the next key pressed anywhere.
     if !matches!(
         decode(id),
-        MenuChoice::Command(cmd::SET_PRIMARY)
-            | MenuChoice::Command(cmd::SET_SECONDARY)
-            | MenuChoice::Command(cmd::SET_PAUSE)
+        MenuChoice::Command(cmd::SET_PRIMARY) | MenuChoice::Command(cmd::SET_SECONDARY)
     ) {
         if let Some(h) = &app.hook {
             h.cancel_learning();
@@ -8552,7 +8722,6 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
         MenuChoice::Command(cmd::SET_PRIMARY) => app.start_learning(HK_PRIMARY),
         MenuChoice::Command(cmd::SET_SECONDARY) => app.start_learning(HK_SECONDARY),
-        MenuChoice::Command(cmd::SET_PAUSE) => app.start_learning(HK_PAUSE),
         MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
         MenuChoice::Command(cmd::RELOAD) => app.reload(),
         MenuChoice::Command(cmd::COPY_DIAGNOSTICS) => app.copy_diagnostics(),
@@ -8950,6 +9119,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             app.on_settings_save(save);
             LRESULT(0)
         }
+        WM_APP_SETTINGS_COMMAND => {
+            if let Some(command) = SettingsCommand::from_wparam(wparam.0) {
+                app.on_settings_command(command);
+            }
+            LRESULT(0)
+        }
         WM_APP_MACHINE_CHECK_RESULT => {
             let facts = unsafe { *Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts) };
             app.on_machine_check_result(&facts);
@@ -9188,7 +9363,9 @@ mod tests {
     };
     use super::{first_provider_model_label, provider_for_router, router_models_for};
     use super::{mode_allowed, settings_reentrancy_policy, SettingsReentrancy};
-    use super::{SettingsSave, WM_APP_SETTINGS_LEFT, WM_APP_SETTINGS_SAVE};
+    use super::{
+        SettingsSave, WM_APP_SETTINGS_COMMAND, WM_APP_SETTINGS_LEFT, WM_APP_SETTINGS_SAVE,
+    };
     use super::{
         WM_APP_ACTIVATE, WM_APP_CALENDAR_RESULT, WM_APP_FORM_FILL_RESULT,
         WM_APP_GENERIC_ACTION_RESULT, WM_APP_MACHINE_CHECK_RESULT, WM_APP_PENDING_STAGE,
@@ -9204,6 +9381,7 @@ mod tests {
     };
     use crate::mode::Mode;
     use crate::options_keys::WM_APP_OPTIONS_CHOICE;
+    use crate::pause::PauseChoice;
     use crate::provider::ollama_admin::FirstRun;
     use crate::provider::Provider;
     use crate::router;
@@ -9338,6 +9516,7 @@ mod tests {
             WM_APP_CONFIG_WRITTEN,
             WM_APP_SETTINGS_LEFT,
             WM_APP_SETTINGS_SAVE,
+            WM_APP_SETTINGS_COMMAND,
             WM_APP_TRAY,
             WM_CLOSE,
             WM_DESTROY,
@@ -9890,6 +10069,71 @@ mod tests {
         let proc_src = wnd_proc_body(&src);
         assert!(proc_src.contains("WM_APP_SETTINGS_LEFT => {"));
         assert!(proc_src.contains("WM_APP_SETTINGS_SAVE => {"));
+    }
+
+    /// #873: the Mode and Pause controls in Settings send one of these; each
+    /// code must come back as the same command, and a stray number as nothing.
+    #[test]
+    fn a_settings_command_round_trips_and_a_stray_code_is_refused() {
+        use super::SettingsCommand as C;
+        let all = [
+            C::Mode(Mode::Cloud),
+            C::Mode(Mode::Local),
+            C::Mode(Mode::Auto),
+            C::Mode(Mode::Offline),
+            C::Pause(PauseChoice::OneHour),
+            C::Pause(PauseChoice::UntilTomorrow),
+            C::Pause(PauseChoice::UntilResumed),
+            C::Resume,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for c in all {
+            assert_eq!(C::from_wparam(c.to_wparam()), Some(c), "{c:?}");
+            assert!(seen.insert(c.to_wparam()), "{c:?} shares a code");
+        }
+        assert_eq!(C::from_wparam(999), None);
+        assert_eq!(C::from_wparam(usize::MAX), None);
+    }
+
+    /// #873: the command can wait for a nested loop, and keeps what it carries.
+    #[test]
+    fn a_settings_command_can_be_held_for_a_nested_loop() {
+        use super::{take_deferred, DeferredMessage, SettingsCommand as C};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        let cmd = C::Mode(Mode::Offline);
+        match take_deferred(WM_APP_SETTINGS_COMMAND, WPARAM(cmd.to_wparam()), LPARAM(0)) {
+            Some(DeferredMessage::SettingsCommand(got)) => assert_eq!(got, cmd),
+            _ => panic!("a held command lost its payload"),
+        }
+        // A stray code is not a command: never a panic in the window procedure.
+        assert!(take_deferred(WM_APP_SETTINGS_COMMAND, WPARAM(999), LPARAM(0)).is_none());
+    }
+
+    /// #873 wired-to-nothing: the owner window has an arm for the message, the
+    /// arm calls the tray's own handlers (one path, not a copy), and every place
+    /// the mode or the pause state changes tells an open Settings window.
+    #[test]
+    fn a_settings_command_runs_the_trays_handlers_and_every_change_tells_settings() {
+        let src = lf(include_str!("app.rs"));
+        let proc_src = wnd_proc_body(&src);
+        assert!(proc_src.contains("WM_APP_SETTINGS_COMMAND => {"), "no arm");
+        let run = body_between(&src, "    fn on_settings_command(", "\n    }\n");
+        for call in ["self.set_mode_with(", "self.pause_for(", "self.resume()"] {
+            assert!(run.contains(call), "{call} is not the tray's path:\n{run}");
+        }
+        for head in [
+            "    fn set_mode_with(&mut self, mode: Mode, quiet: bool) {",
+            "    fn pause_for(&mut self, choice: PauseChoice) {",
+            "    fn resume(&mut self) {",
+            "    fn apply_config(&mut self) {",
+            "    fn open_settings(&mut self) {",
+        ] {
+            let body = body_between(&src, head, "\n    }\n");
+            assert!(
+                body.contains("self.sync_settings_window()"),
+                "{head} leaves an open Settings window showing the old state"
+            );
+        }
     }
 
     // -- readiness_gate (issue #192) ---------------------------------------
@@ -12217,6 +12461,7 @@ mod tests {
         ("WM_APP_CONFIG_WRITTEN", WM_APP_CONFIG_WRITTEN),
         ("WM_APP_SETTINGS_LEFT", WM_APP_SETTINGS_LEFT),
         ("WM_APP_SETTINGS_SAVE", WM_APP_SETTINGS_SAVE),
+        ("WM_APP_SETTINGS_COMMAND", WM_APP_SETTINGS_COMMAND),
         ("WM_APP_OPTIONS_CHOICE", WM_APP_OPTIONS_CHOICE),
     ];
 
@@ -12813,6 +13058,33 @@ mod tests {
         assert!(!both.contains('\u{2014}'));
     }
 
+    /// #1054: an unusable knowledge setting or a scan thread that could not
+    /// start ends on the start-up card, and neither hides the other or the
+    /// tray note it is merged with.
+    #[test]
+    fn knowledge_start_problems_end_on_the_start_card() {
+        assert_eq!(super::knowledge_start_card(None, None), None);
+        let (h, d) = super::knowledge_start_card(Some("must be a full path"), None).unwrap();
+        assert!(h.contains("Knowledge folder"), "{h}");
+        assert!(d.contains("full path"), "{d}");
+        let (_, both) =
+            super::knowledge_start_card(Some("bad setting"), Some("no thread")).unwrap();
+        assert!(
+            both.contains("bad setting") && both.contains("no thread"),
+            "{both}"
+        );
+        assert!(!h.contains('\u{2014}') && !both.contains('\u{2014}'));
+
+        let tray = super::degraded_start_card(Some("x"), None);
+        let know = super::knowledge_start_card(Some("bad setting"), None);
+        let (head, detail) = super::merge_cards(tray.clone(), know.clone()).unwrap();
+        assert!(head.contains("Tray icon"), "{head}");
+        assert!(detail.contains("bad setting"), "{detail}");
+        assert_eq!(super::merge_cards(tray.clone(), None), tray);
+        assert_eq!(super::merge_cards(None, know.clone()), know);
+        assert_eq!(super::merge_cards(None, None), None);
+    }
+
     // #1037: the card says what really happens: a retry on the next key press
     // or Quick Ask open (and on TaskbarCreated), not "as soon as the taskbar is ready".
     #[test]
@@ -13186,6 +13458,11 @@ mod tests {
         (
             "WM_APP_SETTINGS_SAVE",
             WM_APP_SETTINGS_SAVE,
+            SettingsReentrancy::Defer,
+        ),
+        (
+            "WM_APP_SETTINGS_COMMAND",
+            WM_APP_SETTINGS_COMMAND,
             SettingsReentrancy::Defer,
         ),
     ];
@@ -14406,8 +14683,11 @@ mod tests {
     fn the_skipped_actions_notice_rides_on_the_pending_notices() {
         let src = include_str!("app.rs").replace('\r', "");
         let start = src.find("fn with_pending_notices(").expect("fn exists");
-        let body = &src[start..start + 400];
+        let body = &src[start..start + 600];
         assert!(body.contains("take_skipped_notice()"));
+        // #1054: the knowledge scan's queue is drained here too, apart from
+        // the store's one-per-run slot.
+        assert!(body.contains("knowledge::notice::take()"));
         let begin = src.find("fn begin_action<T>").expect("fn exists");
         assert!(src[begin..begin + 1500].contains("queue_skipped_from_disk()"));
     }
@@ -14551,6 +14831,12 @@ mod tests {
         assert!(funnel.contains("self.run_trigger = None"), "{funnel}");
         // The tray menu does the same for its direct commands.
         assert!(production.contains("app.run_trigger = Some(Trigger::Tray)"));
+        // A linked-page action keeps its trigger across the confirm card.
+        let squashed: String = production.split_whitespace().collect();
+        assert!(squashed.contains("PendingPreview::FetchLink(action.id.clone(),self.run_trigger,)"));
+        assert!(squashed.contains(
+            "self.run_trigger=trigger;self.run_generic_action_with(&action_id,Some(url));"
+        ));
         // Workers that call a model carry it into the thread.
         for name in [
             "add_event_from_screen",
@@ -14569,6 +14855,54 @@ mod tests {
                 "{name}'s worker does not set the trigger"
             );
         }
+    }
+
+    /// #906: the persistent error cards outside the setup helper must also arm
+    /// click-away, and the startup cards (welcome, key problems) need the
+    /// watcher installed before they are shown, then an arm after them.
+    #[test]
+    fn persistent_error_cards_arm_click_away() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let production = src
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields a first part");
+        let body_of = |name: &str| {
+            let start = production
+                .find(&format!("    fn {name}("))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &production[start + 1..];
+            &rest[..rest.find("\n    fn ").unwrap_or(rest.len())]
+        };
+        let names = [
+            "show_tray_restore_error",
+            "on_taskbar_created",
+            "copy_region",
+            "commit_import",
+            "export_action",
+        ];
+        for name in names {
+            let body = body_of(name);
+            assert!(body.contains(".show_error"), "{name}: no error card found");
+            assert!(
+                body.contains("set_watch(true)"),
+                "{name} shows a persistent error card without arming click-away"
+            );
+        }
+        // Startup: install, then the cards, then arm if any card is up.
+        let run_start = production.find("pub fn run()").expect("run not found");
+        let run = &production[run_start..];
+        let install = run.find("ClickWatcher::install").expect("no install");
+        let welcome = run.find("welcome_card(").expect("no welcome card");
+        let arm = run.find("app.set_watch(true)").expect("no startup arm");
+        assert!(
+            install < welcome,
+            "the watcher is installed after the welcome card"
+        );
+        assert!(
+            welcome < arm,
+            "the startup arm comes before the welcome card"
+        );
     }
 
     #[test]
