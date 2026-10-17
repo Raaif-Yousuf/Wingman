@@ -244,6 +244,8 @@ pub enum GalleryState {
     /// #885: the setup cards a new user sees, which show their detail line.
     CardSetupNoModel,
     CardSetupOllamaDown,
+    /// #1020: the first failure a new user meets, as a plain setup card.
+    CardSetupKeyRejected,
     PaletteDefault,
     PaletteNoMatches,
     PaletteNoModel,
@@ -300,6 +302,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         CardOptionsNoModel,
         CardSetupNoModel,
         CardSetupOllamaDown,
+        CardSetupKeyRejected,
         PaletteDefault,
         PaletteNoMatches,
         PaletteNoModel,
@@ -346,6 +349,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         CardOptionsNoModel => "card-options-no-model",
         CardSetupNoModel => "card-setup-no-model",
         CardSetupOllamaDown => "card-setup-ollama-down",
+        CardSetupKeyRejected => "card-setup-key-rejected",
         PaletteDefault => "palette-default",
         PaletteNoMatches => "palette-no-matches",
         PaletteNoModel => "palette-no-model",
@@ -923,6 +927,13 @@ mod driver {
                     "config.toml",
                     None,
                 );
+                card.show_settings_needed(&headline, &detail);
+            }
+            CardSetupKeyRejected => {
+                card.hide();
+                palette.hide();
+                let raw = "anthropic: HTTP 401: invalid x-api-key";
+                let (headline, detail) = crate::app::setup_failure(raw).unwrap_or_default();
                 card.show_settings_needed(&headline, &detail);
             }
             CardWelcome => {
@@ -1721,8 +1732,8 @@ mod tests {
         // states + 4 settings states (#560) + the region overlay (#580) + the
         // welcome card (#831) = 28, + the two setup cards (#885) = 30, + the
         // two long palettes (#883) = 33, + the tray menu with and without an
-        // open submenu (#825) = 35, + the long action name (#1000) = 36.
-        assert_eq!(states.len(), 36);
+        // open submenu (#825) = 35, + the long action name (#1000) = 36, + the key-rejected setup card (#1020) = 37.
+        assert_eq!(states.len(), 37);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
