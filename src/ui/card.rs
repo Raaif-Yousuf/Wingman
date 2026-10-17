@@ -78,9 +78,9 @@ use crate::ui::theme::{
     accent_fill, contrast_ratio, detect_theme, progress_ring_ink, read_accent_shades,
     relative_luminance, rgb, setting_change_affects_theme, setting_change_name, type_height_px,
     AccentShades, SysColors, Theme, Tokens, BADGE_HIGH, BADGE_INK_DARK, BADGE_INK_LIGHT, BADGE_LOW,
-    BADGE_MID, BADGE_ULTRA, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE, GAP_DP, GLYPH_ERROR,
-    ICON_BOX_DP, ICON_FONT_DP, MARGIN_DP, PADDING_DP, PREFERRED_FONT_FACE, SPACE_SM_DP,
-    TYPE_BODY_PX, TYPE_CAPTION_PX,
+    BADGE_MID, BADGE_ULTRA, CONTROL_HEIGHT_DP, CONTROL_RADIUS_DP, FALLBACK_FONT_FACE,
+    FORM_ROW_GAP_DP, GAP_DP, GLYPH_ERROR, ICON_BOX_DP, ICON_FONT_DP, LABEL_VALUE_GAP_DP, MARGIN_DP,
+    PADDING_DP, PREFERRED_FONT_FACE, SPACE_SM_DP, TYPE_BODY_PX, TYPE_CAPTION_PX,
 };
 use serde_json::Value;
 use windows::core::PCWSTR;
@@ -1957,6 +1957,7 @@ impl CardInner {
 
         self.layout_collapsed();
         self.reveal();
+        self.announce_to_screen_readers();
     }
 
     fn hide(&mut self) {
@@ -2365,6 +2366,14 @@ impl CardInner {
 
     /// [`Self::uia_snapshot`] for a known visibility.
     fn uia_snapshot_for(&self, visible: bool) -> card_uia::Snapshot {
+        // #977: a collapsed card has no links, but with detail behind it a
+        // screen reader can expand it.
+        if self.state == CardState::Collapsed && visible && !self.detail.is_empty() {
+            return card_uia::Snapshot {
+                expandable: true,
+                ..card_uia::Snapshot::default()
+            };
+        }
         if self.state != CardState::Expanded || !visible {
             return card_uia::Snapshot::default();
         }
@@ -2383,6 +2392,7 @@ impl CardInner {
         card_uia::Snapshot {
             links,
             focus: self.focus_link.map(FooterLink::uia_id),
+            expandable: false,
         }
     }
 
@@ -2424,6 +2434,14 @@ impl CardInner {
     /// #654: a screen reader's Invoke or SetFocus on a link, posted from
     /// the UIA thread. Runs only a link that is on the card now.
     fn uia_link_requested(&mut self, id: i32, how: isize) {
+        // #977: the card-level Invoke expands a collapsed card.
+        if id == card_uia::EXPAND_ID {
+            if how == card_uia::LINK_INVOKE {
+                self.try_expand();
+            }
+            self.sync_uia(None);
+            return;
+        }
         if self.state != CardState::Expanded {
             return;
         }
@@ -2444,6 +2462,13 @@ impl CardInner {
         if lparam.0 as i32 != UiaRootObjectId {
             return None;
         }
+        self.ensure_uia();
+        let root = self.uia.as_ref()?.root.clone();
+        Some(unsafe { UiaReturnRawElementProvider(self.hwnd, wparam, lparam, &root) })
+    }
+
+    /// Creates the UIA tree on first use (a client asked, or one is listening).
+    fn ensure_uia(&mut self) {
         if self.uia.is_none() {
             let shared = card_uia::Shared::default();
             let root = card_uia::new_root(self.hwnd, &shared);
@@ -2454,8 +2479,23 @@ impl CardInner {
             });
             self.sync_uia(None);
         }
-        let root = self.uia.as_ref()?.root.clone();
-        Some(unsafe { UiaReturnRawElementProvider(self.hwnd, wparam, lparam, &root) })
+    }
+
+    /// #977: tells a screen reader about a card that just appeared, with a
+    /// UIA notification (the card never takes focus, so there is no focus
+    /// event to ride on). Costs one cheap check and nothing else when no UIA
+    /// client is listening, so a PC without a screen reader pays nothing.
+    fn announce_to_screen_readers(&mut self) {
+        if !unsafe { UiaClientsAreListening() }.as_bool() {
+            return;
+        }
+        self.ensure_uia();
+        // The tree reads the card's state, so bring it up to date first.
+        self.sync_uia(None);
+        let text = card_uia::announcement_text(&self.headline, &self.detail);
+        if let Some(uia) = self.uia.as_ref() {
+            card_uia::raise_announcement(&uia.root, &text);
+        }
     }
 
     /// #654: detaches the tree from UIA when the window goes away.
@@ -4522,7 +4562,7 @@ impl CardInner {
             .map(|(f, &w)| if f.multiline || w > label_max_w { 0 } else { w })
             .collect();
         let label_w = label_column_width(&measured_label_w, label_min_w, label_max_w);
-        let value_x = content_left + label_w + self.scale(6);
+        let value_x = content_left + label_w + self.scale(LABEL_VALUE_GAP_DP);
         let value_w = (content_right - value_x).max(1);
         // The text column of a read-only value: the same inset the paint
         // applies, so "fits" here means "fits on screen".
@@ -4829,7 +4869,7 @@ impl CardInner {
 const PREVIEW_WIDTH_DP: i32 = 320;
 /// Height of one preview row, which is also the box of an editable field.
 const PREVIEW_ROW_H_DP: i32 = 28;
-const PREVIEW_ROW_GAP_DP: i32 = 8;
+const PREVIEW_ROW_GAP_DP: i32 = FORM_ROW_GAP_DP;
 /// Space between an editable field's border and its text, left and right.
 const FIELD_PAD_X_DP: i32 = 8;
 /// The same, above and below, for a multi-line editable field.
@@ -4837,7 +4877,7 @@ const FIELD_PAD_Y_DP: i32 = 4;
 /// Thickness of the focus underline on an editable field.
 const FIELD_UNDERLINE_DP: i32 = 2;
 const PREVIEW_LABEL_W_DP: i32 = 84;
-const PREVIEW_BUTTON_H_DP: i32 = 26;
+const PREVIEW_BUTTON_H_DP: i32 = CONTROL_HEIGHT_DP;
 const PREVIEW_BUTTON_W_DP: i32 = 84;
 /// Upper bound on the label column as a fraction of the content width
 /// (#355): even the widest label never pushes the value column below 55%
@@ -7344,8 +7384,8 @@ mod tests {
         );
         // The preview error colour was rgb(224, 82, 82) in both themes
         // until #578 moved each one to 4.5:1 on its own surface.
-        assert_eq!(d.danger, 0x0064_64F0);
-        assert_eq!(l.danger, 0x0032_32C8);
+        assert_eq!(d.danger, 0x00A4_99FF);
+        assert_eq!(l.danger, 0x001C_2BC4);
     }
 
     #[test]
@@ -8347,6 +8387,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn preview_metrics_follow_the_windows_11_grid() {
+        // #819: 32 dp buttons, 12 dp between rows, 8 dp between a label
+        // and its value, at every scale. The buttons' rects are the child
+        // windows' rects, so the hit test and UIA bounds follow.
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        let mk = |name: &str, label: &str| Field {
+            name: name.to_string(),
+            label: label.to_string(),
+            value: "x".to_string(),
+            editable: false,
+            required: false,
+            multiline: false,
+        };
+        for dpi in [96u32, 144, 192] {
+            card.inner.dpi = dpi;
+            card.inner.rebuild_fonts();
+            let fields = vec![mk("a", "Title"), mk("b", "Start")];
+            let m = card.inner.compute_preview_layout(&fields, true);
+            let s = |dp: i32| card.inner.scale(dp);
+            let do_it = m.buttons.do_it;
+            assert_eq!(do_it.bottom - do_it.top, s(32), "dpi {dpi}: Do it height");
+            let edit = m.buttons.edit.expect("Edit shown");
+            assert_eq!(edit.bottom - edit.top, s(32), "dpi {dpi}: Edit height");
+            let (a, b) = (&m.rows[0], &m.rows[1]);
+            assert_eq!(
+                b.label_rect.top - a.label_rect.bottom.max(a.value_rect.bottom),
+                s(12),
+                "dpi {dpi}: row gap"
+            );
+            assert_eq!(
+                a.value_rect.left - a.label_rect.right,
+                s(8),
+                "dpi {dpi}: label to value gap"
+            );
+        }
+    }
     #[test]
     fn preview_rows_keep_an_even_gap() {
         let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");

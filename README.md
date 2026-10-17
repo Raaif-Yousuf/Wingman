@@ -295,8 +295,8 @@ saved. Same for the secondary binding.
 
 A third, optional chord toggles Pause: running -> paused until resumed;
 paused, for any reason -> resume. Unlike primary/secondary it has no default
-binding. Use **Set pause key...** (in **Providers and keys** in the tray menu) and press the key, or set
-it by hand in `config.toml`:
+binding. Use **Change...** beside **Pause shortcut** on the **General** page of Settings and press the
+key, or set it by hand in `config.toml`:
 
 ```toml
 [hotkeys.pause]
@@ -368,8 +368,8 @@ which one.
 - **Providers and keys ▸**: **Provider** (which service answers),
   **ChatGPT model** / **Claude model** / **Ollama model** (saved
   immediately), and **Set
-  Copilot key...** / **Set secondary key...** / **Set pause key...** to
-  rebind by pressing the key
+  Copilot key...** / **Set secondary key...** to rebind by pressing the
+  key (the pause key is set in Settings, General)
 - **Settings...**: the settings window (left-clicking the tray icon opens
   this too)
 - **Help and diagnostics ▸**: open `config.toml`, import or export an action
@@ -398,7 +398,7 @@ which one.
 | `ui.card_monitor` | `"cursor"` | which monitor the card appears on: `"cursor"` (the one the mouse is on), `"primary"`, or `"1"`, `"2"`, ... counting monitors left to right (not the numbers in Windows Settings, and they shift if you rearrange or dock monitors). Ignored by `follow_mouse` |
 | `providers.*.models` | see file | what the tray's model submenu offers (Ollama has no list; it uses `providers.ollama.model` directly) |
 | `ui.prompt` | see file | the system prompt, edit it to change what it checks |
-| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, learnable from the tray's **Set pause key...**, see [Hotkeys](#hotkeys) |
+| `hotkeys.pause` | unset (absent from the file) | optional third chord: toggles Pause until resumed / Resume; no default, learnable from Settings, General, see [Hotkeys](#hotkeys) |
 
 Roughly 1-2 cents and 3-8 seconds per check at the defaults.
 
