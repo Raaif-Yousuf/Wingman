@@ -169,8 +169,14 @@ few things first (the zip above is the quick path and needs none of them):
 Then, from the cloned folder:
 
 ```powershell
-.\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
+
+That long form is on purpose. A stock Windows 11 PC refuses to run script
+files ("running scripts is disabled on this system"), and a repository
+downloaded as a zip is also marked as coming from the internet. The flag lifts
+both for this one run only: it changes no Windows setting and needs no
+`Unblock-File`.
 
 Builds it, puts the `.exe` in `%LOCALAPPDATA%\Programs\Wingman`, registers
 it with Windows, and switches on start-with-Windows. Re-run it to upgrade in
@@ -440,7 +446,7 @@ it.
 ## Uninstall
 
 ```powershell
-.\uninstall.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
 Stops it, unregisters the package, clears the autostart entry, hands the
