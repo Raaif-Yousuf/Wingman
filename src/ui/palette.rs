@@ -99,7 +99,8 @@ use std::sync::{Once, OnceLock};
 
 use crate::ui::palette_paint::{
     build_ops, ellipsizes, focus_band_top, palette_colors, query_edit_rect, row_at, snap_rect,
-    snap_stroke, window_height, Face, Op, PaintInput, PaletteColors, SnappedRect, WINDOW_WIDTH,
+    snap_stroke, thumb_hot_at, window_height, Face, Op, PaintInput, PaletteColors, SnappedRect,
+    WINDOW_WIDTH,
 };
 use crate::ui::theme::{
     detect_theme, icon_font_face, setting_change_affects_theme, setting_change_name, SysColors,
@@ -244,6 +245,10 @@ fn font_text_height(font: HFONT, dpi: u32) -> i32 {
 /// `lParam` (`GET_Y_LPARAM`, winuser.h) -- not re-exported by the `windows`
 /// crate for these messages, so spelled out here the same way this file
 /// already spells out `EN_CHANGE`.
+fn mouse_x(lparam: LPARAM) -> i32 {
+    (lparam.0 as i32 as u32 & 0xFFFF) as u16 as i16 as i32
+}
+
 fn mouse_y(lparam: LPARAM) -> i32 {
     let raw = lparam.0 as i32 as u32;
     ((raw >> 16) & 0xFFFF) as u16 as i16 as i32
@@ -294,6 +299,7 @@ impl Palette {
             state: crate::ui::palette_model::PaletteState::new(Vec::new()),
             visible: false,
             hover: None,
+            thumb_hot: false,
             ignore_mouse: false,
             tracking_leave: false,
             suppress_en_change: false,
@@ -558,6 +564,7 @@ impl Palette {
                 offset: inner.state.offset,
                 selected: inner.state.selected,
                 hover: inner.hover,
+                thumb_hot: inner.thumb_hot,
                 footer: &inner.footer_text,
                 colors: &inner.colors,
             },
@@ -615,6 +622,13 @@ impl Palette {
     pub(crate) fn ignore_mouse_for_test(&mut self) {
         self.inner.ignore_mouse = true;
         self.inner.hover = None;
+    }
+
+    /// The UI gallery's widened thumb, as if the mouse were over its strip.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn set_thumb_hot_for_test(&mut self, hot: bool) {
+        self.inner.thumb_hot = hot;
+        self.inner.invalidate();
     }
 
     /// The UI gallery's hovered row, as if the mouse were over it.
@@ -1474,6 +1488,9 @@ struct PaletteInner {
     /// forget the keyboard/last-click selection Enter would still run, only
     /// clear the hover highlight (see `WM_MOUSELEAVE` below).
     hover: Option<usize>,
+    /// #988: the pointer is over the scroll thumb's strip, so the thumb is
+    /// drawn wide with a track.
+    thumb_hot: bool,
     /// #949: set by the gallery and by pixel tests so the real pointer, which
     /// the system reports to any window it is over, cannot change which row
     /// is hovered. Mouse moves and leaves are then ignored; a state that
@@ -1533,6 +1550,7 @@ impl PaletteInner {
         self.model_configured = model_configured;
         self.footer_text = footer_text;
         self.hover = None;
+        self.thumb_hot = false;
         self.tracking_leave = false;
         // #414: SetWindowTextW below fires a real, synchronous EN_CHANGE for
         // this edit control -- see `suppress_en_change`'s doc comment. Armed
@@ -1584,6 +1602,7 @@ impl PaletteInner {
         }
         self.visible = false;
         self.hover = None;
+        self.thumb_hot = false;
         self.tracking_leave = false;
     }
 
@@ -1852,6 +1871,7 @@ impl PaletteInner {
                 offset: self.state.offset,
                 selected: self.state.selected,
                 hover: self.hover,
+                thumb_hot: self.thumb_hot,
                 footer: &self.footer_text,
                 colors: &colors,
             },
@@ -1891,6 +1911,7 @@ impl PaletteInner {
                 offset: self.state.offset,
                 selected: self.state.selected,
                 hover: self.hover,
+                thumb_hot: self.thumb_hot,
                 footer: &self.footer_text,
                 colors: &self.colors,
             },
@@ -2041,16 +2062,19 @@ impl PaletteInner {
                             Some(crate::ui::palette_model::Row::Action { .. })
                         )
                     });
-                if self.hover != hit {
+                let hot = thumb_hot_at(mouse_x(lparam), y, self.dpi, self.state.rows.len());
+                if self.hover != hit || self.thumb_hot != hot {
                     self.hover = hit;
+                    self.thumb_hot = hot;
                     self.invalidate();
                 }
                 Some(LRESULT(0))
             }
             WM_MOUSELEAVE => {
                 self.tracking_leave = false;
-                if self.hover.is_some() {
+                if self.hover.is_some() || self.thumb_hot {
                     self.hover = None;
+                    self.thumb_hot = false;
                     self.invalidate();
                 }
                 Some(LRESULT(0))
@@ -2176,6 +2200,7 @@ mod tests {
                     offset: 0,
                     selected: 0,
                     hover: None,
+                    thumb_hot: false,
                     footer: "",
                     colors: &colors,
                 },
@@ -2773,7 +2798,7 @@ mod tests {
         p.show(many_ungrouped_actions(30), true, String::new());
         let dpi = p.inner.dpi;
         let rows = p.inner.state.rows.len();
-        let at = |offset: usize| thumb_rect(dpi, offset, rows).expect("30 rows overflow 12");
+        let at = |offset: usize| thumb_rect(dpi, offset, rows, false).expect("30 rows overflow 12");
         let (top_rect, end_rect) = (at(0), at(rows - crate::ui::palette_model::MAX_VISIBLE_ROWS));
         let x = (top_rect.left + top_rect.right) / 2;
         let track_top = top_rect.top;
@@ -3065,6 +3090,37 @@ mod tests {
             SendMessageW(p.hwnd(), WM_MOUSELEAVE, Some(WPARAM(0)), Some(LPARAM(0)));
         }
         assert_eq!(p.inner.hover, Some(3), "a leave must not clear it");
+    }
+
+    /// #988: a real mouse move into the strip beside a scrolling list widens
+    /// the thumb, a move onto the rows narrows it, and a leave clears it.
+    #[test]
+    fn the_thumb_widens_while_the_pointer_is_over_its_strip() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(many_ungrouped_actions(30), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let dpi = p.inner.dpi;
+        let at = |x: i32, y: i32| LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize);
+        let y = row_slot(dpi, 2).top + 4;
+        use crate::ui::palette_paint::{px, window_width};
+        let strip = at(window_width(dpi) - px(2, dpi), y);
+        let on_rows = at(50, y);
+        let hwnd = p.hwnd();
+        let send = |msg: u32, lp: LPARAM| unsafe {
+            SendMessageW(hwnd, msg, Some(WPARAM(0)), Some(lp));
+        };
+        assert!(!p.inner.thumb_hot, "not at first");
+        send(WM_MOUSEMOVE, strip);
+        assert!(p.inner.thumb_hot, "over the strip");
+        send(WM_MOUSEMOVE, on_rows);
+        assert!(!p.inner.thumb_hot, "back on the rows");
+        send(WM_MOUSEMOVE, strip);
+        send(WM_MOUSELEAVE, LPARAM(0));
+        assert!(!p.inner.thumb_hot, "the pointer left the window");
+        // A list that fits has no thumb to widen.
+        p.show(many_ungrouped_actions(3), true, "mode: Auto".to_string());
+        send(WM_MOUSEMOVE, strip);
+        assert!(!p.inner.thumb_hot, "nothing scrolls");
     }
 
     /// #357: real Win32 test mirroring
