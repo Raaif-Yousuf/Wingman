@@ -857,7 +857,10 @@ pub fn run() -> Result<()> {
     // on `TaskbarCreated`; without the palette only Quick Ask is gone.
     let (tray, tray_error) = match Tray::new(hwnd, instance) {
         Ok(tray) => (tray, None),
-        Err(e) => (Tray::without_icon(hwnd, instance), Some(format!("{e:#}"))),
+        Err(e) => (
+            Tray::without_icon(hwnd, instance),
+            Some(humanize_error_chain(&worker_error_chain_text(&e))),
+        ),
     };
     // #25: pre-created hidden here (rule 5: zero work while hidden --
     // App::toggle_palette only ever ShowWindow/HideWindow this, never
@@ -867,7 +870,10 @@ pub fn run() -> Result<()> {
             palette.set_owner(hwnd);
             (Some(palette), None)
         }
-        Err(e) => (None, Some(format!("{e:#}"))),
+        Err(e) => (
+            None,
+            Some(humanize_error_chain(&worker_error_chain_text(&e))),
+        ),
     };
     for (piece, error) in [
         ("tray icon", &tray_error),
