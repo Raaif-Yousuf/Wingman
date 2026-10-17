@@ -604,6 +604,9 @@ struct App {
     /// are live until quit; a reload after a later successful write puts them
     /// back on the loaded config instead of silently reverting them.
     unsaved: Vec<crate::config_writer::FieldChange>,
+    /// #901: the finished read of a Reload that was not the last reply. If the
+    /// write that superseded it fails, this is the config that gets applied.
+    carried_reload: Option<Box<Config>>,
     /// #870: writes handed to the writer thread whose reply has not come back.
     /// Only the last reply swaps in the loaded config; an earlier one was read
     /// before a later choice was made.
@@ -972,6 +975,7 @@ pub fn run() -> Result<()> {
         taskbar_created_msg,
         config,
         unsaved: Vec::new(),
+        carried_reload: None,
         pending_writes: Arc::default(),
         settings_saves: Arc::default(),
         settings_save_starts: VecDeque::new(),
@@ -5139,6 +5143,7 @@ impl App {
     /// as `WM_APP_CONFIG_WRITTEN` and `on_config_written` applies it, or says
     /// why it could not.
     fn reload(&mut self) {
+        RELOAD_STUCK.with(|c| c.set(false));
         self.card
             .show_pending(crate::ui::card::PendingStage::Working);
         // The writer answers in well under a second when it is alive; if it
@@ -5389,6 +5394,10 @@ impl App {
                     }
                 }
             }
+        }
+        // #901: after the replies above, so one that arrived meanwhile counts.
+        if RELOAD_STUCK.with(|c| c.replace(false)) {
+            self.on_reload_stuck();
         }
     }
 
@@ -5779,11 +5788,17 @@ impl App {
             key_error,
         } = written;
         let last = crate::config_writer::finish(&self.pending_writes);
-        if outcome.from_reload {
+        // Only the last reply: an earlier one must not disarm the timer that
+        // guards a newer reload still in flight.
+        let carried = if last {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID);
             }
-        }
+            RELOAD_STUCK.with(|c| c.set(false));
+            self.carried_reload.take()
+        } else {
+            None
+        };
         if outcome.from_settings {
             crate::config_writer::finish(&self.settings_saves);
         }
@@ -5814,9 +5829,13 @@ impl App {
                     if reload_reply(outcome.from_reload, last) == ReloadReply::Superseded {
                         // A write sent after the reload is still in flight and
                         // its reply reads the file later, so it is the one to
-                        // swap the config in. Nothing is cleared or claimed
-                        // here; the Working card goes so it cannot outlive
-                        // the answer (a later save keeps a card that is up).
+                        // swap the config in. Changes that failed to save before
+                        // this read are dropped now; the read itself is kept
+                        // for the last reply, which applies it if its own write
+                        // fails. The Working card goes so it cannot outlive the
+                        // answer (a later save keeps a card that is up).
+                        self.unsaved.clear();
+                        self.carried_reload = Some(config);
                         if matches!(self.card.state(), crate::ui::card::CardState::Pending) {
                             self.hide_card();
                             self.set_watch(false);
@@ -5829,12 +5848,19 @@ impl App {
                             // must not be re-applied over it later.
                             self.unsaved.clear();
                         }
-                        // #175: read before the config is moved.
-                        let unreadable = config.unreadable_secrets.clone();
-                        self.config = crate::config_writer::reapply(&config, &self.unsaved)
-                            .unwrap_or(*config);
+                        // #175: read before the config is moved. A reload that
+                        // was superseded hands its card on to this reply.
+                        let unreadable = secrets_to_announce(
+                            outcome.from_reload || carried.is_some(),
+                            &config.unreadable_secrets,
+                            carried.as_deref().map(|c| c.unreadable_secrets.as_slice()),
+                        )
+                        .to_vec();
+                        if let Some(config) = final_config(Some(config), carried, &self.unsaved) {
+                            self.config = config;
+                        }
                         self.apply_config();
-                        if outcome.from_reload && !unreadable.is_empty() {
+                        if !unreadable.is_empty() {
                             let (headline, detail) = unreadable_secrets_card(&unreadable);
                             self.card.show_error(&headline, &detail);
                             self.set_watch(true);
@@ -5895,10 +5921,22 @@ impl App {
                     self.unsaved.extend(changes);
                 }
                 let human = self.track_error(&outcome.fail_headline, &reason);
-                self.card.show_error_with_details(
-                    &outcome.fail_headline,
-                    &format!("{}\n\n{human}", outcome.fail_note),
-                );
+                // #901: a reload that was superseded by this failed write still
+                // applies, with this write's change live on top; its key notice
+                // rides along on the card.
+                let mut note = format!("{}\n\n{human}", outcome.fail_note);
+                if let Some(carried) = &carried {
+                    if !carried.unreadable_secrets.is_empty() {
+                        let (_, detail) = unreadable_secrets_card(&carried.unreadable_secrets);
+                        note = format!("{note}\n\n{detail}");
+                    }
+                }
+                if let Some(config) = final_config(None, carried, &self.unsaved) {
+                    self.config = config;
+                    self.apply_config();
+                }
+                self.card
+                    .show_error_with_details(&outcome.fail_headline, &note);
             }
         }
         self.set_watch(true);
@@ -7900,6 +7938,10 @@ thread_local! {
     /// it. Thread-local for the same reason as `SETTINGS_OPEN`.
     static BUSY_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    /// #901: the reload timer fired while a menu or dialog was open. Killed
+    /// there; the stuck check is made once the modal is over.
+    static RELOAD_STUCK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// #393: the double-press timer fired while Settings was open. `App`
     /// cannot be touched there (see `SETTINGS_OPEN`), so the wait is
     /// forgotten by the next press, through `disarm_key_window`.
@@ -8896,6 +8938,37 @@ fn reload_reply(from_reload: bool, last: bool) -> ReloadReply {
     }
 }
 
+/// The config to run once the last reply is in (#901). The last reply's own read
+/// is the newest; when its write failed there is none, and the config of an
+/// earlier reload that was superseded is used so its read is not lost. Changes
+/// that could not be saved are put back on top either way.
+fn final_config(
+    own: Option<Box<Config>>,
+    carried: Option<Box<Config>>,
+    unsaved: &[crate::config_writer::FieldChange],
+) -> Option<Config> {
+    let config = own.or(carried)?;
+    Some(crate::config_writer::reapply(&config, unsaved).unwrap_or(*config))
+}
+
+/// The providers whose stored key could not be read, to say on a card (#175).
+/// Only a reload says it, including one that was superseded and whose card is
+/// carried to the last reply; the last read's own list wins when it has one.
+fn secrets_to_announce<'a>(
+    reload_involved: bool,
+    own: &'a [String],
+    carried: Option<&'a [String]>,
+) -> &'a [String] {
+    if !reload_involved {
+        return &[];
+    }
+    if own.is_empty() {
+        carried.unwrap_or(&[])
+    } else {
+        own
+    }
+}
+
 /// The reload's timer fired: stuck when the Working card is still up and a
 /// write is still unanswered.
 fn reload_is_stuck(working_card_up: bool, writes_in_flight: u32) -> bool {
@@ -9052,8 +9125,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == RELOAD_TIMER_ID {
-            // Not killed here: it fires again once the menu or dialog is over,
-            // and `on_reload_stuck` kills it then.
+            // Killed at once so it cannot repeat behind the modal (rule 5);
+            // the stuck check is made when the modal is over.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), RELOAD_TIMER_ID);
+            }
+            RELOAD_STUCK.with(|c| c.set(true));
             return LRESULT(0);
         }
         if msg == WM_TIMER && wparam.0 == STUCK_TIMER_ID {
@@ -10052,6 +10129,126 @@ mod tests {
             );
         }
         assert!(checked > 10, "the registry scan found {checked} ids");
+    }
+
+    /// #901 review: while a menu or dialog is open the reload timer is killed
+    /// at once (rule 5: a SetTimer without a callback repeats until killed)
+    /// and the stuck check is made when the modal ends.
+    #[test]
+    fn the_reload_timer_is_killed_behind_a_modal_and_checked_after_it() {
+        let src = lf(include_str!("app.rs"));
+        let arm = body_between(
+            &src,
+            "        if msg == WM_TIMER && wparam.0 == RELOAD_TIMER_ID {",
+            "\n        }\n",
+        );
+        assert!(
+            arm.contains("KillTimer(Some(hwnd), RELOAD_TIMER_ID)"),
+            "{arm}"
+        );
+        assert!(arm.contains("RELOAD_STUCK.with(|c| c.set(true))"), "{arm}");
+        let deliver = body_between(&src, "    fn deliver_deferred(", "\n    }\n");
+        let flag = deliver
+            .find("RELOAD_STUCK.with(|c| c.replace(false))")
+            .expect("the deferred stuck flag is never read");
+        let after_messages = deliver.find("for message in order_deferred").unwrap();
+        assert!(flag > after_messages, "a deferred reply must land first");
+        assert!(
+            deliver[flag..].contains("self.on_reload_stuck()"),
+            "{deliver}"
+        );
+        // A new reload forgets an old flag.
+        let reload = body_between(&src, "    fn reload(&mut self) {", "\n    }\n");
+        assert!(
+            reload.contains("RELOAD_STUCK.with(|c| c.set(false))"),
+            "{reload}"
+        );
+    }
+
+    /// #901 review: a superseded reload's reply must not kill the timer that
+    /// guards the newer reload still in flight; only the last reply does.
+    #[test]
+    fn only_the_last_reply_kills_the_reload_timer() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        let kill = handler
+            .find("KillTimer(Some(self.hwnd()), RELOAD_TIMER_ID)")
+            .expect("the timer is never killed");
+        let guard = handler[..kill].rfind("if last {").expect("no guard");
+        assert!(
+            !handler[guard..kill].contains("}\n"),
+            "the kill must sit directly inside `if last`: {handler}"
+        );
+    }
+
+    /// #901 review: the outcome of a reload that was not the last reply.
+    #[test]
+    fn a_failed_superseding_write_still_gets_the_reloaded_config() {
+        use crate::config_writer::FieldChange;
+        let carried = crate::config::Config {
+            unreadable_secrets: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let unsaved = [FieldChange::mode(crate::mode::Mode::Offline)];
+        // The newer write failed: no config of its own, the reload's is used,
+        // with the failed change still live on top.
+        let out = super::final_config(None, Some(Box::new(carried.clone())), &unsaved)
+            .expect("the reload's config was dropped");
+        assert_eq!(out.mode, crate::mode::Mode::Offline);
+        assert_eq!(out.unreadable_secrets, vec!["openai".to_string()]);
+        // The newer write worked: its later read wins over the carried one.
+        let mut own = crate::config::Config::default();
+        own.providers.openai.model = "newer".to_string();
+        let out = super::final_config(Some(Box::new(own)), Some(Box::new(carried)), &[])
+            .expect("own config");
+        assert_eq!(out.providers.openai.model, "newer");
+        assert!(super::final_config(None, None, &[]).is_none());
+    }
+
+    #[test]
+    fn a_reload_that_was_superseded_still_announces_unreadable_keys() {
+        let own: Vec<String> = vec![];
+        let carried = vec!["openai".to_string()];
+        let none: &[String] = &[];
+        assert_eq!(
+            super::secrets_to_announce(true, &own, Some(&carried)),
+            carried.as_slice()
+        );
+        // The last read's own list wins when it has one.
+        let mine = vec!["anthropic".to_string()];
+        assert_eq!(
+            super::secrets_to_announce(true, &mine, Some(&carried)),
+            mine.as_slice()
+        );
+        // A plain save with nothing carried says nothing.
+        assert_eq!(super::secrets_to_announce(false, &mine, None), none);
+        assert_eq!(super::secrets_to_announce(true, &own, None), none);
+    }
+
+    #[test]
+    fn the_write_handler_carries_a_superseded_reload_forward() {
+        let src = lf(include_str!("app.rs"));
+        let handler = body_between(&src, "    fn on_config_written(", "\n    }\n");
+        // Stored on a superseded reply (and the old unsaved list dropped then).
+        let store = handler
+            .find("self.carried_reload = Some(config)")
+            .expect("a superseded reload's config is thrown away");
+        assert!(
+            handler[..store].contains("self.unsaved.clear()"),
+            "{handler}"
+        );
+        // Taken on the last reply, used on both the success and failure paths.
+        assert!(handler.contains("self.carried_reload.take()"), "{handler}");
+        let err = handler.find("Err(reason) =>").expect("no failure arm");
+        assert!(
+            handler[err..].contains("final_config(None, carried"),
+            "{handler}"
+        );
+        assert!(
+            handler[..err].contains("final_config(Some(config), carried"),
+            "{handler}"
+        );
+        assert!(handler.contains("secrets_to_announce("), "{handler}");
     }
 
     /// The gate is in the one place every model action starts, before the
