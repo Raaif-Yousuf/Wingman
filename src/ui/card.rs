@@ -1842,8 +1842,9 @@ impl CardInner {
         // show_answer, show_error, show_error_with_details and
         // show_settings_needed, every one of which funnels through here.
         // #885: a setup card's detail is on screen, so Narrator reads it too.
-        if open_settings && !detail.is_empty() {
-            self.set_window_text(&format!("{headline}. {detail}"));
+        // The "Open Settings" link is only painted, so the name carries it too.
+        if open_settings {
+            self.set_window_text(&setup_accessible_name(headline, detail));
         } else {
             self.set_window_text(&answer_accessible_name(headline, difficulty));
         }
@@ -5181,6 +5182,26 @@ fn create_preview_button(
 /// The card's accessible name for an answer (#815): the headline, then what
 /// the difficulty badge says when one is shown, so the rating is not lost to
 /// anyone who cannot see its colour.
+/// Accessible name of a setup card: headline, detail, then the painted link,
+/// each ending in one full stop (never a doubled one).
+fn setup_accessible_name(headline: &str, detail: &str) -> String {
+    let mut name = String::new();
+    for part in [headline, detail, SETUP_LINK_LABEL] {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(part);
+        if !part.ends_with(['.', '!', '?']) {
+            name.push('.');
+        }
+    }
+    name
+}
+
 fn answer_accessible_name(headline: &str, difficulty: Option<Difficulty>) -> String {
     match difficulty {
         Some(d) => format!("{headline}. {}", d.accessible_name()),
@@ -5444,6 +5465,9 @@ mod tests {
         );
         // Narrator reads the detail too (the window text is the accessible name).
         assert!(window_text(card.hwnd()).contains("Paste an API key"));
+        // ... and the painted "Open Settings" link, so the name is not worse
+        // than the old "Click here" wording.
+        assert!(window_text(card.hwnd()).ends_with(" Open Settings."));
         // A very long detail is capped, not taller than a few lines.
         let normal = height(&card);
         card.show_settings_needed("No AI model set up yet", &"word ".repeat(200));
@@ -5459,6 +5483,36 @@ mod tests {
         card.show_answer("No AI model set up yet", detail, 0, None);
         assert!(!card.inner.shows_setup_detail());
         assert!(card.inner.chevron_reserve() > 0);
+    }
+
+    #[test]
+    fn the_open_settings_link_line_adds_exactly_one_caption_line() {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let height = |card: &Card| {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(card.hwnd(), &mut r);
+            }
+            r.bottom - r.top
+        };
+        let detail = "Paste an API key, or install Ollama.";
+        let mut card = Card::new_for_test(instance()).expect("Card::new_for_test");
+        card.show_settings_needed("No AI model set up yet", "");
+        let headline_only = height(&card);
+        card.show_settings_needed("No AI model set up yet", detail);
+        let with_link = height(&card);
+        let gap = card.inner.scale(GAP_DP);
+        let width = card.inner.scale(CARD_WIDTH_DP) - card.inner.scale(PADDING_DP) * 2;
+        let line = card.inner.line_height(card.inner.fonts.caption).max(1);
+        let detail_h = card.inner.setup_detail_height(width);
+        assert_eq!(
+            with_link,
+            headline_only + gap + detail_h + gap + line,
+            "detail plus one link line"
+        );
+        // An ordinary answer with the same detail shows neither.
+        card.show_answer("No AI model set up yet", detail, 0, None);
+        assert_eq!(height(&card), headline_only);
     }
 
     #[test]
@@ -5611,7 +5665,11 @@ mod tests {
         card.show_settings_needed("Set up Wingman", "Add a key in Settings.");
         assert_eq!(
             window_text(card.hwnd()),
-            "Set up Wingman. Add a key in Settings."
+            "Set up Wingman. Add a key in Settings. Open Settings."
+        );
+        assert_eq!(
+            setup_accessible_name("No model", ""),
+            "No model. Open Settings."
         );
     }
 
