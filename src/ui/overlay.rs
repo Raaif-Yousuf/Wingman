@@ -866,26 +866,154 @@ impl Windows for WinLookup {
     }
 }
 
+/// One on-screen top-level window, as `EnumWindows` hands it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Stacked {
+    pub hwnd: isize,
+    pub rect: ScreenRect,
+    pub pid: u32,
+    /// `WS_EX_TRANSPARENT`: mouse input falls through it.
+    pub click_through: bool,
+}
+
+/// The window a mark at `(x, y)` was drawn over: the first window in `stack`
+/// (topmost first) that contains the point, skipping Wingman's own windows
+/// (a card or palette in front) and click-through windows. `None` when
+/// nothing qualifies. A point probe (`WindowFromPoint`) cannot do this: it
+/// answers with Wingman's own card and the target is lost.
+pub(crate) fn target_at(stack: &[Stacked], x: i32, y: i32, own_pid: u32) -> Option<isize> {
+    stack
+        .iter()
+        .find(|w| {
+            w.pid != own_pid
+                && !w.click_through
+                && x >= w.rect.left
+                && x < w.rect.right
+                && y >= w.rect.top
+                && y < w.rect.bottom
+        })
+        .map(|w| w.hwnd)
+}
+
+/// The desktop and taskbar windows. They cover large areas but are never what
+/// a mark was drawn over.
+fn is_shell_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    )
+}
+
+/// A layered window set to alpha 0 (`LWA_ALPHA`, value 0): drawn as nothing.
+fn is_invisible_layered(flags: u32, alpha: u8) -> bool {
+    const LWA_ALPHA: u32 = 2;
+    flags & LWA_ALPHA != 0 && alpha == 0
+}
+
+/// The visible, un-cloaked, un-minimised top-level windows, topmost first.
+/// `None` when the enumeration fails: the caller treats that as unknown.
+fn window_stack() -> Option<Vec<Stacked>> {
+    use windows::Win32::Graphics::Dwm::{
+        DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongW, GetWindowRect,
+        IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_LAYERED,
+    };
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        // SAFETY: `lparam` is the `&mut Vec<Stacked>` passed below, which
+        // outlives `EnumWindows`.
+        let out = unsafe { &mut *(lparam.0 as *mut Vec<Stacked>) };
+        let mut cloaked = 0u32;
+        let _ = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        // The visible frame, without the invisible ~7 px DWM shadow border;
+        // the plain window rect when DWM cannot say.
+        let mut r = RECT::default();
+        let dwm_ok = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut r as *mut RECT as *mut core::ffi::c_void,
+                std::mem::size_of::<RECT>() as u32,
+            )
+        }
+        .is_ok();
+        let got = dwm_ok || unsafe { GetWindowRect(hwnd, &mut r) }.is_ok();
+        let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+        let shell = is_shell_class(&String::from_utf16_lossy(&buf[..n.min(buf.len())]));
+        let mut invisible = false;
+        if ex & WS_EX_LAYERED.0 != 0 {
+            let (mut alpha, mut flags) = (0u8, Default::default());
+            if unsafe { GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)) }
+                .is_ok()
+            {
+                invisible = is_invisible_layered(flags.0, alpha);
+            }
+        }
+        if got
+            && cloaked == 0
+            && !shell
+            && !invisible
+            && unsafe { IsWindowVisible(hwnd) }.as_bool()
+            && !unsafe { IsIconic(hwnd) }.as_bool()
+        {
+            let mut pid = 0u32;
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            out.push(Stacked {
+                hwnd: hwnd.0 as isize,
+                rect: ScreenRect {
+                    left: r.left,
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.bottom,
+                },
+                pid,
+                click_through: ex & WS_EX_TRANSPARENT.0 != 0,
+            });
+        }
+        true.into()
+    }
+    let mut out: Vec<Stacked> = Vec::new();
+    // SAFETY: `out` outlives the call; the callback is its only user.
+    unsafe { EnumWindows(Some(visit), LPARAM(&mut out as *mut Vec<Stacked> as isize)) }.ok()?;
+    Some(out)
+}
+
 /// The top-level windows under the marks, one per distinct window: what
-/// the overlay watches for change. Found at each annotation rect's centre.
+/// the overlay watches for change. Found at each annotation rect's centre
+/// from the z-ordered window list. Empty when the list cannot be read, which
+/// the caller treats as "do not show" (no way to go stale is the outcome to
+/// avoid).
 pub(crate) fn targets_under(annotations: &[Annotation]) -> Vec<isize> {
+    let Some(stack) = window_stack() else {
+        return Vec::new();
+    };
+    targets_in(&stack, annotations, unsafe {
+        windows::Win32::System::Threading::GetCurrentProcessId()
+    })
+}
+
+fn targets_in(stack: &[Stacked], annotations: &[Annotation], own_pid: u32) -> Vec<isize> {
     let mut out: Vec<isize> = Vec::new();
     for rect in annotations.iter().flat_map(|a| a.rects.iter()) {
         let x = rect.left + (rect.right.saturating_sub(rect.left)) / 2;
         let y = rect.top + (rect.bottom.saturating_sub(rect.top)) / 2;
-        let w = WinLookup.root_at(x, y);
-        // Wingman's own windows (a card, the palette) are never targets.
-        if w != 0 && !out.contains(&w) && !is_own_process_window(w) {
-            out.push(w);
+        if let Some(w) = target_at(stack, x, y, own_pid) {
+            if !out.contains(&w) {
+                out.push(w);
+            }
         }
     }
     out
-}
-
-fn is_own_process_window(h: isize) -> bool {
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(HWND(h as *mut _), Some(&mut pid)) };
-    pid != 0 && pid == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() }
 }
 
 /// The effective DPI of the monitor nearest `rect`, 96 if Windows will not say.
@@ -1122,6 +1250,172 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    fn stacked(hwnd: isize, rect: ScreenRect, pid: u32, click_through: bool) -> Stacked {
+        Stacked {
+            hwnd,
+            rect,
+            pid,
+            click_through,
+        }
+    }
+
+    #[test]
+    fn target_at_skips_own_and_click_through_windows_in_front() {
+        const OWN: u32 = 7;
+        let stack = [
+            // Wingman's card, in front of everything.
+            stacked(1, r(0, 0, 500, 500), OWN, false),
+            // A click-through overlay from another app.
+            stacked(2, r(0, 0, 500, 500), 9, true),
+            // The window the mark was drawn over.
+            stacked(3, r(100, 100, 400, 400), 9, false),
+            stacked(4, r(0, 0, 1000, 1000), 9, false),
+        ];
+        assert_eq!(target_at(&stack, 250, 250, OWN), Some(3));
+        // Outside the third window the one behind it is the answer.
+        assert_eq!(target_at(&stack, 450, 450, OWN), Some(4));
+        // Nothing there, or nothing but Wingman: unknown, not a guess.
+        assert_eq!(target_at(&stack, 2000, 2000, OWN), None);
+        assert_eq!(target_at(&stack[..1], 250, 250, OWN), None);
+        assert_eq!(target_at(&[], 250, 250, OWN), None);
+    }
+
+    #[test]
+    fn targets_in_gives_one_window_per_distinct_target() {
+        let stack = [
+            stacked(3, r(0, 0, 400, 400), 9, false),
+            stacked(4, r(400, 0, 800, 400), 9, false),
+        ];
+        let marks: Vec<Annotation> = [r(10, 10, 50, 30), r(60, 10, 90, 30), r(500, 10, 540, 30)]
+            .into_iter()
+            .map(|rc| Annotation::note(vec![rc], "x").unwrap())
+            .collect();
+        assert_eq!(targets_in(&stack, &marks, 7), vec![3, 4]);
+        // A mark over nothing adds nothing; no windows means no targets.
+        assert!(targets_in(&[], &marks, 7).is_empty());
+    }
+
+    /// Real windows of a system class (no Wingman name is registered): a
+    /// target, and topmost windows over its centre, one normal and one
+    /// click-through. `target_at` names the window under the cover once the
+    /// cover is Wingman's own; a point probe names whatever is on top.
+    #[test]
+    fn target_at_over_real_windows_with_a_topmost_cover() {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_EX_LAYERED, WS_VISIBLE};
+        let _dpi = DpiAware::enter();
+        let make = |ex, rc: ScreenRect| unsafe {
+            CreateWindowExW(
+                ex,
+                windows::core::w!("STATIC"),
+                PCWSTR::null(),
+                WS_POPUP | WS_VISIBLE,
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let target = make(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, r(300, 300, 700, 600));
+        let cover = make(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            r(400, 400, 600, 500),
+        );
+        let ghost = make(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+            r(400, 400, 600, 500),
+        );
+        let _cleanup = Destroy(vec![ghost, cover, target]);
+        let (t, c, g) = (target.0 as isize, cover.0 as isize, ghost.0 as isize);
+        let (x, y) = (500, 450);
+        let own = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+
+        let stack = window_stack().expect("EnumWindows works");
+        let order = |h: isize| stack.iter().position(|w| w.hwnd == h);
+        let (ot, oc) = (order(t), order(c));
+        assert!(order(g).is_some() && ot.is_some() && oc.is_some());
+        assert!(oc < ot, "a topmost window is above a normal one");
+
+        // Foreign view: the cover is another app's visible window, so it is
+        // what is under the mark; the click-through one is never an answer.
+        // Only the three test windows: whatever else this machine has on top
+        // is not under test.
+        let foreign: Vec<Stacked> = stack
+            .iter()
+            .filter(|w| [t, c, g].contains(&w.hwnd))
+            .map(|w| Stacked { pid: 1, ..*w })
+            .collect();
+        assert_eq!(target_at(&foreign, x, y, own), Some(c));
+        // The cover is Wingman's own: the target underneath is found.
+        let mut mixed = foreign.clone();
+        for w in mixed.iter_mut().filter(|w| w.hwnd == c) {
+            w.pid = own;
+        }
+        assert_eq!(target_at(&mixed, x, y, own), Some(t));
+    }
+
+    /// Destroys its windows on drop, so a failed assert cannot leak topmost
+    /// test windows onto the desktop.
+    struct Destroy(Vec<HWND>);
+    impl Drop for Destroy {
+        fn drop(&mut self) {
+            for h in &self.0 {
+                let _ = unsafe { DestroyWindow(*h) };
+            }
+        }
+    }
+
+    /// Per-monitor-v2 on this thread, as the app runs, restored on drop. DWM
+    /// frame bounds are physical pixels; a DPI-unaware test thread would see
+    /// scaled `GetWindowRect` values and disagree with them.
+    struct DpiAware(windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT);
+    impl DpiAware {
+        fn enter() -> Self {
+            use windows::Win32::UI::HiDpi::{
+                SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            };
+            Self(unsafe {
+                SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            })
+        }
+    }
+    impl Drop for DpiAware {
+        fn drop(&mut self) {
+            unsafe { windows::Win32::UI::HiDpi::SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+
+    #[test]
+    fn shell_windows_are_never_a_target() {
+        for c in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+        ] {
+            assert!(is_shell_class(c), "{c}");
+        }
+        for c in ["Notepad", "Chrome_WidgetWin_1", "STATIC", ""] {
+            assert!(!is_shell_class(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn fully_transparent_layered_windows_are_skipped() {
+        const LWA_ALPHA: u32 = 2;
+        const LWA_COLORKEY: u32 = 1;
+        assert!(is_invisible_layered(LWA_ALPHA, 0));
+        assert!(!is_invisible_layered(LWA_ALPHA, 1));
+        assert!(!is_invisible_layered(LWA_ALPHA, 255));
+        // Alpha is not in play (colour key only): the alpha byte means nothing.
+        assert!(!is_invisible_layered(LWA_COLORKEY, 0));
+        assert!(!is_invisible_layered(0, 0));
     }
 
     fn instance() -> HINSTANCE {
