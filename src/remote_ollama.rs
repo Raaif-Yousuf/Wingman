@@ -58,7 +58,7 @@ pub fn card_text(address: &str) -> (String, String) {
         "Ollama is not on this PC".to_string(),
         format!(
             "Your Ollama address points to {address}. Your screenshot and any selected text \
-             will be sent there. This message shows once for this address. Press the key \
+             will be sent there. This message shows once for this address. Try \
              again to go on, or open Settings to change it."
         ),
     )
@@ -220,6 +220,10 @@ mod tests {
         assert!(detail.contains("homeserver"), "{detail}");
         assert!(detail.contains("screenshot"), "{detail}");
         assert!(detail.contains("once"), "{detail}");
+        // #945: the card can come from the key, the tray or the options card, so
+        // it must not tell the user which one to use.
+        assert!(!detail.to_lowercase().contains("key"), "{detail}");
+        assert!(detail.contains("Try again"), "{detail}");
         assert!(!headline.contains('\u{2014}') && !detail.contains('\u{2014}'));
     }
 
