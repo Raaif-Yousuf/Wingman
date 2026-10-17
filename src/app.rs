@@ -5189,7 +5189,7 @@ fn router_worker(
         .ok_or_else(|| anyhow::anyhow!("router: unrecognized provider \"{}\"", target.provider))?;
 
     let shot = encode_for_upload(raw, providers, mode, redact)?;
-    // #105: the router runs by itself when the palette opens, so it never
+    // #105: the router runs by itself, with no press to confirm, so it never
     // shows the send preview; with the toggle on, a cloud request is refused
     // by the send guard instead and the press simply gets no suggestion.
     // #792: and it stops starting calls (the repair request included) once

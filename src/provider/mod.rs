@@ -772,7 +772,7 @@ impl Chain {
     /// #105: this chain never shows the send preview. With the toggle on, a
     /// request that leaves the machine is then refused by the send guard
     /// instead of asking. Used by the Quick Ask router, which runs on its
-    /// own when the palette opens and so must not pop a card.
+    /// own, with no press to confirm, and so must not pop a card.
     #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn without_prompt(mut self) -> Self {
         self.no_prompt = true;

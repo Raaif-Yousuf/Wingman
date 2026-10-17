@@ -1,6 +1,7 @@
 //! Intent router (#24): one cheap classification call, started on a worker
-//! thread the moment the Quick Ask palette opens, that guesses which
-//! catalogue action the screen in front of the user is probably about.
+//! thread, that guesses which catalogue action the screen in front of the
+//! user is probably about. Opening the palette no longer starts it (#805); it
+//! has no caller until the options card (#307) starts it again.
 //!
 //! Pure module (AGENTS.md rule 8): no `windows` dependency anywhere in this
 //! file. `app.rs` owns every piece of Win32/network wiring this needs --
@@ -31,7 +32,7 @@ use crate::ui::palette_model::PaletteAction;
 /// (1568) and the per-provider vision tiers in `capture.rs`: this call only
 /// needs to recognize the GENRE of what's on screen (an email compose
 /// window, a calendar, a physics problem), not read every character of it,
-/// and it runs on every palette open rather than only on a confirmed press.
+/// and it runs without a confirmed press.
 ///
 /// THEORY (unverified): 512 is a conservative starting point, not a measured
 /// legibility/token sweep -- reasoned from `capture.rs`'s own tables (a
@@ -119,6 +120,7 @@ pub struct RouterCandidate {
 /// (`palette_model::catalogue`'s output) -- the router is offered exactly
 /// the same rows the palette itself would show, never a separate list that
 /// could drift from what Enter can actually dispatch.
+#[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
 pub fn candidates_from_catalogue(catalogue: &[PaletteAction]) -> Vec<RouterCandidate> {
     catalogue
         .iter()
