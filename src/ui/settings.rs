@@ -862,12 +862,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         // #872: the rail draws itself through us.
         WM_DRAWITEM => {
-            draw_rail_item(lparam);
-            LRESULT(1)
+            if is_rail_draw_item(lparam) {
+                draw_rail_item(lparam);
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         WM_MEASUREITEM => {
-            measure_rail_item(lparam, inner.dpi);
-            LRESULT(1)
+            let mis = &*(lparam.0 as *const windows::Win32::UI::Controls::MEASUREITEMSTRUCT);
+            if mis.CtlID == ID_RAIL as u32 {
+                measure_rail_item(lparam, inner.dpi);
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
         }
         // The rail's background is the window's, not the list box's white.
         WM_CTLCOLORLISTBOX => LRESULT(
@@ -6354,6 +6363,7 @@ const LBS_NOINTEGRALHEIGHT: u32 = 0x0100;
 const ODS_SELECTED: u32 = 0x0001;
 const ODS_FOCUS: u32 = 0x0010;
 const ODS_DISABLED: u32 = 0x0004;
+const ODS_COMBOBOXEDIT: u32 = 0x1000;
 const ODT_COMBOBOX: u32 = 3;
 const ODS_NOFOCUSRECT: u32 = 0x0200;
 const WC_LISTBOX: &str = "LISTBOX";
@@ -6763,7 +6773,11 @@ unsafe fn draw_combo_item(lparam: LPARAM) -> bool {
     let rc = di.rcItem;
     let state = di.itemState.0;
     let disabled = state & ODS_DISABLED != 0;
-    let selected = state & ODS_SELECTED != 0 && !disabled;
+    // Only a list item highlights. The closed field gets ODS_SELECTED while the
+    // combo has the focus, and keeps the window colours; the focus line the
+    // frame draws is its focus mark.
+    let in_field = state & ODS_COMBOBOXEDIT != 0;
+    let selected = state & ODS_SELECTED != 0 && !disabled && !in_field;
     let (face, ink) = if disabled {
         (COLOR_3DFACE, COLOR_GRAYTEXT)
     } else if selected {
@@ -6818,6 +6832,13 @@ unsafe fn measure_rail_item(lparam: LPARAM, dpi: u32) {
     if mis.CtlID == ID_RAIL as u32 {
         mis.itemHeight = to_px(RAIL_ITEM_H_DP, dpi).max(1) as u32;
     }
+}
+
+/// Whether a `WM_DRAWITEM` is for the rail (the only owner-drawn control the
+/// main window itself hosts).
+unsafe fn is_rail_draw_item(lparam: LPARAM) -> bool {
+    let di = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+    di.CtlID == ID_RAIL as u32
 }
 
 /// `WM_DRAWITEM` for the rail: one item.
@@ -11967,6 +11988,13 @@ mod tests {
     /// Draws a combo's selected item through the real `draw_combo_item` into
     /// a white bitmap and returns the first column with ink, and the width.
     fn first_ink_column(dpi: u32, disabled: bool) -> (i32, i32) {
+        let (first, w, _) = probe_combo(dpi, if disabled { ODS_DISABLED } else { 0 });
+        (first, w)
+    }
+
+    /// [`first_ink_column`] for any item state; also returns the item's
+    /// background colour (its top-left pixel as a `COLORREF`).
+    fn probe_combo(dpi: u32, state: u32) -> (i32, i32, u32) {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, DeleteDC, GdiFlush, SelectObject, BITMAPINFO,
@@ -12008,6 +12036,7 @@ mod tests {
         }
         let (w, h) = (300i32, 24i32);
         let mut first = -1;
+        let back;
         unsafe {
             let dc = CreateCompatibleDC(None);
             let bmi = BITMAPINFO {
@@ -12029,11 +12058,7 @@ mod tests {
             let dis = DRAWITEMSTRUCT {
                 CtlType: windows::Win32::UI::Controls::DRAWITEMSTRUCT_CTL_TYPE(ODT_COMBOBOX),
                 itemID: 0,
-                itemState: windows::Win32::UI::Controls::ODS_FLAGS(if disabled {
-                    ODS_DISABLED
-                } else {
-                    0
-                }),
+                itemState: windows::Win32::UI::Controls::ODS_FLAGS(state),
                 hwndItem: combo,
                 hDC: dc,
                 rcItem: RECT {
@@ -12051,6 +12076,7 @@ mod tests {
             let _ = GdiFlush();
             let px = std::slice::from_raw_parts(pixels as *const u8, (w * h * 4) as usize);
             let bg = [px[0], px[1], px[2]];
+            back = u32::from(px[2]) | u32::from(px[1]) << 8 | u32::from(px[0]) << 16;
             'cols: for x in 0..w {
                 for y in 0..h {
                     let i = ((y * w + x) * 4) as usize;
@@ -12065,7 +12091,76 @@ mod tests {
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(combo);
         }
-        (first, w)
+        (first, w, back)
+    }
+
+    #[test]
+    fn a_focused_closed_combo_field_keeps_the_window_colours_but_a_list_item_highlights() {
+        use windows::Win32::Graphics::Gdi::{GetSysColor, COLOR_HIGHLIGHT, COLOR_WINDOW};
+        let window = unsafe { GetSysColor(COLOR_WINDOW) } & 0x00FF_FFFF;
+        let highlight = unsafe { GetSysColor(COLOR_HIGHLIGHT) } & 0x00FF_FFFF;
+        assert_ne!(window, highlight, "the check needs two different colours");
+        // The closed field, focused: the combo hands us ODS_SELECTED with it.
+        let (_, _, field) = probe_combo(96, ODS_COMBOBOXEDIT | ODS_SELECTED | ODS_FOCUS);
+        assert_eq!(field, window, "a focused field stays on the window colour");
+        // A list item under the pointer or cursor still highlights.
+        let (_, _, item) = probe_combo(96, ODS_SELECTED);
+        assert_eq!(item, highlight, "a selected list item highlights");
+    }
+
+    /// The combo is a real Settings combo, and the body window really draws it.
+    #[test]
+    fn a_settings_combo_is_owner_drawn_and_the_body_draws_it() {
+        use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, DRAWITEMSTRUCT_CTL_TYPE};
+        use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE};
+        let h = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+        let w = GalleryWindow::open(HINSTANCE(h.0), Some(96)).expect("open");
+        let combo = get_dlg_item(w.hwnd(), ID_ACTIVE_PROVIDER).expect("active provider combo");
+        let style = unsafe { GetWindowLongPtrW(combo, GWL_STYLE) } as u32;
+        assert_ne!(style & CBS_OWNERDRAWFIXED as u32, 0, "owner-drawn");
+        let body = unsafe { GetParent(combo) }.expect("the body");
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let dis = DRAWITEMSTRUCT {
+                CtlType: DRAWITEMSTRUCT_CTL_TYPE(ODT_COMBOBOX),
+                CtlID: ID_ACTIVE_PROVIDER as u32,
+                itemID: 0,
+                hwndItem: combo,
+                hDC: dc,
+                rcItem: windows::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: 100,
+                    bottom: 20,
+                },
+                ..Default::default()
+            };
+            let handled = SendMessageW(
+                body,
+                WM_DRAWITEM,
+                Some(WPARAM(ID_ACTIVE_PROVIDER as usize)),
+                Some(LPARAM(&dis as *const DRAWITEMSTRUCT as isize)),
+            );
+            let _ = DeleteDC(dc);
+            assert_eq!(handled.0, 1, "the body answers a combo's WM_DRAWITEM");
+            // The main window draws rail items only: a list box with another
+            // id is left to the default handling.
+            let other = DRAWITEMSTRUCT {
+                CtlType: DRAWITEMSTRUCT_CTL_TYPE(2),
+                CtlID: ID_ACTIVE_PROVIDER as u32,
+                ..Default::default()
+            };
+            let r = SendMessageW(
+                w.hwnd(),
+                WM_DRAWITEM,
+                Some(WPARAM(ID_ACTIVE_PROVIDER as usize)),
+                Some(LPARAM(&other as *const DRAWITEMSTRUCT as isize)),
+            );
+            assert_ne!(r.0, 1, "not a rail item, so not handled as one");
+        }
+        drop(w);
     }
 
     #[test]
