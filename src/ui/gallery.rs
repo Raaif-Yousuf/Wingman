@@ -1853,8 +1853,8 @@ mod tests {
         // key-rejected setup card (#1020) = 37, + the Settings states going
         // from four to one per page and the prompt open (#872) = 39, + the
         // Models page with Claude active and with every provider shown (#874)
-        // = 41.
-        assert_eq!(states.len(), 41);
+        // = 41, + the status line saved, not valid and not saved (#875) = 44.
+        assert_eq!(states.len(), 44);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
