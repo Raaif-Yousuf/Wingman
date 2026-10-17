@@ -741,11 +741,19 @@ impl CardInner {
             } else {
                 palette.detail
             };
-            let fill = CreateSolidBrush(windows::Win32::Foundation::COLORREF(look.fill));
+            // A filled neutral chip with a hairline; high contrast keeps the
+            // outline in the text colour.
+            let cap_edge = if high_contrast.is_some() {
+                look.text
+            } else {
+                palette.border
+            };
+            let cap_fill = crate::ui::theme::keycap_fill(self.theme, look.fill, palette.headline);
+            let fill = CreateSolidBrush(windows::Win32::Foundation::COLORREF(cap_fill));
             let pen = CreatePen(
                 PS_SOLID,
                 ring.max(1),
-                windows::Win32::Foundation::COLORREF(cap_ink),
+                windows::Win32::Foundation::COLORREF(cap_edge),
             );
             let old_brush = SelectObject(hdc, HGDIOBJ(fill.0));
             let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
@@ -1181,8 +1189,6 @@ mod tests {
             for bg in [t.surface, hover] {
                 assert!(ratio(t.text, bg) >= 4.5, "{theme:?} label on {bg:#08x}");
                 assert!(ratio(t.text_dim, bg) >= 4.5, "{theme:?} digit on {bg:#08x}");
-                // The keycap border is drawn in the digit's colour.
-                assert!(ratio(t.text_dim, bg) >= 3.0, "{theme:?} keycap border");
             }
             assert!(ratio(t.text_faint, t.surface) >= 4.5, "{theme:?} hint");
         }
