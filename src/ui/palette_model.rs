@@ -46,7 +46,7 @@ pub enum Effect {
 pub fn effect_for_executor(executor: &str) -> Effect {
     match executor {
         "none" => Effect::None,
-        "calendar_add" | "replace_text" | "fill_form" => Effect::Preview,
+        "calendar_add" | "replace_text" | "fill_form" | "contact_add" => Effect::Preview,
         _ => Effect::Clipboard,
     }
 }
@@ -416,30 +416,6 @@ impl PaletteState {
     }
 }
 
-/// #24: pre-selects the row whose action id is `action_id`, for the intent
-/// router's suggestion. `false` (a no-op, never a panic -- rule 7) when
-/// `action_id` isn't among today's ROWS at all -- e.g. the row only shows up
-/// once a provider is configured, and the grouped view currently has none,
-/// or the query has since filtered it out. Whether this should even be
-/// attempted (confidence vs. threshold, whether the user already
-/// typed/moved) is [`crate::router::should_apply`]'s job, not this
-/// function's -- this only performs the mechanical "does this id exist as a
-/// row right now, and if so select it" step, which is why it lives here
-/// (state mutation) rather than in `router.rs` (decision).
-pub fn preselect_action(state: &mut PaletteState, action_id: &str) -> bool {
-    match state
-        .rows
-        .iter()
-        .position(|r| matches!(r, Row::Action { id, .. } if id == action_id))
-    {
-        Some(idx) => {
-            state.selected = idx;
-            true
-        }
-        None => false,
-    }
-}
-
 /// What handling a key should cause the caller (the Win32 layer) to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteOutcome {
@@ -605,7 +581,7 @@ pub fn catalogue(resolved: &[crate::actions::Resolved]) -> Vec<PaletteAction> {
 /// `claude-opus-4-8` -> `Claude Opus 4.8`, `gemini-3.8-flash` -> `Gemini 3.8
 /// Flash`. Anything unrecognised (Ollama tags, compat models) falls back to
 /// the model id without the provider prefix, or the raw string.
-fn friendly_model_name(provider_model: &str) -> String {
+pub(crate) fn friendly_model_name(provider_model: &str) -> String {
     let model = provider_model
         .split_once(':')
         .map(|(_, model)| model)
@@ -1181,24 +1157,6 @@ mod tests {
         assert_eq!(state.offset, 20 - MAX_VISIBLE_ROWS);
     }
 
-    // -- preselect_action (#24: the intent router's palette-side half) -----
-
-    #[test]
-    fn preselect_action_selects_the_matching_row() {
-        let mut state = PaletteState::new(three_action_rows());
-        assert_eq!(state.selected_action_id(), Some("a"));
-        assert!(preselect_action(&mut state, "c"));
-        assert_eq!(state.selected_action_id(), Some("c"));
-    }
-
-    #[test]
-    fn preselect_action_false_when_the_id_is_not_a_row_right_now() {
-        let mut state = PaletteState::new(three_action_rows());
-        assert!(!preselect_action(&mut state, "not-a-row"));
-        // Selection is untouched by a failed attempt.
-        assert_eq!(state.selected_action_id(), Some("a"));
-    }
-
     // -- dispatch table: every built-in, tested (rule 8) ------------------
 
     /// Every built-in action id (from `actions::builtin_actions()`) and
@@ -1236,6 +1194,7 @@ mod tests {
             crate::actions::convert_times::ACTION_ID,
             crate::actions::scam_check::ACTION_ID,
             crate::actions::jargon::ACTION_ID,
+            crate::actions::contact::ACTION_ID,
         ];
         for a in crate::actions::builtin_actions() {
             if generic_on_purpose.contains(&a.id.as_str()) {
@@ -1416,6 +1375,7 @@ mod tests {
         assert_eq!(effect_for_executor("image_clipboard"), Effect::Clipboard);
         assert_eq!(effect_for_executor("replace_text"), Effect::Preview);
         assert_eq!(effect_for_executor("calendar_add"), Effect::Preview);
+        assert_eq!(effect_for_executor("contact_add"), Effect::Preview);
         assert_eq!(effect_for_executor("fill_form"), Effect::Preview);
         assert_eq!(effect_for_executor("typo"), Effect::Clipboard);
         assert_eq!(effect_for_executor(""), Effect::Clipboard);

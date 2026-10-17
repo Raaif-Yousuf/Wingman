@@ -642,19 +642,14 @@ mod tests {
         "run_model_free_screen_action",
         "copy_region",
         "calculate_selection",
-        "maybe_start_router",
+        // #307: captures a small image for the router before it shows the
+        // options card.
+        "show_options_card",
     ];
 
-    /// What each guarded fn must contain before it reads. The router runs
-    /// after the palette has taken the foreground, so `toggle_palette`
-    /// asks first and hands the answer down.
-    fn guard_marker(name: &str) -> &'static str {
-        match name {
-            // The parameter name alone also matches the signature, so the
-            // marker is the use: the early return.
-            "maybe_start_router" => "|| password_manager_in_front",
-            _ => "refuse_if_password_manager(",
-        }
+    /// What each guarded fn must contain before it reads.
+    fn guard_marker(_name: &str) -> &'static str {
+        "refuse_if_password_manager("
     }
 
     /// Calls that put pixels or a selection in Wingman's hands from a

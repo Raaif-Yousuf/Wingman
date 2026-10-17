@@ -725,17 +725,18 @@ pub struct Forms {
     pub require_tick_for: RequireTickFor,
 }
 
-/// #24: settings for the Quick Ask palette's intent router.
+/// #24: settings for the intent router's confidence bar.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Palette {
-    /// Minimum `RouterOption::confidence` (0.0..=1.0) for the router's
-    /// suggestion to pre-select a row -- see `router::should_apply`, the one
-    /// place this value is actually consulted (`app.rs` reads it from
-    /// `Config` and passes it through). Kept as a plain `f64` rather than a
-    /// clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never
-    /// clears (or always clears) the threshold, which is a safe degradation,
-    /// not a crash.
+    /// INERT until #308: nothing reads this at runtime (the palette no longer
+    /// asks the router, #805), so changing it has no effect today. It is kept
+    /// so existing configs keep parsing and #308 can wire it.
+    ///
+    /// Minimum `RouterOption::confidence` (0.0..=1.0) for a router option to
+    /// be picked by a bare key press rather than by a click. Kept as a plain
+    /// `f64` rather than a clamped type: an out-of-range hand-edit (`1.4`, `-1`) simply never clears (or always clears) the
+    /// threshold, which is a safe degradation, not a crash.
     pub router_threshold: f64,
 }
 
@@ -759,6 +760,15 @@ pub struct Options {
     /// `palette.router_threshold`: the card exists to show alternatives, so
     /// it needs a lower bar than the palette's pre-select.
     pub min_confidence: f64,
+    /// #307: seconds the options card stays up before it closes by itself
+    /// (default 20). Also bounds how long the digit and Esc claim lasts.
+    /// Clamped to 5..=120 where it is used ([`Options::card_dismiss_secs`]).
+    pub auto_dismiss_secs: u32,
+    /// #307: whether the keyboard hook claims keys 1 to 4 and Esc while the
+    /// options card shows (default true). Off for someone who types digits
+    /// while the card is up, or whose IME uses digits to pick a candidate:
+    /// the options are then picked by click.
+    pub claim_keys: bool,
 }
 
 impl Default for Options {
@@ -766,13 +776,24 @@ impl Default for Options {
         Self {
             max_options: crate::router::DEFAULT_MAX_OPTIONS,
             min_confidence: crate::router::DEFAULT_MIN_CONFIDENCE,
+            auto_dismiss_secs: DEFAULT_OPTIONS_DISMISS_SECS,
+            claim_keys: true,
         }
     }
 }
 
+/// #307: how long the options card stays up by default.
+const DEFAULT_OPTIONS_DISMISS_SECS: u32 = 20;
+
 impl Options {
+    /// The auto-dismiss, clamped to 5..=120 seconds: a hand-edited `0` must
+    /// not mean "never" (the claim is bounded by it) and a huge value must not
+    /// leave the card up for hours.
+    pub fn card_dismiss_secs(&self) -> u32 {
+        self.auto_dismiss_secs.clamp(5, 120)
+    }
+
     /// The clamped limits the router validates a shortlist with.
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub fn router_limits(&self) -> crate::router::RouterLimits {
         crate::router::RouterLimits::new(self.min_confidence, self.max_options)
     }
@@ -1068,6 +1089,24 @@ impl Config {
         }
     }
 
+    /// #924: the config used for a session when [`Config::load`] failed (the
+    /// first-run file could not be created). Default settings, so Mode is Auto,
+    /// but with the stored keys and the env keys read the way `load` reads
+    /// them: without them a later save would see empty key fields and delete
+    /// the user's stored credentials.
+    pub fn defaults_after_failed_load() -> Config {
+        Self::defaults_after_failed_load_with(&CredManagerStore, &|name| std::env::var(name).ok())
+    }
+
+    fn defaults_after_failed_load_with(
+        store: &dyn SecretStore,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Config {
+        let mut config = Config::default();
+        config.hydrate_secrets(store);
+        config.apply_overrides_from(lookup);
+        config
+    }
     /// Moves any non-empty `api_key` out of `self` and into `store` (target
     /// `Wingman/<provider>`), blanking the field here in memory. Returns
     /// whether anything was blanked, so the caller knows whether the file
@@ -1779,7 +1818,7 @@ impl Providers {
     /// router's own cheaper picked model instead of the configured one. A
     /// provider kind added to this match without a matching arm in that
     /// hand-copy silently made the router skip it forever, with no error
-    /// card by design (see `App::maybe_start_router`'s doc comment) --
+    /// card by design (see `App::show_options_card`'s doc comment) --
     /// exactly the `wired-to-nothing` skill's "hard-coded list" row. Now
     /// `app.rs`'s `provider_for_router` is a one-line call into this
     /// function with `model: Some(&target.model)`, so there is nowhere else
@@ -1853,7 +1892,6 @@ impl Providers {
     /// Empty for an unrecognized name or a `"compat:<name>"` entry with no
     /// matching `self.compat` config, same "just skip it" behavior as
     /// [`Providers::provider_for_named_model`].
-    #[allow(dead_code)] // #805: no caller until the options card (#307) starts the router again.
     pub(crate) fn models_for(&self, name: &str) -> Vec<String> {
         match Self::known_provider_for(name) {
             Some(KnownProvider::Openai) => self.openai.models.clone(),
@@ -1915,7 +1953,7 @@ impl Providers {
     /// [`Providers::build_chain`]'s own behavior. The list
     /// `diagnostics::provider_rows` iterates (issue #201).
     pub(crate) fn describe_all(&self) -> Vec<ProviderDescriptor> {
-        self.order
+        self.effective_order()
             .iter()
             .filter_map(|name| self.describe(name))
             .collect()
@@ -1928,13 +1966,37 @@ impl Providers {
     /// `hotkeys`/`capture`/`ui` along for no reason.
     pub fn build_chain(&self) -> Chain {
         let providers: Vec<Box<dyn Provider>> = self
-            .order
+            .effective_order()
             .iter()
             .filter_map(|name| self.provider_for(name))
             .collect();
         Chain::new(providers)
     }
 
+    /// #923: `order` as it is used at runtime. Gemini is not in the stock
+    /// order, and #780 stops an untouched Save from adding it, so a Gemini key
+    /// pasted on its own would never be used. When `order` is still the stock
+    /// pair (in either order, so choosing Anthropic as Active keeps this) and
+    /// Gemini is the only cloud provider with a key, it is appended here, in
+    /// memory only: the file is not rewritten. If OpenAI or Anthropic has a
+    /// key too, nothing is added, so a `GEMINI_API_KEY` set for another tool
+    /// never becomes a silent extra fallback that gets screenshots. An edited
+    /// order is a choice and is returned unchanged.
+    fn effective_order(&self) -> Vec<String> {
+        let mut order = self.order.clone();
+        let stock_pair = order.len() == 2
+            && order.iter().any(|n| n == "openai")
+            && order.iter().any(|n| n == "anthropic");
+        let keyed = |key: &str| !unreadable_as_empty(key).is_empty();
+        if stock_pair
+            && keyed(&self.gemini.api_key)
+            && !keyed(&self.openai.api_key)
+            && !keyed(&self.anthropic.api_key)
+        {
+            order.push("gemini".to_string());
+        }
+        order
+    }
     /// #133: whether a first press with no model ready may look for a local
     /// Ollama and adopt it. Only for a setup the user has not shaped: Cloud
     /// mode is a choice to use the cloud, an `order` that already names
@@ -1999,7 +2061,12 @@ impl Providers {
     /// requests through. Kept as the one place both callers share so they
     /// can never disagree about which providers `mode` allows.
     pub fn selected_order_for_mode(&self, mode: Mode, ollama_ready: bool) -> Vec<String> {
-        crate::mode::select_providers(mode, &self.order, ollama_ready, &self.local_compat_names())
+        crate::mode::select_providers(
+            mode,
+            &self.effective_order(),
+            ollama_ready,
+            &self.local_compat_names(),
+        )
     }
 
     /// #16: a compat endpoint's locality is decided by its configured
@@ -2167,6 +2234,47 @@ mod tests {
         );
         let cfg: Config =
             toml::from_str("[options]\nmax_options = 3\nmin_confidence = 0.5\n").unwrap();
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.options, cfg.options);
+    }
+
+    // -- options.auto_dismiss_secs and claim_keys (issue #307) ----------------
+
+    #[test]
+    fn options_card_defaults_match_the_spec() {
+        let o = Config::default().options;
+        assert_eq!(o.auto_dismiss_secs, 20);
+        assert!(o.claim_keys, "the digit and Esc claim is on by default");
+        assert_eq!(o.card_dismiss_secs(), 20);
+    }
+
+    #[test]
+    fn options_card_auto_dismiss_is_clamped_to_5_through_120() {
+        for (set, want) in [
+            (0u32, 5u32),
+            (1, 5),
+            (5, 5),
+            (20, 20),
+            (120, 120),
+            (9_999, 120),
+        ] {
+            let o = Options {
+                auto_dismiss_secs: set,
+                ..Options::default()
+            };
+            assert_eq!(o.card_dismiss_secs(), want, "auto_dismiss_secs = {set}");
+        }
+    }
+
+    #[test]
+    fn options_card_keys_can_be_switched_off_in_the_file() {
+        let cfg: Config =
+            toml::from_str("[options]\nclaim_keys = false\nauto_dismiss_secs = 30\n").unwrap();
+        assert!(!cfg.options.claim_keys);
+        assert_eq!(cfg.options.card_dismiss_secs(), 30);
+        // The older keys keep their defaults in a partial table.
+        assert_eq!(cfg.options.max_options, 4);
         let text = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.options, cfg.options);
@@ -2816,6 +2924,91 @@ model = "gpt-5.5"
         }
     }
 
+    /// #923: a Gemini key on a stock order is reachable without anyone
+    /// editing `providers.order` (#780 keeps an untouched Save from adding it).
+    #[test]
+    fn a_gemini_key_on_the_stock_order_is_reachable_in_every_cloud_path() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        assert_eq!(p.order, Providers::default().order, "the file is untouched");
+        assert_eq!(
+            p.build_chain_for_mode(Mode::Cloud, false).provider_names(),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Auto, false),
+            vec!["openai", "anthropic", "gemini"]
+        );
+        assert_eq!(
+            p.build_chain().ready_provider_names(),
+            vec!["gemini"],
+            "the mode-agnostic chain sees it too"
+        );
+        assert_eq!(p.order, Providers::default().order, "never rewritten");
+    }
+
+    #[test]
+    fn a_gemini_entry_without_a_key_is_not_added_to_the_stock_order() {
+        let p = Config::default().providers;
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+        let mut unreadable = Config::default().providers;
+        unreadable.gemini.api_key = UNREADABLE_KEY_MARKER.to_string();
+        assert_eq!(
+            unreadable.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic"]
+        );
+    }
+
+    /// A Gemini key set globally for another tool must not become a silent
+    /// extra fallback: Gemini is added only when no other cloud provider has a
+    /// key, in either order of the stock pair (choosing Anthropic as Active
+    /// makes it anthropic, openai).
+    #[test]
+    fn gemini_is_added_only_when_it_is_the_only_keyed_cloud_provider() {
+        for order in [["openai", "anthropic"], ["anthropic", "openai"]] {
+            let mut p = Config::default().providers;
+            p.order = order.iter().map(|s| s.to_string()).collect();
+            p.gemini.api_key = "g-key".to_string();
+            let mut expected: Vec<String> = p.order.clone();
+            expected.push("gemini".to_string());
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), expected);
+            p.openai.api_key = "o-key".to_string();
+            assert_eq!(
+                p.selected_order_for_mode(Mode::Cloud, false),
+                order,
+                "another keyed provider: no gemini"
+            );
+            p.openai.api_key.clear();
+            p.anthropic.api_key = "a-key".to_string();
+            assert_eq!(p.selected_order_for_mode(Mode::Cloud, false), order);
+        }
+    }
+    /// A hand-edited order is a choice: a keyed vendor the user left out
+    /// stays out, so a screenshot never goes to a vendor they removed.
+    #[test]
+    fn a_hand_edited_order_is_never_widened_by_a_gemini_key() {
+        let mut p = Config::default().providers;
+        p.gemini.api_key = "g-key".to_string();
+        p.order = vec!["anthropic".to_string()];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["anthropic"]
+        );
+        p.order = vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "gemini".to_string(),
+        ];
+        assert_eq!(
+            p.selected_order_for_mode(Mode::Cloud, false),
+            vec!["openai", "anthropic", "gemini"],
+            "no duplicate when it is already listed"
+        );
+    }
+
     #[test]
     fn build_chain_for_mode_cloud_excludes_ollama() {
         let mut config = Config::default();
@@ -3271,6 +3464,31 @@ structured = "prompt"
         );
     }
 
+    /// #924: the defaults used after a failed first-run load carry the stored
+    /// keys, and saving them never deletes a stored credential.
+    #[test]
+    fn defaults_after_a_failed_load_keep_stored_keys_and_a_save_never_deletes_them() {
+        let store = crate::secrets::InMemoryStore::default();
+        store.set("Wingman/openai", "sk-stored").unwrap();
+        let config = Config::defaults_after_failed_load_with(&store, &|_| None);
+        assert_eq!(config.providers.openai.api_key, "sk-stored");
+        assert_eq!(config.mode, Mode::Auto);
+
+        let path = scratch_path("924-failed-load-save");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Whether this save is allowed or refused, the credential must stay.
+        let _ = config.save_with_store(&path, &store, &|_| false);
+        assert_eq!(
+            store.get("Wingman/openai").unwrap().as_deref(),
+            Some("sk-stored")
+        );
+        cleanup(&path);
+
+        let env = Config::defaults_after_failed_load_with(&store, &|n| {
+            (n == "ANTHROPIC_API_KEY").then(|| "sk-env".to_string())
+        });
+        assert_eq!(env.providers.anthropic.api_key, "sk-env");
+    }
     #[test]
     fn push_secrets_to_store_deletes_the_compat_credential_when_the_field_is_cleared() {
         let mut config = Config::default();
