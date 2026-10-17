@@ -131,21 +131,25 @@ pub fn answer_for_text(text: &str, today: CivilDate, week: WeekStart) -> Answer 
     answer_at(text, today, None, week)
 }
 
-/// The selection when it holds anything, else the text from `screen_text`.
-/// A selection that cannot be read counts as no selection: the screen is the
-/// other input, and it is read only on this PC.
-pub fn run_with(
-    selection: &dyn SelectionSource,
+/// The selected text when it holds anything (#709). `None` means the screen is
+/// needed: nothing selected, only blanks, or a selection that could not be
+/// read. Reading it can block on another app, so this runs on a worker thread;
+/// the app takes the screenshot only when this says `None`.
+pub fn selection_text(selection: &dyn SelectionSource) -> Option<String> {
+    match selection.selected_text() {
+        Ok(Some(text)) if !text.trim().is_empty() => Some(text),
+        _ => None,
+    }
+}
+
+/// The card for the text on screen, read by `screen_text`. A screen with no
+/// text says so; a failed read is an error, not an empty card.
+pub fn screen_answer(
     screen_text: impl FnOnce() -> Result<String>,
     today: CivilDate,
     now_minute: Option<u16>,
     week: WeekStart,
 ) -> Result<Answer> {
-    if let Ok(Some(text)) = selection.selected_text() {
-        if !text.trim().is_empty() {
-            return Ok(answer_at(&text, today, now_minute, week));
-        }
-    }
     let text = screen_text()?;
     if text.trim().is_empty() {
         return Ok(Answer {
@@ -157,17 +161,15 @@ pub fn run_with(
     Ok(answer_at(&text, today, now_minute, week))
 }
 
-/// The real pipeline over the foreground selection and Windows OCR of `raw`.
-/// Runs on a worker thread: reading the selection can block on another app,
-/// and OCR takes a moment.
-pub fn run(
+/// [`screen_answer`] over Windows OCR of `raw`. Runs on a worker thread: OCR
+/// takes a moment.
+pub fn screen_answer_ocr(
     raw: &RawShot,
     today: CivilDate,
     now_minute: Option<u16>,
     week: WeekStart,
 ) -> Result<Answer> {
-    run_with(
-        &crate::calc::ForegroundSelection,
+    screen_answer(
         || {
             let ocr = WindowsOcr
                 .recognize(raw)
@@ -178,6 +180,22 @@ pub fn run(
         now_minute,
         week,
     )
+}
+
+/// The whole flow in one call: the selection when it holds anything, else the
+/// text from `screen_text`.
+#[cfg(test)]
+pub fn run_with(
+    selection: &dyn SelectionSource,
+    screen_text: impl FnOnce() -> Result<String>,
+    today: CivilDate,
+    now_minute: Option<u16>,
+    week: WeekStart,
+) -> Result<Answer> {
+    if let Some(text) = selection_text(selection) {
+        return Ok(answer_at(&text, today, now_minute, week));
+    }
+    screen_answer(screen_text, today, now_minute, week)
 }
 
 #[cfg(test)]
@@ -409,6 +427,34 @@ mod tests {
         .unwrap();
         assert_eq!(a.headline, "tomorrow: Thu Sep 24");
         assert!(!screen_read.get(), "OCR must not run when text is selected");
+    }
+
+    /// #709: the skip-capture decision. Only a selection with text in it is
+    /// enough; nothing selected, blank text and a read that failed all mean
+    /// the screen is needed.
+    #[test]
+    fn only_a_selection_with_text_skips_the_capture() {
+        assert_eq!(
+            selection_text(&selected("see you tomorrow")).as_deref(),
+            Some("see you tomorrow")
+        );
+        for sel in [
+            Selected(Ok(None)),
+            selected("   \n "),
+            Selected(Err("UIA failed")),
+        ] {
+            assert_eq!(selection_text(&sel), None);
+        }
+    }
+
+    #[test]
+    fn the_screen_step_reads_text_and_says_so_when_there_is_none() {
+        let a = screen_answer(|| Ok("due next Tuesday".to_string()), WED, None, MON).unwrap();
+        assert_eq!(a.headline, "next Tuesday: Tue Sep 29");
+        let a = screen_answer(|| Ok(" \n".to_string()), WED, None, MON).unwrap();
+        assert_eq!(a.headline, NO_TEXT_HEADLINE);
+        let e = screen_answer(|| Err(anyhow::anyhow!("OCR failed")), WED, None, MON).unwrap_err();
+        assert!(format!("{e:#}").contains("OCR failed"));
     }
 
     #[test]
