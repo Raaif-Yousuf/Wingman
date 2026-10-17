@@ -620,7 +620,8 @@ struct App {
     /// #25: the Quick Ask palette. Pre-created hidden at startup, shown and
     /// hidden repeatedly (never re-created) -- see `ui::palette`'s module
     /// doc comment.
-    palette: Palette,
+    /// `None` when its window could not be created at startup (#1019).
+    palette: Option<Palette>,
     tray: Tray,
     hook: Option<HotkeyHook>,
     /// Global click watcher. Armed only while an answer is on screen, so a
@@ -776,12 +777,8 @@ pub fn run() -> Result<()> {
     // while Settings still reports it as enabled.
     crate::autostart::repair_if_stale();
 
-    // One-time copilot-ask -> Wingman migration. Both steps are individually
-    // idempotent (a no-op once done), so this runs unconditionally on every
-    // launch rather than needing its own "have we migrated yet" flag.
-    if let (Ok(old_path), Ok(new_path)) = (Config::old_path(), Config::path()) {
-        let _ = Config::migrate_from(&old_path, &new_path);
-    }
+    // The copilot-ask -> Wingman config copy runs inside `Config::load` (#1018),
+    // so a failure shows a card and is retried on the next load.
     let _ = crate::autostart::remove_old_run_value();
 
     // #769: delete old calendar files once at startup, on a short-lived
@@ -859,6 +856,36 @@ pub fn run() -> Result<()> {
     // here when "Do it"/Cancel closes it -- see Card::set_owner's doc
     // comment.
     card.set_owner(hwnd);
+    // #1019: neither of these may end the process. The tray is added again
+    // on `TaskbarCreated`; without the palette only Quick Ask is gone.
+    let (tray, tray_error) = match Tray::new(hwnd, instance) {
+        Ok(tray) => (tray, None),
+        Err(e) => (
+            Tray::without_icon(hwnd, instance),
+            Some(humanize_error_chain(&worker_error_chain_text(&e))),
+        ),
+    };
+    // #25: pre-created hidden here (rule 5: zero work while hidden --
+    // App::toggle_palette only ever ShowWindow/HideWindow this, never
+    // re-creates it).
+    let (palette, palette_error) = match Palette::new(instance) {
+        Ok(mut palette) => {
+            palette.set_owner(hwnd);
+            (Some(palette), None)
+        }
+        Err(e) => (
+            None,
+            Some(humanize_error_chain(&worker_error_chain_text(&e))),
+        ),
+    };
+    for (piece, error) in [
+        ("tray icon", &tray_error),
+        ("Quick Ask palette", &palette_error),
+    ] {
+        if let Some(error) = error {
+            crate::diagnostics::note_warning(&format!("Could not create the {piece}: {error}"));
+        }
+    }
     // #175: a stored key that could not be read is never silently dropped
     // (rule 7) -- the card is the first thing to exist that can show it.
     // #237 shares the card: a lockless start must be visible too (rule 7).
@@ -869,16 +896,10 @@ pub fn run() -> Result<()> {
         create_failed
             .as_ref()
             .map(|(folder, error)| (folder.as_str(), error.as_str())),
+        degraded_start_card(tray_error.as_deref(), palette_error.as_deref()),
     ) {
         card.show_error(&headline, &detail);
     }
-    let tray = Tray::new(hwnd, instance).context("creating the tray icon")?;
-
-    // #25: pre-created hidden here (rule 5: zero work while hidden --
-    // App::toggle_palette only ever ShowWindow/HideWindow this, never
-    // re-creates it).
-    let mut palette = Palette::new(instance).context("creating the Quick Ask palette window")?;
-    palette.set_owner(hwnd);
 
     let mut app = Box::new(App {
         instance,
@@ -1044,6 +1065,7 @@ fn startup_card(
     lock_squatted: bool,
     config_problem: Option<&str>,
     create_failed: Option<(&str, &str)>,
+    degraded: Option<(String, String)>,
 ) -> Option<(String, String)> {
     let squat = (
         "Another program holds Wingman's startup lock".to_string(),
@@ -1064,9 +1086,42 @@ fn startup_card(
     if lock_squatted {
         cards.push(squat);
     }
+    cards.extend(degraded);
     let mut cards = cards.into_iter();
     let (headline, mut detail) = cards.next()?;
     for (h, d) in cards {
+        detail = format!("{detail}\n\n{h}. {d}");
+    }
+    Some((headline, detail))
+}
+
+/// #1019: the card for a start that went ahead without its tray icon or its
+/// Quick Ask window. Pure. No em dash (rule 11).
+fn degraded_start_card(
+    tray_error: Option<&str>,
+    palette_error: Option<&str>,
+) -> Option<(String, String)> {
+    let tray = tray_error.map(|e| {
+        (
+            "Tray icon not added yet".to_string(),
+            format!(
+                "Windows did not accept the tray icon ({e}). This can happen right after \
+                 sign-in. Wingman keeps running and adds the icon as soon as the taskbar is \
+                 ready. The Copilot key works meanwhile."
+            ),
+        )
+    });
+    let palette = palette_error.map(|e| {
+        (
+            "Quick Ask unavailable".to_string(),
+            format!(
+                "The Quick Ask window could not be created ({e}). The rest of Wingman works. \
+                 Use the Copilot key."
+            ),
+        )
+    });
+    let (headline, mut detail) = tray.clone().or(palette.clone())?;
+    if let (Some(_), Some((h, d))) = (&tray, &palette) {
         detail = format!("{detail}\n\n{h}. {d}");
     }
     Some((headline, detail))
@@ -1941,8 +1996,15 @@ impl App {
     /// the screen is read only after the user picks an action or types
     /// something, by that action's own flow.
     fn toggle_palette(&mut self) {
-        if self.palette.is_visible() {
-            self.palette.hide();
+        let Some(palette) = self.palette.as_mut() else {
+            self.card.show_error(
+                "Quick Ask unavailable",
+                "Its window could not be created at startup. Restart Wingman to try again.",
+            );
+            return;
+        };
+        if palette.is_visible() {
+            palette.hide();
             return;
         }
         if pause::is_paused_now() {
@@ -1970,7 +2032,9 @@ impl App {
 
         // #339: asked BEFORE the palette takes the foreground.
         self.palette_password_manager = self.password_manager_now();
-        self.palette.show(catalogue, model_configured, footer);
+        if let Some(palette) = self.palette.as_mut() {
+            palette.show(catalogue, model_configured, footer);
+        }
     }
 
     /// The actions a picker (the palette, the options card) chooses from: the
@@ -4806,8 +4870,16 @@ impl App {
         if settings::is_foreground() {
             return;
         }
-        let pending: VecDeque<DeferredMessage> =
+        let mut pending: VecDeque<DeferredMessage> =
             PENDING_MESSAGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        // "The tray menu was open" is only true right after the menu; by now
+        // it would be a stale card (#1011).
+        pending.retain(|m| {
+            !matches!(
+                m,
+                DeferredMessage::KeyDuringMenu | DeferredMessage::ActivateDuringMenu
+            )
+        });
         self.deliver_deferred(pending);
         // Click-away dismissal needs the global mouse hook, which is armed only
         // while a card is showing (nothing runs while idle).
@@ -4905,6 +4977,7 @@ impl App {
     /// same as if they had arrived that close together with no Settings
     /// window involved at all. A no-op on an empty queue.
     fn deliver_deferred(&mut self, pending: VecDeque<DeferredMessage>) {
+        let mut menu_card_shown = false;
         for message in pending {
             match message {
                 DeferredMessage::Result(result) => self.on_result(result),
@@ -4923,8 +4996,47 @@ impl App {
                 DeferredMessage::SettingsLeft => self.on_settings_left(),
                 DeferredMessage::SettingsSave(save) => self.on_settings_save(*save),
                 DeferredMessage::PauseToggle => self.toggle_pause(),
+                DeferredMessage::RouterResult(generation, result) => {
+                    self.on_router_result(generation, *result)
+                }
+                DeferredMessage::MachineCheck(facts) => self.on_machine_check_result(&facts),
+                DeferredMessage::KeyDuringMenu => {
+                    // Repeats collapse into one card.
+                    if !menu_card_shown {
+                        menu_card_shown = true;
+                        self.show_menu_was_open_card();
+                    }
+                }
+                DeferredMessage::ActivateDuringMenu => {
+                    // Every one is counted, as in `wnd_proc`; a refusal says so.
+                    match crate::activation::check_activation_now() {
+                        crate::activation::Verdict::Allowed => {
+                            if !menu_card_shown {
+                                menu_card_shown = true;
+                                self.show_menu_was_open_card();
+                            }
+                        }
+                        crate::activation::Verdict::Refused { notify: true } => {
+                            menu_card_shown = true;
+                            self.card.show_answer(
+                                "Too many requests in a row",
+                                "Try again in a moment.",
+                                3,
+                                None,
+                            )
+                        }
+                        crate::activation::Verdict::Refused { notify: false } => {}
+                    }
+                }
             }
         }
+    }
+
+    /// #1011: the card for a key press or a second launch that arrived while
+    /// the tray menu was open.
+    fn show_menu_was_open_card(&mut self) {
+        self.card
+            .show_answer("The tray menu was open", "Try again.", 3, None);
     }
 
     /// #722: the tray menu runs with the same reentrancy policy as Settings,
@@ -7372,6 +7484,22 @@ enum DeferredMessage {
     /// is not, so no "Paused" card lands on the window being typed in. Nothing
     /// can start a request meanwhile (`settings_hold_card`).
     PauseToggle,
+    /// `WM_APP_ROUTER_RESULT` (#1011), tray menu only: the options card the
+    /// answer belongs to is still up when the menu closes, and a stale one is
+    /// dropped by `on_router_result`'s generation check.
+    RouterResult(u64, Box<std::result::Result<router::RouterResult, String>>),
+    /// `WM_APP_MACHINE_CHECK_RESULT` (#1011), tray menu only: the "Working"
+    /// card from "Check this PC" turns into its verdict once the menu is gone.
+    MachineCheck(Box<crate::machine::MachineFacts>),
+    /// `WM_APP_HOTKEY` (#1011) during the tray menu. The hook has already
+    /// swallowed the key, so it must not vanish; it is not run later either
+    /// (that would bill a request for a screen the user has moved on from),
+    /// so it ends in a card that says to try again.
+    KeyDuringMenu,
+    /// `WM_APP_ACTIVATE` (#1011) during the tray menu. Any process of this
+    /// user can post it (#236), so each one still goes through the activation
+    /// rate limit when it is delivered, and only then may it show the card.
+    ActivateDuringMenu,
 }
 
 /// Marks the single preview slot as the calendar add, replacing whatever was
@@ -7547,12 +7675,22 @@ enum SettingsReentrancy {
 /// before it opens, so it can drop a send preview, a first-run answer and a
 /// pending-stage update; the tray menu does not, so those are deferred and
 /// delivered when the menu closes (a send preview must not be cancelled just
-/// because the tray was opened). `WM_APP_DISMISS` stays dropped: the click
-/// that closes the menu is the user's dismissal, and the menu took that
-/// click, so there is no card click left to act on.
+/// because the tray was opened). #1011: the same goes for the router's answer
+/// and the machine check's verdict (their cards are still up), a Pause
+/// toggle, and a press of the Wingman key (which ends in a card, never a
+/// silent drop). `WM_APP_DISMISS` stays dropped: the click that closes the
+/// menu is the user's dismissal, and the menu took that click, so there is
+/// no card click left to act on.
 fn tray_menu_policy(msg: u32, taskbar_created_msg: u32) -> SettingsReentrancy {
     match msg {
-        WM_APP_SEND_PREVIEW | WM_APP_FIRST_RUN | WM_APP_PENDING_STAGE => SettingsReentrancy::Defer,
+        WM_APP_SEND_PREVIEW
+        | WM_APP_FIRST_RUN
+        | WM_APP_PENDING_STAGE
+        | WM_APP_ROUTER_RESULT
+        | WM_APP_MACHINE_CHECK_RESULT
+        | WM_APP_PAUSE_TOGGLE
+        | WM_APP_HOTKEY
+        | WM_APP_ACTIVATE => SettingsReentrancy::Defer,
         _ => settings_reentrancy_policy(msg, taskbar_created_msg),
     }
 }
@@ -7729,7 +7867,8 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             *Box::from_raw(lparam.0 as *mut std::result::Result<Value, String>)
         }),
         WM_APP_PREVIEW_DECIDED => DeferredMessage::PreviewDecided(wparam.0 as u32),
-        // #722: only `tray_menu_policy` defers these three.
+        // #722: only `tray_menu_policy` defers these three (and, #1011, the
+        // arms further down).
         WM_APP_SEND_PREVIEW => DeferredMessage::SendPreview(unsafe {
             *Box::from_raw(lparam.0 as *mut crate::ui::send_gate::SendRequest)
         }),
@@ -7756,6 +7895,20 @@ fn take_deferred(msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<DeferredMes
             DeferredMessage::SettingsSave(unsafe { Box::from_raw(lparam.0 as *mut SettingsSave) })
         }
         WM_APP_PAUSE_TOGGLE => DeferredMessage::PauseToggle,
+        // #1011: tray menu only; see `tray_menu_policy`.
+        WM_APP_ROUTER_RESULT => {
+            let (generation, result) = unsafe {
+                *Box::from_raw(
+                    lparam.0 as *mut (u64, std::result::Result<router::RouterResult, String>),
+                )
+            };
+            DeferredMessage::RouterResult(generation, Box::new(result))
+        }
+        WM_APP_MACHINE_CHECK_RESULT => DeferredMessage::MachineCheck(unsafe {
+            Box::from_raw(lparam.0 as *mut crate::machine::MachineFacts)
+        }),
+        WM_APP_HOTKEY => DeferredMessage::KeyDuringMenu,
+        WM_APP_ACTIVATE => DeferredMessage::ActivateDuringMenu,
         _ => return None,
     })
 }
@@ -9521,7 +9674,7 @@ mod tests {
                 "toggle_palette must not use {forbidden}"
             );
         }
-        assert!(body.contains("self.palette.show("));
+        assert!(body.contains("palette.show("));
     }
 
     /// The options card is reachable and answered: the tray item runs it, the
@@ -10053,7 +10206,7 @@ mod tests {
         let end = body.find("\n    }\n").expect("toggle_palette ends");
         let body = &body[..end];
         assert!(
-            body.contains("self.palette.show("),
+            body.contains("palette.show("),
             "the scan found the wrong body"
         );
         for forbidden in [
@@ -11655,12 +11808,12 @@ mod tests {
     #[test]
     fn startup_card_shows_neither_one_or_both_problems() {
         let keys = vec!["openai".to_string()];
-        assert_eq!(super::startup_card(&[], false, None, None), None);
-        let only_keys = super::startup_card(&keys, false, None, None).unwrap();
+        assert_eq!(super::startup_card(&[], false, None, None, None), None);
+        let only_keys = super::startup_card(&keys, false, None, None, None).unwrap();
         assert!(only_keys.0.contains("key"), "{only_keys:?}");
-        let only_squat = super::startup_card(&[], true, None, None).unwrap();
+        let only_squat = super::startup_card(&[], true, None, None, None).unwrap();
         assert!(only_squat.0.contains("startup lock"), "{only_squat:?}");
-        let (headline, detail) = super::startup_card(&keys, true, None, None).unwrap();
+        let (headline, detail) = super::startup_card(&keys, true, None, None, None).unwrap();
         assert_eq!(headline, only_keys.0);
         assert!(detail.contains(&only_keys.1), "keys text kept: {detail}");
         assert!(detail.contains(&only_squat.0), "squat text added: {detail}");
@@ -11672,13 +11825,14 @@ mod tests {
     #[test]
     fn startup_card_reports_a_config_file_that_did_not_parse() {
         let problem = "config.toml has an error at line 3, column 7";
-        let (headline, detail) = super::startup_card(&[], false, Some(problem), None).unwrap();
+        let (headline, detail) =
+            super::startup_card(&[], false, Some(problem), None, None).unwrap();
         assert!(headline.contains("Settings file"), "{headline}");
         assert!(detail.contains(problem), "{detail}");
         assert!(detail.contains("Reload settings"), "{detail}");
         assert!(!detail.contains('\u{2014}'));
         let (_, both) =
-            super::startup_card(&["openai".to_string()], true, Some(problem), None).unwrap();
+            super::startup_card(&["openai".to_string()], true, Some(problem), None, None).unwrap();
         assert!(
             both.contains(problem) && both.contains("startup lock"),
             "{both}"
@@ -11695,17 +11849,47 @@ mod tests {
             "C:\\Users\\x\\AppData\\Roaming\\Wingman",
             "Access is denied. (os error 5)",
         ));
-        let (headline, detail) = super::startup_card(&[], false, None, failed).unwrap();
+        let (headline, detail) = super::startup_card(&[], false, None, failed, None).unwrap();
         assert!(headline.contains("Settings file"), "{headline}");
         assert!(detail.contains("AppData\\Roaming\\Wingman"), "{detail}");
         assert!(detail.contains("Access is denied"), "{detail}");
         assert!(detail.contains("default settings"), "{detail}");
         assert!(!detail.contains('\u{2014}'));
-        let (_, both) = super::startup_card(&[], true, None, failed).unwrap();
+        let (_, both) = super::startup_card(&[], true, None, failed, None).unwrap();
         assert!(
             both.contains("Access is denied") && both.contains("startup lock"),
             "{both}"
         );
+    }
+
+    // #1019: a tray or palette that could not be created is a card, not an exit.
+    #[test]
+    fn degraded_start_names_each_missing_piece() {
+        assert_eq!(super::degraded_start_card(None, None), None);
+        let (h, d) = super::degraded_start_card(Some("NIM_ADD failed"), None).unwrap();
+        assert!(h.contains("Tray icon"), "{h}");
+        assert!(
+            d.contains("NIM_ADD failed") && d.contains("Copilot key"),
+            "{d}"
+        );
+        let (h, d) = super::degraded_start_card(None, Some("no window")).unwrap();
+        assert!(h.contains("Quick Ask"), "{h}");
+        assert!(d.contains("no window"), "{d}");
+        let (_, both) = super::degraded_start_card(Some("a"), Some("b")).unwrap();
+        assert!(
+            both.contains("Quick Ask") && both.contains("tray icon"),
+            "{both}"
+        );
+        assert!(!both.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn startup_card_keeps_the_degraded_start_note() {
+        let degraded = super::degraded_start_card(Some("x"), None);
+        let (headline, detail) =
+            super::startup_card(&["openai".to_string()], false, None, None, degraded).unwrap();
+        assert!(headline.contains("key"), "{headline}");
+        assert!(detail.contains("Tray icon"), "{detail}");
     }
 
     /// A long error (an `icacls` message) is capped, and a blank one still
@@ -11735,6 +11919,83 @@ mod tests {
         );
     }
 
+    /// #1011: what `tray_menu_policy` does with every `WM_APP_*` id. The tray
+    /// menu does not hide the card, so every id whose card can be up while it
+    /// is open must be delivered afterwards, never dropped. Keyed on
+    /// `ALL_WM_APP_IDS` so a new id cannot be forgotten.
+    #[test]
+    fn tray_menu_policy_covers_every_wm_app_id() {
+        use super::tray_menu_policy;
+        // The ids the menu itself makes moot: it took the click or the key
+        // claim, or the surface they act on (palette, card buttons) is not
+        // reachable while a menu has the mouse.
+        const DROPPED: &[u32] = &[
+            WM_APP_TRAY,
+            WM_APP_DISMISS,
+            WM_APP_LEARNED,
+            WM_APP_PALETTE_TOGGLE,
+            WM_APP_PALETTE_RUN,
+            WM_APP_CARD_OPEN_SETTINGS,
+            WM_APP_CARD_COPY_DETAILS,
+            WM_APP_CARD_REPORT_PROBLEM,
+            WM_APP_OPTIONS_CHOICE,
+        ];
+        let mut ignored = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            let got = tray_menu_policy(*id, FAKE_TASKBAR_CREATED_MSG);
+            if DROPPED.contains(id) {
+                ignored += 1;
+                assert_eq!(got, SettingsReentrancy::Ignore, "{name}");
+            } else {
+                assert_eq!(
+                    got,
+                    SettingsReentrancy::Defer,
+                    "{name} can have a card up while the tray menu is open, so it must be \
+                     deferred and delivered when the menu closes"
+                );
+            }
+        }
+        assert_eq!(
+            ignored,
+            DROPPED.len(),
+            "an id in DROPPED is not in the registry"
+        );
+    }
+
+    /// #1011: every id the menu defers has a form `take_deferred` can hold, or
+    /// `wnd_proc` would free the payload and the answer would be lost anyway.
+    #[test]
+    fn every_id_the_tray_menu_defers_can_be_held() {
+        use super::{take_deferred, tray_menu_policy};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        let src = lf(include_str!("app.rs"));
+        let take = body_between(&src, "fn take_deferred(", "\n}\n");
+        let mut checked = 0;
+        for (name, id) in ALL_WM_APP_IDS {
+            if tray_menu_policy(*id, FAKE_TASKBAR_CREATED_MSG) == SettingsReentrancy::Defer {
+                checked += 1;
+                // Code only: a name in a comment must not satisfy this.
+                let arm = take.lines().any(|l| {
+                    let l = l.trim();
+                    !l.starts_with("//")
+                        && (l.starts_with(&format!("{name} =>"))
+                            || l.starts_with(&format!("{name} |"))
+                            || l.starts_with(&format!("| {name}"))
+                            || l.contains(&format!(" {name} =>")))
+                });
+                assert!(arm, "{name} is deferred but has no arm");
+            }
+        }
+        assert!(
+            checked >= 18,
+            "the scan found {checked} ids: the list moved"
+        );
+        // The payload-free ones can be taken without a box.
+        for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE, WM_APP_PAUSE_TOGGLE] {
+            assert!(take_deferred(id, WPARAM(0), LPARAM(0)).is_some(), "{id}");
+        }
+    }
+
     /// #722: the tray menu defers what Settings drops, so opening the menu
     /// never cancels a send waiting on its preview.
     #[test]
@@ -11747,7 +12008,7 @@ mod tests {
             );
         }
         // Everything else matches the Settings policy.
-        for msg in [WM_APP_RESULT, WM_APP_HOTKEY, WM_APP_DISMISS, WM_APP_TRAY, 0] {
+        for msg in [WM_APP_RESULT, WM_APP_DISMISS, WM_APP_TRAY, 0] {
             assert_eq!(
                 super::tray_menu_policy(msg, 0),
                 settings_reentrancy_policy(msg, 0)

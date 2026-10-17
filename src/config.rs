@@ -1206,7 +1206,12 @@ impl Config {
     /// credentials (rule 9).
     pub fn load() -> Result<Config> {
         let path = Self::path()?;
-        let mut config = Self::load_from_file(&path)?;
+        // #1018: the copilot-ask copy runs here, not in `app::run`, so a
+        // Reload settings retries it too.
+        let mut config = match Self::old_path() {
+            Ok(old) => Self::load_file_after_migration(&old, &path)?,
+            Err(_) => Self::load_from_file(&path)?,
+        };
 
         let store = CredManagerStore;
         if config.import_secrets_and_blank(&store) {
@@ -1217,6 +1222,22 @@ impl Config {
         config.hydrate_secrets(&store);
         config.apply_env_overrides();
         Ok(config)
+    }
+
+    /// #1018: runs the copilot-ask migration, then the file load. A failed
+    /// migration must not fall through to `load_from_file`, which would write a
+    /// default file and stop the migration from ever running again. It returns
+    /// "not loaded" defaults (Offline, never saved over anything) naming the
+    /// cause, and the next load tries the copy again.
+    fn load_file_after_migration(old_path: &Path, path: &Path) -> Result<Config> {
+        if let Err(e) = Self::migrate_from(old_path, path) {
+            return Ok(Self::not_loaded(format!(
+                "Your copilot-ask settings could not be copied to the Wingman folder ({}). \
+                 They are still in the copilot-ask folder",
+                format!("{e:#}").chars().take(200).collect::<String>()
+            )));
+        }
+        Self::load_from_file(path)
     }
 
     /// Same as [`Config::load`] but against an arbitrary path, and without
@@ -4486,6 +4507,84 @@ Use plain text only in both fields: no markdown (no asterisks, backticks, header
              ACL step failed"
         );
 
+        cleanup(&root.join("dummy"));
+    }
+
+    // #1018: a failed migration used to be dropped, and the next load wrote a
+    // default file that stopped the migration from ever running again.
+    #[test]
+    fn failed_migration_leaves_no_config_and_reports_it() {
+        let root = scratch_dir("migrate-fail-load");
+        let old_path = root.join("old").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "mode = \"offline\"\n").unwrap();
+        // The new folder cannot be created: its parent is a plain file.
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let new_path = blocker.join("Wingman").join("config.toml");
+
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        let problem = config
+            .load_problem
+            .clone()
+            .expect("the failure must be reported");
+        assert!(problem.contains("copilot-ask"), "{problem}");
+        assert_eq!(config.mode, Mode::Offline, "fail safe until it is copied");
+        assert!(!new_path.exists(), "no default file may be written");
+        assert!(old_path.exists(), "the old file is left alone");
+        assert!(config.check_save_allowed(&new_path).is_err());
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn failed_migration_retries_on_the_next_load() {
+        let root = scratch_dir("migrate-retry-load");
+        let old_path = root.join("old").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "[ui]\ntext_scale = 1.5\n").unwrap();
+        let blocker = root.join("blocker");
+        fs::write(&blocker, "x").unwrap();
+        let blocked = blocker.join("Wingman").join("config.toml");
+        assert!(Config::load_file_after_migration(&old_path, &blocked)
+            .unwrap()
+            .load_problem
+            .is_some());
+
+        let new_path = root.join("new").join("config.toml");
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        assert!(config.load_problem.is_none());
+        assert!((config.ui.text_scale - 1.5).abs() < f32::EPSILON);
+        assert!(new_path.exists());
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn successful_migration_loads_the_old_settings() {
+        let root = scratch_dir("migrate-ok-load");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+        fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        fs::write(&old_path, "[ui]\ntext_scale = 1.25\n").unwrap();
+
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        assert!(config.load_problem.is_none());
+        assert!((config.ui.text_scale - 1.25).abs() < f32::EPSILON);
+        cleanup(&root.join("dummy"));
+    }
+
+    #[test]
+    fn no_old_file_still_creates_defaults() {
+        let root = scratch_dir("migrate-none-load");
+        let old_path = root.join("old").join("config.toml");
+        let new_path = root.join("new").join("config.toml");
+
+        let config = Config::load_file_after_migration(&old_path, &new_path).unwrap();
+
+        assert!(config.load_problem.is_none());
+        assert!(new_path.exists());
         cleanup(&root.join("dummy"));
     }
 
