@@ -140,7 +140,8 @@ pub enum KeyCheck {
     /// 2xx: the vendor knows the key. The first page of its model list came with
     /// the answer; the flag says that page was the whole list.
     Accepted(Vec<String>, bool),
-    /// 401 or 403 (or Gemini's 400 `API_KEY_INVALID`): the vendor refused it.
+    /// 401 (or a 400 or 403 whose body says `API_KEY_INVALID`): the vendor
+    /// refused it. A bare 403 is `Unchecked`.
     Rejected,
     /// No network, a timeout, 5xx, a rate limit, an answer that is not a list:
     /// nothing is known about the key.
@@ -177,9 +178,11 @@ fn classify(result: Result<(Vec<String>, bool)>) -> KeyCheck {
     let refused = err
         .downcast_ref::<common::HttpStatus>()
         .is_some_and(|http| match http.status {
-            401 | 403 => true,
-            // Gemini says a bad key with a 400 and a reason in the body.
-            400 => err.to_string().contains(common::KIND_KEY_INVALID),
+            401 => true,
+            // Gemini says a bad key with a 400 (or a 403) and a reason in the
+            // body. A bare 403 is a restricted key, a region block or an API
+            // not enabled, so it says nothing about the key (#1135).
+            400 | 403 => err.to_string().contains(common::KIND_KEY_INVALID),
             _ => false,
         });
     if refused {
@@ -636,15 +639,40 @@ mod key_check_tests {
     }
 
     #[test]
-    fn a_401_or_403_is_a_rejection_for_every_vendor() {
+    fn a_401_is_a_rejection_for_every_vendor() {
         for vendor in [Vendor::OpenAi, Vendor::Anthropic, Vendor::Gemini] {
-            for code in [401u16, 403] {
-                let got = check_key_with(vendor, "key", &|_, _| {
-                    Err(status_error(code, r#"{"error":{"message":"no"}}"#))
-                });
-                assert!(matches!(got, KeyCheck::Rejected), "{vendor:?} {code}");
+            let got = check_key_with(vendor, "key", &|_, _| {
+                Err(status_error(401, r#"{"error":{"message":"no"}}"#))
+            });
+            assert!(matches!(got, KeyCheck::Rejected), "{vendor:?} 401");
+        }
+    }
+
+    /// #1135: a bare 403 is a restricted key, a region block or an API not
+    /// enabled: the key may be fine for chat, so it is saved unchecked.
+    #[test]
+    fn a_403_without_a_bad_key_marker_is_unchecked_for_every_vendor() {
+        let bodies = [
+            r#"{"error":{"message":"You have insufficient permissions for this operation. Missing scopes: models.read"}}"#,
+            r#"{"error":{"message":"Country, region, or territory not supported"}}"#,
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Generative Language API has not been used in project 1 before"}}"#,
+            r#"{"type":"error","error":{"type":"permission_error","message":"forbidden"}}"#,
+            "<html>403</html>",
+        ];
+        for vendor in [Vendor::OpenAi, Vendor::Anthropic, Vendor::Gemini] {
+            for body in bodies {
+                let got = check_key_with(vendor, "key", &|_, _| Err(status_error(403, body)));
+                assert!(matches!(got, KeyCheck::Unchecked), "{vendor:?} {body}");
             }
         }
+    }
+
+    /// A 403 that says `API_KEY_INVALID` in its structured body is still a bad key.
+    #[test]
+    fn a_403_that_says_the_key_is_invalid_is_a_rejection() {
+        let body = r#"{"error":{"code":403,"message":"API key not valid.","details":[{"reason":"API_KEY_INVALID"}]}}"#;
+        let got = check_key_with(Vendor::Gemini, "AIza", &|_, _| Err(status_error(403, body)));
+        assert!(matches!(got, KeyCheck::Rejected));
     }
 
     /// Gemini answers a bad key with 400 and `API_KEY_INVALID`, not 401.
