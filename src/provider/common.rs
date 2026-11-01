@@ -2944,24 +2944,6 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Both process-wide gates `post_json_with` consults, taken together in
-    /// one fixed order, by every test in this module that can reach it.
-    ///
-    /// #260. `post_json_with` starts with `send_preview_guard()` then
-    /// `offline_guard()`, and each reads a different process-wide value:
-    /// `config::EGRESS_PREVIEW_ENABLED` and `mode::CURRENT_MODE`. A test
-    /// that flips either one refuses every *other* test's request before
-    /// its scripted transport is ever invoked, and the failure reads as
-    /// "0 attempts" against whatever that test was actually asserting, so
-    /// it looks like a retry-arithmetic regression rather than a race.
-    /// Locking only one of the two, which is what this module did, leaves
-    /// the other half of the race in place.
-    ///
-    /// The order is egress-preview first, then mode, and it is the only
-    /// order any test may take them in: two tests taking them in opposite
-    /// orders deadlock the suite rather than flake it. `run` deliberately
-    /// does NOT lock, so a test can hold these across setup and assertions
-    /// without the non-reentrant `Mutex` deadlocking against itself.
     /// Reads one whole HTTP request (headers, then `Content-Length` bytes of
     /// body) so a test server never closes with unread data. On Windows that
     /// close sends a reset, and the client can see it before the reply (#1326).
@@ -3009,6 +2991,24 @@ mod tests {
         client.join().unwrap();
     }
 
+    /// Both process-wide gates `post_json_with` consults, taken together in
+    /// one fixed order, by every test in this module that can reach it.
+    ///
+    /// #260. `post_json_with` starts with `send_preview_guard()` then
+    /// `offline_guard()`, and each reads a different process-wide value:
+    /// `config::EGRESS_PREVIEW_ENABLED` and `mode::CURRENT_MODE`. A test
+    /// that flips either one refuses every *other* test's request before
+    /// its scripted transport is ever invoked, and the failure reads as
+    /// "0 attempts" against whatever that test was actually asserting, so
+    /// it looks like a retry-arithmetic regression rather than a race.
+    /// Locking only one of the two, which is what this module did, leaves
+    /// the other half of the race in place.
+    ///
+    /// The order is egress-preview first, then mode, and it is the only
+    /// order any test may take them in: two tests taking them in opposite
+    /// orders deadlock the suite rather than flake it. `run` deliberately
+    /// does NOT lock, so a test can hold these across setup and assertions
+    /// without the non-reentrant `Mutex` deadlocking against itself.
     fn network_guard() -> (
         std::sync::MutexGuard<'static, ()>,
         std::sync::MutexGuard<'static, ()>,
