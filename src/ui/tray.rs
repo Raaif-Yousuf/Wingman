@@ -633,7 +633,8 @@ impl Tray {
             uFlags: NIF_TIP | NIF_SHOWTIP,
             ..Default::default()
         };
-        set_sz_tip(&mut nid.szTip, text);
+        // #1271: a dev instance says so, to tell two icons apart.
+        set_sz_tip(&mut nid.szTip, &crate::dev_instance::tray_tooltip(text));
         let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
     }
 
@@ -1442,7 +1443,10 @@ fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<HICON> {
         hIcon: icon,
         ..Default::default()
     };
-    set_sz_tip(&mut nid.szTip, "Wingman");
+    set_sz_tip(
+        &mut nid.szTip,
+        &crate::dev_instance::tray_tooltip("Wingman"),
+    );
 
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
     if !added.as_bool() {

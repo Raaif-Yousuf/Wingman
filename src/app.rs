@@ -686,7 +686,7 @@ impl OllamaModelCache {
     }
 }
 
-const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
+pub(crate) const OWNER_CLASS: &str = "Wingman.Owner.Window.4d1b62f0";
 
 /// How long to wait after hiding a visible card before capturing, so the
 /// compositor has actually taken it off the screen. Without this the old card
@@ -1493,12 +1493,18 @@ pub fn run() -> Result<()> {
     }
 
     // The hook must be installed on the thread that pumps messages — this one.
-    match HotkeyHook::install(
-        hwnd,
-        app.config.hotkeys.primary,
-        app.config.hotkeys.secondary,
-    ) {
-        Ok(h) => {
+    // #1271: a debug dev instance skips the hook so the installed instance
+    // keeps the Copilot key.
+    let hook_result = crate::dev_instance::hook_enabled().then(|| {
+        HotkeyHook::install(
+            hwnd,
+            app.config.hotkeys.primary,
+            app.config.hotkeys.secondary,
+        )
+    });
+    match hook_result {
+        None => {}
+        Some(Ok(h)) => {
             // #181: no default binding, so this is a no-op (packs to the
             // "unconfigured" sentinel) unless the owner hand-edited
             // config.toml.
@@ -1508,7 +1514,7 @@ pub fn run() -> Result<()> {
             h.set_palette_chord(app.config.hotkeys.palette);
             app.hook = Some(h);
         }
-        Err(e) => {
+        Some(Err(e)) => {
             let detail = app.track_error("Hotkeys unavailable", &format!("{e:#}"));
             app.card.show_error_with_details(
                 "Hotkeys unavailable",
@@ -1903,11 +1909,14 @@ fn settings_create_failed_card(folder: &str, error: &str) -> (String, String) {
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
+    // #1271: a debug dev instance has its own class name.
+    let class_name = crate::dev_instance::wide_name(OWNER_CLASS);
+    let window_class = PCWSTR(class_name.as_ptr());
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance,
-        lpszClassName: WINDOW_CLASS,
+        lpszClassName: window_class,
         ..Default::default()
     };
     // A duplicate that destroyed its window and starts anyway registers the
@@ -1925,7 +1934,7 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            WINDOW_CLASS,
+            window_class,
             w!("Wingman"),
             WS_OVERLAPPED,
             CW_USEDEFAULT,
