@@ -5465,10 +5465,13 @@ impl App {
                 self.card
                     .show_error_with_details("Couldn't update the email", &detail);
             }
-            ExecDone::FixText { report, .. } => {
+            ExecDone::FixText { report, undo } => {
                 use actions::generic_replace::ReplaceReport;
                 match report {
                     ReplaceReport::Replaced(summary) => {
+                        let summary = undo
+                            .as_ref()
+                            .map_or_else(|| summary.clone(), |u| u.summary_with_hint());
                         self.card.show_answer(
                             "Text fixed",
                             &with_pending_notices(&summary),
@@ -5479,7 +5482,7 @@ impl App {
                     ReplaceReport::Copied(detail) => {
                         self.card.show_answer(
                             "Fixed text copied to the clipboard",
-                            &with_pending_notices(&detail),
+                            &with_pending_notices(detail),
                             0,
                             None,
                         );
@@ -5493,7 +5496,7 @@ impl App {
                         );
                     }
                     ReplaceReport::Failed(reason) => {
-                        let detail = self.track_error("Couldn't fix the text", &reason);
+                        let detail = self.track_error("Couldn't fix the text", reason);
                         self.card
                             .show_error_with_details("Couldn't fix the text", &detail);
                     }
@@ -9300,11 +9303,9 @@ enum ExecDone {
     Calendar(anyhow::Result<executors::Undo>),
     Review(anyhow::Result<executors::Undo>),
     /// #1274: the fixed text was written, or copied instead.
-    /// The undo is carried here for the shared card Undo slot (#1281).
+    /// The undo is kept in the shared card Undo slot (`undo_slot_after`).
     FixText {
         report: actions::generic_replace::ReplaceReport,
-        // Read once #1281 adds the shared card Undo slot.
-        #[allow(dead_code)]
         undo: Option<executors::Undo>,
     },
     FormFill(anyhow::Result<executors::Undo>),
@@ -9419,7 +9420,9 @@ fn undo_slot_after(done: ExecDone) -> Option<executors::Undo> {
             result: Ok(undo),
             ..
         } if keeps_undo(&executor_name) => undo.remember(),
-        ExecDone::Replace { undo, .. } => undo.and_then(executors::Undo::remember),
+        ExecDone::Replace { undo, .. } | ExecDone::FixText { undo, .. } => {
+            undo.and_then(executors::Undo::remember)
+        }
         _ => None,
     }
 }
@@ -14867,6 +14870,12 @@ mod tests {
             undo: Some(kept("rep")),
         };
         assert_eq!(some(replaced).as_deref(), Some("rep"));
+        // #1274: a fixed text box keeps its undo.
+        let fixed = ExecDone::FixText {
+            report: actions::generic_replace::ReplaceReport::Replaced("x".into()),
+            undo: Some(kept("fix")),
+        };
+        assert_eq!(some(fixed).as_deref(), Some("fix"));
     }
 
     #[test]
@@ -14888,6 +14897,13 @@ mod tests {
                 report,
                 undo: None,
             }));
+        }
+        // #1274: the fixed text only copied, or failed: nothing to undo.
+        for report in [
+            actions::generic_replace::ReplaceReport::Copied("c".into()),
+            actions::generic_replace::ReplaceReport::Failed("f".into()),
+        ] {
+            assert!(none(ExecDone::FixText { report, undo: None }));
         }
         assert!(none(ExecDone::RegionCopy {
             width: 1,
