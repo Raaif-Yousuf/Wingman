@@ -114,8 +114,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_ACTIVATE, WM_CLOSE, WM_COMMAND,
     WM_DESTROY, WM_DPICHANGED, WM_HSCROLL, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT,
-    WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_SETFONT, WM_SETREDRAW, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetParent, GetScrollInfo, GetWindow, IsWindowVisible, CBN_SELCHANGE, GW_CHILD,
@@ -694,6 +695,10 @@ struct SettingsInner {
     /// The smaller font of the helper lines (#1015); null until the first
     /// layout, when they use `font`.
     hint_font: HFONT,
+    /// #1292: the semibold section title and the larger page title fonts; null
+    /// until the first layout, when they use `font`.
+    section_font: HFONT,
+    page_title_font: HFONT,
     /// The window's current DPI; updated by `WM_DPICHANGED` (#233).
     dpi: u32,
     /// Every child with its design rect, for re-layout on a DPI change.
@@ -921,6 +926,8 @@ impl SettingsInner {
             hwnd: HWND(std::ptr::null_mut()),
             font: HFONT(std::ptr::null_mut()),
             hint_font: HFONT(std::ptr::null_mut()),
+            section_font: HFONT(std::ptr::null_mut()),
+            page_title_font: HFONT(std::ptr::null_mut()),
             dpi: 96,
             children: Vec::new(),
             content_top_dp: 0,
@@ -1285,6 +1292,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !inner.hint_font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
                 inner.hint_font = HFONT(std::ptr::null_mut());
+            }
+            for f in [&mut inner.section_font, &mut inner.page_title_font] {
+                if !f.0.is_null() {
+                    let _ = DeleteObject(HGDIOBJ(f.0));
+                    *f = HFONT(std::ptr::null_mut());
+                }
             }
             if !inner.font.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(inner.font.0));
@@ -2910,6 +2923,12 @@ const ID_EXPORT_ACTION: i32 = 164;
 const ID_KEY_MODE: i32 = 165;
 const ID_DOUBLE_PRESS: i32 = 166;
 const ID_CLICK_AWAY: i32 = 167;
+/// #1292: a page's title, a section's title, and the rounded card behind a
+/// section's rows. Shared across pages like the row descriptions: no code reads
+/// them back, the id only says how to paint and which font to use.
+const ID_PAGE_TITLE: i32 = 168;
+const ID_SECTION_TITLE: i32 = 169;
+const ID_SECTION_CARD: i32 = 170;
 const TB_ENDTRACK: u32 = 8;
 
 /// One cloud vendor's three rows on the Models page (#877): the ids of its
@@ -3258,6 +3277,9 @@ const CHROME_IDS: &[i32] = &[
     // Repeated on every page, so not one page's control (#877).
     ID_ROW_DESC,
     ID_ROW_SEPARATOR,
+    ID_PAGE_TITLE,
+    ID_SECTION_TITLE,
+    ID_SECTION_CARD,
 ];
 
 /// #509: what capture.redact covers, in plain words. Three things: the
@@ -3346,6 +3368,9 @@ const ALL_CONTROL_IDS: &[(&str, i32)] = &[
     ("ID_KEY_MODE", ID_KEY_MODE),
     ("ID_DOUBLE_PRESS", ID_DOUBLE_PRESS),
     ("ID_CLICK_AWAY", ID_CLICK_AWAY),
+    ("ID_PAGE_TITLE", ID_PAGE_TITLE),
+    ("ID_SECTION_TITLE", ID_SECTION_TITLE),
+    ("ID_SECTION_CARD", ID_SECTION_CARD),
 ];
 
 // ---------------------------------------------------------------------------
@@ -4030,6 +4055,18 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
     } else {
         build_hint_font(new_font, dpi)
     };
+    // #1292: the title fonts follow the body font the same way.
+    let keep_titles = new_font == inner.font && !inner.section_font.0.is_null();
+    let new_section_font = if keep_titles {
+        inner.section_font
+    } else {
+        build_title_font(new_font, dpi, crate::ui::theme::TYPE_BODY_PX)
+    };
+    let new_page_title_font = if keep_titles {
+        inner.page_title_font
+    } else {
+        build_title_font(new_font, dpi, crate::ui::theme::TYPE_SUBTITLE_PX)
+    };
     // No repaint between the individual moves: one redraw at the end, so a
     // drag across monitors does not flicker.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(0)), None);
@@ -4061,8 +4098,13 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
         }
         let _ = SetWindowPos(c.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         // #1015: helper lines are set smaller than the labels.
-        let font = if !new_hint_font.0.is_null() && is_hint_id(GetDlgCtrlID(c.hwnd)) {
+        let id = GetDlgCtrlID(c.hwnd);
+        let font = if !new_hint_font.0.is_null() && is_hint_id(id) {
             new_hint_font
+        } else if !new_section_font.0.is_null() && id == ID_SECTION_TITLE {
+            new_section_font
+        } else if !new_page_title_font.0.is_null() && id == ID_PAGE_TITLE {
+            new_page_title_font
         } else {
             new_font
         };
@@ -4085,6 +4127,14 @@ unsafe fn apply_layout(inner: &mut SettingsInner, rebuild_font: bool) {
         let _ = DeleteObject(HGDIOBJ(inner.hint_font.0));
     }
     inner.hint_font = new_hint_font;
+    if new_section_font != inner.section_font && !inner.section_font.0.is_null() {
+        let _ = DeleteObject(HGDIOBJ(inner.section_font.0));
+    }
+    inner.section_font = new_section_font;
+    if new_page_title_font != inner.page_title_font && !inner.page_title_font.0.is_null() {
+        let _ = DeleteObject(HGDIOBJ(inner.page_title_font.0));
+    }
+    inner.page_title_font = new_page_title_font;
     // `win_h_dp` stays the baseline the recorded design rects were built
     // for, so every later change diffs against the same reference.
     SendMessageW(inner.hwnd, WM_SETREDRAW, Some(WPARAM(1)), None);
@@ -4623,6 +4673,11 @@ struct EditStyle {
     /// The line between rows (#877): the border token, or the system's window
     /// text in high contrast.
     hairline_brush: windows::Win32::Graphics::Gdi::HBRUSH,
+    /// #1292: the layer a section's rows sit on, its stroke, and the brush of
+    /// the layer.
+    card: u32,
+    card_stroke: u32,
+    card_brush: windows::Win32::Graphics::Gdi::HBRUSH,
     /// The hovered row of a combo's drop list (#1169).
     item_hover_brush: windows::Win32::Graphics::Gdi::HBRUSH,
 }
@@ -4669,6 +4724,9 @@ unsafe fn edit_style() -> EditStyle {
         brush: solid(colors.fill),
         disabled_brush: solid(colors.disabled_fill),
         hairline_brush: solid(colors.border),
+        card: tokens.card,
+        card_stroke: tokens.card_stroke,
+        card_brush: solid(tokens.card),
         item_hover_brush: solid(colors.item_hover),
     };
     EDIT_STYLE.set(Some(style));
@@ -4683,6 +4741,7 @@ unsafe fn invalidate_edit_style() {
         let _ = DeleteObject(HGDIOBJ(style.brush.0));
         let _ = DeleteObject(HGDIOBJ(style.disabled_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.hairline_brush.0));
+        let _ = DeleteObject(HGDIOBJ(style.card_brush.0));
         let _ = DeleteObject(HGDIOBJ(style.item_hover_brush.0));
     }
 }
@@ -4755,7 +4814,17 @@ unsafe fn answer_button_draw(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
     if header.code != NM_CUSTOMDRAW_CODE {
         return None;
     }
-    let palette = Palette::new(style.look.theme, &style.look.sys, style.colors.focus_line);
+    let mut palette = Palette::new(style.look.theme, &style.look.sys, style.colors.focus_line);
+    // #1292: a control on a section card sits on the card layer, not the page.
+    let on_card = card_of(header.hwndFrom).is_some();
+    if on_card {
+        palette.tokens.surface = style.card;
+    }
+    let face = if on_card {
+        style.card_brush
+    } else {
+        style.face_brush
+    };
     // #582 slice 4: the trackbar answers for itself; anything else is a button.
     if let Some(answer) =
         crate::ui::settings_trackbar::handle_custom_draw(lparam, dpi_for(hwnd), &palette)
@@ -4766,7 +4835,7 @@ unsafe fn answer_button_draw(hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
         lparam,
         dpi_for(hwnd),
         &palette,
-        style.face_brush,
+        face,
     )))
 }
 
@@ -4783,6 +4852,192 @@ unsafe fn erase_with_face(hwnd: HWND, wparam: WPARAM) -> LRESULT {
         );
     }
     LRESULT(1)
+}
+
+// ---------------------------------------------------------------------------
+// Section cards (#1292)
+// ---------------------------------------------------------------------------
+
+/// The window property that ties a control to the section card it sits on.
+const CARD_PROP: &str = "WingmanSectionCard";
+
+/// Records that `child` sits on `card`, so its colour messages and its paint
+/// use the card layer instead of the page.
+unsafe fn tag_card_child(child: HWND, card: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::SetPropW;
+    let name = wide_z(CARD_PROP);
+    let _ = SetPropW(
+        child,
+        PCWSTR(name.as_ptr()),
+        Some(windows::Win32::Foundation::HANDLE(card.0)),
+    );
+}
+
+/// The section card `child` sits on, if it was made on one.
+unsafe fn card_of(child: HWND) -> Option<HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::GetPropW;
+    let name = wide_z(CARD_PROP);
+    let h = GetPropW(child, PCWSTR(name.as_ptr()));
+    (!h.0.is_null()).then_some(HWND(h.0))
+}
+
+/// Whether `child` is a label (a static that is not a line, a card or a text
+/// box) on a section card.
+unsafe fn is_card_label(child: HWND) -> bool {
+    let id = GetDlgCtrlID(child);
+    id != ID_ROW_SEPARATOR
+        && id != ID_SECTION_CARD
+        && card_of(child).is_some()
+        && !is_edit_control(child)
+}
+
+/// A label's colours on a card: the hint ink for a helper line, the text ink
+/// otherwise, over a transparent background with the card brush behind.
+unsafe fn answer_card_label_colors(hdc: windows::Win32::Graphics::Gdi::HDC, id: i32) -> LRESULT {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{
+        GetSysColor, SetBkMode, SetTextColor, COLOR_WINDOWTEXT, TRANSPARENT,
+    };
+    let style = edit_style();
+    let ink = if is_hint_id(id) {
+        style.hint_text
+    } else if style.paints_face {
+        style.colors.text
+    } else {
+        GetSysColor(COLOR_WINDOWTEXT)
+    };
+    SetTextColor(hdc, COLORREF(ink));
+    SetBkMode(hdc, TRANSPARENT);
+    LRESULT(style.card_brush.0 as isize)
+}
+
+/// A card's rect in `body`'s client px, for each visible card of the body.
+unsafe fn visible_cards(body: HWND) -> Vec<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::MapWindowPoints;
+    let mut out = Vec::new();
+    let mut child = GetWindow(body, GW_CHILD).ok();
+    while let Some(c) = child {
+        if GetDlgCtrlID(c) == ID_SECTION_CARD && IsWindowVisible(c).as_bool() {
+            let mut wr = windows::Win32::Foundation::RECT::default();
+            if GetWindowRect(c, &mut wr).is_ok() {
+                let mut pts = [
+                    POINT {
+                        x: wr.left,
+                        y: wr.top,
+                    },
+                    POINT {
+                        x: wr.right,
+                        y: wr.bottom,
+                    },
+                ];
+                MapWindowPoints(None, Some(body), &mut pts);
+                out.push(windows::Win32::Foundation::RECT {
+                    left: pts[0].x,
+                    top: pts[0].y,
+                    right: pts[1].x,
+                    bottom: pts[1].y,
+                });
+            }
+        }
+        child = GetWindow(c, GW_HWNDNEXT).ok();
+    }
+    out
+}
+
+/// `WM_ERASEBKGND` on the body: the page face over the client area, then the
+/// card layer over each section's rect. Always runs, light included, because a
+/// themed checkbox or trackbar paints its background by asking this window.
+unsafe fn erase_body(hwnd: HWND, wparam: WPARAM) -> LRESULT {
+    use windows::Win32::Graphics::Gdi::{FillRect, HDC};
+    let hdc = HDC(wparam.0 as *mut c_void);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() {
+        FillRect(hdc, &rc, face_brush_now());
+        let brush = edit_style().card_brush;
+        for card in visible_cards(hwnd) {
+            FillRect(hdc, &card, brush);
+        }
+    }
+    LRESULT(1)
+}
+
+const CARD_SUBCLASS_ID: usize = 0x1292;
+
+/// Gives a card static its own paint: the rounded layer and its stroke.
+unsafe fn subclass_card(card: HWND) {
+    let _ = windows::Win32::UI::Shell::SetWindowSubclass(
+        card,
+        Some(card_subclass),
+        CARD_SUBCLASS_ID,
+        0,
+    );
+}
+
+unsafe extern "system" fn card_subclass(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND;
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint_card(hwnd);
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(card_subclass), CARD_SUBCLASS_ID);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Paints a section card, double-buffered: the page face in the corners, the
+/// card layer inside a 1 px stroke with an 8 dp corner.
+unsafe fn paint_card(hwnd: HWND) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Gdi::{
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen,
+        CreateSolidBrush, DeleteDC, EndPaint, FillRect, RoundRect, SelectObject, PAINTSTRUCT,
+        PS_INSIDEFRAME, SRCCOPY,
+    };
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = windows::Win32::Foundation::RECT::default();
+    if GetClientRect(hwnd, &mut rc).is_ok() && rc.right > 0 && rc.bottom > 0 {
+        let (w, h) = (rc.right, rc.bottom);
+        let dpi = dpi_for(hwnd);
+        let style = edit_style();
+        let mem = CreateCompatibleDC(Some(hdc));
+        let bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old_bmp = SelectObject(mem, HGDIOBJ(bmp.0));
+        let face = CreateSolidBrush(COLORREF(style.face));
+        FillRect(mem, &rc, face);
+        let pen = CreatePen(
+            PS_INSIDEFRAME,
+            to_px(1, dpi).max(1),
+            COLORREF(style.card_stroke),
+        );
+        let old_pen = SelectObject(mem, HGDIOBJ(pen.0));
+        let old_brush = SelectObject(mem, HGDIOBJ(style.card_brush.0));
+        let round = 2 * to_px(crate::ui::theme::CARD_RADIUS_DP, dpi);
+        let _ = RoundRect(mem, 0, 0, w, h, round, round);
+        let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
+        SelectObject(mem, old_brush);
+        SelectObject(mem, old_pen);
+        SelectObject(mem, old_bmp);
+        let _ = DeleteObject(HGDIOBJ(pen.0));
+        let _ = DeleteObject(HGDIOBJ(face.0));
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+    }
+    let _ = EndPaint(hwnd, &ps);
 }
 
 /// Draws a text box's frame onto `hdc` (#934): the Windows 11 look of a
@@ -4856,7 +5111,14 @@ unsafe fn paint_edit_frame(hwnd: HWND) {
         wr.right - wr.left,
         wr.bottom - wr.top,
         dpi_for(hwnd),
-        &frame_colors(&edit_style().colors, combo_is_hovered(hwnd)),
+        &{
+            let mut colors = frame_colors(&edit_style().colors, combo_is_hovered(hwnd));
+            // #1292: inside a section card the corners show the card.
+            if card_of(hwnd).is_some() {
+                colors.face = edit_style().card;
+            }
+            colors
+        },
         GetFocus() == hwnd,
         windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool(),
     );
@@ -5062,6 +5324,18 @@ unsafe extern "system" fn body_wndproc(
         }
     }
     match msg {
+        // #1292: a label on a section card is painted on the card layer.
+        windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
+            if is_card_label(HWND(lparam.0 as *mut c_void)) =>
+        {
+            answer_card_label_colors(
+                windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut c_void),
+                GetDlgCtrlID(HWND(lparam.0 as *mut c_void)),
+            )
+        }
+        // #1292: the page face, then the section cards (a themed checkbox asks
+        // its parent to paint what is behind it, through this).
+        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => erase_body(hwnd, wparam),
         WM_COMMAND | WM_HSCROLL => {
             let parent = GetParent(hwnd).unwrap_or_default();
             SendMessageW(parent, msg, Some(wparam), Some(lparam))
@@ -5082,10 +5356,6 @@ unsafe extern "system" fn body_wndproc(
             );
             SetBkMode(hdc, TRANSPARENT);
             LRESULT(face_brush_now().0 as isize)
-        }
-        // #582: the body's own face, where Settings paints it (dark).
-        windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND if edit_style().paints_face => {
-            erase_with_face(hwnd, wparam)
         }
         // #877: a hairline is a one pixel static filled with the border token.
         windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC
@@ -5541,6 +5811,25 @@ unsafe fn build_hint_font(body: HFONT, dpi: u32) -> HFONT {
     CreateFontIndirectW(&lf)
 }
 
+/// #1292: a title font: the body font `body` at a type ramp size, semibold
+/// (the ramp's body-strong at 14 px, the subtitle at 20 px). Null when the body
+/// font cannot be read, so the caller keeps the body font. The caller deletes it.
+unsafe fn build_title_font(body: HFONT, dpi: u32, ramp_px: i32) -> HFONT {
+    use windows::Win32::Graphics::Gdi::GetObjectW;
+    let mut lf = LOGFONTW::default();
+    let got = GetObjectW(
+        HGDIOBJ(body.0),
+        std::mem::size_of::<LOGFONTW>() as i32,
+        Some(&mut lf as *mut LOGFONTW as *mut c_void),
+    );
+    if got <= 0 {
+        return HFONT(std::ptr::null_mut());
+    }
+    lf.lfHeight = crate::ui::theme::type_height_px(ramp_px, dpi, 1.0);
+    lf.lfWeight = 600;
+    CreateFontIndirectW(&lf)
+}
+
 // ---------------------------------------------------------------------------
 // UI construction
 // ---------------------------------------------------------------------------
@@ -5556,6 +5845,13 @@ struct Rows {
     /// The width of the control column. Rows whose controls are small buttons
     /// narrow it, so a long title (a key combination) has the room.
     ctl_w: i32,
+    /// Where the hairlines between rows run (#1292): the rows' own width, or the
+    /// whole card's inside a section card.
+    line_x: i32,
+    line_w: i32,
+    /// How many sections the page has started (#1292): the gap goes before a
+    /// section, so the last one leaves none under it.
+    sections: u32,
 }
 
 impl Rows {
@@ -5566,6 +5862,9 @@ impl Rows {
             w,
             first: true,
             ctl_w: CONTROL_W,
+            line_x: x,
+            line_w: w,
+            sections: 0,
         }
     }
 
@@ -5593,6 +5892,14 @@ fn row_height(desc_lines: i32) -> i32 {
     } else {
         2 * ROW_PAD + ROW_TITLE_H + desc_lines * DESC_LINE_H
     }
+}
+
+/// A section that has been started (#1292).
+struct SectionGeom {
+    card: HWND,
+    top: i32,
+    /// The rows' x, width and control width before the section, restored after.
+    outer: (i32, i32, i32),
 }
 
 /// A row that has been started: where it sits and how tall it is.
@@ -5647,6 +5954,8 @@ struct Ctx {
     slot: std::cell::Cell<Option<Slot>>,
     /// Every control made under a slot, at the place it has when all show.
     flow: std::cell::RefCell<Vec<FlowChild>>,
+    /// #1292: the section card the next control is laid on, if any.
+    card: std::cell::Cell<Option<HWND>>,
 }
 
 /// A Models page control that moves or hides with the provider choice (#874).
@@ -5733,6 +6042,9 @@ impl Ctx {
                     );
                 }
             }
+            if let Some(card) = self.card.get() {
+                unsafe { tag_card_child(hwnd, card) };
+            }
             if let Some(slot) = self.slot.get() {
                 self.flow.borrow_mut().push(FlowChild { hwnd, slot, y, h });
             }
@@ -5755,7 +6067,17 @@ impl Ctx {
 impl Ctx {
     /// A hairline across the row that starts at `r.y` (#877).
     fn hairline(&self, r: &Rows) {
-        let h = self.create(WC_STATIC, "", 0, 0, r.x, r.y, r.w, 1, ID_ROW_SEPARATOR);
+        let h = self.create(
+            WC_STATIC,
+            "",
+            0,
+            0,
+            r.line_x,
+            r.y,
+            r.line_w,
+            1,
+            ID_ROW_SEPARATOR,
+        );
         self.set_anchor(h, Anchor::Hairline);
     }
 
@@ -5872,6 +6194,104 @@ impl Ctx {
         }
         r.y += h;
         check
+    }
+
+    /// #1292: the page's title, at the top of the page.
+    fn page_title(&self, r: &mut Rows, title: &str) {
+        self.create(
+            WC_STATIC,
+            title,
+            0,
+            0,
+            r.x,
+            r.y,
+            r.w,
+            crate::ui::settings_sections::PAGE_TITLE_H_DP,
+            ID_PAGE_TITLE,
+        );
+        r.y = crate::ui::settings_sections::first_section_top(r.y);
+    }
+
+    /// #1292: starts a section: its title, then the card its rows sit on. The
+    /// card is made before the rows, so it is behind them, and is sized by
+    /// [`Ctx::end_section`]. The rows keep their x and width and the card
+    /// reaches out around them; the hairlines between rows run its full width.
+    fn begin_section(&self, r: &mut Rows, title: &str) -> SectionGeom {
+        use crate::ui::settings_sections as sec;
+        if r.sections > 0 {
+            r.y = sec::next_section_top(r.y);
+        }
+        r.sections += 1;
+        let (card_x, card_w) = sec::card_outer(r.x, r.w);
+        self.create(
+            WC_STATIC,
+            title,
+            0,
+            0,
+            r.x,
+            r.y,
+            r.w,
+            sec::SECTION_TITLE_H_DP,
+            ID_SECTION_TITLE,
+        );
+        let top = sec::card_top(r.y);
+        let card = self.create(
+            WC_STATIC,
+            "",
+            WS_CLIPSIBLINGS.0,
+            0,
+            card_x,
+            top,
+            card_w,
+            1,
+            ID_SECTION_CARD,
+        );
+        unsafe { subclass_card(card) };
+        self.card.set(Some(card));
+        let geom = SectionGeom {
+            card,
+            top,
+            outer: (r.x, r.w, r.ctl_w),
+        };
+        r.line_x = card_x;
+        r.line_w = card_w;
+        r.y = top;
+        r.first = true;
+        geom
+    }
+
+    /// #1292: ends a section: the card gets the height of its rows, and the
+    /// cursor moves down by the gap before the next section.
+    fn end_section(&self, r: &mut Rows, g: SectionGeom) {
+        let h = (r.y - g.top).max(1);
+        if let Some(c) = self
+            .children
+            .borrow_mut()
+            .iter_mut()
+            .find(|c| c.hwnd == g.card)
+        {
+            c.h = h;
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                    g.card,
+                    None,
+                    0,
+                    0,
+                    to_px(c.w, self.dpi),
+                    to_px(h, self.dpi),
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+            }
+        }
+        self.card.set(None);
+        let (x, w, ctl_w) = g.outer;
+        r.x = x;
+        r.w = w;
+        r.line_x = x;
+        r.line_w = w;
+        r.ctl_w = ctl_w;
     }
 
     /// Marks an already-created child as one of the elastic pieces of the
@@ -7627,6 +8047,7 @@ fn build_ui_recorded(
         children: std::cell::RefCell::new(Vec::new()),
         slot: std::cell::Cell::new(None),
         flow: std::cell::RefCell::new(Vec::new()),
+        card: std::cell::Cell::new(None),
     };
     let content_x = MARGIN;
     let content_w = PAGE_W_DP - 2 * MARGIN;
@@ -7906,63 +8327,12 @@ fn build_ui_recorded(
     ctx.page.set(Some(Page::General));
     let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
     let change_w = 90;
-    // #873: Mode and Pause act at once, through the tray's own handlers.
-    let g = ctx.begin_row(&mut r, "&Mode", 0, 2);
-    let mode_combo = ctx.create(
-        WC_COMBOBOX,
-        "",
-        combo_style,
-        0,
-        r.control_x(),
-        g.control_y(),
-        CONTROL_W,
-        ROW_H * 5,
-        ID_MODE,
-    );
-    for m in MODE_CHOICES {
-        combo_add(mode_combo, m.label());
-    }
-    combo_select(mode_combo, config.mode.label());
-    ctx.end_row(&mut r, &g, Some((MODE_DESC, ID_ROW_DESC)));
+    ctx.page_title(&mut r, "General");
 
+    // -- Keys ----------------------------------------------------------------
+    let sec = ctx.begin_section(&mut r, "Keys");
     // The rows with only small buttons give their title the room.
     r.ctl_w = 2 * change_w + COL_GAP / 2;
-    let paused_now = crate::pause::is_paused_now();
-    let (can_pause, can_resume) = pause_buttons_enabled(paused_now);
-    let g = ctx.begin_row(
-        &mut r,
-        &pause_status_line(paused_now.then_some("Paused")),
-        ID_PAUSE_STATUS,
-        0,
-    );
-    let pause_button = ctx.create(
-        WC_BUTTON,
-        "&Pause...",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
-        0,
-        r.right() - 2 * change_w - COL_GAP / 2,
-        g.control_y(),
-        change_w,
-        ROW_H,
-        ID_PAUSE_BUTTON,
-    );
-    let resume_button = ctx.create(
-        WC_BUTTON,
-        "&Resume",
-        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
-        0,
-        r.right() - change_w,
-        g.control_y(),
-        change_w,
-        ROW_H,
-        ID_RESUME_BUTTON,
-    );
-    unsafe {
-        let _ = EnableWindow(pause_button, can_pause);
-        let _ = EnableWindow(resume_button, can_resume);
-    }
-    ctx.end_row(&mut r, &g, None);
-
     // The three key rows: what it is, and the button that changes it.
     for (label, id_label, button) in [
         (
@@ -8063,19 +8433,12 @@ fn build_ui_recorded(
     );
     ctx.end_row(&mut r, &g, Some((DOUBLE_PRESS_NOTE, ID_ROW_DESC)));
 
+    ctx.end_section(&mut r, sec);
+
+    // -- Card ----------------------------------------------------------------
+    let sec = ctx.begin_section(&mut r, "Card");
     let click_away = ctx.check_row(&mut r, CLICK_AWAY_LABEL, ID_CLICK_AWAY, None, 0);
     set_checkbox(click_away, config.options.click_away_dismiss);
-
-    // Autostart state is owned by Windows, not by Config. The box starts
-    // unchecked: the Run key is read by a worker once the window exists (#1105),
-    // so the box can never disagree with reality for long.
-    let autostart = ctx.check_row(&mut r, "Start with &Windows", ID_AUTOSTART, None, 0);
-    // Portable mode (#130) makes no registry writes, so the switch is greyed.
-    if crate::portable::is_portable() {
-        unsafe {
-            let _ = EnableWindow(autostart, false);
-        }
-    }
 
     // -- Card (General) ---------------------------------------------------------
     let g = ctx.begin_row(&mut r, CARD_SECONDS_LABEL, 0, 1);
@@ -8190,11 +8553,86 @@ fn build_ui_recorded(
         &card_monitor_display(&config.ui.card_monitor, monitors),
     );
     ctx.end_row(&mut r, &g, None);
+    ctx.end_section(&mut r, sec);
+
+    // -- Startup -------------------------------------------------------------
+    let sec = ctx.begin_section(&mut r, "Startup");
+    // Autostart state is owned by Windows, not by Config. The box starts
+    // unchecked: the Run key is read by a worker once the window exists (#1105),
+    // so the box can never disagree with reality for long.
+    let autostart = ctx.check_row(&mut r, "Start with &Windows", ID_AUTOSTART, None, 0);
+    // Portable mode (#130) makes no registry writes, so the switch is greyed.
+    if crate::portable::is_portable() {
+        unsafe {
+            let _ = EnableWindow(autostart, false);
+        }
+    }
+
+    // #873: Mode and Pause act at once, through the tray's own handlers.
+    let g = ctx.begin_row(&mut r, "&Mode", 0, 2);
+    let mode_combo = ctx.create(
+        WC_COMBOBOX,
+        "",
+        combo_style,
+        0,
+        r.control_x(),
+        g.control_y(),
+        CONTROL_W,
+        ROW_H * 5,
+        ID_MODE,
+    );
+    for m in MODE_CHOICES {
+        combo_add(mode_combo, m.label());
+    }
+    combo_select(mode_combo, config.mode.label());
+    ctx.end_row(&mut r, &g, Some((MODE_DESC, ID_ROW_DESC)));
+
+    // The rows with only small buttons give their title the room.
+    r.ctl_w = 2 * change_w + COL_GAP / 2;
+    let paused_now = crate::pause::is_paused_now();
+    let (can_pause, can_resume) = pause_buttons_enabled(paused_now);
+    let g = ctx.begin_row(
+        &mut r,
+        &pause_status_line(paused_now.then_some("Paused")),
+        ID_PAUSE_STATUS,
+        0,
+    );
+    let pause_button = ctx.create(
+        WC_BUTTON,
+        "&Pause...",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.right() - 2 * change_w - COL_GAP / 2,
+        g.control_y(),
+        change_w,
+        ROW_H,
+        ID_PAUSE_BUTTON,
+    );
+    let resume_button = ctx.create(
+        WC_BUTTON,
+        "&Resume",
+        BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
+        0,
+        r.right() - change_w,
+        g.control_y(),
+        change_w,
+        ROW_H,
+        ID_RESUME_BUTTON,
+    );
+    unsafe {
+        let _ = EnableWindow(pause_button, can_pause);
+        let _ = EnableWindow(resume_button, can_resume);
+    }
+    ctx.end_row(&mut r, &g, None);
+
+    ctx.end_section(&mut r, sec);
     page_bottom[Page::General.index()] = r.y;
 
     // -- Privacy -------------------------------------------------------------
     ctx.page.set(Some(Page::Privacy));
     let mut r = Rows::new(content_x, PAGE_TOP_PAD_DP, content_w);
+    ctx.page_title(&mut r, "Privacy");
+    let sec = ctx.begin_section(&mut r, "Screenshots and forms");
     // #341: a one-line note, since "screenshot detail" alone doesn't say what
     // changes or why it costs more.
     let g = ctx.begin_row(&mut r, "Screenshot &detail", 0, 1);
@@ -8280,6 +8718,7 @@ fn build_ui_recorded(
         require_tick_for_label(config.forms.require_tick_for),
     );
     ctx.end_row(&mut r, &g, None);
+    ctx.end_section(&mut r, sec);
     page_bottom[Page::Privacy.index()] = r.y;
 
     // -- Actions (#872): no setting yet, so one note, never an empty page ---
@@ -11418,7 +11857,18 @@ mod tests {
             for dpi in [96u32, 144] {
                 let fitted = fitted_height_for_work_px(1040, dpi);
                 for page in Page::ALL {
-                    let need = page_max_dp(inner, page) + FOOTER_H_DP + NC_HEIGHT_GUESS_DP;
+                    // #1292: the titles and gaps of a sectioned page are not
+                    // rows. The rows themselves must still fit; the page may
+                    // scroll by the section chrome (General: 176 dp). Pages
+                    // without sections have none, so their rule is unchanged.
+                    let sections = inner
+                        .children
+                        .iter()
+                        .filter(|c| c.page == Some(page))
+                        .filter(|c| unsafe { GetDlgCtrlID(c.hwnd) } == ID_SECTION_TITLE)
+                        .count() as i32;
+                    let chrome = crate::ui::settings_sections::chrome_h(sections);
+                    let need = page_max_dp(inner, page) - chrome + FOOTER_H_DP + NC_HEIGHT_GUESS_DP;
                     assert!(
                         need <= fitted,
                         "{page:?} needs {need} dp at {dpi} dpi, the window gets {fitted}"
@@ -11906,6 +12356,83 @@ mod tests {
                     assert!(line.y > top, "{page:?}: a hairline above the first row");
                 }
             }
+        });
+    }
+
+    /// #1292: the General page has a title and three titled sections; every
+    /// control of a section sits inside its card, a card starts 8 dp under its
+    /// title and the next title is 24 dp under a card, and the hairlines run the
+    /// card's full width.
+    #[test]
+    fn general_rows_sit_in_titled_section_cards() {
+        use crate::ui::settings_sections as sec;
+        with_window(Config::default(), |_hwnd, raw| {
+            let inner = unsafe { &*raw };
+            let general: Vec<&ChildLayout> = inner
+                .children
+                .iter()
+                .filter(|c| c.page == Some(Page::General))
+                .collect();
+            let by_id = |id: i32| -> Vec<&ChildLayout> {
+                general
+                    .iter()
+                    .copied()
+                    .filter(|c| unsafe { GetDlgCtrlID(c.hwnd) } == id)
+                    .collect()
+            };
+            let page_title = by_id(ID_PAGE_TITLE);
+            assert_eq!(page_title.len(), 1);
+            assert_eq!(get_text(page_title[0].hwnd), "General");
+            let titles = by_id(ID_SECTION_TITLE);
+            let cards = by_id(ID_SECTION_CARD);
+            let names: Vec<String> = titles.iter().map(|t| get_text(t.hwnd)).collect();
+            assert_eq!(names, ["Keys", "Card", "Startup"]);
+            assert_eq!(cards.len(), 3);
+            assert_eq!(
+                titles[0].y,
+                sec::first_section_top(page_title[0].y),
+                "first section under the page title"
+            );
+            for (i, (t, c)) in titles.iter().zip(&cards).enumerate() {
+                assert_eq!(c.y, sec::card_top(t.y), "card {i} sits under its title");
+                assert!(c.h > 3 * ROW_PITCH / 2, "card {i} is {} dp tall", c.h);
+                if let Some(next) = titles.get(i + 1) {
+                    assert_eq!(next.y, sec::next_section_top(c.y + c.h), "gap after {i}");
+                }
+            }
+            let boxes: Vec<sec::Box4> = cards.iter().map(|c| (c.x, c.y, c.w, c.h)).collect();
+            let mut held = 0;
+            for c in &general {
+                // A combo's recorded height is its drop-down's: use one row's.
+                let c_h = c.h.min(ROW_H);
+                let id = unsafe { GetDlgCtrlID(c.hwnd) };
+                if [ID_PAGE_TITLE, ID_SECTION_TITLE, ID_SECTION_CARD].contains(&id) {
+                    continue;
+                }
+                let n = boxes
+                    .iter()
+                    .filter(|b| sec::card_holds(**b, (c.x, c.y, c.w, c_h)))
+                    .count();
+                assert_eq!(n, 1, "id {id} at y {} is in {n} cards", c.y);
+                assert!(
+                    unsafe { card_of(c.hwnd) }.is_some(),
+                    "id {id} is not tied to its card"
+                );
+                if id == ID_ROW_SEPARATOR {
+                    let b = boxes
+                        .iter()
+                        .find(|b| sec::card_holds(**b, (c.x, c.y, c.w, c_h)))
+                        .unwrap();
+                    assert_eq!((c.x, c.w), (b.0, b.2), "a hairline runs the card's width");
+                } else {
+                    assert!(
+                        c.x >= boxes[0].0 + sec::CARD_PAD_DP,
+                        "id {id} touches the edge"
+                    );
+                }
+                held += 1;
+            }
+            assert!(held > 20, "only {held} controls were checked");
         });
     }
 
@@ -13579,22 +14106,24 @@ mod tests {
             contrast_ratio(relative_luminance(a), relative_luminance(b))
         };
         assert!(
-            ratio(edge, DARK.surface) >= 3.0,
+            ratio(edge, DARK.card) >= 3.0,
             "the unchecked box edge is {edge:#08x}"
         );
-        assert_eq!(face, DARK.surface, "the face behind the box");
+        // #1292: the box sits on a section card, so the card is behind it.
+        assert_eq!(face, DARK.card, "the card behind the box");
         assert_eq!(corner, accent, "a checked box is the accent");
         let (light_edge, light_corner, light_face, _) = probe(Theme::Light);
         assert_ne!(
             light_edge, edge,
             "light is the stock box, not the dark paint"
         );
-        // And it is what stock drawing gives: the system face behind the box
-        // and a checked box that is not the dark accent paint.
-        let system_face = unsafe {
-            windows::Win32::Graphics::Gdi::GetSysColor(windows::Win32::Graphics::Gdi::COLOR_3DFACE)
-        };
-        assert_eq!(light_face, system_face, "the stock face behind the box");
+        // And it is what stock drawing gives: the light card behind the box
+        // (#1292) and a checked box that is not the dark accent paint.
+        assert_eq!(
+            light_face,
+            crate::ui::theme::LIGHT.card,
+            "the light card behind the box"
+        );
         assert_ne!(light_face, DARK.surface);
         assert_ne!(light_corner, accent, "a stock checked box is not our fill");
     }
@@ -13632,11 +14161,11 @@ mod tests {
                 )
             };
             ui(1);
-            assert_eq!(printed_pixel(check, 0, mid), DARK.surface, "cue hidden");
+            assert_eq!(printed_pixel(check, 0, mid), DARK.card, "cue hidden");
             ui(2);
             let frame = printed_pixel(check, 0, mid);
             use crate::ui::theme::{contrast_ratio, relative_luminance};
-            let ratio = contrast_ratio(relative_luminance(frame), relative_luminance(DARK.surface));
+            let ratio = contrast_ratio(relative_luminance(frame), relative_luminance(DARK.card));
             assert!(ratio >= 3.0, "cue shown: the frame pixel is {frame:#08x}");
         });
     }
@@ -13934,7 +14463,7 @@ mod tests {
                         // The end mark the system draws under the rail's left end.
                         (cy + 6..rc.bottom)
                             .flat_map(|y| (rc.left..rc.left + 12).map(move |x| (x, y)))
-                            .filter(|&(x, y)| GetPixel(dc, x, y).0 != DARK.surface)
+                            .filter(|&(x, y)| GetPixel(dc, x, y).0 != DARK.card)
                             .count() as u32,
                     );
                     SelectObject(dc, old);
@@ -13955,7 +14484,7 @@ mod tests {
         assert_eq!(rail, DARK.control_border, "the rail after the thumb");
         assert_eq!(dot, accent, "the dot in the thumb");
         assert_eq!(disc, DARK.text, "the thumb");
-        assert_eq!(face, DARK.surface, "the background behind the rail");
+        assert_eq!(face, DARK.card, "the card behind the rail");
         assert_eq!(marks, 0, "no stock end mark under the rail");
         // Light keeps the stock trackbar: none of the four pixels is any colour
         // the dark paint uses.

@@ -187,6 +187,13 @@ pub(crate) struct Tokens {
     /// it reaches 3:1 against the surface and the fill (#582). `border` is
     /// decorative and does not. Settings draws it in dark only for now; light keeps `border` there until its own slice.
     pub(crate) control_border: u32,
+    /// The layer a Settings section's rows sit on (#1292): one step off the
+    /// page colour, like the Windows 11 Settings card. High contrast: the
+    /// system window colour.
+    pub(crate) card: u32,
+    /// The 1 px stroke around that card. Decorative, like `border`. High
+    /// contrast: the system window text colour.
+    pub(crate) card_stroke: u32,
 }
 
 /// Neither pure black nor pure white, per the card spec.
@@ -201,6 +208,8 @@ pub(crate) const LIGHT: Tokens = Tokens {
     danger: rgb(0xC4, 0x2B, 0x1C),
     control_fill: rgb(255, 255, 255),
     control_border: rgb(138, 138, 138),
+    card: rgb(251, 251, 251),
+    card_stroke: rgb(229, 229, 229),
 };
 
 pub(crate) const DARK: Tokens = Tokens {
@@ -214,6 +223,8 @@ pub(crate) const DARK: Tokens = Tokens {
     danger: rgb(0xFF, 0x99, 0xA4),
     control_fill: rgb(45, 45, 45),
     control_border: rgb(135, 135, 135),
+    card: rgb(43, 43, 43),
+    card_stroke: rgb(58, 58, 58),
 };
 
 /// The Windows system colours that matter in high contrast, read again on
@@ -268,6 +279,8 @@ impl Tokens {
                 mark_note: sys.highlight,
                 control_fill: sys.window,
                 control_border: sys.window_text,
+                card: sys.window,
+                card_stroke: sys.window_text,
             },
         }
     }
@@ -491,6 +504,12 @@ pub(crate) const SPACE_MD_DP: i32 = 12;
 pub(crate) const SPACE_LG_DP: i32 = 16;
 #[allow(dead_code)] // ramp token for surfaces not yet moved onto it
 pub(crate) const SPACE_XL_DP: i32 = 24;
+
+/// The gap between two Settings sections, and under the last one (#1292).
+/// Windows 11 Settings leaves 24 between a card and the next section title.
+pub(crate) const SECTION_GAP_DP: i32 = SPACE_XL_DP;
+/// Corner radius of a Settings card, in dp.
+pub(crate) const CARD_RADIUS_DP: i32 = 8;
 
 /// Outer margin around a surface, in dp.
 pub(crate) const MARGIN_DP: i32 = SPACE_LG_DP;
