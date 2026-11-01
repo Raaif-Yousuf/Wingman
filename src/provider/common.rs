@@ -233,7 +233,7 @@ fn is_provably_unsent(e: &ureq::Error) -> bool {
 /// local Ollama call (prompt plus screenshot) would go to the proxy unless
 /// `NO_PROXY` happened to list it. A loopback address never uses a proxy; any
 /// other address keeps the environment's proxy settings.
-fn agent_for(url: &str) -> ureq::Agent {
+pub(crate) fn agent_for(url: &str) -> ureq::Agent {
     agent_with_base(url, ureq::Agent::config_builder())
 }
 
@@ -3285,6 +3285,68 @@ mod tests {
             0
         );
         assert_eq!(agent_for("http://127.0.0.1:1/").config().max_redirects(), 0);
+    }
+
+    /// #1265: outside `provider/common.rs` (the shared builder) and
+    /// `inputs/web_page.rs` (follows and re-checks each hop itself, on
+    /// purpose), no non-test code in `src/` may build a `ureq` agent or
+    /// call a bare `ureq::post`/`get`, which follow redirects by default.
+    #[test]
+    fn no_other_file_builds_a_ureq_agent_that_follows_redirects() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 20, "the scan found too few files");
+        let banned = [
+            "ureq::get(",
+            "ureq::post(",
+            "ureq::put(",
+            "ureq::delete(",
+            "ureq::head(",
+            "ureq::patch(",
+            "ureq::request(",
+            "ureq::agent(",
+            "Agent::new_with",
+            "Agent::with_parts",
+            "config_builder(",
+        ];
+        let mut scanned_oauth = false;
+        for path in files {
+            let name = path.to_string_lossy().replace('\\', "/");
+            if name.ends_with("provider/common.rs") || name.ends_with("inputs/web_page.rs") {
+                continue;
+            }
+            scanned_oauth |= name.ends_with("connectors/oauth.rs");
+            let whole = std::fs::read_to_string(&path).unwrap().replace('\r', "");
+            let code = whole
+                .split(
+                    "
+#[cfg(test)]",
+                )
+                .next()
+                .unwrap();
+            for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                for bad in banned {
+                    assert!(
+                        !line.contains(bad),
+                        "{name}: `{bad}` builds an agent that follows redirects; use provider::common::agent_for"
+                    );
+                }
+            }
+        }
+        assert!(scanned_oauth, "the scan never reached connectors/oauth.rs");
     }
 
     /// #1157: every `ureq` send in this file must be built from
