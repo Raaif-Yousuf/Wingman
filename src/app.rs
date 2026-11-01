@@ -3813,6 +3813,11 @@ impl App {
             self.show_busy_card();
             return;
         }
+        // #1256: Pause means nothing runs, even the model-free actions.
+        if let Err((headline, detail)) = actions::extract_text::gate(pause::is_paused_now()) {
+            self.card.show_answer(headline, detail, 3, None);
+            return;
+        }
 
         if self.refuse_if_password_manager() {
             return;
@@ -3841,6 +3846,11 @@ impl App {
         // would overlap. The picked region is dropped, as on a busy press.
         if self.busy_now() {
             self.show_busy_card();
+            return;
+        }
+        // #1256: Pause may have been turned on while the selector was open.
+        if let Err((headline, detail)) = actions::extract_text::gate(pause::is_paused_now()) {
+            self.card.show_answer(headline, detail, 3, None);
             return;
         }
 
@@ -14194,6 +14204,37 @@ mod tests {
         let between = &body[select..spawn];
         assert!(between.contains("busy_now()"), "{between}");
         assert!(between.contains("show_busy_card()"), "{between}");
+    }
+
+    /// #1256: Pause means nothing runs, so `copy_region` shows the Paused
+    /// card after the busy check and before the selector opens, and the
+    /// palette reaches it through `dispatch_palette_target`.
+    #[test]
+    fn copy_region_honours_pause_before_the_selector() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn copy_region(", "\n    fn ");
+        let busy = body.find("busy_now()").expect("busy check");
+        let gate = "actions::extract_text::gate(pause::is_paused_now())";
+        let paused = body
+            .find(gate)
+            .unwrap_or_else(|| panic!("copy_region lost its Pause gate:\n{body}"));
+        let select = body.find("select_region(").expect("opens the selector");
+        assert!(busy < paused && paused < select, "{body}");
+        // The selector pumps its own message loop, so Pause can be turned on
+        // while it is open: check again before the clipboard write is spawned.
+        let spawn = body.find("spawn_executor(").expect("spawns the worker");
+        let again = body[select..spawn]
+            .find(gate)
+            .unwrap_or_else(|| panic!("no Pause re-check after the selector:\n{body}"));
+        assert!(
+            body[select + again..spawn].contains("show_answer("),
+            "{body}"
+        );
+        let dispatch = body_between(&src, "    fn dispatch_palette_target(", "\n    }\n");
+        assert!(
+            dispatch.contains("DispatchTarget::CopyRegion) => self.copy_region()"),
+            "{dispatch}"
+        );
     }
 
     #[test]
