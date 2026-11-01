@@ -30,6 +30,19 @@ pub struct GalleryArgs {
     /// (`tray-menu`, `card-options`), so one surface can be looked at without
     /// rendering the whole gallery.
     pub only: Option<String>,
+    /// Flags after `--ui-gallery` that the gallery does not know (#1270). The
+    /// driver refuses to run with any, so a mistyped flag cannot fall into the
+    /// interactive window and wait for a person.
+    pub unknown: Vec<String>,
+}
+
+/// The error for flags the gallery does not know (#1270).
+#[cfg(any(test, debug_assertions))]
+pub fn unknown_flags_message(unknown: &[String]) -> String {
+    format!(
+        "unknown flag {} after --ui-gallery; known flags: --screenshot <dir> (or --out <dir>), --theme <name>, --dpi <percent>, --matrix, --only <prefix>",
+        unknown.join(", ")
+    )
 }
 
 /// How long a screenshot run may take before it is given up as hung (#1270):
@@ -127,8 +140,11 @@ pub fn theme_from_arg(name: &str) -> Option<crate::ui::theme::Theme> {
 }
 
 /// Recognizes `--ui-gallery` (optionally followed anywhere later by
-/// `--screenshot <dir>`, `--theme <name>`, `--dpi <percent>` and `--matrix`) among `args` (normally `std::env::args().skip(1)`
-/// collected by the caller). Returns `None` when `--ui-gallery` is absent.
+/// `--screenshot <dir>` (or `--out <dir>`), `--theme <name>`, `--dpi <percent>`,
+/// `--only <prefix>` and `--matrix`) among `args` (normally
+/// `std::env::args().skip(1)` collected by the caller). Returns `None` when
+/// `--ui-gallery` is absent. Any other `--flag` after it lands in `unknown`,
+/// which the driver turns into an error (#1270).
 /// `--screenshot` with no following value is treated as if `--screenshot`
 /// were absent (documented, not an error): the gallery still runs
 /// interactively rather than aborting on a typo.
@@ -141,6 +157,8 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
     let mut dpi = None;
     let mut matrix = false;
     let mut only = None;
+    let mut unknown = Vec::new();
+    let mut seen_gallery = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a == "--screenshot" || a == "--out" {
@@ -161,6 +179,10 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
             if let Some(prefix) = iter.next() {
                 only = Some(prefix.clone());
             }
+        } else if a == "--ui-gallery" {
+            seen_gallery = true;
+        } else if seen_gallery && a.starts_with("--") {
+            unknown.push(a.clone());
         }
     }
     Some(GalleryArgs {
@@ -169,6 +191,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
         dpi,
         matrix,
         only,
+        unknown,
     })
 }
 
@@ -500,6 +523,12 @@ mod driver {
     /// first state and lets Left/Right step through the rest until the
     /// window closes.
     pub fn run_gallery(args: GalleryArgs) -> anyhow::Result<()> {
+        // Before any window: a mistyped flag must end the run, not open the
+        // interactive gallery and wait for a person (#1270).
+        anyhow::ensure!(
+            args.unknown.is_empty(),
+            unknown_flags_message(&args.unknown)
+        );
         unsafe {
             let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
                 windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -1789,6 +1818,80 @@ mod tests {
     }
 
     #[test]
+    fn out_is_another_name_for_screenshot() {
+        // #1270: `--out <dir>` was ignored, so the run fell into the
+        // interactive window and never exited.
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only", "tray", "--out", "d"]))
+            .expect("--ui-gallery is present");
+        assert_eq!(parsed.screenshot_dir, Some(PathBuf::from("d")));
+        assert!(parsed.unknown.is_empty());
+    }
+
+    #[test]
+    fn unknown_flags_after_ui_gallery_are_collected() {
+        let parsed = parse_gallery_args(&args(&[
+            "--ui-gallery",
+            "--only",
+            "tray",
+            "--outt",
+            "d",
+            "--matrx",
+        ]))
+        .unwrap();
+        // "d" is a value, not a flag.
+        assert_eq!(
+            parsed.unknown,
+            vec!["--outt".to_string(), "--matrx".to_string()]
+        );
+    }
+
+    #[test]
+    fn flags_before_ui_gallery_and_known_flags_are_not_unknown() {
+        let parsed = parse_gallery_args(&args(&[
+            "--foo",
+            "--ui-gallery",
+            "--screenshot",
+            "d",
+            "--theme",
+            "dark",
+            "--dpi",
+            "150",
+            "--matrix",
+            "--only",
+            "tray",
+            "--out",
+            "e",
+        ]))
+        .unwrap();
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+    }
+
+    #[test]
+    fn the_unknown_flag_error_names_the_flag_and_the_known_ones() {
+        let msg = unknown_flags_message(&["--outt".to_string()]);
+        assert!(msg.contains("--outt"));
+        for known in [
+            "--screenshot",
+            "--out",
+            "--theme",
+            "--dpi",
+            "--matrix",
+            "--only",
+        ] {
+            assert!(msg.contains(known), "{msg}");
+        }
+    }
+
+    #[test]
+    fn watchdog_limit_grows_with_shots_and_has_a_floor() {
+        assert_eq!(watchdog_limit(0), Duration::from_secs(30));
+        assert_eq!(watchdog_limit(1), Duration::from_secs(30));
+        // A whole matrix of 24 shots takes about 33 s: the limit stays above it.
+        assert!(watchdog_limit(24) >= Duration::from_secs(120));
+        assert!(watchdog_limit(25) > watchdog_limit(24));
+    }
+
+    #[test]
     fn only_names_a_state_prefix() {
         let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only", "tray-menu"]))
             .expect("--ui-gallery is present");
@@ -1959,7 +2062,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_args_interspersed_do_not_confuse_parsing() {
+    fn garbage_args_interspersed_do_not_confuse_parsing_and_unknown_flags_are_listed() {
         assert_eq!(
             parse_gallery_args(&args(&[
                 "--foo",
@@ -1972,6 +2075,7 @@ mod tests {
             ])),
             Some(GalleryArgs {
                 screenshot_dir: Some(PathBuf::from("C:\\out dir")),
+                unknown: vec!["--baz".to_string(), "--qux".to_string()],
                 ..Default::default()
             })
         );
