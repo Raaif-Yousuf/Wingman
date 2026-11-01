@@ -9241,6 +9241,8 @@ enum ExecDone {
     /// The undo is carried here for the shared card Undo slot (#1281).
     FixText {
         report: actions::generic_replace::ReplaceReport,
+        // Read once #1281 adds the shared card Undo slot.
+        #[allow(dead_code)]
         undo: Option<executors::Undo>,
     },
     FormFill(anyhow::Result<executors::Undo>),
