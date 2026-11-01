@@ -182,7 +182,13 @@ fn classify(result: Result<(Vec<String>, bool)>) -> KeyCheck {
             // Gemini says a bad key with a 400 (or a 403) and a reason in the
             // body. A bare 403 is a restricted key, a region block or an API
             // not enabled, so it says nothing about the key (#1135).
-            400 | 403 => err.to_string().contains(common::KIND_KEY_INVALID),
+            // Match the exact marker `http_error` writes, not the bare word,
+            // which a vendor's free text could contain.
+            400 | 403 => err.to_string().contains(&format!(
+                "HTTP {} ({})",
+                http.status,
+                common::KIND_KEY_INVALID
+            )),
             _ => false,
         });
     if refused {
@@ -664,6 +670,18 @@ mod key_check_tests {
                 let got = check_key_with(vendor, "key", &|_, _| Err(status_error(403, body)));
                 assert!(matches!(got, KeyCheck::Unchecked), "{vendor:?} {body}");
             }
+        }
+    }
+
+    /// Free text in a body that mentions the marker word is not the marker.
+    #[test]
+    fn free_text_naming_key_invalid_does_not_reject() {
+        for code in [400u16, 403] {
+            let body = r#"{"error":{"message":"this is not a key_invalid case (key_invalid)"}}"#;
+            let got = check_key_with(Vendor::Gemini, "AIza", &|_, _| {
+                Err(status_error(code, body))
+            });
+            assert!(matches!(got, KeyCheck::Unchecked), "{code}");
         }
     }
 
