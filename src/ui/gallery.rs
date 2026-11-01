@@ -9,8 +9,10 @@
 //! wired-to-nothing manual check described in the PR, not by `cargo test`).
 
 use std::path::PathBuf;
+#[cfg(any(test, debug_assertions))]
+use std::time::Duration;
 
-/// Parsed `--ui-gallery [--screenshot <dir>] [--theme <name>] [--dpi <percent>]
+/// Parsed `--ui-gallery [--screenshot <dir> | --out <dir>] [--theme <name>] [--dpi <percent>]
 /// [--matrix]` invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GalleryArgs {
@@ -28,6 +30,15 @@ pub struct GalleryArgs {
     /// (`tray-menu`, `card-options`), so one surface can be looked at without
     /// rendering the whole gallery.
     pub only: Option<String>,
+}
+
+/// How long a screenshot run may take before it is given up as hung (#1270):
+/// 30 s, or 5 s per picture when that is more. A real shot takes about
+/// 1.5 s (MEASURED 2026-11-01: 24 tray shots in 33 s), so this never fires on
+/// a healthy run.
+#[cfg(any(test, debug_assertions))]
+pub fn watchdog_limit(shots: usize) -> Duration {
+    Duration::from_secs(30u64.max(5 * shots as u64))
 }
 
 /// The themes `--matrix` renders, by their `--theme` names.
@@ -132,7 +143,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
     let mut only = None;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
-        if a == "--screenshot" {
+        if a == "--screenshot" || a == "--out" {
             if let Some(dir) = iter.next() {
                 screenshot_dir = Some(PathBuf::from(dir));
             }
@@ -468,6 +479,22 @@ mod driver {
         MSG, PM_REMOVE, WM_KEYDOWN, WM_PRINT,
     };
 
+    /// Ends the process with exit code 1 if a screenshot run is still going
+    /// after [`watchdog_limit`]. A modal loop that is never dismissed (a menu,
+    /// a drop list) cannot be interrupted from the thread that runs it, so a
+    /// thread that does not pump messages is the one that can end the run.
+    fn start_watchdog(shots: usize) {
+        let limit = watchdog_limit(shots);
+        std::thread::spawn(move || {
+            std::thread::sleep(limit);
+            eprintln!(
+                "Wingman: --ui-gallery did not finish within {} s; giving up",
+                limit.as_secs()
+            );
+            std::process::exit(1);
+        });
+    }
+
     /// Runs the gallery. With `args.screenshot_dir` set, drives every state
     /// non-interactively, screenshots it, and exits; otherwise shows the
     /// first state and lets Left/Right step through the rest until the
@@ -504,6 +531,7 @@ mod driver {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("--matrix needs --screenshot <dir>"))?;
             std::fs::create_dir_all(dir)?;
+            start_watchdog(states.len() * MATRIX_THEMES.len() * MATRIX_SCALES.len());
             for state in &states {
                 for theme_name in MATRIX_THEMES {
                     for percent in MATRIX_SCALES {
@@ -541,6 +569,7 @@ mod driver {
 
         if let Some(dir) = &args.screenshot_dir {
             std::fs::create_dir_all(dir)?;
+            start_watchdog(states.len());
             for state in &states {
                 let path = dir.join(screenshot_filename(state_name(*state)));
                 shoot(
