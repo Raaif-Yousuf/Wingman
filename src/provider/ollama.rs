@@ -213,12 +213,17 @@ impl Ollama {
     /// `think: true` to such a model is a 400 (#1266, MEASURED 2026-10-17).
     /// With no live answer it stays `true` (today's behaviour).
     fn may_think(&self) -> bool {
+        // A refusal from the server beats a cached list (a re-pull can make
+        // the list stale); see `complete`.
+        if is_no_think(&self.base_url, &self.model) {
+            return false;
+        }
         match cache_get(&self.base_url, &self.model) {
             Some(shown) if !shown.capabilities.is_empty() => {
                 shown.capabilities.iter().any(|c| c == "thinking")
             }
-            // No list: try, unless this model already refused (see `complete`).
-            _ => !is_no_think(&self.base_url, &self.model),
+            // No list: try.
+            _ => true,
         }
     }
 
@@ -923,6 +928,33 @@ mod tests {
         assert_eq!(think_of(&seen[1]), true);
         assert_eq!(think_of(&seen[2]), false);
         // Remembered: the next body skips the 400 altogether.
+        assert_eq!(provider.build_body(&req("sys", false))["think"], false);
+    }
+
+    #[test]
+    fn a_stale_thinking_list_is_overruled_by_the_400() {
+        let (base, seen) = fake_server(vec![
+            (
+                "200 OK",
+                r#"{"capabilities":["completion","vision","thinking"]}"#,
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"\"gemma3:4b\" does not support thinking"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"message":{"role":"assistant","content":"ok"},"done_reason":"stop"}"#,
+            ),
+        ]);
+        let provider = Ollama::new(&base, "gemma3:4b", "high");
+        provider.complete(&req("sys", false)).expect("resent");
+        let seen = seen.lock().unwrap();
+        let think_of = |r: &str| -> Value {
+            serde_json::from_str::<Value>(r.split_once(' ').unwrap().1).unwrap()["think"].clone()
+        };
+        assert_eq!(think_of(&seen[1]), true);
+        assert_eq!(think_of(&seen[2]), false);
         assert_eq!(provider.build_body(&req("sys", false))["think"], false);
     }
 
