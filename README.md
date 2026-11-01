@@ -61,7 +61,7 @@ palette (the full list is in `actions.example.toml` and
 - **Review this email**: screenshots, proposes edited text, and on confirm
   replaces the selected text via the `replace_text` executor.
 - **Fill this form**: screenshots, proposes field values, and on confirm
-  fills the form via the `fill_form` executor (with **Restore last form**
+  fills the form via the `fill_form` executor (with **Undo last action**
   to undo). Goes through the same Look, Propose, Confirm, Do loop as the
   others: `App::on_preview_decided` reads the card's confirmed proposal and
   calls `confirm::confirm(...)` before the executor runs.
