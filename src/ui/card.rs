@@ -882,15 +882,21 @@ struct Palette {
 
 /// The card's colours for `theme`, from the shared tokens (#362). Light and
 /// dark are fixed; high contrast takes the system colours in `sys`.
-fn palette_for(theme: Theme, sys: &SysColors) -> Palette {
+fn palette_for(theme: Theme, sys: &SysColors, accent: crate::ui::theme::AccentShades) -> Palette {
     let tokens = Tokens::for_theme(theme, sys);
+    // Links follow the user's accent in light and dark (#998); high contrast
+    // keeps the system hotlight the token already holds.
+    let link = match theme {
+        Theme::HighContrast => tokens.link,
+        _ => crate::ui::theme::link_ink(theme, accent, tokens.surface),
+    };
     Palette {
         bg: tokens.surface,
         border: tokens.border,
         headline: tokens.text,
         detail: tokens.text_dim,
         hint: tokens.text_faint,
-        link: tokens.link,
+        link,
         danger: tokens.danger,
     }
 }
@@ -2195,7 +2201,7 @@ impl CardInner {
 
     /// The card's colours in its current theme.
     fn palette(&self) -> Palette {
-        palette_for(self.theme, &self.sys)
+        palette_for(self.theme, &self.sys, self.accent_shades)
     }
 
     /// The colours for the preview buttons while high contrast is on, from
@@ -7246,7 +7252,7 @@ mod tests {
             let preview = card.inner.preview.as_ref().unwrap();
             let (do_it, edit) = (preview.do_it_btn, preview.edit_btn.unwrap());
             let do_px = drawn_pixel(&mut card, do_it, ID_PREVIEW_DO_IT, 0, 8, 12);
-            let bg = palette_for(theme, &SysColors::read()).bg;
+            let bg = palette_for(theme, &SysColors::read(), theme::DEFAULT_ACCENT).bg;
             assert_eq!(
                 do_px,
                 system_accent(theme, bg),
@@ -7255,7 +7261,7 @@ mod tests {
             let edit_px = drawn_pixel(&mut card, edit, ID_PREVIEW_EDIT, 0, 8, 12);
             assert_eq!(
                 edit_px,
-                palette_for(theme, &SysColors::read()).bg,
+                palette_for(theme, &SysColors::read(), theme::DEFAULT_ACCENT).bg,
                 "Edit is an outline on the card background"
             );
         }
@@ -7635,7 +7641,7 @@ mod tests {
     #[test]
     fn the_high_contrast_palette_is_the_system_colours() {
         let sys = theme::HC_BLACK;
-        let p = palette_for(Theme::HighContrast, &sys);
+        let p = palette_for(Theme::HighContrast, &sys, theme::DEFAULT_ACCENT);
         assert_eq!(p.bg, sys.window);
         assert_eq!(p.headline, sys.window_text);
         assert_eq!(p.detail, sys.window_text);
@@ -7645,7 +7651,10 @@ mod tests {
         );
         assert_eq!(p.danger, sys.window_text);
         // Dark ignores the system colours.
-        assert_eq!(palette_for(Theme::Dark, &sys).bg, theme::DARK.surface);
+        assert_eq!(
+            palette_for(Theme::Dark, &sys, theme::DEFAULT_ACCENT).bg,
+            theme::DARK.surface
+        );
     }
 
     #[test]
@@ -7681,12 +7690,29 @@ mod tests {
     }
 
     #[test]
+    fn the_card_palette_link_follows_the_accent_it_is_given() {
+        let sys = SysColors::read();
+        let green = theme::AccentShades {
+            light2: theme::rgb(0x6C, 0xE0, 0x9A),
+            dark1: theme::rgb(0x00, 0x7A, 0x3D),
+        };
+        for t in [Theme::Light, Theme::Dark] {
+            let blue = palette_for(t, &sys, theme::DEFAULT_ACCENT).link;
+            let other = palette_for(t, &sys, green).link;
+            assert_ne!(
+                blue, other,
+                "{t:?}: the accent argument must reach the link"
+            );
+        }
+    }
+
+    #[test]
     fn footer_links_use_the_link_colour_not_the_hint() {
-        let p = palette_for(Theme::HighContrast, &theme::HC_BLACK);
+        let p = palette_for(Theme::HighContrast, &theme::HC_BLACK, theme::DEFAULT_ACCENT);
         assert_eq!(p.link, theme::HC_BLACK.hotlight);
         assert_ne!(p.link, p.hint);
-        let l = palette_for(Theme::Light, &theme::HC_BLACK);
-        assert_eq!(l.link, l.hint);
+        let l = palette_for(Theme::Light, &theme::HC_BLACK, theme::DEFAULT_ACCENT);
+        assert_ne!(l.link, l.hint, "#998: light links are not hint text");
     }
 
     #[test]
@@ -7820,7 +7846,7 @@ mod tests {
     fn card_palettes_keep_the_colours_they_always_had() {
         // #362 slice 1 moved the values into `theme`; the card must paint
         // exactly what it painted before. Literal numbers on purpose.
-        let d = palette_for(Theme::Dark, &SysColors::read());
+        let d = palette_for(Theme::Dark, &SysColors::read(), theme::DEFAULT_ACCENT);
         assert_eq!(
             (d.bg, d.border, d.headline, d.detail, d.hint),
             (
@@ -7831,7 +7857,7 @@ mod tests {
                 0x008C_8C8C
             )
         );
-        let l = palette_for(Theme::Light, &SysColors::read());
+        let l = palette_for(Theme::Light, &SysColors::read(), theme::DEFAULT_ACCENT);
         assert_eq!(
             (l.bg, l.border, l.headline, l.detail, l.hint),
             (
@@ -7855,12 +7881,12 @@ mod tests {
         // come from the same Palette the rest of the card paints with, not
         // a hardcoded pair -- otherwise dark mode gets a bright rectangle in
         // the one place the user reads carefully before confirming.
-        let dark = palette_for(Theme::Dark, &SysColors::read());
+        let dark = palette_for(Theme::Dark, &SysColors::read(), theme::DEFAULT_ACCENT);
         let (dark_text, dark_bg) = edit_field_colors(&dark, Theme::Dark, 0);
         assert_eq!(dark_bg, field_look(&dark, Theme::Dark, 0).fill);
         assert_eq!(dark_text, dark.headline);
 
-        let light = palette_for(Theme::Light, &SysColors::read());
+        let light = palette_for(Theme::Light, &SysColors::read(), theme::DEFAULT_ACCENT);
         let (light_text, light_bg) = edit_field_colors(&light, Theme::Light, 0);
         assert_eq!(light_bg, field_look(&light, Theme::Light, 0).fill);
         assert_eq!(light_text, light.headline);
@@ -7917,7 +7943,7 @@ mod tests {
         let sys = SysColors::read();
         let mut checked = 0;
         for theme in [Theme::Light, Theme::Dark] {
-            let p = palette_for(theme, &sys);
+            let p = palette_for(theme, &sys, theme::DEFAULT_ACCENT);
             let f = field_look(&p, theme, 0);
             let ratio =
                 |a: u32, b: u32| contrast_ratio(relative_luminance(a), relative_luminance(b));
@@ -7928,7 +7954,7 @@ mod tests {
             checked += 1;
         }
         // High contrast: the system colours, no custom fill.
-        let hc = palette_for(Theme::HighContrast, &theme::HC_BLACK);
+        let hc = palette_for(Theme::HighContrast, &theme::HC_BLACK, theme::DEFAULT_ACCENT);
         let f = field_look(&hc, Theme::HighContrast, theme::HC_BLACK.highlight);
         assert_eq!((f.fill, f.border, f.text), (hc.bg, hc.border, hc.headline));
         assert_ne!(f.border, f.fill);
@@ -8667,7 +8693,7 @@ mod tests {
         let brush = result.expect("WM_CTLCOLOREDIT must be handled, not fall through to Def*");
         assert_ne!(brush.0, 0, "must return a real brush, not NULL");
 
-        let dark = palette_for(Theme::Dark, &SysColors::read());
+        let dark = palette_for(Theme::Dark, &SysColors::read(), theme::DEFAULT_ACCENT);
         let text_after = unsafe { GetTextColor(hdc) };
         let bg_after = unsafe { GetBkColor(hdc) };
         assert_eq!(text_after.0, dark.headline);
