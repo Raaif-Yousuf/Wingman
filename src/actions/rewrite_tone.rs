@@ -18,6 +18,9 @@ use super::{Action, InputKind, Prefer};
 pub const SHORTER_ID: &str = "rewrite-shorter";
 pub const FRIENDLIER_ID: &str = "rewrite-friendlier";
 pub const FORMAL_ID: &str = "rewrite-formal";
+/// "Simplify this text" (#1278): a plain-language rewrite, listed after the
+/// tones.
+pub const SIMPLIFY_ID: &str = "simplify-text";
 
 /// The shared prompt start. Only the rewrite comes back, so it can replace
 /// the selection as is. Keeping facts and names is the load-bearing part: a
@@ -70,7 +73,18 @@ pub fn builtin_actions() -> Vec<Action> {
             "Rewrite: more formal",
             "in a more formal, professional tone. Avoid slang, contractions and casual phrases, and do not make it much longer.",
         ),
+        simplify_action(),
     ]
+}
+
+/// "Simplify this text": plain words and short sentences at a lower reading
+/// level. Same proposal and executor as the tones. Its own prompt, because
+/// the shared end tells the model to change only the wording and tone, and
+/// this one must also say when meaning would be lost.
+fn simplify_action() -> Action {
+    let mut a = tone_action(SIMPLIFY_ID, "Simplify this text", "");
+    a.prompt = "You are given a piece of text the user selected, such as a policy, a contract clause or a paper abstract. Rewrite it in plain words and short sentences, at a lower reading level, so a general reader understands it the first time. Replace jargon and long phrases with everyday words, and split long sentences. Keep the meaning, facts and the language of the original, and keep every number, name and date exactly as written. Do not add information that is not in the text. If part of it cannot be simplified without losing meaning, keep that part as written and add a last line starting with \"Note:\" that says which part and why. Keep the line breaks and formatting characters where they still make sense. Return only the rewritten text in `text`, with no quotation marks or explanation. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them.".to_string();
+    a
 }
 
 #[cfg(test)]
@@ -81,13 +95,13 @@ mod tests {
     fn there_are_three_distinct_tone_actions() {
         let actions = builtin_actions();
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, [SHORTER_ID, FRIENDLIER_ID, FORMAL_ID]);
+        assert_eq!(ids, [SHORTER_ID, FRIENDLIER_ID, FORMAL_ID, SIMPLIFY_ID]);
         let prompts: std::collections::HashSet<&str> =
             actions.iter().map(|a| a.prompt.as_str()).collect();
-        assert_eq!(prompts.len(), 3, "each tone has its own prompt");
+        assert_eq!(prompts.len(), 4, "each tone has its own prompt");
         let names: std::collections::HashSet<&str> =
             actions.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names.len(), 3);
+        assert_eq!(names.len(), 4);
     }
 
     #[test]
@@ -135,12 +149,41 @@ mod tests {
     }
 
     #[test]
+    fn simplify_asks_for_plain_words_and_keeps_every_fact() {
+        let p = builtin_actions()
+            .into_iter()
+            .find(|a| a.id == SIMPLIFY_ID)
+            .unwrap()
+            .prompt;
+        for needle in [
+            "plain words",
+            "short sentences",
+            "reading level",
+            "cannot be simplified without losing meaning",
+            "every number, name and date exactly",
+        ] {
+            assert!(p.contains(needle), "simplify prompt lacks {needle}");
+        }
+        assert!(!p.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn simplify_sits_right_after_formal() {
+        let ids: Vec<String> = crate::actions::builtin_actions()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        let at = ids.iter().position(|i| i == FORMAL_ID).unwrap();
+        assert_eq!(ids[at + 1], SIMPLIFY_ID);
+    }
+
+    #[test]
     fn the_actions_are_visible_by_default_and_dispatch_generically() {
         let shown = crate::actions::visible(
             crate::actions::merge_actions(crate::actions::builtin_actions(), vec![]),
             &[],
         );
-        for id in [SHORTER_ID, FRIENDLIER_ID, FORMAL_ID] {
+        for id in [SHORTER_ID, FRIENDLIER_ID, FORMAL_ID, SIMPLIFY_ID] {
             assert!(shown.iter().any(|r| r.action.id == id), "{id}");
             assert_eq!(
                 crate::ui::palette_model::dispatch_target_for(id),
