@@ -816,16 +816,20 @@ pub(crate) fn post_json_with(
             // as a fresh attempt; surfaces immediately, naming the status
             // that was received so the card is honest about what's known.
             Err(TransportError::BodyReadFailed { status, error }) => {
+                count_unconfirmed(tag, url, body);
                 return Err(anyhow!(
-                    "{tag}: HTTP {status} received, then failed reading the response body: {}",
+                    "{tag}: HTTP {status} received, then failed reading the response body{}: {}",
+                    billed_note(tag, url),
                     redact_detail(&error)
                 ));
             }
             // #727: the request may have arrived and been billed; a second
             // send could charge again, so this surfaces as a card at once.
             Err(TransportError::TimedOut(e)) => {
+                count_unconfirmed(tag, url, body);
                 return Err(anyhow!(
-                    "{tag}: the connection failed after the request may have been sent, so it was not sent again: {}",
+                    "{tag}: the connection failed after the request may have been sent, so it was not sent again{}: {}",
+                    billed_note(tag, url),
                     redact_detail(&e)
                 ));
             }
@@ -895,6 +899,30 @@ pub(crate) fn post_json_with(
     }
 }
 
+/// #1284: counts a request that failed after it may have been sent, once.
+fn count_unconfirmed(tag: &str, url: &str, request: &Value) {
+    let model = egress::model_from(url, request);
+    crate::usage::record_unconfirmed(tag, url, model.as_deref());
+}
+
+/// #1284: the egress row's note that the failed request was counted.
+fn egress_counted_note(tag: &str, url: &str) -> &'static str {
+    if crate::usage::can_be_billed(tag, url) {
+        " (counted as one unpriced request)"
+    } else {
+        ""
+    }
+}
+
+/// #1284: the card text for a paid request that failed after it was sent.
+fn billed_note(tag: &str, url: &str) -> &'static str {
+    if crate::usage::can_be_billed(tag, url) {
+        " (it may have been billed and was counted in today's spend)"
+    } else {
+        ""
+    }
+}
+
 /// #487: what a successful response cost, for its egress row.
 fn success_cost(tag: &str, url: &str, request: &Value, response: &str) -> Option<f64> {
     let model = egress::model_from(url, request);
@@ -956,7 +984,10 @@ fn log_attempt(
             bytes_sent,
             0,
             egress::Outcome::Failure,
-            Some(&format!("failed after send: {e}")),
+            Some(&format!(
+                "failed after send: {e}{}",
+                egress_counted_note(tag, url)
+            )),
         ),
         Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
             tag,
@@ -966,7 +997,10 @@ fn log_attempt(
             bytes_sent,
             0,
             egress::Outcome::Failure,
-            Some(&format!("HTTP {status} then body read failed: {error}")),
+            Some(&format!(
+                "HTTP {status} then body read failed: {error}{}",
+                egress_counted_note(tag, url)
+            )),
         ),
     };
     record_entry(entry, redactions);
@@ -2427,6 +2461,96 @@ mod tests {
         assert!(text.contains("not sent again"), "{text}");
         assert!(text.contains("timeout: global"), "{text}");
         assert!(!text.contains('\u{2014}'), "{text}");
+    }
+
+    // -- #1284: a request that failed after it may have been sent is billed
+    // by the vendor, so it counts once toward today's spend -----------------
+
+    fn run_url(
+        url: &str,
+        transport: &ScriptedTransport,
+    ) -> (
+        Result<String>,
+        crate::usage::DayTotal,
+        crate::usage::DayTotal,
+    ) {
+        let _u = crate::usage::lock_usage_test();
+        let before = crate::usage::day_total_today_for_test();
+        let sleeper = RecordingSleeper::new();
+        let clock = FixedClock(0);
+        let policy = RetryPolicy::default();
+        let env = RetryEnv {
+            transport,
+            sleeper: &sleeper,
+            clock: &clock,
+            policy: &policy,
+        };
+        let result = post_json_with(
+            &env,
+            url,
+            &[],
+            json!({"model": "no-such-priced-model"}),
+            Duration::from_secs(1),
+            "anthropic",
+        );
+        (result, before, crate::usage::day_total_today_for_test())
+    }
+
+    #[test]
+    fn a_timeout_after_send_counts_one_unpriced_cloud_request() {
+        let _g = network_guard();
+        let t = ScriptedTransport::new(vec![timed_out("timeout: global"), ok("done")]);
+        let (res, before, after) = run_url("https://example.invalid/", &t);
+        let text = res.unwrap_err().to_string();
+        assert!(text.contains("may have been billed"), "{text}");
+        assert!(!text.contains('\u{2014}'), "{text}");
+        assert_eq!(t.call_count(), 1);
+        assert_eq!(after.requests, before.requests + 1, "counted once");
+        assert_eq!(after.unpriced, before.unpriced + 1, "as unpriced");
+    }
+
+    #[test]
+    fn a_body_read_failure_counts_one_unpriced_cloud_request() {
+        let _g = network_guard();
+        let t = ScriptedTransport::new(vec![body_read_failed(200, "reset")]);
+        let (res, before, after) = run_url("https://example.invalid/", &t);
+        let text = res.unwrap_err().to_string();
+        assert!(text.contains("may have been billed"), "{text}");
+        assert_eq!(after.requests, before.requests + 1, "counted once");
+        assert_eq!(after.unpriced, before.unpriced + 1, "as unpriced");
+    }
+
+    #[test]
+    fn a_loopback_failure_after_send_counts_nothing() {
+        let _g = network_guard();
+        let t = ScriptedTransport::new(vec![timed_out("timeout: global")]);
+        let (res, before, after) = run_url("http://127.0.0.1:11434/api/chat", &t);
+        assert!(res.is_err());
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_failure_before_any_send_counts_nothing() {
+        let _g = network_guard();
+        let t = ScriptedTransport::new(vec![
+            no_response("refused"),
+            no_response("refused"),
+            no_response("refused"),
+            no_response("refused"),
+        ]);
+        let (res, before, after) = run_url("https://example.invalid/", &t);
+        assert!(res.is_err());
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn a_retried_unsent_request_is_counted_once_when_it_then_times_out() {
+        let _g = network_guard();
+        let t = ScriptedTransport::new(vec![no_response("refused"), timed_out("reset")]);
+        let (res, before, after) = run_url("https://example.invalid/", &t);
+        assert!(res.is_err());
+        assert_eq!(t.call_count(), 2);
+        assert_eq!(after.requests, before.requests + 1);
     }
 
     #[test]
