@@ -95,6 +95,11 @@ impl Anthropic {
         let value: Value =
             serde_json::from_str(body).context("anthropic: response body is not valid JSON")?;
 
+        // #1285: a `type: "error"` body in a 2xx.
+        if let Some(e) = super::common::error_in_ok_body("anthropic", &value) {
+            return Err(e);
+        }
+
         let stop_reason = value.get("stop_reason").and_then(Value::as_str);
 
         if stop_reason == Some("refusal") {
@@ -696,6 +701,18 @@ mod tests {
         assert_eq!((u.input_tokens, u.output_tokens), (120, 4000));
         assert!(Anthropic::parse_usage("not json").is_none());
         assert!(Anthropic::parse_usage(r#"{"content":[]}"#).is_none());
+    }
+
+    // #1285: Anthropic error bodies are {"type":"error","error":{...}}.
+    #[test]
+    fn parse_completion_surfaces_a_typed_error_body() {
+        let err = Anthropic::parse_completion(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("Overloaded"), "{text}");
+        assert!(!text.contains("no content"), "{text}");
     }
 
     #[test]
