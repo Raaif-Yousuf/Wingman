@@ -262,7 +262,7 @@ pub fn replace_or_copy(
     }
 }
 
-fn copy_report(
+pub(super) fn copy_report(
     copy: &dyn Executor,
     confirmed: Confirmed<Value>,
     detail: String,

@@ -1699,7 +1699,7 @@ mod tests {
             "fn start_options_router(",
             "fn add_event_from_screen(",
             "fn run_generic_action_with(",
-            "fn review_this_email(",
+            "fn review_text(",
             "fn fill_form_from_screen(",
         ] {
             let at = app.find(f).unwrap_or_else(|| panic!("{f}"));
@@ -1716,6 +1716,18 @@ mod tests {
                     || body.contains("pending.map(capture::PendingShot::finish)"),
                 "{f} must finish the shot on its worker"
             );
+        }
+    }
+
+    /// #1274: both review entry points are one-line delegations to the shared
+    /// `review_text`, which the guard above checks, so neither can skip it.
+    #[test]
+    fn both_review_entry_points_delegate_to_the_guarded_review_text() {
+        let app = include_str!("app.rs").replace('\r', "");
+        for f in ["fn review_this_email(", "fn fix_spelling_grammar("] {
+            let at = app.find(f).unwrap_or_else(|| panic!("{f}"));
+            let end = app[at..].find("\n    }\n").unwrap();
+            assert!(app[at..at + end].contains("self.review_text("), "{f}");
         }
     }
 

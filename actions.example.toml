@@ -115,6 +115,24 @@ enabled = true
 mode = "auto"
 
 [[actions]]
+id = "fix-spelling-grammar"
+name = "Fix spelling and grammar"
+group = "Writing"
+inputs = [
+    "uia",
+    "selection",
+]
+proposal = "text_review"
+executor = "replace_text"
+confirm = true
+prompt = """You are shown a piece of text the user is typing. Fix spelling, grammar and punctuation mistakes only. Never change the tone, the style, the word choice or the meaning, and never rewrite a sentence that is already correct. Keep names, numbers, dates, URLs, code and the language of the text exactly as they are, and keep the author's own spelling variant (for example British or American) when it is used consistently. For each individual mistake, propose one edit: the EXACT original text to find ("before"), what it should become ("after"), and a short reason such as "spelling" or "missing comma". Keep each edit as small and specific as possible: one edit per individual mistake (for example one misspelled word), never one edit spanning a whole sentence or paragraph just because it contains more than one mistake. Never propose an edit whose "after" is identical to its "before". If nothing needs fixing, set "verdict" to "good_to_go" and leave "edits" empty. Otherwise set "verdict" to "needs_edits". List the edits in the order they appear in the text. Leave every other field empty: an empty string for text, false for a flag. Use plain text only in every field: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes (use a full stop, a colon, or the word "and" or "but" instead)."""
+rate_difficulty = false
+enabled = true
+
+[actions.prefer]
+mode = "auto"
+
+[[actions]]
 id = "fill-this-form"
 name = "Fill this form"
 group = "Work"

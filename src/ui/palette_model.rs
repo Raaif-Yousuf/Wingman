@@ -571,6 +571,8 @@ pub enum DispatchTarget {
     ReadQr,
     AddToCalendar,
     ReviewEmail,
+    /// "Fix spelling and grammar" (#1274): shares the review flow, own cards.
+    FixSpelling,
     FillForm,
     CalculateSelection,
     CopyRegion,
@@ -603,6 +605,7 @@ pub fn dispatch_target_for(action_id: &str) -> Option<DispatchTarget> {
         crate::actions::READ_QR_ACTION_ID => Some(DispatchTarget::ReadQr),
         crate::actions::calendar::ACTION_ID => Some(DispatchTarget::AddToCalendar),
         crate::actions::review_email::ACTION_ID => Some(DispatchTarget::ReviewEmail),
+        crate::actions::fix_spelling::ACTION_ID => Some(DispatchTarget::FixSpelling),
         crate::actions::fill_form::ACTION_ID => Some(DispatchTarget::FillForm),
         crate::actions::relative_dates::ACTION_ID => Some(DispatchTarget::ResolveDates),
         CALCULATE_SELECTION_ACTION_ID => Some(DispatchTarget::CalculateSelection),
@@ -1467,6 +1470,10 @@ mod tests {
         assert_eq!(
             dispatch_target_for(crate::actions::review_email::ACTION_ID),
             Some(DispatchTarget::ReviewEmail)
+        );
+        assert_eq!(
+            dispatch_target_for(crate::actions::fix_spelling::ACTION_ID),
+            Some(DispatchTarget::FixSpelling)
         );
         assert_eq!(
             dispatch_target_for(crate::actions::fill_form::ACTION_ID),

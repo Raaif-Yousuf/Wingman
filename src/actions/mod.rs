@@ -18,6 +18,7 @@ pub mod explain_error;
 pub mod explain_screen;
 pub mod extract_text;
 pub mod fill_form;
+pub mod fix_spelling;
 pub mod generic_answer;
 pub mod generic_inputs;
 pub mod generic_replace;
@@ -438,6 +439,11 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   second Look/Propose/Confirm/Do action, and the first whose "Do" step
 ///   writes text into an arbitrary UIA-editable control (`replace_text`)
 ///   instead of opening a generated file.
+/// - `"fix-spelling-grammar"` (#1274, `fix_spelling::builtin_action`): proposal
+///   `text_review`, executor `replace_text`. Fixes spelling, grammar and
+///   punctuation in the focused text box (else the selection), never tone, for
+///   any text, not only email. A box it cannot write to gets the fixed text on
+///   the clipboard instead.
 /// - `"fill-this-form"` (#40, `fill_form::builtin_action`): proposal
 ///   `form_fill`, executor `fill_form` (#33, already shipped). See
 ///   `actions::fill_form`'s own module doc comment for the two-stage
@@ -551,6 +557,7 @@ pub fn builtin_actions() -> Vec<Action> {
         page_summary::builtin_action(),
         calendar::builtin_action(),
         review_email::builtin_action(),
+        fix_spelling::builtin_action(),
         fill_form::builtin_action(),
         action_items::builtin_action(),
         table::builtin_action(),
@@ -981,6 +988,7 @@ mod tests {
             "summarize-page",
             "add-to-calendar",
             "review-this-email",
+            "fix-spelling-grammar",
             "fill-this-form",
             "action-items-checklist",
         ] {
