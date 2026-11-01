@@ -203,15 +203,30 @@ pub(crate) enum TransportError {
     TimedOut(String),
 }
 
-/// #727: true when this send failure proves nothing reached the vendor, so a
-/// retry cannot bill twice. Only a DNS or connect timeout qualifies; any
-/// other timeout (global, send, waiting for the response) may have come
-/// after the request was delivered. Non-timeout failures (refused, TLS,
-/// unknown host) happen before the body is sent and stay retryable.
+/// #727, #1267: true only when this send failure proves nothing reached the
+/// vendor, so a retry cannot bill twice. An allow-list: a DNS or connect
+/// timeout, an unknown host, a failed connect or TLS setup, a proxy connect
+/// failure, and an `Io` error whose kind can only come from connecting
+/// (refused, unreachable). Everything else is not retried: a reset, a broken
+/// pipe, an early EOF, a protocol error or any other timeout can happen after
+/// the body was written.
 fn is_provably_unsent(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
     match e {
         ureq::Error::Timeout(t) => matches!(t, ureq::Timeout::Resolve | ureq::Timeout::Connect),
-        _ => true,
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::ConnectProxyFailed(_)
+        | ureq::Error::Tls(_)
+        | ureq::Error::TlsRequired => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::AddrNotAvailable
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+        ),
+        _ => false,
     }
 }
 
@@ -2430,8 +2445,59 @@ mod tests {
         assert!(!is_provably_unsent(&ureq::Error::Timeout(
             Timeout::SendBody
         )));
-        // Any non-timeout failure keeps the existing behaviour (retryable).
         assert!(is_provably_unsent(&ureq::Error::HostNotFound));
+        assert!(is_provably_unsent(&ureq::Error::ConnectionFailed));
+        assert!(is_provably_unsent(&ureq::Error::Tls("handshake")));
+    }
+
+    #[test]
+    fn an_io_or_protocol_failure_after_connect_is_not_provably_unsent() {
+        // #1267: a reset or a truncated reply can come after the body was
+        // written, so a retry could bill twice.
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !is_provably_unsent(&ureq::Error::Io(Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!is_provably_unsent(&ureq::Error::TooManyRedirects));
+        // Refused or unreachable happens at connect, before any byte is sent.
+        assert!(is_provably_unsent(&ureq::Error::Io(Error::from(
+            ErrorKind::ConnectionRefused
+        ))));
+    }
+
+    #[test]
+    fn the_real_transport_does_not_retry_a_dropped_connection() {
+        // Server accepts, reads, and closes with no reply: not provably unsent.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+        });
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_secs(5));
+        server.join().unwrap();
+        assert!(matches!(result, Err(TransportError::TimedOut(_))));
+    }
+
+    #[test]
+    fn the_real_transport_still_retries_a_refused_connection() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/");
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_secs(5));
+        assert!(matches!(result, Err(TransportError::NoResponse(_))));
     }
 
     #[test]
