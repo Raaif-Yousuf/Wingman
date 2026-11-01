@@ -108,7 +108,7 @@ use crate::ui::theme::{
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    COLORREF, D2DERR_RECREATE_TARGET, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
@@ -134,18 +134,18 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
-    GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor,
-    UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBRUSH, HDC, HFONT, HGDIOBJ, LOGFONTW,
-    PAINTSTRUCT, TEXTMETRICW, TRANSPARENT,
+    GetTextMetricsW, InvalidateRect, ReleaseDC, ScreenToClient, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, DEFAULT_CHARSET, DRAW_TEXT_FORMAT,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, HBRUSH, HDC,
+    HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, LoadCursorW, PostMessageW, RegisterClassExW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
@@ -302,6 +302,8 @@ impl Palette {
             visible: false,
             hover: None,
             thumb_hot: false,
+            wheel_remainder: 0,
+            pressed: None,
             ignore_mouse: false,
             dpi_forced: false,
             tracking_leave: false,
@@ -388,20 +390,28 @@ impl Palette {
 
         let edit_hwnd = create_query_edit(hwnd, instance, inner_ref.font, inner_ref.dpi);
         inner_ref.edit_hwnd = edit_hwnd;
-        if !edit_hwnd.0.is_null() {
-            unsafe {
-                let _ = SetWindowSubclass(
-                    edit_hwnd,
-                    Some(palette_edit_subclass),
-                    PALETTE_SUBCLASS_ID,
-                    hwnd.0 as usize,
-                );
-            }
+        // From here `Palette`'s Drop owns the window and the state.
+        let palette = Palette {
+            inner: unsafe { Box::from_raw(raw) },
+        };
+        // #1260: without the query box no key or focus-loss message can ever
+        // arrive, so an unusable palette is an error (the caller shows the
+        // "Quick Ask unavailable" card), not a window that cannot be closed.
+        if edit_hwnd.0.is_null() {
+            return Err(anyhow::anyhow!(
+                "Wingman: could not create the palette's query box"
+            ));
+        }
+        unsafe {
+            let _ = SetWindowSubclass(
+                edit_hwnd,
+                Some(palette_edit_subclass),
+                PALETTE_SUBCLASS_ID,
+                hwnd.0 as usize,
+            );
         }
 
-        Ok(Palette {
-            inner: unsafe { Box::from_raw(raw) },
-        })
+        Ok(palette)
     }
 
     /// Exposed for tests (which need the raw `HWND` to assert against and
@@ -765,6 +775,17 @@ fn create_query_edit(parent: HWND, instance: HINSTANCE, font: HFONT, dpi: u32) -
             WM_SETFONT,
             Some(WPARAM(font.0 as usize)),
             Some(LPARAM(1)),
+        );
+        // #1260: the typed line is the question, so it is capped like the
+        // selection and clipboard inputs (a longer paste is cut by the box).
+        // A limit on the box, not a cut in the worker: the user sees it stop,
+        // and `run_generic_action_with` stays as it is.
+        const EM_SETLIMITTEXT: u32 = 0x00C5;
+        SendMessageW(
+            hwnd,
+            EM_SETLIMITTEXT,
+            Some(WPARAM(crate::inputs::selection::DEFAULT_MAX_CHARS)),
+            None,
         );
     }
     hwnd
@@ -1474,6 +1495,14 @@ struct PaletteInner {
     /// #988: the pointer is over the scroll thumb's strip, so the thumb is
     /// drawn wide with a track.
     thumb_hot: bool,
+    /// #1260: the part of a wheel notch not yet scrolled (high-resolution
+    /// wheels send deltas under 120). Cleared whenever the list is rebuilt.
+    wheel_remainder: i32,
+    /// #1289: the left button went down; the inner value is the action row
+    /// it was on (`None` for a header, a hint or empty space). A release runs
+    /// a row only when it is on the same row. The outer `None` is no press
+    /// seen at all, where the release row is used as before.
+    pressed: Option<Option<usize>>,
     /// #949: set by the gallery and by pixel tests so the real pointer, which
     /// the system reports to any window it is over, cannot change which row
     /// is hovered. Mouse moves and leaves are then ignored; a state that
@@ -1590,6 +1619,10 @@ impl PaletteInner {
         self.hover = None;
         self.thumb_hot = false;
         self.tracking_leave = false;
+        self.pressed = None;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
     }
 
     fn reposition_centered(&mut self) {
@@ -1737,6 +1770,19 @@ impl PaletteInner {
         let rows =
             crate::ui::palette_model::build_rows(&self.catalogue, query, self.model_configured);
         self.state = crate::ui::palette_model::PaletteState::new(rows);
+        self.wheel_remainder = 0;
+        self.pressed = None;
+    }
+
+    /// The `Action` row under a client point, if any: headers, hints and
+    /// blank space are not rows a pointer can hover or click.
+    fn action_row_at(&self, x: i32, y: i32) -> Option<usize> {
+        row_at(x, y, self.dpi, self.state.offset, self.state.rows.len()).filter(|&i| {
+            matches!(
+                self.state.rows.get(i),
+                Some(crate::ui::palette_model::Row::Action { .. })
+            )
+        })
     }
 
     fn invalidate(&self) {
@@ -2025,12 +2071,15 @@ impl PaletteInner {
             // the row list is this HWND directly -- no subclass forwarding
             // needed, unlike the query edit control's keys.
             WM_MOUSEWHEEL => {
-                // HIWORD(wParam) is the signed wheel delta, in multiples of
-                // WHEEL_DELTA (120, winuser.h) -- spelled out here the same
-                // way this file already spells out EN_CHANGE.
-                const WHEEL_DELTA: i32 = 120;
+                // HIWORD(wParam) is the signed wheel delta. A notch is 120
+                // (winuser.h), but touchpads and free-spinning wheels send
+                // less, so the part of a notch not yet scrolled is kept
+                // (#1260).
                 let raw_delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
-                let notches = raw_delta as i32 / WHEEL_DELTA;
+                let notches = crate::ui::palette_model::wheel_notches(
+                    &mut self.wheel_remainder,
+                    raw_delta as i32,
+                );
                 if notches != 0 {
                     // Wheel-up (positive notches) reveals earlier rows, i.e.
                     // moves the viewport toward the top (negative delta_rows
@@ -2041,6 +2090,16 @@ impl PaletteInner {
                         self.state.rows.len(),
                         crate::ui::palette_model::MAX_VISIBLE_ROWS,
                     );
+                    // #1289: the rows moved under a pointer that did not, so
+                    // the highlight is worked out again from where it is.
+                    if !self.ignore_mouse {
+                        let mut pt = POINT::default();
+                        if unsafe { GetCursorPos(&mut pt) }.is_ok()
+                            && unsafe { ScreenToClient(self.hwnd, &mut pt) }.as_bool()
+                        {
+                            self.hover = self.action_row_at(pt.x, pt.y);
+                        }
+                    }
                     self.invalidate();
                 }
                 Some(LRESULT(0))
@@ -2106,20 +2165,24 @@ impl PaletteInner {
             // (no `WS_TABSTOP`) doesn't do anything Win32-default with it
             // and the click is a single visible action, on release, like an
             // ordinary button.
-            WM_LBUTTONDOWN => Some(LRESULT(0)),
+            // #1289: the press is remembered and the mouse captured, so the
+            // release arrives here even when it is dragged off the window,
+            // and runs a row only if it is the row that was pressed.
+            WM_LBUTTONDOWN => {
+                self.pressed = Some(self.action_row_at(mouse_x(lparam), mouse_y(lparam)));
+                unsafe {
+                    let _ = SetCapture(self.hwnd);
+                }
+                Some(LRESULT(0))
+            }
             WM_LBUTTONUP => {
-                let y = mouse_y(lparam);
-                if let Some(idx) = row_at(
-                    mouse_x(lparam),
-                    y,
-                    self.dpi,
-                    self.state.offset,
-                    self.state.rows.len(),
-                ) {
-                    if matches!(
-                        self.state.rows.get(idx),
-                        Some(crate::ui::palette_model::Row::Action { .. })
-                    ) {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                let released = self.action_row_at(mouse_x(lparam), mouse_y(lparam));
+                let pressed = self.pressed.take();
+                if let Some(idx) = released {
+                    if pressed.map_or(true, |p| p == Some(idx)) {
                         self.state.selected = idx;
                         self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Enter);
                     }
@@ -3506,6 +3569,122 @@ mod tests {
             selected_before,
             "the wheel must never change the selection"
         );
+    }
+
+    /// #1260 item 1: a touchpad sends deltas of 10 to 60. Four of 30 are one
+    /// row; the old `delta / 120` truncated every one of them to nothing.
+    #[test]
+    fn small_wheel_deltas_add_up_to_a_row() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let wparam = WPARAM(((-30i16 as u16 as u32) as usize) << 16);
+        for _ in 0..3 {
+            p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
+        }
+        assert_eq!(p.state_offset(), 0, "three of 30 is not yet a row");
+        p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
+        assert_eq!(p.state_offset(), 1, "four of 30 is one row");
+    }
+
+    /// #1260 item 1: a typed-over list starts a fresh remainder.
+    #[test]
+    fn a_new_list_forgets_the_wheel_leftover() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let wparam = WPARAM(((-90i16 as u16 as u32) as usize) << 16);
+        p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
+        assert_eq!(p.state_offset(), 0);
+        p.set_query_for_test("action");
+        let wparam = WPARAM(((-30i16 as u16 as u32) as usize) << 16);
+        p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
+        assert_eq!(
+            p.state_offset(),
+            0,
+            "90 from before the retype must be gone"
+        );
+    }
+
+    /// #1260 item 3: the typed line is cut at the same size as a selection.
+    #[test]
+    fn the_query_box_takes_no_more_than_the_selection_limit() {
+        const EM_GETLIMITTEXT: u32 = 0x00D5;
+        let inst = instance();
+        let p = Palette::new_for_test(inst).unwrap();
+        let limit = unsafe { SendMessageW(p.edit_hwnd(), EM_GETLIMITTEXT, None, None) }.0 as usize;
+        assert_eq!(limit, crate::inputs::selection::DEFAULT_MAX_CHARS);
+    }
+
+    fn client_lparam(x: i32, y: i32) -> LPARAM {
+        LPARAM(((y as u16 as u32) << 16 | (x as u16 as u32)) as isize)
+    }
+
+    fn row_mid_y(p: &Palette, pos: i32) -> i32 {
+        let slot = row_slot(p.inner.dpi, pos);
+        (slot.top + slot.bottom) / 2
+    }
+
+    /// #1289 item 2: press on one row, release on another runs nothing.
+    #[test]
+    fn a_click_that_moves_to_another_row_runs_nothing() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        let owner = create_test_owner_window(inst);
+        p.set_owner(owner);
+        p.show(many_ungrouped_actions(5), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let down = client_lparam(50, row_mid_y(&p, 1));
+        let up = client_lparam(50, row_mid_y(&p, 2));
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONDOWN, Some(WPARAM(1)), Some(down));
+            SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(up));
+        }
+        let mut msg = MSG::default();
+        let queued = unsafe { PeekMessageW(&mut msg, Some(owner), 0, 0, PM_REMOVE) }.as_bool();
+        assert!(!queued, "release on another row must not run it");
+        assert!(p.is_visible(), "the palette stays open");
+        // Press and release on the same row does run.
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONDOWN, Some(WPARAM(1)), Some(down));
+            SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(down));
+        }
+        let queued = unsafe { PeekMessageW(&mut msg, Some(owner), 0, 0, PM_REMOVE) }.as_bool();
+        assert!(queued, "press and release on one row runs it");
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
+    /// #1289 item 3: after the wheel moves the list, the highlight follows
+    /// the row now under the pointer, as a click would.
+    #[test]
+    fn the_hover_follows_the_pointer_after_a_wheel_scroll() {
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let y = row_mid_y(&p, 1);
+        p.handle_message(WM_MOUSEMOVE, WPARAM(0), client_lparam(50, y));
+        assert_eq!(p.inner.hover, Some(1));
+        let mut old = POINT::default();
+        let mut pt = POINT { x: 50, y };
+        unsafe {
+            let _ = GetCursorPos(&mut old);
+            let _ = ClientToScreen(p.hwnd(), &mut pt);
+            let _ = SetCursorPos(pt.x, pt.y);
+        }
+        let wparam = WPARAM(((-120i16 as u16 as u32) as usize) << 16);
+        p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
+        unsafe {
+            let _ = SetCursorPos(old.x, old.y);
+        }
+        assert_eq!(p.state_offset(), 1);
+        assert_eq!(p.inner.hover, Some(2), "the row under the pointer now");
     }
 
     fn create_test_owner_window(instance: HINSTANCE) -> HWND {
