@@ -115,6 +115,11 @@ impl OpenAi {
         let value: Value =
             serde_json::from_str(body).context("openai: response body is not valid JSON")?;
 
+        // #1285: `status: "failed"` carries its reason in `error`.
+        if let Some(e) = super::common::error_in_ok_body("openai", &value) {
+            return Err(e);
+        }
+
         let output = value
             .get("output")
             .and_then(Value::as_array)
@@ -648,6 +653,23 @@ mod tests {
         let completion = OpenAi::parse_completion(body).expect("should parse");
         let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.difficulty, None);
+    }
+
+    // #1285: a Responses body with status failed and an error object.
+    #[test]
+    fn parse_completion_surfaces_a_failed_responses_error() {
+        let err = OpenAi::parse_completion(
+            r#"{"status":"failed","output":[],"error":{"code":"429","message":"rate limited"}}"#,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("rate limited") && text.contains("HTTP 429"),
+            "{text}"
+        );
+        let none = OpenAi::parse_completion(r#"{"status":"failed","output":[],"error":null}"#)
+            .unwrap_err();
+        assert!(none.to_string().contains("failed"), "{none:#}");
     }
 
     #[test]

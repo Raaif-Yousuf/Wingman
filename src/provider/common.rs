@@ -669,6 +669,48 @@ pub(crate) fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
     }
 }
 
+/// #1285: the error a 2xx body carries in place of a completion, if any.
+///
+/// Some gateways answer 200 with `{"error":{...}}`, Anthropic and Gemini put
+/// the same shape in their error bodies, and the Responses API reports a
+/// `status: "failed"` run through its `error` object. Only a non-empty object
+/// or string counts: `"error": null` (a normal Responses success) and any
+/// other shape are not an error. The text goes through [`http_error`], so it
+/// is redacted, cut by chars and kind-tagged like a non-2xx answer; the status
+/// is `error.code` when numeric (a number or numeric string in 400..=599),
+/// else a `(200)` marker that says the reply was an HTTP 200. A stringly
+/// `insufficient_quota` code is read as the 429 it names. No retry: this runs
+/// after the transport returned, so there is no `Retry-After` and the vendor's
+/// answer is final; the fallback chain still moves to the next provider. Pure.
+pub(crate) fn error_in_ok_body(tag: &str, value: &Value) -> Option<anyhow::Error> {
+    let error = value.get("error")?;
+    // Re-wrapped under `error` so `failure_kind` reads it like a real body.
+    let text = match error {
+        Value::Object(o) if !o.is_empty() => json!({ "error": error }).to_string(),
+        Value::String(s) if !s.trim().is_empty() => {
+            json!({ "error": { "message": s } }).to_string()
+        }
+        _ => return None,
+    };
+    let code = error.get("code");
+    let from_code = code
+        .and_then(|c| match c {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => s.trim().parse::<u64>().ok(),
+            _ => None,
+        })
+        .filter(|c| (400..=599).contains(c))
+        .map(|c| c as u16);
+    let status = from_code.or_else(|| failure_kind(429, &text).map(|_| 429));
+    Some(match status {
+        Some(status) => HttpStatus::wrap(http_error(tag, status, &text), status),
+        None => anyhow!(
+            "{tag}: HTTP 200 with an error: {}",
+            redact_and_truncate(&text)
+        ),
+    })
+}
+
 /// #253: the one place network-derived text becomes user-facing text.
 ///
 /// [`egress::build_entry`] already redacts key-shaped tokens out of the

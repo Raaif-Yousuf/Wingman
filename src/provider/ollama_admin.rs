@@ -304,6 +304,11 @@ pub fn port_from_base_url(base_url: &str) -> Option<u16> {
 const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const DISCOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The per-press `/api/show` check (#1268): local, so it should answer at
+/// once; a wedged server is given up on quickly.
+const SHOW_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+const SHOW_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct TagsDetails {
     #[serde(default)]
@@ -362,17 +367,10 @@ pub(crate) fn list_tags_with_timeout(base_url: &str, timeout: Duration) -> Resul
     Ok(parsed.models)
 }
 
-/// Not read from any live UI path yet -- Settings' one status line gets its
-/// vision counts from `/api/tags`' own `capabilities` array
-/// ([`vision_from_tags_entry`]), which is enough for that surface and one
-/// fewer request. `show_capabilities` exists because #14 calls for a typed
-/// `/api/show` client regardless (a future per-model detail view wants more
-/// than `/api/tags` carries, e.g. `families`/`parameter_size`), so it is
-/// built and tested now rather than left undone -- same "reserved for a
-/// consumer that doesn't exist yet" shape as `Caps`/`Provider::capabilities`
-/// in `provider/mod.rs`. A follow-up issue (referencing #51's upcoming
-/// WebView2 settings window) covers wiring a real caller.
-#[allow(dead_code)]
+/// What `/api/show` says one model can do. Read by the Ollama provider
+/// (#1268, #1266) to decide vision and `think`. Settings' status line still
+/// takes its vision counts from `/api/tags` ([`vision_from_tags_entry`]),
+/// which needs one fewer request.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ShowCapabilities {
     pub capabilities: Vec<String>,
@@ -387,17 +385,19 @@ struct ShowResponse {
 
 /// `POST /api/show` -- capabilities for one model. Falls back to the
 /// static [`is_vision_model`] allowlist when the response carries no
-/// `capabilities` array (an older Ollama). See [`ShowCapabilities`]'s doc
-/// comment for why nothing calls this outside tests yet.
-#[allow(dead_code)]
+/// `capabilities` array (an older Ollama). `Ollama` calls it on a worker
+/// thread. One attempt, no retry, short timeouts, and capped to the chain's
+/// call deadline: it runs before the real request, so it must not add a
+/// backoff of its own when Ollama is down.
 pub fn show_capabilities(base_url: &str, model: &str) -> Result<ShowCapabilities> {
     let url = format!("{}/api/show", base_url.trim_end_matches('/'));
     let body = json!({"model": model});
-    let response_body = common::post_json(
+    let response_body = common::post_json_with_connect_timeout(
         &url,
         &[("Content-Type", "application/json")],
         body,
-        DISCOVERY_TOTAL_TIMEOUT,
+        SHOW_CONNECT_TIMEOUT,
+        SHOW_TOTAL_TIMEOUT,
         "ollama",
     )?;
     parse_show_response(&response_body, model)

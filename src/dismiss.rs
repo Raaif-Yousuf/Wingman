@@ -47,7 +47,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSLLHOOKSTRUCT,
     WH_MOUSE_LL, WM_APP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN,
+    WM_RBUTTONDOWN, WM_XBUTTONDOWN,
 };
 
 /// Posted to the target `HWND` when a click lands anywhere on screen while
@@ -84,7 +84,11 @@ pub fn unpack_point(packed: u32) -> (i32, i32) {
 /// True if `msg` (a `WM_*` value taken from the low-level hook's `wparam`)
 /// is one of the button-down events this watcher reports.
 fn is_button_down(msg: u32) -> bool {
-    msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN
+    // #1254: `WM_XBUTTONDOWN` is the mouse Back and Forward buttons. A
+    // low-level hook reports them as this one message (never the `NC`
+    // variant); which button it was is in `MSLLHOOKSTRUCT.mouseData`, and
+    // both mean the page is about to change.
+    msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN
 }
 
 /// Pure decision the hook callback makes on every event: report it (post
@@ -343,6 +347,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONUP};
 
     // -- pack_point / unpack_point round trip ---------------------------
 
@@ -522,10 +527,27 @@ mod tests {
     }
 
     #[test]
-    fn is_button_down_matches_exactly_the_three_messages() {
+    fn is_button_down_matches_exactly_the_four_messages() {
         assert!(is_button_down(WM_LBUTTONDOWN));
         assert!(is_button_down(WM_RBUTTONDOWN));
         assert!(is_button_down(WM_MBUTTONDOWN));
+        // #1254: mouse Back and Forward are a press too.
+        assert!(is_button_down(WM_XBUTTONDOWN));
         assert!(!is_button_down(0));
+        // Releases and double-clicks are not a new press.
+        assert!(!is_button_down(WM_XBUTTONUP));
+        assert!(!is_button_down(WM_XBUTTONDBLCLK));
+        assert!(!is_button_down(WM_LBUTTONUP));
+    }
+
+    #[test]
+    fn xbutton_press_is_reported_to_the_card_and_the_overlay() {
+        assert!(should_report(true, WM_XBUTTONDOWN));
+        assert!(!should_report(false, WM_XBUTTONDOWN));
+        assert_eq!(
+            overlay_report(true, WM_XBUTTONDOWN),
+            Some(crate::overlay::wire::Kind::Click)
+        );
+        assert_eq!(overlay_report(false, WM_XBUTTONDOWN), None);
     }
 }
