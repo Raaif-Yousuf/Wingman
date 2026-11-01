@@ -983,6 +983,12 @@ Each ships alone and has an observable.
    conversion.
 5. **#329 ghost text.** Field anchors only. Validates the "own window" filter,
    the edit-hides-ghost rule and the Enter/Esc interplay with the preview card.
+6a. **Show me where to click (#1276), the first model-backed overlay.** A ring
+   around the control a typed how-to question names. Its own spec:
+   [show me where to click](2026-11-01-show-me-where-to-click-design.md).
+   Needs the model-backed `output = "overlay"` branch, a `click_target`
+   proposal and `AnnotationKind::Ring`; the later slice 6 kinds reuse that
+   branch.
 6. **Model-backed read-only marks**, in this order: #334 (smallest, `signs[]`
    gains an anchor, nothing clickable), #332 (the demo; needs the handwriting
    fallback), #335 (needs the code clamp), #337 (needs the gutter matcher and a
