@@ -166,29 +166,29 @@ impl Ollama {
         // "length"` with `message.content` empty (all the budget spent on
         // `message.thinking`); a non-thinking model in the same situation
         // returns `done_reason: "length"` with truncated, invalid-JSON
-        // `content`. Both cases are the same user-facing problem, so both
-        // are reported the same way rather than only the empty-content one.
-        if done_reason == Some("length") {
-            return Err(anyhow!(
-                "ollama: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-            ));
-        }
-
+        // `content`. Both cases are the same user-facing problem.
+        //
+        // #1269: with no text the reply is the stop-the-chain `Truncated`
+        // error. With text it is returned as a completion with a
+        // `MaxTokens` stop (the text may be a whole valid answer); the
+        // chain turns an unparseable one into `Truncated`.
         let text = value
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("ollama: response has no message.content"))?;
-
-        if text.is_empty() {
+            .filter(|t| !t.is_empty());
+        let Some(text) = text else {
+            if done_reason == Some("length") {
+                return Err(super::truncated_error("ollama"));
+            }
             return Err(anyhow!("ollama: response has no message.content"));
-        }
+        };
 
         let usage = Self::usage_of(&value);
 
         let stop = match done_reason {
             Some("stop") => StopReason::Complete,
-            Some("length") => StopReason::MaxTokens, // unreachable: handled above
+            Some("length") => StopReason::MaxTokens,
             _ => StopReason::Other,
         };
 
@@ -506,6 +506,28 @@ mod tests {
         assert!(msg.contains("ran out of room"), "{msg}");
     }
 
+    /// #1269: a `length` stop with text is still a completion.
+    #[test]
+    fn parse_completion_keeps_text_when_done_reason_is_length() {
+        let body = r#"{"message": {"role": "assistant", "content": "{\"detail\":\"d\",\"headline\":\"h\"}"}, "done": true, "done_reason": "length"}"#;
+        let c = Ollama::parse_completion(body).unwrap();
+        assert_eq!(c.stop, StopReason::MaxTokens);
+        assert!(crate::provider::parse_answer(&c.text).is_ok());
+    }
+
+    /// #1269: a `length` stop with no text is the stop-the-chain `Truncated`
+    /// error.
+    #[test]
+    fn parse_completion_reports_truncated_for_length_with_no_text() {
+        let body = r#"{"message": {"role": "assistant", "content": ""}, "done": true, "done_reason": "length"}"#;
+        let err = Ollama::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
+    }
+
     /// Neighbour: `done_reason: "length"` with non-empty (but truncated,
     /// invalid-JSON) content must still be reported as budget exhaustion,
     /// not passed through to fail confusingly inside `parse_answer`
@@ -513,10 +535,12 @@ mod tests {
     /// non-thinking model returns when cut short, not just the
     /// thinking-model case the other fixture covers.
     #[test]
-    fn parse_completion_reports_budget_exhaustion_even_with_truncated_content() {
+    fn parse_completion_returns_truncated_content_with_a_max_tokens_stop() {
+        // #1269: the text is returned and the chain decides after parsing.
         let body = r#"{"message": {"role": "assistant", "content": "{\n  "}, "done": true, "done_reason": "length"}"#;
-        let err = Ollama::parse_completion(body).unwrap_err();
-        assert!(err.to_string().contains("ran out of room"));
+        let c = Ollama::parse_completion(body).unwrap();
+        assert_eq!(c.stop, StopReason::MaxTokens);
+        assert!(crate::provider::parse_answer(&c.text).is_err());
     }
 
     #[test]

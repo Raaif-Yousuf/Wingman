@@ -34,8 +34,8 @@ Describe 'the names the script waits on' {
         $si = (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\src\single_instance.rs') -Raw) -replace "`r", ''
         $app | Should -Not -BeNullOrEmpty
         $si | Should -Not -BeNullOrEmpty
-        $app.Contains('w!("' + $OwnerWindowClass + '")') | Should -BeTrue
-        $si.Contains('w!("' + $InstanceMutexName.Replace('\', '\\') + '")') | Should -BeTrue
+        $app.Contains('const OWNER_CLASS: &str = "' + $OwnerWindowClass + '";') | Should -BeTrue
+        $si.Contains('const MUTEX_NAME: &str = "' + $InstanceMutexName.Replace('\', '\\') + '";') | Should -BeTrue
     }
 }
 

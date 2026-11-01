@@ -150,21 +150,28 @@ impl OpenAi {
 
         let status = value.get("status").and_then(Value::as_str);
 
+        let incomplete_reason = value
+            .get("incomplete_details")
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str);
+
+        // Incomplete because of the content filter is a decline, not a
+        // budget problem, with or without partial text (#731, #1269).
+        if status == Some("incomplete") && incomplete_reason == Some("content_filter") {
+            return Err(super::declined_error("openai", "content_filter"));
+        }
+
         if text.is_empty() {
             // `status: "incomplete"` with no `message` entry means the
             // model spent its whole output-token budget on reasoning and
-            // never got to emit the answer -- a specific, reachable shape
-            // (see `tests/fixtures/openai_response_no_message.json`), not
-            // a generic malformed response (#155).
+            // never got to emit the answer (see
+            // `tests/fixtures/openai_response_no_message.json`, #155).
             if status == Some("incomplete") {
-                // Incomplete because of the content filter is a decline, not
-                // a budget problem (#731).
-                let reason = value
-                    .get("incomplete_details")
-                    .and_then(|d| d.get("reason"))
-                    .and_then(Value::as_str);
-                if reason == Some("content_filter") {
-                    return Err(super::declined_error("openai", "content_filter"));
+                let reason = incomplete_reason;
+                // Cut off at the limit: stops the chain (#1269). Any other
+                // or missing reason keeps the plain error.
+                if reason == Some("max_output_tokens") {
+                    return Err(super::truncated_error("openai"));
                 }
                 return Err(anyhow!(
                     "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
@@ -179,8 +186,12 @@ impl OpenAi {
             });
         }
 
+        // A limit stop only for `max_output_tokens` (#1269); any other
+        // `incomplete` reason is not one.
         let stop = match status {
-            Some("incomplete") => StopReason::MaxTokens,
+            Some("incomplete") if incomplete_reason == Some("max_output_tokens") => {
+                StopReason::MaxTokens
+            }
             Some("completed") => StopReason::Complete,
             _ => StopReason::Other,
         };
@@ -709,6 +720,55 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("refused"), "{msg}");
         assert!(!msg.contains("no message text"), "{msg}");
+    }
+
+    /// #1269: `incomplete` for `max_output_tokens` with text is still a
+    /// completion.
+    #[test]
+    fn parse_completion_keeps_text_when_stopped_at_max_output_tokens() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"detail\":\"d\",\"headline\":\"h\"}"}]}]}"#;
+        let c = OpenAi::parse_completion(body).unwrap();
+        assert_eq!(c.stop, StopReason::MaxTokens);
+        assert!(crate::provider::parse_answer(&c.text).is_ok());
+    }
+
+    /// #1269: `incomplete` for the content filter is a decline even with
+    /// partial text; an unknown reason with text is not a limit stop.
+    #[test]
+    fn parse_completion_gates_incomplete_with_text_on_the_reason() {
+        let filtered = r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"detail\":\"The"}]}]}"#;
+        let err = OpenAi::parse_completion(filtered).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Declined>().is_some(),
+            "{err:#}"
+        );
+        for reason in [r#""incomplete_details":{"reason":"something_new"},"#, ""] {
+            let body = format!(
+                r#"{{"status":"incomplete",{reason}"output":[{{"type":"message","content":[{{"type":"output_text","text":"{{\"detail\":\"d\",\"headline\":\"h\"}}"}}]}}]}}"#
+            );
+            let c = OpenAi::parse_completion(&body).unwrap();
+            assert_eq!(c.stop, StopReason::Other, "{reason}");
+        }
+    }
+
+    /// #1269: `max_output_tokens` with no text is the `Truncated` error; any
+    /// other or missing reason with no text keeps the old plain error.
+    #[test]
+    fn parse_completion_reports_truncated_only_for_max_output_tokens() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning","summary":[]}]}"#;
+        let err = OpenAi::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
+        let other = r#"{"status":"incomplete","incomplete_details":{"reason":"something_new"},"output":[]}"#;
+        let err = OpenAi::parse_completion(other).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_none(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("ran out of room"));
     }
 
     /// Neighbour: a `content[]` mixing a `text` part with a `refusal` part
