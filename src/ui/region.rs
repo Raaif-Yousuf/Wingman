@@ -266,6 +266,21 @@ impl SnapshotEntry {
     }
 }
 
+/// Builds the hit-test snapshot from `(facts, entry)` pairs, topmost first,
+/// keeping only windows a user could be pointing at (#1252): the overlay's
+/// "real window" rule (not cloaked, not a shell window, not alpha 0) plus
+/// not click-through. A cloaked window on another virtual desktop must not
+/// sit above the visible one and steal the click.
+fn snapshot_from(
+    candidates: Vec<(crate::ui::overlay::WindowFacts, SnapshotEntry)>,
+) -> Vec<SnapshotEntry> {
+    candidates
+        .into_iter()
+        .filter(|(facts, _)| facts.is_real() && !facts.click_through())
+        .map(|(_, entry)| entry)
+        .collect()
+}
+
 /// Finds the topmost entry in `snapshot` (ordered topmost-first, exactly as
 /// [`win32::capture_window_snapshot`] produces it) whose `hit_rect` contains
 /// `point` (virtual-desktop space), and returns the `(dwm_rect,
@@ -1608,6 +1623,7 @@ fn wide_z(s: &str) -> Vec<u16> {
 
 mod win32 {
     use super::{Rect, SnapshotEntry};
+    use crate::ui::overlay::{read_window_facts, WindowFacts};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
@@ -1633,26 +1649,28 @@ mod win32 {
     /// and confirm a click-without-drag on the visible (topmost) one stages
     /// ITS bounds -- watch the "W x H" label before pressing Enter -- not
     /// the full desktop rect and not the window it is covering. Also check
-    /// a click on bare desktop background: `THEORY (unverified)`: the
-    /// shell's own desktop window (`Progman`/`WorkerW`) may appear in this
-    /// snapshot with a real, full-monitor `GetWindowRect`, which would
-    /// stage that whole rect rather than falling back to a point-sized one
-    /// -- this was equally possible in the pre-#271 code once corrected for
-    /// the overlay-always-wins bug, so it is not a regression this fix
-    /// introduces, but it has not been observed on a live desktop.
+    /// a click on bare desktop background: the shell's desktop windows
+    /// (`Progman`/`WorkerW`) and the taskbar are dropped by the shared
+    /// [`crate::ui::overlay::WindowFacts::is_real`] filter (#1252), so that
+    /// click should fall back to the point-sized region. That is by
+    /// construction (unit-tested on the class names), not yet seen on a live
+    /// desktop (`THEORY (unverified)` that no other full-monitor shell
+    /// window exists). Cloaked windows (another virtual desktop) are dropped
+    /// the same way; check by putting a window at the same spot on a second
+    /// virtual desktop and clicking: the foreground window must stage.
     pub(super) fn capture_window_snapshot() -> Vec<SnapshotEntry> {
-        let mut entries: Vec<SnapshotEntry> = Vec::new();
+        let mut candidates: Vec<(WindowFacts, SnapshotEntry)> = Vec::new();
         unsafe {
             let _ = EnumWindows(
                 Some(enum_proc),
-                LPARAM(&mut entries as *mut Vec<SnapshotEntry> as isize),
+                LPARAM(&mut candidates as *mut Vec<(WindowFacts, SnapshotEntry)> as isize),
             );
         }
-        entries
+        super::snapshot_from(candidates)
     }
 
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let entries = unsafe { &mut *(lparam.0 as *mut Vec<SnapshotEntry>) };
+        let entries = unsafe { &mut *(lparam.0 as *mut Vec<(WindowFacts, SnapshotEntry)>) };
         let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
         let minimized = unsafe { IsIconic(hwnd) }.as_bool();
         if !visible || minimized {
@@ -1686,11 +1704,14 @@ mod win32 {
         };
 
         if let Some(hit_rect) = dwm_rect.filter(|r| !r.is_empty()).or(fallback_rect) {
-            entries.push(SnapshotEntry {
-                hit_rect,
-                dwm_rect,
-                fallback_rect,
-            });
+            entries.push((
+                read_window_facts(hwnd),
+                SnapshotEntry {
+                    hit_rect,
+                    dwm_rect,
+                    fallback_rect,
+                },
+            ));
         }
 
         BOOL(1) // continue enumerating
@@ -1931,6 +1952,86 @@ mod tests {
         let cy = (chosen.top + chosen.bottom) / 2;
         assert!((cx - 500).abs() <= 1);
         assert!((cy - 500).abs() <= 1);
+    }
+
+    // -- snapshot_from: #1252's shared "real window" filter -------------------
+
+    fn facts() -> crate::ui::overlay::WindowFacts {
+        crate::ui::overlay::WindowFacts {
+            cloaked: false,
+            class: "Notepad".to_string(),
+            ex_style: 0,
+            layered: None,
+        }
+    }
+
+    const WS_EX_TRANSPARENT_BIT: u32 = 0x20;
+
+    /// A foreground window at `back` and one candidate `front` above it at
+    /// the same spot; returns what a click at the shared point hits.
+    fn click_through_candidate(
+        front: crate::ui::overlay::WindowFacts,
+    ) -> Option<(Option<Rect>, Option<Rect>)> {
+        let front_rect = Rect {
+            left: 0,
+            top: 0,
+            right: 500,
+            bottom: 500,
+        };
+        let back_rect = Rect {
+            left: 100,
+            top: 100,
+            right: 300,
+            bottom: 300,
+        };
+        let snap = snapshot_from(vec![
+            (front, SnapshotEntry::for_test(front_rect)),
+            (facts(), SnapshotEntry::for_test(back_rect)),
+        ]);
+        window_at_point(&snap, (150, 150))
+    }
+
+    #[test]
+    fn snapshot_keeps_a_normal_window() {
+        let hit = click_through_candidate(facts());
+        assert_eq!(hit.unwrap().0.unwrap().right, 500);
+    }
+
+    #[test]
+    fn snapshot_skips_a_cloaked_window() {
+        let mut f = facts();
+        f.cloaked = true;
+        assert_eq!(click_through_candidate(f).unwrap().0.unwrap().right, 300);
+    }
+
+    #[test]
+    fn snapshot_skips_shell_class_windows() {
+        for c in ["Progman", "WorkerW", "Shell_TrayWnd"] {
+            let mut f = facts();
+            f.class = c.to_string();
+            assert_eq!(
+                click_through_candidate(f).unwrap().0.unwrap().right,
+                300,
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_skips_a_click_through_window() {
+        let mut f = facts();
+        f.ex_style = WS_EX_TRANSPARENT_BIT;
+        assert_eq!(click_through_candidate(f).unwrap().0.unwrap().right, 300);
+    }
+
+    #[test]
+    fn snapshot_skips_an_alpha_zero_layered_window_but_keeps_a_faint_one() {
+        let mut f = facts();
+        f.layered = Some((2, 0));
+        assert_eq!(click_through_candidate(f).unwrap().0.unwrap().right, 300);
+        let mut g = facts();
+        g.layered = Some((2, 1));
+        assert_eq!(click_through_candidate(g).unwrap().0.unwrap().right, 500);
     }
 
     // -- window_at_point: #271's pure snapshot lookup -----------------------
