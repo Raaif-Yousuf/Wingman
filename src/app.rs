@@ -3834,6 +3834,11 @@ impl App {
         // still queued for this window. Drop them before they run as a new
         // ask (a billed request) the user did not mean. Cancel and error too.
         drop_queued_presses(self.hwnd());
+        // A Pause chord pressed meanwhile is state the user meant: apply it
+        // now, so the Pause re-check below reads the real state.
+        for _ in 0..take_queued_pause_toggles(self.hwnd()) {
+            self.toggle_pause();
+        }
         let raw = match picked {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // cancelled: no card, nothing changed
@@ -11228,8 +11233,75 @@ fn drop_queued_presses(hwnd: HWND) -> usize {
     dropped
 }
 
+/// #1253: removes the queued `WM_APP_PAUSE_TOGGLE`s for `hwnd` and returns
+/// how many there were, so the caller can apply them in order. Unlike a key
+/// press, a Pause toggle is state the user meant, so it is applied, not
+/// dropped. Never blocks.
+fn take_queued_pause_toggles(hwnd: HWND) -> usize {
+    let mut taken = 0;
+    let mut m = MSG::default();
+    while unsafe {
+        PeekMessageW(
+            &mut m,
+            Some(hwnd),
+            WM_APP_PAUSE_TOGGLE,
+            WM_APP_PAUSE_TOGGLE,
+            PM_REMOVE,
+        )
+    }
+    .as_bool()
+    {
+        taken += 1;
+    }
+    taken
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_pause_toggles_are_taken_and_counted_and_nothing_else() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
+        let hwnd = test_message_window();
+        for id in [
+            super::WM_APP_PAUSE_TOGGLE,
+            super::WM_APP_PAUSE_TOGGLE,
+            super::WM_APP_HOTKEY,
+            super::WM_APP_ROUTER_RESULT,
+        ] {
+            unsafe { PostMessageW(Some(hwnd), id, WPARAM(0), LPARAM(0)) }.unwrap();
+        }
+        assert_eq!(super::take_queued_pause_toggles(hwnd), 2);
+        assert!(!queued(hwnd, super::WM_APP_PAUSE_TOGGLE));
+        assert!(queued(hwnd, super::WM_APP_HOTKEY));
+        assert!(queued(hwnd, super::WM_APP_ROUTER_RESULT));
+        assert_eq!(super::take_queued_pause_toggles(hwnd), 0);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    /// #1253: a Pause chord pressed while the picker is open is applied
+    /// right after it returns, before the Pause re-check reads the state, or
+    /// that re-check can never fire (the toggle is still queued).
+    #[test]
+    fn copy_region_applies_queued_pause_toggles_before_the_pause_recheck() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn copy_region(", "\n    fn ");
+        let select = body.find("select_region(").expect("opens the selector");
+        let take = body
+            .find("take_queued_pause_toggles(self.hwnd())")
+            .unwrap_or_else(|| panic!("copy_region never takes queued pause toggles:\n{body}"));
+        let apply = body
+            .find("self.toggle_pause()")
+            .expect("never applies them");
+        let gate = "actions::extract_text::gate(pause::is_paused_now())";
+        let recheck = select + body[select..].find(gate).expect("Pause re-check");
+        let spawn = body.find("spawn_executor(").expect("spawns the worker");
+        assert!(select < take && take < apply && apply < recheck && recheck < spawn);
+        // And before the busy re-check's show_busy_card early return.
+        let busy = select + body[select..].find("busy_now()").expect("busy re-check");
+        assert!(take < busy, "{body}");
+    }
+
     // -- #1253 presses queued during the region picker --------------------
     /// Message-only window of the system `STATIC` class: no registered class
     /// or named kernel object of ours (Hard Rule 9).
