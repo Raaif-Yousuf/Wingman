@@ -393,12 +393,36 @@ pub(crate) fn accent_fill(theme: Theme, shades: AccentShades, surface: u32) -> u
 /// user's accent (Accent Dark 1 on light, Accent Light 2 on dark, as Windows 11
 /// links), pushed apart from the surface until it holds 4.5:1 (WCAG AA for
 /// text). High contrast uses `hotlight` instead and never comes here.
+/// A grey or very pale accent can only give a grey link, which may sit on the
+/// hint colour; then the default Windows blue's shade is used instead.
 pub(crate) fn link_ink(theme: Theme, shades: AccentShades, surface: u32) -> u32 {
-    let shade = match theme {
-        Theme::Dark => shades.light2,
-        Theme::Light | Theme::HighContrast => shades.dark1,
+    let pick = |s: AccentShades| {
+        let shade = match theme {
+            Theme::Dark => s.light2,
+            Theme::Light | Theme::HighContrast => s.dark1,
+        };
+        ensure_contrast(shade, surface, 4.5)
     };
-    ensure_contrast(shade, surface, 4.5)
+    let hint = match theme {
+        Theme::Dark => DARK.text_faint,
+        Theme::Light | Theme::HighContrast => LIGHT.text_faint,
+    };
+    let ink = pick(shades);
+    if channel_distance(ink, hint) >= MIN_LINK_HINT_DISTANCE {
+        ink
+    } else {
+        pick(DEFAULT_ACCENT)
+    }
+}
+
+/// How far a link must be from the hint colour (sum of channel differences)
+/// to read as a different colour.
+const MIN_LINK_HINT_DISTANCE: u32 = 60;
+
+fn channel_distance(a: u32, b: u32) -> u32 {
+    (0..3)
+        .map(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF))
+        .sum()
 }
 
 /// The user's accent shades. Read from the registry rather than
@@ -796,6 +820,11 @@ mod tests {
             rgb(0x00, 0x00, 0x00),
             rgb(0xFF, 0xFF, 0xFF),
             rgb(0xFF, 0xF1, 0x00),
+            // Greys that land on or next to the hint greys.
+            rgb(0x70, 0x70, 0x70),
+            rgb(0x76, 0x76, 0x76),
+            rgb(0x8C, 0x8C, 0x8C),
+            rgb(0x88, 0x88, 0x88),
         ];
         let mut checked = 0;
         for (theme, t) in [(Theme::Light, LIGHT), (Theme::Dark, DARK)] {
@@ -807,16 +836,14 @@ mod tests {
                 let ink = link_ink(theme, shades, t.surface);
                 let ratio = contrast_between(ink, t.surface);
                 assert!(ratio >= AA_TEXT, "{theme:?} {a:#08x}: {ratio:.2}:1");
-                // A grey accent can only ever give a grey link, which may land
-                // on the hint grey; a coloured accent never should.
-                let grey = (a & 0xFF) == ((a >> 8) & 0xFF) && (a & 0xFF) == ((a >> 16) & 0xFF);
-                if !grey {
-                    assert_ne!(ink, t.text_faint, "{theme:?} {a:#08x}");
-                }
+                assert!(
+                    channel_distance(ink, t.text_faint) >= MIN_LINK_HINT_DISTANCE,
+                    "{theme:?} {a:#08x}: link {ink:#08x} is too close to the hint colour"
+                );
                 checked += 1;
             }
         }
-        assert_eq!(checked, 14);
+        assert_eq!(checked, 22);
         // The default blue is used unchanged where it already reads.
         assert_eq!(
             link_ink(Theme::Light, DEFAULT_ACCENT, LIGHT.surface),

@@ -7690,6 +7690,23 @@ mod tests {
     }
 
     #[test]
+    fn the_card_palette_link_follows_the_accent_it_is_given() {
+        let sys = SysColors::read();
+        let green = theme::AccentShades {
+            light2: theme::rgb(0x6C, 0xE0, 0x9A),
+            dark1: theme::rgb(0x00, 0x7A, 0x3D),
+        };
+        for t in [Theme::Light, Theme::Dark] {
+            let blue = palette_for(t, &sys, theme::DEFAULT_ACCENT).link;
+            let other = palette_for(t, &sys, green).link;
+            assert_ne!(
+                blue, other,
+                "{t:?}: the accent argument must reach the link"
+            );
+        }
+    }
+
+    #[test]
     fn footer_links_use_the_link_colour_not_the_hint() {
         let p = palette_for(Theme::HighContrast, &theme::HC_BLACK, theme::DEFAULT_ACCENT);
         assert_eq!(p.link, theme::HC_BLACK.hotlight);
