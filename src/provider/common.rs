@@ -187,6 +187,7 @@ pub(crate) struct RawResponse {
 /// reached the vendor -- and, for a billed completion API, was almost
 /// certainly already processed/charged -- so a failure reading the body
 /// after that point must never be treated the same as "never connected".
+#[derive(Debug)]
 pub(crate) enum TransportError {
     /// DNS, connect, TLS, or send failed -- no response was ever received.
     /// Safe to retry per [`RetryPolicy`].
@@ -3109,6 +3110,53 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Reads one whole HTTP request (headers, then `Content-Length` bytes of
+    /// body) so a test server never closes with unread data. On Windows that
+    /// close sends a reset, and the client can see it before the reply (#1326).
+    fn read_whole_request(s: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut req = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                let want = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if req.len() >= end + 4 + want {
+                    return;
+                }
+            }
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    #[test]
+    fn read_whole_request_waits_for_the_body() {
+        use std::io::Write;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.write_all(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
+                .unwrap();
+            c.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            c.write_all(b"hello").unwrap();
+        });
+        let (mut s, _) = l.accept().unwrap();
+        let started = std::time::Instant::now();
+        read_whole_request(&mut s);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        client.join().unwrap();
+    }
+
     /// Both process-wide gates `post_json_with` consults, taken together in
     /// one fixed order, by every test in this module that can reach it.
     ///
@@ -3353,13 +3401,12 @@ mod tests {
     /// config, not the environment, so parallel tests are not affected.
     #[test]
     fn loopback_request_ignores_a_dead_proxy_and_a_remote_one_does_not() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let _ = s.read(&mut buf);
+            read_whole_request(&mut s);
             let _ =
                 s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         });
@@ -3386,7 +3433,7 @@ mod tests {
     /// connection and the caller must get the 302 as a plain response.
     #[test]
     fn a_redirect_is_not_followed_and_the_key_header_goes_nowhere() {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         other.set_nonblocking(true).unwrap();
         let other_port = other.local_addr().unwrap().port();
@@ -3394,8 +3441,7 @@ mod tests {
         let first_port = first.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut s, _) = first.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = s.read(&mut buf);
+            read_whole_request(&mut s);
             let reply = format!(
                 "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{other_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
@@ -3409,7 +3455,7 @@ mod tests {
                 &serde_json::json!({"a": 1}),
                 Duration::from_secs(5),
             )
-            .unwrap_or_else(|_| panic!("a 302 is a response, not a transport error"));
+            .unwrap_or_else(|e| panic!("a 302 is a response, not a transport error: {e:?}"));
         server.join().unwrap();
         assert_eq!(raw.status, 302);
         std::thread::sleep(Duration::from_millis(300));
