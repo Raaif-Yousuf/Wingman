@@ -1172,12 +1172,12 @@ struct App {
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
     fallback_footer: Option<String>,
-    /// #40: the `Undo` the most recent successful `fill_form` run returned,
-    /// so "Restore last form" (tray) can put its fields back. `FnOnce`
+    /// #40, #1281: the `Undo` the most recent successful writing run returned (form fill, calendar, contact, replace),
+    /// so "Undo last action" (tray) can put it back. `FnOnce`
     /// (`executors::Undo::undo` consumes it), so this is `take()`n on use --
     /// a second "Restore" click after a successful restore reports "nothing
     /// to restore" rather than attempting a stale undo twice.
-    last_form_undo: Option<executors::Undo>,
+    last_undo: Option<executors::Undo>,
     /// #712: an executor worker is writing into another window. Quit waits
     /// for it, so a write is never killed half way.
     exec_in_flight: bool,
@@ -1468,7 +1468,7 @@ pub fn run() -> Result<()> {
         first_run_for_options: false,
         first_run_not_running_until: None,
         fallback_footer: None,
-        last_form_undo: None,
+        last_undo: None,
         exec_in_flight: false,
         last_error: None,
     });
@@ -5260,6 +5260,7 @@ impl App {
                 let headline = Self::calendar_headline(&undo.outcome);
                 self.card
                     .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
+                self.last_undo = undo.remember();
             }
             ExecDone::Calendar(Err(e)) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
@@ -5269,10 +5270,11 @@ impl App {
             ExecDone::Review(Ok(undo)) => {
                 self.card.show_answer(
                     "Email updated",
-                    &with_pending_notices(&undo.summary),
+                    &with_pending_notices(&undo.summary_with_hint()),
                     0,
                     None,
                 );
+                self.last_undo = undo.remember();
             }
             ExecDone::Review(Err(e)) => {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
@@ -5283,7 +5285,7 @@ impl App {
                 let headline = Self::form_fill_headline(&undo.outcome);
                 self.card
                     .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-                self.last_form_undo = undo.is_restorable().then_some(undo);
+                self.last_undo = undo.remember();
             }
             ExecDone::FormFill(Err(e)) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
@@ -5322,7 +5324,11 @@ impl App {
             ExecDone::Replace {
                 action_name,
                 report,
+                undo,
             } => {
+                if let Some(undo) = undo {
+                    self.last_undo = Some(undo);
+                }
                 use actions::generic_replace::ReplaceReport;
                 match report {
                     ReplaceReport::Replaced(summary) => {
@@ -5371,23 +5377,19 @@ impl App {
                 self.set_watch(true);
             }
             ExecDone::RestoreForm(Ok(())) => {
-                self.card.show_answer(
-                    "Form restored",
-                    "The fields this filled have been put back.",
-                    5,
-                    None,
-                );
+                self.card
+                    .show_answer("Undone", "The last action has been undone.", 5, None);
             }
             ExecDone::RestoreForm(Err(e)) => {
-                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
+                let detail = self.track_error("Couldn't fully undo that", &format!("{e:#}"));
                 self.card
-                    .show_error_with_details("Couldn't fully restore the form", &detail);
+                    .show_error_with_details("Couldn't fully undo that", &detail);
             }
         }
         self.set_watch(true);
     }
     /// Tray "Restore last form" (#40's Undo requirement). Takes
-    /// `self.last_form_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
+    /// `self.last_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
     /// so a second click after a successful restore reports "nothing to
     /// restore" rather than attempting a stale undo twice. Always shown in
     /// the tray (no dynamic enable/disable state) -- clicking it with
@@ -5399,17 +5401,17 @@ impl App {
         if self.busy {
             self.card.show_answer(
                 "Still working",
-                "Try Restore last form again once the current action has finished.",
+                "Try Undo last action again once the current action has finished.",
                 5,
                 None,
             );
             self.set_watch(true);
             return;
         }
-        let Some(undo) = self.last_form_undo.take() else {
+        let Some(undo) = self.last_undo.take() else {
             self.card.show_answer(
                 "Nothing to restore",
-                "No form fill that can be restored since Wingman started, or it was already restored.",
+                "No action that can be undone since Wingman started, or it was already undone.",
                 5,
                 None,
             );
@@ -9071,6 +9073,7 @@ enum ExecDone {
     Replace {
         action_name: String,
         report: actions::generic_replace::ReplaceReport,
+        undo: Option<executors::Undo>,
     },
     RestoreForm(anyhow::Result<()>),
     /// #772: the region copy's clipboard write, with the size for the card.
@@ -9142,7 +9145,7 @@ fn exec_work_replace(
     plan: Option<Box<actions::generic_replace::ReplaceSelection>>,
     confirmed: confirm::Confirmed<Value>,
 ) -> ExecDone {
-    let report = actions::generic_replace::replace_or_copy(
+    let (report, undo) = actions::generic_replace::replace_or_copy(
         replace.as_ref(),
         copy.as_ref(),
         plan.as_deref(),
@@ -9151,6 +9154,7 @@ fn exec_work_replace(
     ExecDone::Replace {
         action_name,
         report,
+        undo,
     }
 }
 
@@ -14269,6 +14273,33 @@ mod tests {
             }
         }
         assert!(hits >= 5, "the scan found only {hits} calls");
+    }
+
+    /// #1281: every result arm whose card can promise an Undo keeps it for
+    /// the tray's "Undo last action". Reads the arms' own text, with the CRLF
+    /// stripped first.
+    #[test]
+    fn writing_result_arms_keep_their_undo_for_the_tray() {
+        let src = include_str!("app.rs").replace('\r', "");
+        let start = src.find("fn on_exec_done(").expect("fn exists");
+        let end = start + src[start..].find("fn restore_last_form(").expect("next fn");
+        let body = &src[start..end];
+        for arm in [
+            "ExecDone::Calendar(Ok(undo))",
+            "ExecDone::Review(Ok(undo))",
+            "ExecDone::FormFill(Ok(undo))",
+            "ExecDone::Replace {",
+        ] {
+            let at = body
+                .find(arm)
+                .unwrap_or_else(|| panic!("{arm} arm missing"));
+            let rest = &body[at + arm.len()..];
+            let next = rest.find("\n            ExecDone::").unwrap_or(rest.len());
+            assert!(
+                rest[..next].contains("self.last_undo = "),
+                "{arm} drops its Undo instead of keeping it in last_undo"
+            );
+        }
     }
 
     #[test]

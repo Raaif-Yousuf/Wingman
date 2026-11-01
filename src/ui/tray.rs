@@ -891,7 +891,7 @@ impl Tray {
         append_item(actions, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
         append_item(actions, cmd::REVIEW_EMAIL, "Review this email")?;
         append_item(actions, cmd::FILL_FORM, "Fill this form")?;
-        append_item(actions, cmd::RESTORE_LAST_FORM, "Restore last form")?;
+        append_item(actions, cmd::RESTORE_LAST_FORM, "Undo last action")?;
         if let Some(files) = self.knowledge_files {
             append_separator(actions)?;
             append_item(actions, cmd::OPEN_KNOWLEDGE, &knowledge_label(files))?;
