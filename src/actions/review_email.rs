@@ -499,6 +499,10 @@ pub struct ReviewOutcome {
     pub source: InputSource,
     /// The selection was cut to the length limit (see [`CUT_NOTICE`]).
     pub cut: bool,
+    /// Which action asked for this review ([`ACTION_ID`] or
+    /// `fix_spelling::ACTION_ID`): both share this capture and worker, but
+    /// show different cards.
+    pub action_id: String,
 }
 
 /// Everything "Do it" needs, stashed by `app.rs` between the preview being

@@ -3491,6 +3491,7 @@ impl App {
             Some(DispatchTarget::ResolveDates) => self.resolve_dates(),
             Some(DispatchTarget::AddToCalendar) => self.add_event_from_screen(),
             Some(DispatchTarget::ReviewEmail) => self.review_this_email(),
+            Some(DispatchTarget::FixSpelling) => self.fix_spelling_grammar(),
             Some(DispatchTarget::FillForm) => self.fill_form_from_screen(),
             Some(DispatchTarget::CalculateSelection) => self.calculate_selection(),
             Some(DispatchTarget::CopyRegion) => self.copy_region(),
@@ -4599,6 +4600,9 @@ impl App {
             Some(PendingPreview::Review(ctx)) => {
                 self.run_review_executor(ctx);
             }
+            Some(PendingPreview::FixText { ctx, new_text }) => {
+                self.run_fix_executor(ctx, new_text);
+            }
             Some(PendingPreview::FormFill(original)) => {
                 self.run_confirmed_form_fill(&original, confirmed);
             }
@@ -4826,6 +4830,18 @@ impl App {
     /// `begin_model_action`, exactly like `add_event_from_screen`'s already
     /// does.
     fn review_this_email(&mut self) {
+        self.review_text(actions::review_email::ACTION_ID);
+    }
+
+    /// #1274: "Fix spelling and grammar". The same Look and model steps as
+    /// [`Self::review_this_email`], then its own cards (`on_fix_result`).
+    fn fix_spelling_grammar(&mut self) {
+        self.review_text(actions::fix_spelling::ACTION_ID);
+    }
+
+    /// The shared start of both review flows: `action_id` picks the prompt
+    /// and which result handler shows the cards.
+    fn review_text(&mut self, action_id: &'static str) {
         let Some((pending, foreground_hwnd_isize, ())) = self.begin_model_action(|_| Some(()))
         else {
             return;
@@ -4845,7 +4861,14 @@ impl App {
                     (|| -> Result<actions::review_email::ReviewOutcome> {
                         let mut raw = pending.finish();
                         let shot = encode_for_upload(&mut raw, &providers, mode, redact)?;
-                        review_worker(&providers, mode, &shot, &raw, foreground_hwnd_isize)
+                        review_worker(
+                            action_id,
+                            &providers,
+                            mode,
+                            &shot,
+                            &raw,
+                            foreground_hwnd_isize,
+                        )
                     })()
                     .map_err(|e| {
                         let chain_text = worker_error_chain_text(&e);
@@ -4911,6 +4934,11 @@ impl App {
                 return;
             }
         };
+
+        if outcome.action_id == actions::fix_spelling::ACTION_ID {
+            self.on_fix_result(outcome);
+            return;
+        }
 
         if actions::review_email::is_good_to_go(&outcome.proposal) {
             let detail = with_fallback_footer(
@@ -4980,6 +5008,85 @@ impl App {
         // Same "Preview manages its own lifecycle" reasoning as
         // `on_calendar_result`'s own return here -- the global click
         // watcher stays disarmed.
+    }
+
+    /// #1274: shows what "Fix spelling and grammar" found. Nothing to fix and
+    /// nothing readable are plain cards. Otherwise the preview lists each
+    /// change as `old -> new`, and "Do it" writes the fixed text (or, where
+    /// the box cannot be written, copies it: see `fix_spelling::write_or_copy`).
+    fn on_fix_result(&mut self, outcome: actions::review_email::ReviewOutcome) {
+        use actions::fix_spelling::{self, FixPlan};
+        let footer = self.fallback_footer.clone();
+        let plain =
+            |detail: &str| with_fallback_footer(&with_pending_notices(detail), footer.as_deref());
+        match fix_spelling::plan(&outcome) {
+            FixPlan::NoText => {
+                self.card.show_answer(
+                    "Nothing to fix",
+                    &plain(fix_spelling::NO_TEXT_DETAIL),
+                    0,
+                    None,
+                );
+                self.set_watch(true);
+            }
+            FixPlan::NoChanges => {
+                self.card.show_answer(
+                    actions::generic_replace::NO_CHANGES_HEADLINE,
+                    &plain(fix_spelling::NO_CHANGES_DETAIL),
+                    5,
+                    None,
+                );
+                self.set_watch(true);
+            }
+            FixPlan::TooLong(detail) => {
+                self.card
+                    .show_answer("Fixes found", &plain(&detail), 0, None);
+                self.set_watch(true);
+            }
+            FixPlan::Preview {
+                ctx,
+                new_text,
+                title,
+                shown,
+            } => {
+                self.pending_preview = Some(PendingPreview::FixText { ctx, new_text });
+                self.pending_preview_generation = self.card.show_preview_with_note(
+                    &title,
+                    &fix_spelling::display_schema(),
+                    &shown,
+                    false,
+                    self.fallback_footer.as_deref(),
+                );
+            }
+        }
+    }
+
+    /// #1274: the fix flow's half of `on_preview_decided`.
+    fn run_fix_executor(
+        &mut self,
+        ctx: Option<Box<actions::review_email::ReviewContext>>,
+        new_text: String,
+    ) {
+        let executors = executors::registry::resolve("replace_text")
+            .and_then(|replace| Ok((replace, executors::registry::resolve("clipboard")?)));
+        match executors {
+            Ok((replace, copy)) => {
+                self.spawn_executor(Box::new(move || {
+                    ExecDone::FixText(actions::fix_spelling::write_or_copy(
+                        replace.as_ref(),
+                        copy.as_ref(),
+                        ctx.as_deref(),
+                        &new_text,
+                    ))
+                }));
+            }
+            Err(e) => {
+                let detail = self.track_error("Couldn't fix the text", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't fix the text", &detail);
+                self.set_watch(true);
+            }
+        }
     }
 
     /// #38: the review flow's half of `on_preview_decided` -- resolves the
@@ -5278,6 +5385,40 @@ impl App {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't update the email", &detail);
+            }
+            ExecDone::FixText(report) => {
+                use actions::generic_replace::ReplaceReport;
+                match report {
+                    ReplaceReport::Replaced(summary) => {
+                        self.card.show_answer(
+                            "Text fixed",
+                            &with_pending_notices(&summary),
+                            0,
+                            None,
+                        );
+                    }
+                    ReplaceReport::Copied(detail) => {
+                        self.card.show_answer(
+                            "Fixed text copied to the clipboard",
+                            &with_pending_notices(&detail),
+                            0,
+                            None,
+                        );
+                    }
+                    ReplaceReport::NothingToReplace => {
+                        self.card.show_answer(
+                            actions::generic_replace::NO_CHANGES_HEADLINE,
+                            &with_pending_notices(""),
+                            0,
+                            None,
+                        );
+                    }
+                    ReplaceReport::Failed(reason) => {
+                        let detail = self.track_error("Couldn't fix the text", &reason);
+                        self.card
+                            .show_error_with_details("Couldn't fix the text", &detail);
+                    }
+                }
             }
             ExecDone::FormFill(Ok(undo)) => {
                 let headline = Self::form_fill_headline(&undo.outcome);
@@ -7834,6 +7975,7 @@ fn calendar_worker(
 /// retry/repair and non-vision fallback machinery are otherwise identical
 /// to `worker`/`calendar_worker`.
 fn review_worker(
+    action_id: &str,
     providers: &Providers,
     mode: Mode,
     shot: &Shot,
@@ -7843,19 +7985,29 @@ fn review_worker(
     let resolved = actions::load_actions().context("failed to load actions")?;
     let action = resolved
         .iter()
-        .find(|r| r.action.id == actions::review_email::ACTION_ID)
+        .find(|r| r.action.id == action_id)
         .map(|r| &r.action)
         .with_context(|| {
-            format!(
-                "the \"{}\" action is disabled or missing; check actions.toml",
-                actions::review_email::ACTION_ID
-            )
+            format!("the \"{action_id}\" action is disabled or missing; check actions.toml")
         })?;
 
     let captured = actions::review_email::capture_input(foreground_hwnd);
     let source = captured.source();
     let original_text = captured.text().unwrap_or_default().to_string();
     let target = captured.target();
+
+    // #1274: with no text to fix there is nothing to ask a model, and the
+    // screenshot fallback is for email only.
+    if action_id == actions::fix_spelling::ACTION_ID && captured.text().is_none() {
+        return Ok(actions::review_email::ReviewOutcome {
+            proposal: Value::Null,
+            original_text,
+            target,
+            source,
+            cut: false,
+            action_id: action_id.to_string(),
+        });
+    }
 
     let req = match captured.text() {
         Some(text) => review_request_from_text(&action.prompt, text),
@@ -7879,6 +8031,7 @@ fn review_worker(
         target,
         source,
         cut: captured.was_cut(),
+        action_id: action_id.to_string(),
     })
 }
 
@@ -9059,6 +9212,8 @@ fn unpack_error(packed: &str) -> (&str, &str) {
 enum ExecDone {
     Calendar(anyhow::Result<executors::Undo>),
     Review(anyhow::Result<executors::Undo>),
+    /// #1274: the fixed text was written, or copied instead.
+    FixText(actions::generic_replace::ReplaceReport),
     FormFill(anyhow::Result<executors::Undo>),
     /// A non-built-in action's executor. Carries the action and the
     /// confirmed proposal because the card text is built from both.
@@ -9088,6 +9243,7 @@ impl std::fmt::Debug for ExecDone {
         f.write_str(match self {
             ExecDone::Calendar(_) => "ExecDone::Calendar",
             ExecDone::Review(_) => "ExecDone::Review",
+            ExecDone::FixText(_) => "ExecDone::FixText",
             ExecDone::FormFill(_) => "ExecDone::FormFill",
             ExecDone::Generic { .. } => "ExecDone::Generic",
             ExecDone::Replace { .. } => "ExecDone::Replace",
@@ -9719,6 +9875,12 @@ enum PendingPreview {
     /// the card confirmed is only the preview's flat translation, so this is
     /// what `actions::fill_form::rebuild_after_confirm` rebuilds against.
     FormFill(Value),
+    /// #1274 "Fix spelling and grammar": where to write the fixed text, or
+    /// `None` to copy it, and the whole fixed text for the copy.
+    FixText {
+        ctx: Option<Box<actions::review_email::ReviewContext>>,
+        new_text: String,
+    },
     /// #242: a non-built-in `actions.toml` action awaiting its preview
     /// decision. Carries the resolved `Action` itself (not just its id) so
     /// `run_confirmed_generic_action` does not need a second
