@@ -686,7 +686,7 @@ impl OllamaModelCache {
     }
 }
 
-const WINDOW_CLASS: PCWSTR = w!("Wingman.Owner.Window.4d1b62f0");
+pub(crate) const OWNER_CLASS: &str = "Wingman.Owner.Window.4d1b62f0";
 
 /// How long to wait after hiding a visible card before capturing, so the
 /// compositor has actually taken it off the screen. Without this the old card
@@ -1190,12 +1190,12 @@ struct App {
     /// action result handler from the worker's attribution and `None` unless
     /// a fallback answered.
     fallback_footer: Option<String>,
-    /// #40: the `Undo` the most recent successful `fill_form` run returned,
-    /// so "Restore last form" (tray) can put its fields back. `FnOnce`
+    /// #40, #1281: the `Undo` the most recent successful writing run returned (form fill, calendar, contact, replace),
+    /// so "Undo last action" (tray) can put it back. `FnOnce`
     /// (`executors::Undo::undo` consumes it), so this is `take()`n on use --
     /// a second "Restore" click after a successful restore reports "nothing
     /// to restore" rather than attempting a stale undo twice.
-    last_form_undo: Option<executors::Undo>,
+    last_undo: Option<executors::Undo>,
     /// #712: an executor worker is writing into another window. Quit waits
     /// for it, so a write is never killed half way.
     exec_in_flight: bool,
@@ -1486,7 +1486,7 @@ pub fn run() -> Result<()> {
         first_run_for_options: false,
         first_run_not_running_until: None,
         fallback_footer: None,
-        last_form_undo: None,
+        last_undo: None,
         exec_in_flight: false,
         last_error: None,
     });
@@ -1511,12 +1511,18 @@ pub fn run() -> Result<()> {
     }
 
     // The hook must be installed on the thread that pumps messages — this one.
-    match HotkeyHook::install(
-        hwnd,
-        app.config.hotkeys.primary,
-        app.config.hotkeys.secondary,
-    ) {
-        Ok(h) => {
+    // #1271: a debug dev instance skips the hook so the installed instance
+    // keeps the Copilot key.
+    let hook_result = crate::dev_instance::hook_enabled().then(|| {
+        HotkeyHook::install(
+            hwnd,
+            app.config.hotkeys.primary,
+            app.config.hotkeys.secondary,
+        )
+    });
+    match hook_result {
+        None => {}
+        Some(Ok(h)) => {
             // #181: no default binding, so this is a no-op (packs to the
             // "unconfigured" sentinel) unless the owner hand-edited
             // config.toml.
@@ -1526,7 +1532,7 @@ pub fn run() -> Result<()> {
             h.set_palette_chord(app.config.hotkeys.palette);
             app.hook = Some(h);
         }
-        Err(e) => {
+        Some(Err(e)) => {
             let detail = app.track_error("Hotkeys unavailable", &format!("{e:#}"));
             app.card.show_error_with_details(
                 "Hotkeys unavailable",
@@ -1921,11 +1927,14 @@ fn settings_create_failed_card(folder: &str, error: &str) -> (String, String) {
 }
 
 fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
+    // #1271: a debug dev instance has its own class name.
+    let class_name = crate::dev_instance::wide_name(OWNER_CLASS);
+    let window_class = PCWSTR(class_name.as_ptr());
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance,
-        lpszClassName: WINDOW_CLASS,
+        lpszClassName: window_class,
         ..Default::default()
     };
     // A duplicate that destroyed its window and starts anyway registers the
@@ -1943,7 +1952,7 @@ fn create_owner_window(instance: HINSTANCE) -> Result<HWND> {
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            WINDOW_CLASS,
+            window_class,
             w!("Wingman"),
             WS_OVERLAPPED,
             CW_USEDEFAULT,
@@ -3846,7 +3855,18 @@ impl App {
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
-        let raw = match crate::ui::region::select_region(self.instance) {
+        let picked = crate::ui::region::select_region(self.instance);
+        // #1253: the picker's loop reads only its own window, so a Copilot key
+        // press, second launch or palette chord made while it was open is
+        // still queued for this window. Drop them before they run as a new
+        // ask (a billed request) the user did not mean. Cancel and error too.
+        drop_queued_presses(self.hwnd());
+        // A Pause chord pressed meanwhile is state the user meant: apply it
+        // now, so the Pause re-check below reads the real state.
+        for _ in 0..take_queued_pause_toggles(self.hwnd()) {
+            self.toggle_pause();
+        }
+        let raw = match picked {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // cancelled: no card, nothing changed
             Err(e) => {
@@ -3859,9 +3879,11 @@ impl App {
             }
         };
 
-        // The selector pumped its own message loop: a hotkey or tray command
-        // may have started another action meanwhile. Check again, or two runs
-        // would overlap. The picked region is dropped, as on a busy press.
+        // The selector pumped its own message loop, which delivers other
+        // windows' messages only for the ones it dispatches (none for this
+        // window), so nothing should have started meanwhile. Check again
+        // anyway, or two runs would overlap. The picked region is dropped,
+        // as on a busy press.
         if self.busy_now() {
             self.show_busy_card();
             return;
@@ -5201,7 +5223,7 @@ impl App {
     /// `executors::fill_form::format_outcomes`, already lists filled,
     /// skipped and refused fields by name; #268: the headline above it
     /// must agree, via [`Self::form_fill_headline`]). On success, stashes
-    /// the `Undo` for "Restore last form" (tray, `restore_last_form`).
+    /// the `Undo` for "Undo last action" (tray, `undo_last_action`).
     fn run_form_fill_executor(
         &mut self,
         executor: Box<dyn executors::Executor>,
@@ -5264,13 +5286,15 @@ impl App {
     /// #712: shows the card for a finished executor run, whichever action
     /// it was. Each arm is what that action's own handler showed when it ran
     /// the executor inline. On the form fill, stashes the `Undo` for
-    /// "Restore last form" (#645: only when something can be restored).
+    /// "Undo last action" (#645: only when something can be restored).
     fn on_exec_done(&mut self, result: std::result::Result<ExecDone, String>) {
         self.exec_in_flight = false;
         self.set_busy(false);
         let done = match result {
             Ok(done) => done,
             Err(packed) => {
+                // Nothing was written: an older undo must not stay live.
+                self.last_undo = None;
                 if self.show_empty_chain_failure(&packed) {
                     return;
                 }
@@ -5283,11 +5307,15 @@ impl App {
                 return;
             }
         };
-        match done {
+        match &done {
             ExecDone::Calendar(Ok(undo)) => {
                 let headline = Self::calendar_headline(&undo.outcome);
-                self.card
-                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
+                self.card.show_answer(
+                    headline,
+                    &with_pending_notices(&undo.summary_with_hint()),
+                    0,
+                    None,
+                );
             }
             ExecDone::Calendar(Err(e)) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
@@ -5297,7 +5325,7 @@ impl App {
             ExecDone::Review(Ok(undo)) => {
                 self.card.show_answer(
                     "Email updated",
-                    &with_pending_notices(&undo.summary),
+                    &with_pending_notices(&undo.summary_with_hint()),
                     0,
                     None,
                 );
@@ -5309,9 +5337,12 @@ impl App {
             }
             ExecDone::FormFill(Ok(undo)) => {
                 let headline = Self::form_fill_headline(&undo.outcome);
-                self.card
-                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-                self.last_form_undo = undo.is_restorable().then_some(undo);
+                self.card.show_answer(
+                    headline,
+                    &with_pending_notices(&undo.summary_with_hint()),
+                    0,
+                    None,
+                );
             }
             ExecDone::FormFill(Err(e)) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
@@ -5326,12 +5357,17 @@ impl App {
             } => {
                 // #441: a read-only `"none"` action's answer comes from the
                 // proposal the card confirmed.
+                let summary = if keeps_undo(executor_name) {
+                    undo.summary_with_hint()
+                } else {
+                    undo.summary.clone()
+                };
                 let text = actions::generic_answer::result_card_text(
                     &action.name,
-                    &executor_name,
+                    executor_name,
                     &action.proposal,
-                    &undo.summary,
-                    &proposal,
+                    &summary,
+                    proposal,
                 );
                 let detail = with_pending_notices(&text.detail);
                 let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
@@ -5350,13 +5386,14 @@ impl App {
             ExecDone::Replace {
                 action_name,
                 report,
+                ..
             } => {
                 use actions::generic_replace::ReplaceReport;
                 match report {
                     ReplaceReport::Replaced(summary) => {
                         self.card.show_answer(
                             "Selection replaced",
-                            &with_pending_notices(&summary),
+                            &with_pending_notices(summary),
                             0,
                             None,
                         );
@@ -5364,7 +5401,7 @@ impl App {
                     ReplaceReport::Copied(detail) => {
                         self.card.show_answer(
                             "Copied to the clipboard",
-                            &with_pending_notices(&detail),
+                            &with_pending_notices(detail),
                             0,
                             None,
                         );
@@ -5379,7 +5416,7 @@ impl App {
                     }
                     ReplaceReport::Failed(reason) => {
                         let title = format!("Couldn't run \"{action_name}\"");
-                        let detail = self.track_error(&title, &reason);
+                        let detail = self.track_error(&title, reason);
                         self.card.show_error_with_details(&title, &detail);
                     }
                 }
@@ -5398,46 +5435,43 @@ impl App {
                     .show_error_with_details("Couldn't copy the region", &detail);
                 self.set_watch(true);
             }
-            ExecDone::RestoreForm(Ok(())) => {
-                self.card.show_answer(
-                    "Form restored",
-                    "The fields this filled have been put back.",
-                    5,
-                    None,
-                );
-            }
-            ExecDone::RestoreForm(Err(e)) => {
-                let detail = self.track_error("Couldn't fully restore the form", &format!("{e:#}"));
+            ExecDone::UndoLast(Ok(())) => {
                 self.card
-                    .show_error_with_details("Couldn't fully restore the form", &detail);
+                    .show_answer("Undone", "The last action has been undone.", 5, None);
+            }
+            ExecDone::UndoLast(Err(e)) => {
+                let detail = self.track_error("Couldn't fully undo that", &format!("{e:#}"));
+                self.card
+                    .show_error_with_details("Couldn't fully undo that", &detail);
             }
         }
+        self.last_undo = undo_slot_after(done);
         self.set_watch(true);
     }
-    /// Tray "Restore last form" (#40's Undo requirement). Takes
-    /// `self.last_form_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
+    /// Tray "Undo last action" (#40's Undo requirement). Takes
+    /// `self.last_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
     /// so a second click after a successful restore reports "nothing to
     /// restore" rather than attempting a stale undo twice. Always shown in
     /// the tray (no dynamic enable/disable state) -- clicking it with
     /// nothing to restore is a plain informational card, never a dialog
     /// box (rule 7).
-    fn restore_last_form(&mut self) {
+    fn undo_last_action(&mut self) {
         // #712: the restore runs off the UI thread, so it needs the same
         // "one thing at a time" as every other run. Keep the undo for later.
         if self.busy {
             self.card.show_answer(
                 "Still working",
-                "Try Restore last form again once the current action has finished.",
+                "Try Undo last action again once the current action has finished.",
                 5,
                 None,
             );
             self.set_watch(true);
             return;
         }
-        let Some(undo) = self.last_form_undo.take() else {
+        let Some(undo) = self.last_undo.take() else {
             self.card.show_answer(
-                "Nothing to restore",
-                "No form fill that can be restored since Wingman started, or it was already restored.",
+                "Nothing to undo",
+                "No action that can be undone since Wingman started, or it was already undone.",
                 5,
                 None,
             );
@@ -9099,8 +9133,9 @@ enum ExecDone {
     Replace {
         action_name: String,
         report: actions::generic_replace::ReplaceReport,
+        undo: Option<executors::Undo>,
     },
-    RestoreForm(anyhow::Result<()>),
+    UndoLast(anyhow::Result<()>),
     /// #772: the region copy's clipboard write, with the size for the card.
     RegionCopy {
         width: u32,
@@ -9119,7 +9154,7 @@ impl std::fmt::Debug for ExecDone {
             ExecDone::FormFill(_) => "ExecDone::FormFill",
             ExecDone::Generic { .. } => "ExecDone::Generic",
             ExecDone::Replace { .. } => "ExecDone::Replace",
-            ExecDone::RestoreForm(_) => "ExecDone::RestoreForm",
+            ExecDone::UndoLast(_) => "ExecDone::UndoLast",
             ExecDone::RegionCopy { .. } => "ExecDone::RegionCopy",
         })
     }
@@ -9170,7 +9205,7 @@ fn exec_work_replace(
     plan: Option<Box<actions::generic_replace::ReplaceSelection>>,
     confirmed: confirm::Confirmed<Value>,
 ) -> ExecDone {
-    let report = actions::generic_replace::replace_or_copy(
+    let (report, undo) = actions::generic_replace::replace_or_copy(
         replace.as_ref(),
         copy.as_ref(),
         plan.as_deref(),
@@ -9179,11 +9214,40 @@ fn exec_work_replace(
     ExecDone::Replace {
         action_name,
         report,
+        undo,
     }
 }
 
+/// #1281: what the tray's "Undo last action" holds after a result: the
+/// result's own undo when it wrote something that can be put back, and
+/// nothing otherwise, so an old undo never stays live behind a card about
+/// something else.
+fn undo_slot_after(done: ExecDone) -> Option<executors::Undo> {
+    match done {
+        ExecDone::Calendar(Ok(undo))
+        | ExecDone::Review(Ok(undo))
+        | ExecDone::FormFill(Ok(undo)) => undo.remember(),
+        ExecDone::Generic {
+            executor_name,
+            result: Ok(undo),
+            ..
+        } if keeps_undo(&executor_name) => undo.remember(),
+        ExecDone::Replace { undo, .. } => undo.and_then(executors::Undo::remember),
+        _ => None,
+    }
+}
+
+/// The clipboard executors' undo has no stale check (it could overwrite
+/// something copied later) and their cards never promise one, so it is
+/// not kept.
+fn keeps_undo(executor_name: &str) -> bool {
+    matches!(
+        executor_name,
+        "calendar_add" | "contact_add" | "fill_form" | "replace_text"
+    )
+}
 fn exec_work_restore(undo: executors::Undo) -> ExecDone {
-    ExecDone::RestoreForm(undo.undo())
+    ExecDone::UndoLast(undo.undo())
 }
 
 /// #772: puts the selected region on the clipboard as an image. Encoding the
@@ -10465,7 +10529,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card(Trigger::Tray, true),
         MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
         MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
-        MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
+        MenuChoice::Command(cmd::UNDO_LAST_ACTION) => app.undo_last_action(),
         MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
         MenuChoice::Command(cmd::OPEN_KNOWLEDGE) => app.open_knowledge_folder(),
         MenuChoice::Command(cmd::RELOAD) => app.reload(),
@@ -11220,8 +11284,211 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
+/// #1253: the region picker pumps a message loop filtered to its own window,
+/// so a Copilot key press, a second launch or a palette chord made while it is
+/// open waits in the main window's queue and would run, as a new ask, the
+/// moment the picker closes. Removes those queued presses (none carries a
+/// boxed payload) without dispatching them and returns how many went. Pause
+/// toggles and results are state, not presses, and stay queued. Never blocks:
+/// `PeekMessageW` with `PM_REMOVE` returns at once when nothing matches.
+fn drop_queued_presses(hwnd: HWND) -> usize {
+    let mut dropped = 0;
+    let mut m = MSG::default();
+    for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE, WM_APP_PALETTE_TOGGLE] {
+        while unsafe { PeekMessageW(&mut m, Some(hwnd), id, id, PM_REMOVE) }.as_bool() {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+/// #1253: removes the queued `WM_APP_PAUSE_TOGGLE`s for `hwnd` and returns
+/// how many there were, so the caller can apply them in order. Unlike a key
+/// press, a Pause toggle is state the user meant, so it is applied, not
+/// dropped. Never blocks.
+fn take_queued_pause_toggles(hwnd: HWND) -> usize {
+    let mut taken = 0;
+    let mut m = MSG::default();
+    while unsafe {
+        PeekMessageW(
+            &mut m,
+            Some(hwnd),
+            WM_APP_PAUSE_TOGGLE,
+            WM_APP_PAUSE_TOGGLE,
+            PM_REMOVE,
+        )
+    }
+    .as_bool()
+    {
+        taken += 1;
+    }
+    taken
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queued_pause_toggles_are_taken_and_counted_and_nothing_else() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
+        let hwnd = test_message_window();
+        for id in [
+            super::WM_APP_PAUSE_TOGGLE,
+            super::WM_APP_PAUSE_TOGGLE,
+            super::WM_APP_HOTKEY,
+            super::WM_APP_ROUTER_RESULT,
+        ] {
+            unsafe { PostMessageW(Some(hwnd), id, WPARAM(0), LPARAM(0)) }.unwrap();
+        }
+        assert_eq!(super::take_queued_pause_toggles(hwnd), 2);
+        assert!(!queued(hwnd, super::WM_APP_PAUSE_TOGGLE));
+        assert!(queued(hwnd, super::WM_APP_HOTKEY));
+        assert!(queued(hwnd, super::WM_APP_ROUTER_RESULT));
+        assert_eq!(super::take_queued_pause_toggles(hwnd), 0);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    /// #1253: a Pause chord pressed while the picker is open is applied
+    /// right after it returns, before the Pause re-check reads the state, or
+    /// that re-check can never fire (the toggle is still queued).
+    #[test]
+    fn copy_region_applies_queued_pause_toggles_before_the_pause_recheck() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn copy_region(", "\n    fn ");
+        let select = body.find("select_region(").expect("opens the selector");
+        let take = body
+            .find("take_queued_pause_toggles(self.hwnd())")
+            .unwrap_or_else(|| panic!("copy_region never takes queued pause toggles:\n{body}"));
+        let apply = body
+            .find("self.toggle_pause()")
+            .expect("never applies them");
+        let gate = "actions::extract_text::gate(pause::is_paused_now())";
+        let recheck = select + body[select..].find(gate).expect("Pause re-check");
+        let spawn = body.find("spawn_executor(").expect("spawns the worker");
+        assert!(select < take && take < apply && apply < recheck && recheck < spawn);
+        // And before the busy re-check's show_busy_card early return.
+        let busy = select + body[select..].find("busy_now()").expect("busy re-check");
+        assert!(take < busy, "{body}");
+    }
+
+    // -- #1253 presses queued during the region picker --------------------
+    /// Message-only window of the system `STATIC` class: no registered class
+    /// or named kernel object of ours (Hard Rule 9).
+    fn test_message_window() -> windows::Win32::Foundation::HWND {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, HWND_MESSAGE};
+        unsafe {
+            CreateWindowExW(
+                super::WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("wingman-1253-test"),
+                super::WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("message-only window")
+    }
+
+    fn queued(hwnd: windows::Win32::Foundation::HWND, id: u32) -> bool {
+        let mut m = super::MSG::default();
+        // PM_NOREMOVE: look without consuming.
+        unsafe {
+            super::PeekMessageW(
+                &mut m,
+                Some(hwnd),
+                id,
+                id,
+                windows::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+            )
+        }
+        .as_bool()
+    }
+
+    #[test]
+    fn queued_presses_are_dropped_and_other_messages_stay() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
+        let hwnd = test_message_window();
+        let keep = [
+            super::WM_APP_PAUSE_TOGGLE,
+            super::WM_APP_ROUTER_RESULT,
+            super::WM_APP_COPY_TEXT_RESULT,
+        ];
+        let presses = [
+            super::WM_APP_HOTKEY,
+            super::WM_APP_ACTIVATE,
+            super::WM_APP_PALETTE_TOGGLE,
+        ];
+        for id in presses.iter().chain(keep.iter()) {
+            // Two of each: the drain must not stop at the first.
+            unsafe { PostMessageW(Some(hwnd), *id, WPARAM(0), LPARAM(0)) }.unwrap();
+            unsafe { PostMessageW(Some(hwnd), *id, WPARAM(0), LPARAM(0)) }.unwrap();
+        }
+        for id in presses.iter().chain(keep.iter()) {
+            assert!(queued(hwnd, *id), "setup: {id} should be queued");
+        }
+        assert_eq!(super::drop_queued_presses(hwnd), 6);
+        for id in presses {
+            assert!(!queued(hwnd, id), "press {id} survived the drain");
+        }
+        for id in keep {
+            assert!(queued(hwnd, id), "message {id} was wrongly consumed");
+        }
+        // Nothing left to drop, and it returns instead of waiting.
+        assert_eq!(super::drop_queued_presses(hwnd), 0);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn queued_presses_for_another_window_are_left_alone() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
+        let a = test_message_window();
+        let b = test_message_window();
+        unsafe { PostMessageW(Some(b), super::WM_APP_HOTKEY, WPARAM(0), LPARAM(0)) }.unwrap();
+        assert_eq!(super::drop_queued_presses(a), 0);
+        assert!(queued(b, super::WM_APP_HOTKEY));
+        assert_eq!(super::drop_queued_presses(b), 1);
+        let _ = unsafe { DestroyWindow(a) };
+        let _ = unsafe { DestroyWindow(b) };
+    }
+
+    /// #1253: the drop runs after the selector returns, on every outcome
+    /// (selected, cancelled, error), before anything else reads the queue.
+    #[test]
+    fn copy_region_drops_queued_presses_right_after_the_selector() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn copy_region(", "\n    fn ");
+        let select = body.find("select_region(").expect("opens the selector");
+        let drop = body
+            .find("drop_queued_presses(self.hwnd())")
+            .unwrap_or_else(|| panic!("copy_region never drops queued presses:\n{body}"));
+        // Straight after the call, before the outcome is matched on (so a
+        // cancel or an error drops them too) and before the busy re-check.
+        let call_end = select + body[select..].find(';').expect("end of the call");
+        assert!(
+            body[select..call_end].contains("select_region(self.instance)")
+                && body[call_end..drop]
+                    .trim_start_matches(';')
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//")),
+            "{body}"
+        );
+        let recheck = select + body[select..].find("busy_now()").expect("busy re-check");
+        assert!(drop < recheck, "{body}");
+        assert!(
+            !body.contains("hotkey may have started another action"),
+            "the misleading comment is back"
+        );
+    }
+
     // -- #105 send preview slot ------------------------------------------
 
     #[test]
@@ -14090,7 +14357,7 @@ mod tests {
     fn an_executor_result_box_is_freed_when_dropped_unhandled() {
         use windows::Win32::Foundation::LPARAM;
         let done: std::result::Result<ExecDone, String> =
-            Ok(ExecDone::RestoreForm(Err(anyhow::anyhow!("x"))));
+            Ok(ExecDone::UndoLast(Err(anyhow::anyhow!("x"))));
         let boxed = Box::into_raw(Box::new(done));
         assert!(super::free_boxed_payload(
             WM_APP_EXECUTOR_DONE,
@@ -14306,7 +14573,7 @@ mod tests {
         let undo = executors::Undo::recording("x", || anyhow::bail!("could not put it back"));
         let done = exec_work_restore(undo);
         assert!(
-            matches!(done, ExecDone::RestoreForm(Err(ref e)) if e.root_cause().to_string().contains("put it back"))
+            matches!(done, ExecDone::UndoLast(Err(ref e)) if e.root_cause().to_string().contains("put it back"))
         );
     }
 
@@ -14362,6 +14629,86 @@ mod tests {
         assert!(hits >= 5, "the scan found only {hits} calls");
     }
 
+    use super::undo_slot_after;
+
+    fn kept(summary: &str) -> executors::Undo {
+        executors::Undo::recording(summary, || Ok(()))
+    }
+
+    fn generic_done(executor: &str, undo: anyhow::Result<executors::Undo>) -> ExecDone {
+        ExecDone::Generic {
+            action: Box::new(actions::contact::builtin_action()),
+            executor_name: executor.to_string(),
+            proposal: Value::Null,
+            result: undo,
+        }
+    }
+
+    /// #1281: every writing result keeps its undo for the tray's "Undo last
+    /// action", and anything that produced none clears the slot, so an old
+    /// undo never stays live behind a card about something else.
+    #[test]
+    fn the_undo_slot_follows_the_latest_result() {
+        let some = |d: ExecDone| undo_slot_after(d).map(|u| u.summary);
+        assert_eq!(
+            some(ExecDone::Calendar(Ok(kept("cal")))).as_deref(),
+            Some("cal")
+        );
+        assert_eq!(
+            some(ExecDone::Review(Ok(kept("rev")))).as_deref(),
+            Some("rev")
+        );
+        assert_eq!(
+            some(ExecDone::FormFill(Ok(kept("form")))).as_deref(),
+            Some("form")
+        );
+        assert_eq!(
+            some(generic_done("contact_add", Ok(kept("contact")))).as_deref(),
+            Some("contact")
+        );
+        let replaced = ExecDone::Replace {
+            action_name: "r".into(),
+            report: actions::generic_replace::ReplaceReport::Replaced("x".into()),
+            undo: Some(kept("rep")),
+        };
+        assert_eq!(some(replaced).as_deref(), Some("rep"));
+    }
+
+    #[test]
+    fn a_result_with_no_undo_clears_the_slot() {
+        let none = |d: ExecDone| undo_slot_after(d).is_none();
+        assert!(none(ExecDone::Calendar(Err(anyhow::anyhow!("x")))));
+        assert!(none(ExecDone::Review(Ok(executors::Undo::none("x")))));
+        assert!(none(ExecDone::FormFill(Ok(executors::Undo::none("x")))));
+        assert!(none(generic_done("none", Ok(executors::Undo::none("x")))));
+        assert!(none(generic_done("contact_add", Err(anyhow::anyhow!("x")))));
+        // Copy-instead and failure: nothing was written, so nothing to undo.
+        for report in [
+            actions::generic_replace::ReplaceReport::Copied("c".into()),
+            actions::generic_replace::ReplaceReport::Failed("f".into()),
+            actions::generic_replace::ReplaceReport::NothingToReplace,
+        ] {
+            assert!(none(ExecDone::Replace {
+                action_name: "r".into(),
+                report,
+                undo: None,
+            }));
+        }
+        assert!(none(ExecDone::RegionCopy {
+            width: 1,
+            height: 1,
+            result: Ok(()),
+        }));
+    }
+
+    /// The clipboard undo has no stale check (it could overwrite something
+    /// copied later) and its card never promises one, so it is not kept.
+    #[test]
+    fn a_clipboard_undo_is_not_kept() {
+        for name in ["clipboard", "image_clipboard", "some_future_executor"] {
+            assert!(undo_slot_after(generic_done(name, Ok(kept("copied")))).is_none());
+        }
+    }
     #[test]
     fn begin_plan_without_a_model_skips_gate_capture_and_model_card() {
         let none = BeginPlan::for_fill_form(false);

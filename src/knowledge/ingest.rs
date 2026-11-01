@@ -16,7 +16,7 @@ use super::chunk::chunk_text;
 use super::hash::sha256_hex;
 use super::mask::mask_sensitive;
 use super::notice;
-use super::parse::{parse, parser_for, Parser, MAX_FILE_BYTES, PARSER_VERSION};
+use super::parse::{parse, parser_for, Parser, INGEST_VERSION, MAX_FILE_BYTES};
 use crate::store::chunks::IndexedChunk;
 use crate::store::knowledge::{DocumentRow, DocumentUpdate};
 use crate::store::{self, Store, StoreError};
@@ -715,7 +715,7 @@ pub(super) fn index_file(
     // Same size, same modified time, same parser: not even read.
     if let Some(doc) = existing {
         let settled = matches!(doc.status.as_str(), "indexed" | "failed")
-            && doc.parser_ver == Some(PARSER_VERSION)
+            && doc.parser_ver == Some(INGEST_VERSION)
             && doc.size == size
             && doc.mtime_unix == file.mtime
             // Strictly older than the last index: a save in the same second
@@ -765,7 +765,7 @@ pub(super) fn index_file(
     };
     if let Some(doc) = existing {
         if doc.status == "indexed"
-            && doc.parser_ver == Some(PARSER_VERSION)
+            && doc.parser_ver == Some(INGEST_VERSION)
             && doc.content_hash.as_deref() == Some(hash.as_str())
         {
             // Touched but not changed: remember the new size and time.
@@ -815,7 +815,7 @@ pub(super) fn index_file(
             title: title.as_deref(),
             content_hash: Some(&hash),
             parser: Some(file.parser.name()),
-            parser_ver: Some(PARSER_VERSION),
+            parser_ver: Some(INGEST_VERSION),
             ..stamp
         },
     )?;
@@ -837,7 +837,7 @@ fn fail(
         "failed",
         Some(why),
         &DocumentUpdate {
-            parser_ver: Some(PARSER_VERSION),
+            parser_ver: Some(INGEST_VERSION),
             ..stamp.clone()
         },
     )?;
@@ -901,6 +901,60 @@ mod tests {
             section("Skills", "Rust and Win32. "),
         ]
         .concat()
+    }
+
+    /// #1261: a file indexed under older mask rules (an old stored version, same
+    /// size and mtime) is read again, and the chunks and `chunk_fts` rows
+    /// carry the current mask.
+    #[test]
+    fn a_file_indexed_under_an_old_version_is_masked_again() {
+        let dir = scratch("old-mask-version");
+        let raw = "# Notes
+password: hunter2zzq
+";
+        fs::write(dir.join("a.md"), raw).unwrap();
+        let store = Store::in_memory();
+        scan_folder(&store, &dir, FUT).unwrap();
+        assert_eq!(store.fts_hits("hunter2zzq").unwrap(), 0);
+        let root_id = store.ensure_root(&dir.to_string_lossy(), FUT).unwrap();
+        let doc = store.documents_in_root(root_id).unwrap().remove(0);
+        assert_eq!(doc.parser_ver, Some(INGEST_VERSION));
+        // Put back what an older build stored: unmasked text, the old version.
+        let parsed = parse(Parser::Markdown, raw.as_bytes()).unwrap();
+        let stale: Vec<IndexedChunk> = chunk_text(&parsed.text)
+            .into_iter()
+            .map(|chunk| IndexedChunk {
+                text_hash: sha256_hex(chunk.text.as_bytes()).unwrap(),
+                chunk,
+            })
+            .collect();
+        store.replace_chunks(doc.id, &stale).unwrap();
+        store
+            .mark_document(
+                root_id,
+                "a.md",
+                "indexed",
+                None,
+                &DocumentUpdate {
+                    parser_ver: Some(1),
+                    ..DocumentUpdate::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.fts_hits("hunter2zzq").unwrap(), 1, "setup holds it");
+        let summary = scan_folder(&store, &dir, FUT).unwrap();
+        assert_eq!(summary.indexed, 1, "read again, not Unchanged");
+        assert_eq!(store.fts_hits("hunter2zzq").unwrap(), 0);
+        let hits = store
+            .search_chunks(&dir.to_string_lossy(), "\"password\"", 5)
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits
+            .iter()
+            .all(|h| !h.text.contains("hunter2zzq") && h.text.contains("[secret]")));
+        let doc = store.documents_in_root(root_id).unwrap().remove(0);
+        assert_eq!(doc.parser_ver, Some(INGEST_VERSION));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

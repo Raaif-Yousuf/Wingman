@@ -9,7 +9,7 @@ use std::ops::Range;
 
 /// Words that label a secret, lower case. A space inside a label matches a run
 /// of spaces, `_` and `-`, so `api key`, `API_KEY` and `api-key` all match.
-const SECRET_LABELS: &[&str] = &[
+pub(crate) const SECRET_LABELS: &[&str] = &[
     "password",
     "passwd",
     "passcode",
