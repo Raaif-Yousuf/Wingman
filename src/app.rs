@@ -19002,7 +19002,7 @@ mod tests {
         for name in [
             "add_event_from_screen",
             "run_generic_action_with",
-            "review_this_email",
+            "review_text",
             "fill_form_from_screen",
         ] {
             let body = body_of(name);
