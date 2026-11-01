@@ -410,6 +410,76 @@ fn monitor_to_local(monitor: Rect, desktop: Rect) -> Rect {
     }
 }
 
+/// #1255: the DPI to draw a selection's outline and size label at: that of the
+/// monitor holding the selection's centre (`monitors` is each monitor's
+/// overlay-local rect and effective DPI, taken when the picker opened). A
+/// centre in no monitor (a gap between unaligned monitors) takes the monitor
+/// with the most overlap, and `fallback` when the list is empty or nothing
+/// overlaps. Pure.
+fn dpi_for_selection(monitors: &[(Rect, u32)], selection: Rect, fallback: u32) -> u32 {
+    let cx = selection.left + (selection.right - selection.left) / 2;
+    let cy = selection.top + (selection.bottom - selection.top) / 2;
+    if let Some((_, dpi)) = monitors
+        .iter()
+        .find(|(m, _)| cx >= m.left && cx < m.right && cy >= m.top && cy < m.bottom)
+    {
+        return (*dpi).max(1);
+    }
+    let overlap = |m: &Rect| {
+        let w = (selection.right.min(m.right) - selection.left.max(m.left)).max(0) as i64;
+        let h = (selection.bottom.min(m.bottom) - selection.top.max(m.top)).max(0) as i64;
+        w * h
+    };
+    monitors
+        .iter()
+        .map(|(m, dpi)| (overlap(m), *dpi))
+        .filter(|(area, _)| *area > 0)
+        .max_by_key(|(area, _)| *area)
+        .map_or(fallback, |(_, dpi)| dpi.max(1))
+}
+
+/// Win32-only: every monitor's overlay-local rect and effective DPI, for
+/// [`dpi_for_selection`]. Empty if enumeration fails (the selection then
+/// uses the opening monitor's DPI). Checked by hand (rule 8).
+fn monitor_dpis(desktop: Rect) -> Vec<(Rect, u32)> {
+    use windows::core::BOOL;
+    use windows::Win32::Graphics::Gdi::EnumDisplayMonitors;
+    unsafe extern "system" fn visit(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rc: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `data` is the `&mut Vec` passed below, alive for the call.
+        let out = unsafe { &mut *(data.0 as *mut Vec<(RECT, u32)>) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(hmon, &mut info) }.as_bool() {
+            let (mut x, mut y) = (96u32, 96u32);
+            if unsafe { GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut x, &mut y) }.is_err() {
+                x = 96;
+            }
+            out.push((info.rcMonitor, x));
+        }
+        true.into()
+    }
+    let mut raw: Vec<(RECT, u32)> = Vec::new();
+    // SAFETY: `raw` outlives the call; the callback is its only user.
+    let _ = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(visit),
+            LPARAM(&mut raw as *mut Vec<(RECT, u32)> as isize),
+        )
+    };
+    raw.into_iter()
+        .map(|(r, dpi)| (monitor_to_local(Rect::from(r), desktop), dpi))
+        .collect()
+}
+
 /// Win32-only: the monitor under the cursor at the moment the overlay
 /// opens, in overlay-local coordinates, plus that monitor's effective DPI.
 /// Falls back to the whole overlay (`desktop`, converted to local
@@ -802,6 +872,7 @@ impl Overlay {
             window_snapshot,
             hint_monitor,
             hint_dpi,
+            monitors: monitor_dpis(desktop),
             theme: crate::ui::theme::detect_theme(),
             sys: SysColors::read(),
             theme_forced: false,
@@ -1063,6 +1134,9 @@ struct OverlayInner {
     /// creation via [`hint_monitor_and_dpi`], not re-queried per paint.
     hint_monitor: Rect,
     hint_dpi: u32,
+    /// #1255: every monitor's overlay-local rect and DPI, taken at open, so
+    /// the selection is drawn at the DPI of the monitor it is on.
+    monitors: Vec<(Rect, u32)>,
     /// #580: the look the overlay is drawn in, re-read on every theme
     /// message, and the system colours high contrast draws from.
     theme: Theme,
@@ -1294,7 +1368,10 @@ impl OverlayInner {
                 right: w,
                 bottom: h,
             };
-            draw_selection(hdc, rect, self.hint_dpi, colors, bounds);
+            // #1255: the DPI of the monitor the selection is on, not the one
+            // the picker opened on.
+            let dpi = dpi_for_selection(&self.monitors, rect, self.hint_dpi);
+            draw_selection(hdc, rect, dpi, colors, bounds);
         }
     }
 
@@ -1353,6 +1430,10 @@ impl OverlayInner {
     }
 }
 
+/// Mouse coordinates arrive packed as two signed 16-bit words, so a virtual
+/// desktop reaching past 32767 px (or below -32768) in either axis would give
+/// wrong points here (#1255). Real layouts, even several 8K panels side by
+/// side, stay inside that; a wider one needs `GetCursorPos` instead.
 fn point_from_lparam(lparam: LPARAM) -> (i32, i32) {
     let raw = lparam.0 as u32;
     let x = (raw & 0xFFFF) as u16 as i16 as i32;
@@ -2283,6 +2364,49 @@ mod tests {
     }
 
     // -- monitor_to_local (#360) ----------------------------------------------
+
+    fn rc(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// #1255: the selection is drawn at the DPI of the monitor it is on.
+    #[test]
+    fn dpi_for_selection_follows_the_monitor_under_the_centre() {
+        let monitors = [(rc(0, 0, 1920, 1080), 96), (rc(1920, 0, 3840, 1080), 192)];
+        let left = rc(100, 100, 400, 300);
+        let right = rc(2000, 100, 2400, 300);
+        assert_eq!(dpi_for_selection(&monitors, left, 144), 96);
+        assert_eq!(dpi_for_selection(&monitors, right, 144), 192);
+        // Straddling the seam: the centre decides.
+        let seam_right = rc(1800, 100, 2400, 300);
+        assert_eq!(dpi_for_selection(&monitors, seam_right, 144), 192);
+        let seam_left = rc(1500, 100, 2000, 300);
+        assert_eq!(dpi_for_selection(&monitors, seam_left, 144), 96);
+    }
+
+    #[test]
+    fn dpi_for_selection_falls_back_when_no_monitor_fits() {
+        // No monitors listed: the opening monitor's DPI.
+        let sel = rc(10, 10, 50, 50);
+        assert_eq!(dpi_for_selection(&[], sel, 144), 144);
+        // Centre in a gap: the monitor with the most overlap.
+        let monitors = [(rc(0, 0, 1000, 1000), 96), (rc(1100, 0, 2100, 1000), 192)];
+        let gap = rc(900, 100, 1250, 300);
+        assert_eq!(dpi_for_selection(&monitors, gap, 144), 192);
+        // Nothing overlaps at all: fallback.
+        let far = rc(5000, 5000, 5100, 5100);
+        assert_eq!(dpi_for_selection(&monitors, far, 144), 144);
+        // A zero DPI is never returned.
+        assert_eq!(
+            dpi_for_selection(&[(rc(0, 0, 10, 10), 0)], rc(1, 1, 5, 5), 96),
+            1
+        );
+    }
 
     /// A realistic two-monitor layout: the primary monitor sits at the
     /// virtual desktop's origin, and a secondary monitor of the same size
