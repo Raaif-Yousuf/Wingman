@@ -98,9 +98,9 @@ use std::ffi::c_void;
 use std::sync::{Once, OnceLock};
 
 use crate::ui::palette_paint::{
-    build_ops, ellipsizes, focus_band_top, palette_colors, query_edit_rect, row_at, snap_rect,
-    snap_stroke, thumb_hot_at, window_height, Face, Op, PaintInput, PaletteColors, SnappedRect,
-    WINDOW_WIDTH,
+    build_ops, ellipsizes, fit_window_height, focus_band_top, palette_colors, query_edit_rect,
+    row_at, snap_rect, snap_stroke, thumb_hot_at, window_height, Face, Op, PaintInput,
+    PaletteColors, SnappedRect, WINDOW_WIDTH,
 };
 use crate::ui::theme::{
     detect_theme, icon_font_face, setting_change_affects_theme, setting_change_name, SysColors,
@@ -523,7 +523,7 @@ impl Palette {
         let inner = &mut *self.inner;
         let (w, h) = (
             scale(WINDOW_WIDTH, inner.dpi).max(1),
-            window_height(inner.dpi).max(1),
+            fit_window_height(inner.dpi, inner.state.rows.len()).max(1),
         );
         let hwnd = inner.hwnd;
         let dpi = inner.dpi;
@@ -1607,7 +1607,10 @@ impl PaletteInner {
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
         };
-        place(self.hwnd, centered_rect(monitor, self.dpi));
+        place(
+            self.hwnd,
+            centered_rect(monitor, self.dpi, self.state.rows.len()),
+        );
         // #1258: moving to a monitor with another scale makes Windows send
         // WM_DPICHANGED from inside that call, and the arm has already
         // updated `self.dpi` by the time it returns, so `self.dpi` cannot say
@@ -1628,7 +1631,8 @@ impl PaletteInner {
             }
             .is_ok()
             {
-                if let Some(r) = replacement_rect(monitor, real_dpi, actual) {
+                if let Some(r) = replacement_rect(monitor, real_dpi, self.state.rows.len(), actual)
+                {
                     place(self.hwnd, r);
                 }
             }
@@ -1641,7 +1645,7 @@ impl PaletteInner {
         let (w, h) = if have_client {
             (client.right - client.left, client.bottom - client.top)
         } else {
-            let r = centered_rect(monitor, self.dpi);
+            let r = centered_rect(monitor, self.dpi, self.state.rows.len());
             (r.right - r.left, r.bottom - r.top)
         };
         if let Some(renderer) = &mut self.d2d {
@@ -1737,6 +1741,50 @@ impl PaletteInner {
         let rows =
             crate::ui::palette_model::build_rows(&self.catalogue, query, self.model_configured);
         self.state = crate::ui::palette_model::PaletteState::new(rows);
+        self.refit_height();
+    }
+
+    /// #1294: resizes the window to fit the current rows, keeping its top
+    /// edge where it is so the query box does not move. One `SetWindowPos`
+    /// (no copy of the old bits), then the render target follows and the
+    /// window repaints, so the change is a single step and not a flicker.
+    fn refit_height(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowRect, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOZORDER,
+        };
+        let want = fit_window_height(self.dpi, self.state.rows.len());
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut client) }.is_err() {
+            return;
+        }
+        if client.bottom - client.top == want {
+            return;
+        }
+        let mut win = RECT::default();
+        if unsafe { GetWindowRect(self.hwnd, &mut win) }.is_err() {
+            return;
+        }
+        // A popup has no frame, so the window height is the client height.
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                (win.right - win.left).max(1),
+                want.max(1),
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            );
+        }
+        if unsafe { GetClientRect(self.hwnd, &mut client) }.is_ok() {
+            if let Some(renderer) = &mut self.d2d {
+                renderer.resize(
+                    (client.right - client.left).max(1) as u32,
+                    (client.bottom - client.top).max(1) as u32,
+                );
+            }
+        }
+        self.invalidate();
     }
 
     fn invalidate(&self) {
@@ -1852,7 +1900,7 @@ impl PaletteInner {
             return false;
         };
         let w = scale(WINDOW_WIDTH, self.dpi).max(1) as u32;
-        let h = window_height(self.dpi).max(1) as u32;
+        let h = fit_window_height(self.dpi, self.state.rows.len()).max(1) as u32;
         if !renderer.ensure_target(self.hwnd, self.dpi, w, h) {
             return false;
         }
@@ -2145,7 +2193,7 @@ impl PaletteInner {
                 // ends centred. The suggested rect is the fallback.
                 let suggested = unsafe { &*(lparam.0 as *const RECT) };
                 let target = match crate::capture::active_monitor_rect() {
-                    Ok(monitor) => centered_rect(monitor, self.dpi),
+                    Ok(monitor) => centered_rect(monitor, self.dpi, self.state.rows.len()),
                     Err(_) => *suggested,
                 };
                 unsafe {
@@ -2183,13 +2231,16 @@ impl PaletteInner {
 /// #1258: where the palette goes on `monitor` at `dpi`: its scaled size,
 /// centred across the monitor and in the upper third, like a launcher. Pure,
 /// so it can be recomputed with the DPI the window really ends up at.
-fn centered_rect(monitor: RECT, dpi: u32) -> RECT {
+fn centered_rect(monitor: RECT, dpi: u32, row_count: usize) -> RECT {
     let w = scale(WINDOW_WIDTH, dpi);
-    let h = window_height(dpi);
+    let h = fit_window_height(dpi, row_count);
+    // #1294: the top edge is placed for the tallest window, so it does not
+    // move as the list grows and shrinks with the filter.
+    let full_h = window_height(dpi);
     let mon_w = monitor.right - monitor.left;
     let mon_h = monitor.bottom - monitor.top;
     let x = monitor.left + (mon_w - w).max(0) / 2;
-    let y = monitor.top + (mon_h - h).max(0) / 3;
+    let y = monitor.top + (mon_h - full_h).max(0) / 3;
     RECT {
         left: x,
         top: y,
@@ -2202,8 +2253,8 @@ fn centered_rect(monitor: RECT, dpi: u32) -> RECT {
 /// it. Moving to a monitor with another scale makes Windows resize the window
 /// from inside `SetWindowPos`, so the size and centring worked out from the
 /// old DPI can be left stale.
-fn replacement_rect(monitor: RECT, real_dpi: u32, actual: RECT) -> Option<RECT> {
-    let want = centered_rect(monitor, real_dpi);
+fn replacement_rect(monitor: RECT, real_dpi: u32, row_count: usize, actual: RECT) -> Option<RECT> {
+    let want = centered_rect(monitor, real_dpi, row_count);
     let same = (want.left, want.top, want.right, want.bottom)
         == (actual.left, actual.top, actual.right, actual.bottom);
     (!same).then_some(want)
@@ -2762,9 +2813,14 @@ mod tests {
         // row (after the group header) is the selected one.
         let fill = row_fill(dpi, 1);
         let selected = pixel(fill.right - scale(8, dpi), (fill.top + fill.bottom) / 2);
-        let empty_slot = row_slot(dpi, 8);
-        let empty = pixel(w / 2, (empty_slot.top + empty_slot.bottom) / 2);
-        assert!(h > empty_slot.bottom);
+        // #1294: the window fits its rows, so the unpainted spot is the right
+        // end of the last row (no fill, no text, no thumb).
+        let empty_slot = row_slot(dpi, p.inner.state.rows.len() as i32 - 1);
+        let empty = pixel(
+            empty_slot.right - scale(2, dpi),
+            (empty_slot.top + empty_slot.bottom) / 2,
+        );
+        assert!(h >= empty_slot.bottom);
         unsafe {
             SelectObject(mem, old);
             let _ = DeleteObject(bmp.into());
@@ -2799,9 +2855,18 @@ mod tests {
         unsafe {
             let _ = GetWindowRect(p.hwnd(), &mut rc);
         }
-        assert_eq!((rc.right - rc.left, rc.bottom - rc.top), (w, h));
+        // #1294: the window is as tall as its rows, not the full 12.
+        let rows = p.inner.state.rows.len();
+        assert_eq!(
+            (rc.right - rc.left, rc.bottom - rc.top),
+            (w, fit_window_height(dpi, rows))
+        );
+        assert!(
+            rc.bottom - rc.top < h,
+            "a short list is shorter than a full one"
+        );
         let fill = row_fill(dpi, 1);
-        let empty_slot = row_slot(dpi, 8);
+        let empty_slot = row_slot(dpi, rows as i32 - 1);
         let (selected, empty, painted);
         unsafe {
             let screen = GetDC(None);
@@ -2814,7 +2879,11 @@ mod tests {
                 fill.right - scale(8, dpi),
                 (fill.top + fill.bottom) / 2,
             );
-            empty = GetPixel(mem, w / 2, (empty_slot.top + empty_slot.bottom) / 2);
+            empty = GetPixel(
+                mem,
+                empty_slot.right - scale(2, dpi),
+                (empty_slot.top + empty_slot.bottom) / 2,
+            );
             SelectObject(mem, old);
             let _ = DeleteObject(bmp.into());
             let _ = DeleteDC(mem);
@@ -2882,9 +2951,11 @@ mod tests {
         );
 
         p.show(many_ungrouped_actions(5), true, String::new());
+        // The window shrank to fit, so only the probe inside it is read.
+        assert!(thumb_rect(dpi, 0, p.inner.state.rows.len(), false).is_none());
         assert_eq!(
-            printed_pixels(&p, &probes),
-            [bg, bg],
+            printed_pixels(&p, &probes[..1]),
+            [bg],
             "a short list has no thumb"
         );
     }
@@ -2994,11 +3065,11 @@ mod tests {
             crate::capture::active_monitor_rect().expect("active monitor rect must be readable");
         let dpi = unsafe { GetDpiForWindow(p.hwnd()) }.max(1);
         let expected_w = scale(WINDOW_WIDTH, dpi);
-        let expected_h = window_height(dpi);
+        let expected_h = fit_window_height(dpi, p.inner.state.rows.len());
         let mon_w = monitor.right - monitor.left;
         let mon_h = monitor.bottom - monitor.top;
         let expected_x = monitor.left + (mon_w - expected_w).max(0) / 2;
-        let expected_y = monitor.top + (mon_h - expected_h).max(0) / 3;
+        let expected_y = monitor.top + (mon_h - window_height(dpi)).max(0) / 3;
 
         assert_eq!(
             (rect.left, rect.top, w, h),
@@ -3018,7 +3089,7 @@ mod tests {
             bottom: 1180,
         };
         for dpi in [96u32, 144, 192] {
-            let r = centered_rect(monitor, dpi);
+            let r = centered_rect(monitor, dpi, crate::ui::palette_model::MAX_VISIBLE_ROWS);
             assert_eq!(
                 r.right - r.left,
                 scale(WINDOW_WIDTH, dpi),
@@ -3038,10 +3109,29 @@ mod tests {
             );
         }
         assert_ne!(
-            centered_rect(monitor, 96).left,
-            centered_rect(monitor, 192).left,
+            centered_rect(monitor, 96, crate::ui::palette_model::MAX_VISIBLE_ROWS).left,
+            centered_rect(monitor, 192, crate::ui::palette_model::MAX_VISIBLE_ROWS).left,
             "a different DPI must move the centre"
         );
+    }
+
+    /// #1294: the top edge does not depend on the row count, so the query box
+    /// stays put while the list grows and shrinks; the height does follow it.
+    #[test]
+    fn centered_rect_keeps_the_top_edge_as_the_row_count_changes() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        for dpi in [96u32, 144, 240] {
+            let short = centered_rect(monitor, dpi, 1);
+            let full = centered_rect(monitor, dpi, crate::ui::palette_model::MAX_VISIBLE_ROWS);
+            assert_eq!(short.top, full.top, "dpi {dpi}: top anchored");
+            assert_eq!(short.left, full.left, "dpi {dpi}: left anchored");
+            assert!(short.bottom < full.bottom, "dpi {dpi}: shorter");
+        }
     }
 
     /// #1258: the cross-DPI case, which the client-size test below cannot
@@ -3054,11 +3144,15 @@ mod tests {
             right: 3840,
             bottom: 2160,
         };
-        let stale = centered_rect(monitor, 96);
-        let want = centered_rect(monitor, 192);
-        assert_eq!(replacement_rect(monitor, 192, stale), Some(want));
-        assert_eq!(replacement_rect(monitor, 192, want), None, "already right");
-        assert_eq!(replacement_rect(monitor, 96, stale), None, "same dpi");
+        let stale = centered_rect(monitor, 96, 5);
+        let want = centered_rect(monitor, 192, 5);
+        assert_eq!(replacement_rect(monitor, 192, 5, stale), Some(want));
+        assert_eq!(
+            replacement_rect(monitor, 192, 5, want),
+            None,
+            "already right"
+        );
+        assert_eq!(replacement_rect(monitor, 96, 5, stale), None, "same dpi");
     }
     /// #1258: after `show` the Direct2D target is exactly the window's client
     /// size (a stale target size paints stretched or clipped).
@@ -3373,6 +3467,34 @@ mod tests {
             p.selected_action_id().as_deref(),
             Some("extract-text-to-clipboard")
         );
+    }
+
+    /// #1294: typing resizes the real window to fit the rows, and the top edge
+    /// (so the query box) stays where it was.
+    #[test]
+    fn typing_resizes_the_real_window_and_keeps_its_top_edge() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let rect_of = |p: &Palette| {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(p.hwnd(), &mut r).expect("GetWindowRect") };
+            r
+        };
+        let before = rect_of(&p);
+        p.set_query_for_test("zzzzqqqq");
+        pump_pending(p.hwnd());
+        let after = rect_of(&p);
+        let dpi = unsafe { GetDpiForWindow(p.hwnd()) }.max(1);
+        assert_eq!(after.top, before.top, "the top edge stays put");
+        assert_eq!(after.left, before.left);
+        assert_eq!(after.bottom - after.top, fit_window_height(dpi, 1));
+        assert!(after.bottom < before.bottom, "no matches is a shorter box");
+        p.set_query_for_test("");
+        pump_pending(p.hwnd());
+        let back = rect_of(&p);
+        assert_eq!((back.top, back.bottom), (before.top, before.bottom));
     }
 
     /// #414: the fix for `show`'s programmatic clear must not also swallow

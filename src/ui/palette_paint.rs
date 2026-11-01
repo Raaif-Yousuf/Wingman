@@ -223,13 +223,22 @@ pub(super) fn row_height(dpi: u32) -> i32 {
     px(ROW_HEIGHT_DP, dpi)
 }
 
+#[cfg(test)]
 fn list_bottom(dpi: u32) -> i32 {
     list_top(dpi) + row_height(dpi) * MAX_VISIBLE_ROWS as i32
 }
 
-/// The footer line: caption height, level with the row text.
-pub(super) fn footer_rect(dpi: u32) -> RECT {
-    let top = list_bottom(dpi) + px(FOOTER_GAP_DP, dpi);
+/// #1294: how many row slots a window with `row_count` rows is tall enough
+/// for: one line at least (the empty state's message), the maximum at most.
+pub(super) fn visible_rows(row_count: usize) -> usize {
+    row_count.clamp(1, MAX_VISIBLE_ROWS)
+}
+
+/// The footer line: caption height, level with the row text, just under the
+/// last visible row of a list of `row_count` rows.
+pub(super) fn footer_rect(dpi: u32, row_count: usize) -> RECT {
+    let list_end = list_top(dpi) + row_height(dpi) * visible_rows(row_count) as i32;
+    let top = list_end + px(FOOTER_GAP_DP, dpi);
     rect(
         px(EDGE_DP + TEXT_INSET_DP, dpi),
         top,
@@ -238,8 +247,15 @@ pub(super) fn footer_rect(dpi: u32) -> RECT {
     )
 }
 
+/// #1294: the window height for `row_count` rows (clamped to one line up to
+/// `MAX_VISIBLE_ROWS`), so a short list leaves no empty box.
+pub(super) fn fit_window_height(dpi: u32, row_count: usize) -> i32 {
+    footer_rect(dpi, row_count).bottom + px(FOOTER_MARGIN_DP, dpi)
+}
+
+/// The tallest the window gets (a full list).
 pub(super) fn window_height(dpi: u32) -> i32 {
-    footer_rect(dpi).bottom + px(FOOTER_MARGIN_DP, dpi)
+    fit_window_height(dpi, MAX_VISIBLE_ROWS)
 }
 
 /// The slot of the row painted `pos` rows down the viewport: the full list
@@ -616,7 +632,7 @@ pub(super) fn build_ops(dpi: u32, input: &PaintInput) -> Vec<Op> {
     }
 
     ops.push(Op::Text {
-        rect: footer_rect(dpi),
+        rect: footer_rect(dpi, input.rows.len()),
         text: input.footer.to_string(),
         color: c.footer,
         face: Face::Caption,
@@ -743,7 +759,11 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(row_text, glyph, "dpi {dpi}: row text vs glyph");
-            assert_eq!(footer_rect(dpi).left, glyph, "dpi {dpi}: footer vs glyph");
+            assert_eq!(
+                footer_rect(dpi, 1).left,
+                glyph,
+                "dpi {dpi}: footer vs glyph"
+            );
         }
     }
 
@@ -865,10 +885,57 @@ mod tests {
         );
     }
 
+    /// #1294: the window is as tall as its rows, from one line up to the
+    /// maximum, so a short list leaves no empty box.
+    #[test]
+    fn the_window_height_fits_the_rows_between_one_and_the_maximum() {
+        for dpi in DPIS {
+            let one = fit_window_height(dpi, 1);
+            assert_eq!(
+                fit_window_height(dpi, 0),
+                one,
+                "dpi {dpi}: empty is one line"
+            );
+            for n in 1..MAX_VISIBLE_ROWS {
+                assert_eq!(
+                    fit_window_height(dpi, n + 1) - fit_window_height(dpi, n),
+                    row_height(dpi),
+                    "dpi {dpi}: each row adds one row height"
+                );
+            }
+            assert_eq!(fit_window_height(dpi, MAX_VISIBLE_ROWS), window_height(dpi));
+            assert_eq!(
+                fit_window_height(dpi, 500),
+                window_height(dpi),
+                "dpi {dpi}: clamped"
+            );
+            assert!(
+                one < window_height(dpi) / 2,
+                "dpi {dpi}: one line is a short box"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_window_keeps_the_footer_margin_under_the_last_row() {
+        for dpi in DPIS {
+            for n in [0usize, 1, 5, MAX_VISIBLE_ROWS] {
+                let f = footer_rect(dpi, n);
+                assert_eq!(
+                    fit_window_height(dpi, n) - f.bottom,
+                    px(12, dpi),
+                    "dpi {dpi} n {n}"
+                );
+                let last = row_fill(dpi, visible_rows(n) as i32 - 1);
+                assert!(f.top - last.bottom >= px(8, dpi), "dpi {dpi} n {n}");
+            }
+        }
+    }
+
     #[test]
     fn the_footer_has_a_twelve_dp_margin_and_room_above_it() {
         for dpi in DPIS {
-            let f = footer_rect(dpi);
+            let f = footer_rect(dpi, MAX_VISIBLE_ROWS);
             assert_eq!(window_height(dpi) - f.bottom, px(12, dpi), "dpi {dpi}");
             let last_fill = row_fill(dpi, MAX_VISIBLE_ROWS as i32 - 1);
             assert!(f.top - last_fill.bottom >= px(8, dpi), "dpi {dpi}");
