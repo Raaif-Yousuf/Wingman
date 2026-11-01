@@ -79,6 +79,12 @@ use super::{Action, InputKind, Prefer};
 /// This action's id.
 pub const ACTION_ID: &str = "review-this-email";
 
+/// Whether a review result belongs to "Fix spelling and grammar" (its own
+/// cards) rather than this email flow.
+pub fn is_fix_flow(action_id: &str) -> bool {
+    action_id == super::fix_spelling::ACTION_ID
+}
+
 /// The base system prompt, before any per-request text is appended (unlike
 /// `actions::calendar::build_prompt`, nothing here varies per request --
 /// there is no date/offset to bake in -- so [`builtin_action`] uses this

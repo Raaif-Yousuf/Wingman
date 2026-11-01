@@ -4600,8 +4600,23 @@ impl App {
             Some(PendingPreview::Review(ctx)) => {
                 self.run_review_executor(ctx);
             }
-            Some(PendingPreview::FixText { ctx, new_text }) => {
-                self.run_fix_executor(ctx, new_text);
+            Some(PendingPreview::FixText {
+                ctx,
+                new_text,
+                shown,
+            }) => {
+                // What is written must be what the card confirmed.
+                if actions::fix_spelling::confirmed_matches(&shown, confirmed.value()) {
+                    self.run_fix_executor(ctx, new_text);
+                } else {
+                    let detail = self.track_error(
+                        "Couldn't fix the text",
+                        "the confirmed changes are not the ones that were shown",
+                    );
+                    self.card
+                        .show_error_with_details("Couldn't fix the text", &detail);
+                    self.set_watch(true);
+                }
             }
             Some(PendingPreview::FormFill(original)) => {
                 self.run_confirmed_form_fill(&original, confirmed);
@@ -4935,7 +4950,7 @@ impl App {
             }
         };
 
-        if outcome.action_id == actions::fix_spelling::ACTION_ID {
+        if actions::review_email::is_fix_flow(&outcome.action_id) {
             self.on_fix_result(outcome);
             return;
         }
@@ -5049,7 +5064,11 @@ impl App {
                 title,
                 shown,
             } => {
-                self.pending_preview = Some(PendingPreview::FixText { ctx, new_text });
+                self.pending_preview = Some(PendingPreview::FixText {
+                    ctx,
+                    new_text,
+                    shown: shown.clone(),
+                });
                 self.pending_preview_generation = self.card.show_preview_with_note(
                     &title,
                     &fix_spelling::display_schema(),
@@ -5072,12 +5091,16 @@ impl App {
         match executors {
             Ok((replace, copy)) => {
                 self.spawn_executor(Box::new(move || {
-                    ExecDone::FixText(actions::fix_spelling::write_or_copy(
+                    let done = actions::fix_spelling::write_or_copy(
                         replace.as_ref(),
                         copy.as_ref(),
                         ctx.as_deref(),
                         &new_text,
-                    ))
+                    );
+                    ExecDone::FixText {
+                        report: done.report,
+                        undo: done.undo,
+                    }
                 }));
             }
             Err(e) => {
@@ -5386,7 +5409,7 @@ impl App {
                 self.card
                     .show_error_with_details("Couldn't update the email", &detail);
             }
-            ExecDone::FixText(report) => {
+            ExecDone::FixText { report, .. } => {
                 use actions::generic_replace::ReplaceReport;
                 match report {
                     ReplaceReport::Replaced(summary) => {
@@ -7998,7 +8021,9 @@ fn review_worker(
 
     // #1274: with no text to fix there is nothing to ask a model, and the
     // screenshot fallback is for email only.
-    if action_id == actions::fix_spelling::ACTION_ID && captured.text().is_none() {
+    if actions::review_email::is_fix_flow(action_id)
+        && !actions::fix_spelling::should_ask(captured.text())
+    {
         return Ok(actions::review_email::ReviewOutcome {
             proposal: Value::Null,
             original_text,
@@ -9213,7 +9238,11 @@ enum ExecDone {
     Calendar(anyhow::Result<executors::Undo>),
     Review(anyhow::Result<executors::Undo>),
     /// #1274: the fixed text was written, or copied instead.
-    FixText(actions::generic_replace::ReplaceReport),
+    /// The undo is carried here for the shared card Undo slot (#1281).
+    FixText {
+        report: actions::generic_replace::ReplaceReport,
+        undo: Option<executors::Undo>,
+    },
     FormFill(anyhow::Result<executors::Undo>),
     /// A non-built-in action's executor. Carries the action and the
     /// confirmed proposal because the card text is built from both.
@@ -9243,7 +9272,7 @@ impl std::fmt::Debug for ExecDone {
         f.write_str(match self {
             ExecDone::Calendar(_) => "ExecDone::Calendar",
             ExecDone::Review(_) => "ExecDone::Review",
-            ExecDone::FixText(_) => "ExecDone::FixText",
+            ExecDone::FixText { .. } => "ExecDone::FixText",
             ExecDone::FormFill(_) => "ExecDone::FormFill",
             ExecDone::Generic { .. } => "ExecDone::Generic",
             ExecDone::Replace { .. } => "ExecDone::Replace",
@@ -9880,6 +9909,8 @@ enum PendingPreview {
     FixText {
         ctx: Option<Box<actions::review_email::ReviewContext>>,
         new_text: String,
+        /// The proposal the card was drawn from, to check the confirmation.
+        shown: Value,
     },
     /// #242: a non-built-in `actions.toml` action awaiting its preview
     /// decision. Carries the resolved `Action` itself (not just its id) so

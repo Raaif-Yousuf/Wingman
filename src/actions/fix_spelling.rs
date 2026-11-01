@@ -18,7 +18,7 @@ use super::review_email::{
     ReviewOutcome, CUT_NOTICE,
 };
 use super::{Action, InputKind, Prefer};
-use crate::executors::Executor;
+use crate::executors::{Executor, Undo};
 
 /// This action's id.
 pub const ACTION_ID: &str = "fix-spelling-grammar";
@@ -143,6 +143,33 @@ pub fn plan(outcome: &ReviewOutcome) -> FixPlan {
     }
 }
 
+/// What applying a confirmed fix did: the report for the card, and the undo
+/// for a successful in-place write (`None` when the text was only copied).
+pub struct FixDone {
+    pub report: ReplaceReport,
+    pub undo: Option<Undo>,
+}
+
+impl FixDone {
+    fn of(report: ReplaceReport) -> Self {
+        FixDone { report, undo: None }
+    }
+}
+
+/// Whether there is text worth sending to a model: blank or whitespace-only
+/// text never is, so it never costs a call.
+pub fn should_ask(text: Option<&str>) -> bool {
+    text.is_some_and(|t| !t.trim().is_empty())
+}
+
+/// Whether the value the card confirmed is exactly what [`plan`] showed. No
+/// field of the preview is editable, so anything else means the card and the
+/// plan disagree, and nothing is written.
+pub fn confirmed_matches(shown: &Value, confirmed: &Value) -> bool {
+    let model = crate::ui::preview::PreviewModel::from_schema(&display_schema(), shown);
+    model.to_value() == *confirmed
+}
+
 /// Applies a confirmed fix: writes `ctx` through `replace` when there is one
 /// and it works, otherwise copies `new_text` to the clipboard so the fix is
 /// never lost.
@@ -151,9 +178,9 @@ pub fn write_or_copy(
     copy: &dyn Executor,
     ctx: Option<&ReviewContext>,
     new_text: &str,
-) -> ReplaceReport {
+) -> FixDone {
     if new_text.trim().is_empty() {
-        return ReplaceReport::NothingToReplace;
+        return FixDone::of(ReplaceReport::NothingToReplace);
     }
     let copy_value = || {
         crate::ui::confirm::confirm(
@@ -162,17 +189,25 @@ pub fn write_or_copy(
         )
     };
     let Some(ctx) = ctx else {
-        return copy_report(copy, copy_value(), COPIED_INSTEAD_DETAIL.to_string(), None);
+        return FixDone::of(copy_report(
+            copy,
+            copy_value(),
+            COPIED_INSTEAD_DETAIL.to_string(),
+            None,
+        ));
     };
     match do_review_confirmed(replace, ctx) {
-        Ok(undo) => ReplaceReport::Replaced(undo.summary),
+        Ok(undo) => FixDone {
+            report: ReplaceReport::Replaced(undo.summary.clone()),
+            undo: Some(undo),
+        },
         Err(e) => {
             let reason = format!("{e:#}");
             let detail = format!(
                 "Could not replace in place: {}. The text is on the clipboard.",
                 reason.trim_end_matches('.')
             );
-            copy_report(copy, copy_value(), detail, Some(reason))
+            FixDone::of(copy_report(copy, copy_value(), detail, Some(reason)))
         }
     }
 }
@@ -441,7 +476,7 @@ mod tests {
     fn a_working_write_replaces_the_whole_text_and_copies_nothing() {
         let replace = Fake::new("replace_text", Ok(Undo::none("wrote it")));
         let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
-        let report = write_or_copy(&replace, &copy, Some(&ctx()), "fixed");
+        let report = write_or_copy(&replace, &copy, Some(&ctx()), "fixed").report;
         assert_eq!(report, ReplaceReport::Replaced("wrote it".into()));
         let sent = replace.seen().expect("the write ran");
         assert_eq!(sent["new_text"], "fixed");
@@ -454,7 +489,7 @@ mod tests {
     fn no_target_copies_the_fixed_text_and_never_writes() {
         let replace = Fake::new("replace_text", Ok(Undo::none("wrote it")));
         let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
-        let report = write_or_copy(&replace, &copy, None, "fixed");
+        let report = write_or_copy(&replace, &copy, None, "fixed").report;
         assert_eq!(
             report,
             ReplaceReport::Copied(crate::actions::generic_replace::COPIED_INSTEAD_DETAIL.into())
@@ -467,7 +502,7 @@ mod tests {
     fn a_failed_write_falls_back_to_the_clipboard_and_says_why() {
         let replace = Fake::new("replace_text", Err(anyhow::anyhow!("the text changed")));
         let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
-        let report = write_or_copy(&replace, &copy, Some(&ctx()), "fixed");
+        let report = write_or_copy(&replace, &copy, Some(&ctx()), "fixed").report;
         let ReplaceReport::Copied(detail) = report else {
             panic!("expected a copy, got {report:?}");
         };
@@ -480,7 +515,7 @@ mod tests {
     fn when_both_fail_the_report_names_both() {
         let replace = Fake::new("replace_text", Err(anyhow::anyhow!("no value pattern")));
         let copy = Fake::new("clipboard", Err(anyhow::anyhow!("clipboard busy")));
-        let report = write_or_copy(&replace, &copy, Some(&ctx()), "fixed");
+        let report = write_or_copy(&replace, &copy, Some(&ctx()), "fixed").report;
         let ReplaceReport::Failed(why) = report else {
             panic!("expected a failure, got {report:?}");
         };
@@ -491,9 +526,81 @@ mod tests {
     fn blank_text_never_blanks_the_box_or_the_clipboard() {
         let replace = Fake::new("replace_text", Ok(Undo::none("x")));
         let copy = Fake::new("clipboard", Ok(Undo::none("x")));
-        let report = write_or_copy(&replace, &copy, Some(&ctx()), "  \n");
+        let report = write_or_copy(&replace, &copy, Some(&ctx()), "  \n").report;
         assert_eq!(report, ReplaceReport::NothingToReplace);
         assert_eq!(replace.seen(), None);
         assert_eq!(copy.seen(), None);
+    }
+
+    // -- review round: undo, confirmation, rendering, blank text -------------
+
+    #[test]
+    fn a_working_write_hands_its_undo_up_and_a_copy_has_none() {
+        let replace = Fake::new("replace_text", Ok(Undo::none("wrote it")));
+        let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
+        let done = write_or_copy(&replace, &copy, Some(&ctx()), "fixed");
+        assert!(done.undo.is_some(), "the undo is carried, not dropped");
+        let replace = Fake::new("replace_text", Ok(Undo::none("x")));
+        let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
+        assert!(write_or_copy(&replace, &copy, None, "fixed").undo.is_none());
+    }
+
+    fn shown() -> Value {
+        json!({"edits": [
+            {"before": "recieve", "after": "receive", "reason": "spelling"},
+            {"before": "teh", "after": "the", "reason": "spelling"}
+        ]})
+    }
+
+    #[test]
+    fn the_preview_renders_each_change_as_old_arrow_new() {
+        let model = crate::ui::preview::PreviewModel::from_schema(&display_schema(), &shown());
+        let fields = model.fields();
+        assert_eq!(fields.len(), 1, "only the edits are drawn");
+        assert_eq!(
+            fields[0].value,
+            "recieve -> receive (spelling)\nteh -> the (spelling)"
+        );
+        assert!(!fields[0].editable);
+    }
+
+    #[test]
+    fn only_the_value_the_card_showed_counts_as_confirmed() {
+        let model = crate::ui::preview::PreviewModel::from_schema(&display_schema(), &shown());
+        let confirmed = model.to_value();
+        assert!(confirmed_matches(&shown(), &confirmed));
+        // A change dropped or altered on the card no longer matches.
+        assert!(!confirmed_matches(
+            &shown(),
+            &json!({"edits": "teh -> the (spelling)"})
+        ));
+        assert!(!confirmed_matches(&shown(), &json!({})));
+    }
+
+    #[test]
+    fn blank_text_is_never_sent_to_a_model() {
+        assert!(!should_ask(None));
+        assert!(!should_ask(Some("")));
+        assert!(!should_ask(Some("  \r\n\t ")));
+        assert!(should_ask(Some("hello")));
+        let mut o = outcome("  \n ", json!([]), Some(target()));
+        o.proposal = Value::Null;
+        assert_eq!(plan(&o), FixPlan::NoText);
+    }
+
+    #[test]
+    fn review_this_email_keeps_its_own_path_and_prompt() {
+        use crate::actions::review_email;
+        assert!(!review_email::is_fix_flow(review_email::ACTION_ID));
+        assert!(review_email::is_fix_flow(ACTION_ID));
+        let email = review_email::builtin_action();
+        assert_eq!(email.id, "review-this-email");
+        assert_eq!(email.prompt, review_email::BASE_PROMPT);
+        assert!(email.prompt.contains("email") && email.prompt.contains("tone"));
+        assert_ne!(email.prompt, builtin_action().prompt);
+        assert_eq!(
+            crate::ui::palette_model::dispatch_target_for(review_email::ACTION_ID),
+            Some(crate::ui::palette_model::DispatchTarget::ReviewEmail)
+        );
     }
 }
