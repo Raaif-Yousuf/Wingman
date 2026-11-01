@@ -3828,7 +3828,13 @@ impl App {
             std::thread::sleep(Duration::from_millis(CARD_SETTLE_MS));
         }
 
-        let raw = match crate::ui::region::select_region(self.instance) {
+        let picked = crate::ui::region::select_region(self.instance);
+        // #1253: the picker's loop reads only its own window, so a Copilot key
+        // press, second launch or palette chord made while it was open is
+        // still queued for this window. Drop them before they run as a new
+        // ask (a billed request) the user did not mean. Cancel and error too.
+        drop_queued_presses(self.hwnd());
+        let raw = match picked {
             Ok(Some(raw)) => raw,
             Ok(None) => return, // cancelled: no card, nothing changed
             Err(e) => {
@@ -3841,9 +3847,11 @@ impl App {
             }
         };
 
-        // The selector pumped its own message loop: a hotkey or tray command
-        // may have started another action meanwhile. Check again, or two runs
-        // would overlap. The picked region is dropped, as on a busy press.
+        // The selector pumped its own message loop, which delivers other
+        // windows' messages only for the ones it dispatches (none for this
+        // window), so nothing should have started meanwhile. Check again
+        // anyway, or two runs would overlap. The picked region is dropped,
+        // as on a busy press.
         if self.busy_now() {
             self.show_busy_card();
             return;
@@ -11202,8 +11210,144 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
+/// #1253: the region picker pumps a message loop filtered to its own window,
+/// so a Copilot key press, a second launch or a palette chord made while it is
+/// open waits in the main window's queue and would run, as a new ask, the
+/// moment the picker closes. Removes those queued presses (none carries a
+/// boxed payload) without dispatching them and returns how many went. Pause
+/// toggles and results are state, not presses, and stay queued. Never blocks:
+/// `PeekMessageW` with `PM_REMOVE` returns at once when nothing matches.
+fn drop_queued_presses(hwnd: HWND) -> usize {
+    let mut dropped = 0;
+    let mut m = MSG::default();
+    for id in [WM_APP_HOTKEY, WM_APP_ACTIVATE, WM_APP_PALETTE_TOGGLE] {
+        while unsafe { PeekMessageW(&mut m, Some(hwnd), id, id, PM_REMOVE) }.as_bool() {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
+    // -- #1253 presses queued during the region picker --------------------
+    /// Message-only window of the system `STATIC` class: no registered class
+    /// or named kernel object of ours (Hard Rule 9).
+    fn test_message_window() -> windows::Win32::Foundation::HWND {
+        use windows::core::w;
+        use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, HWND_MESSAGE};
+        unsafe {
+            CreateWindowExW(
+                super::WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("wingman-1253-test"),
+                super::WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .expect("message-only window")
+    }
+
+    fn queued(hwnd: windows::Win32::Foundation::HWND, id: u32) -> bool {
+        let mut m = super::MSG::default();
+        // PM_NOREMOVE: look without consuming.
+        unsafe {
+            super::PeekMessageW(
+                &mut m,
+                Some(hwnd),
+                id,
+                id,
+                windows::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+            )
+        }
+        .as_bool()
+    }
+
+    #[test]
+    fn queued_presses_are_dropped_and_other_messages_stay() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
+        let hwnd = test_message_window();
+        let keep = [
+            super::WM_APP_PAUSE_TOGGLE,
+            super::WM_APP_ROUTER_RESULT,
+            super::WM_APP_COPY_TEXT_RESULT,
+        ];
+        let presses = [
+            super::WM_APP_HOTKEY,
+            super::WM_APP_ACTIVATE,
+            super::WM_APP_PALETTE_TOGGLE,
+        ];
+        for id in presses.iter().chain(keep.iter()) {
+            // Two of each: the drain must not stop at the first.
+            unsafe { PostMessageW(Some(hwnd), *id, WPARAM(0), LPARAM(0)) }.unwrap();
+            unsafe { PostMessageW(Some(hwnd), *id, WPARAM(0), LPARAM(0)) }.unwrap();
+        }
+        for id in presses.iter().chain(keep.iter()) {
+            assert!(queued(hwnd, *id), "setup: {id} should be queued");
+        }
+        assert_eq!(super::drop_queued_presses(hwnd), 6);
+        for id in presses {
+            assert!(!queued(hwnd, id), "press {id} survived the drain");
+        }
+        for id in keep {
+            assert!(queued(hwnd, id), "message {id} was wrongly consumed");
+        }
+        // Nothing left to drop, and it returns instead of waiting.
+        assert_eq!(super::drop_queued_presses(hwnd), 0);
+        let _ = unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn queued_presses_for_another_window_are_left_alone() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, PostMessageW};
+        let a = test_message_window();
+        let b = test_message_window();
+        unsafe { PostMessageW(Some(b), super::WM_APP_HOTKEY, WPARAM(0), LPARAM(0)) }.unwrap();
+        assert_eq!(super::drop_queued_presses(a), 0);
+        assert!(queued(b, super::WM_APP_HOTKEY));
+        assert_eq!(super::drop_queued_presses(b), 1);
+        let _ = unsafe { DestroyWindow(a) };
+        let _ = unsafe { DestroyWindow(b) };
+    }
+
+    /// #1253: the drop runs after the selector returns, on every outcome
+    /// (selected, cancelled, error), before anything else reads the queue.
+    #[test]
+    fn copy_region_drops_queued_presses_right_after_the_selector() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn copy_region(", "\n    fn ");
+        let select = body.find("select_region(").expect("opens the selector");
+        let drop = body
+            .find("drop_queued_presses(self.hwnd())")
+            .unwrap_or_else(|| panic!("copy_region never drops queued presses:\n{body}"));
+        // Straight after the call, before the outcome is matched on (so a
+        // cancel or an error drops them too) and before the busy re-check.
+        let call_end = select + body[select..].find(';').expect("end of the call");
+        assert!(
+            body[select..call_end].contains("select_region(self.instance)")
+                && body[call_end..drop]
+                    .trim_start_matches(';')
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.trim_start().starts_with("//")),
+            "{body}"
+        );
+        let recheck = select + body[select..].find("busy_now()").expect("busy re-check");
+        assert!(drop < recheck, "{body}");
+        assert!(
+            !body.contains("hotkey may have started another action"),
+            "the misleading comment is back"
+        );
+    }
+
     // -- #105 send preview slot ------------------------------------------
 
     #[test]
