@@ -412,9 +412,9 @@ pub fn is_payment_shaped_value(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Labels after which a nine-digit number is a US social security number.
-const SSN_LABELS: &[&str] = &["ssn", "social security"];
+pub(crate) const SSN_LABELS: &[&str] = &["ssn", "social security"];
 /// Labels after which a run of six or more digits is an identity number.
-const ID_LABELS: &[&str] = &["national id", "passport number", "tax id"];
+pub(crate) const ID_LABELS: &[&str] = &["national id", "passport number", "tax id"];
 
 /// Byte ranges of every national-id shaped value in `text`, merged and sorted:
 /// a US social security shape (`ddd-dd-dddd`, or nine digits after "ssn" or

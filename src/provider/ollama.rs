@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -53,6 +55,116 @@ pub(crate) fn is_vision_model(model: &str) -> bool {
         .any(|family| model.starts_with(family))
 }
 
+use super::ollama_admin::ShowCapabilities;
+
+/// What one `/api/show` attempt produced (#1268, #1266).
+enum Entry {
+    /// An answer. `capabilities` is empty for an old server that sends no
+    /// list; `vision` then already holds the name-list fallback.
+    Shown(ShowCapabilities),
+    /// The call failed at this time. Not asked again until
+    /// [`FAILURE_WINDOW`] passes (measured with `Instant`, no timer), so a
+    /// stopped Ollama costs one short attempt, not one per call.
+    Failed(Instant),
+}
+
+/// Per `(base_url, model)`. Filled by [`warm_caps`] on a worker thread; read
+/// by `capabilities`, which never touches the network.
+static CAPS_CACHE: Mutex<BTreeMap<String, Entry>> = Mutex::new(BTreeMap::new());
+
+/// Models Ollama refused `think: true` for (400 "does not support
+/// thinking"), kept for the process. Covers the case where `/api/show`
+/// could not say.
+static NO_THINK: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+const FAILURE_WINDOW: Duration = Duration::from_secs(30);
+
+fn cache_key(base_url: &str, model: &str) -> String {
+    format!("{}|{}", base_url.trim_end_matches('/'), model)
+}
+
+/// A successful answer only (the live list, or the old-server fallback).
+fn cache_get(base_url: &str, model: &str) -> Option<ShowCapabilities> {
+    match CAPS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key(base_url, model))
+    {
+        Some(Entry::Shown(shown)) => Some(shown.clone()),
+        _ => None,
+    }
+}
+
+/// True when there is nothing to ask: an answer, or a failure still inside
+/// its window.
+fn already_asked(base_url: &str, model: &str) -> bool {
+    match CAPS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key(base_url, model))
+    {
+        Some(Entry::Shown(_)) => true,
+        Some(Entry::Failed(at)) => at.elapsed() < FAILURE_WINDOW,
+        None => false,
+    }
+}
+
+fn cache_store(base_url: &str, model: &str, entry: Entry) {
+    CAPS_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cache_key(base_url, model), entry);
+}
+
+#[cfg(test)]
+fn cache_put(base_url: &str, model: &str, caps: Vec<String>) {
+    let vision = caps.iter().any(|c| c == "vision");
+    cache_store(
+        base_url,
+        model,
+        Entry::Shown(ShowCapabilities {
+            capabilities: caps,
+            vision,
+        }),
+    );
+}
+
+fn mark_no_think(base_url: &str, model: &str) {
+    NO_THINK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cache_key(base_url, model));
+}
+
+fn is_no_think(base_url: &str, model: &str) -> bool {
+    NO_THINK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&cache_key(base_url, model))
+}
+
+/// Asks Ollama what `model` supports, once per process (a failure is
+/// remembered for [`FAILURE_WINDOW`]). Blocking: call from a worker thread
+/// only. With no answer, callers use the name list and the 400 retry in
+/// `complete`.
+fn warm_caps(base_url: &str, model: &str) {
+    if already_asked(base_url, model) {
+        return;
+    }
+    let entry = match super::ollama_admin::show_capabilities(base_url, model) {
+        Ok(shown) => Entry::Shown(shown),
+        Err(_) => Entry::Failed(Instant::now()),
+    };
+    cache_store(base_url, model, entry);
+}
+
+/// Ollama's refusal of `think` for a model without a thinking mode
+/// (MEASURED 2026-10-17: HTTP 400 `"<model>" does not support thinking`).
+fn is_think_unsupported(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("HTTP 400") && text.contains("does not support thinking")
+}
+
 pub struct Ollama {
     pub base_url: String,
     pub model: String,
@@ -97,6 +209,24 @@ impl Ollama {
         matches!(effort, Effort::Medium | Effort::High)
     }
 
+    /// `false` only when Ollama said this model lacks `thinking`: sending
+    /// `think: true` to such a model is a 400 (#1266, MEASURED 2026-10-17).
+    /// With no live answer it stays `true` (today's behaviour).
+    fn may_think(&self) -> bool {
+        // A refusal from the server beats a cached list (a re-pull can make
+        // the list stale); see `complete`.
+        if is_no_think(&self.base_url, &self.model) {
+            return false;
+        }
+        match cache_get(&self.base_url, &self.model) {
+            Some(shown) if !shown.capabilities.is_empty() => {
+                shown.capabilities.iter().any(|c| c == "thinking")
+            }
+            // No list: try.
+            _ => true,
+        }
+    }
+
     /// Builds the exact `/api/chat` request body. Pure and network-free so
     /// it can be unit tested directly.
     ///
@@ -133,7 +263,7 @@ impl Ollama {
                 user_message
             ],
             "stream": false,
-            "think": Self::think(effort),
+            "think": Self::think(effort) && self.may_think(),
             "keep_alive": self.keep_alive,
             "options": {
                 "num_ctx": DEFAULT_NUM_CTX,
@@ -239,21 +369,26 @@ impl Provider for Ollama {
         !self.base_url.trim().is_empty()
     }
 
-    /// No network call (issue #14 does live discovery via `/api/tags` +
-    /// `/api/show`). `vision` comes from the static [`VISION_FAMILIES`]
-    /// allowlist. `json_schema` is `true` unconditionally: Ollama's
-    /// grammar-constrained `format` works for any model, not just
-    /// vision-capable ones. `thinking` is `false` unconditionally for now
-    /// -- several configured-by-default models (`qwen3.5`, `gemma4`) do
-    /// support it, but telling those apart from `gemma3` (which does not)
-    /// needs the same per-model data #14 is bringing; until then this
-    /// under-reports rather than risks over-reporting a capability that
-    /// isn't there.
+    /// No network call, so it is safe on the UI thread. `vision` and
+    /// `thinking` come from the live `/api/show` list when
+    /// [`resolve_caps`](Provider::resolve_caps) or `complete` has cached it
+    /// (#1268); until then `vision` comes from the static [`VISION_FAMILIES`]
+    /// allowlist and `thinking` is `false`. `json_schema` is `true`
+    /// unconditionally: Ollama's grammar-constrained `format` works for any
+    /// model.
     fn capabilities(&self, model: &str) -> Caps {
+        // #1268: the live list wins when it is cached (no network here);
+        // otherwise the name list.
+        let live = cache_get(&self.base_url, model);
         Caps {
-            vision: is_vision_model(model),
+            vision: match &live {
+                Some(shown) => shown.vision,
+                None => is_vision_model(model),
+            },
             json_schema: true,
-            thinking: false,
+            thinking: live
+                .as_ref()
+                .is_some_and(|shown| shown.capabilities.iter().any(|c| c == "thinking")),
             // Issue #169: `capture.rs`'s conservative default
             // (`OLLAMA_CONSERVATIVE_*`) for every model -- there is no
             // vendor-documented image limit for a user-pulled local model,
@@ -269,22 +404,43 @@ impl Provider for Ollama {
         self.capabilities(&self.model)
     }
 
+    /// Asks `/api/show` first (once per model), so a worker thread sees the
+    /// real vision answer. Never call from the UI thread.
+    fn resolve_caps(&self) -> Caps {
+        warm_caps(&self.base_url, &self.model);
+        self.own_caps()
+    }
+
     fn model_label(&self) -> String {
         format!("{}:{}", self.id(), self.model)
     }
 
     fn complete(&self, req: &Request) -> Result<Completion> {
+        warm_caps(&self.base_url, &self.model);
         let body = self.build_body(req);
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let sent_think = body["think"] == true;
 
-        let body_text = common::post_json_with_connect_timeout(
-            &url,
-            &[("Content-Type", "application/json")],
-            body,
-            CONNECT_TIMEOUT,
-            TOTAL_TIMEOUT,
-            "ollama",
-        )?;
+        let post = |body: Value| {
+            common::post_json_with_connect_timeout(
+                &url,
+                &[("Content-Type", "application/json")],
+                body,
+                CONNECT_TIMEOUT,
+                TOTAL_TIMEOUT,
+                "ollama",
+            )
+        };
+        let body_text = match post(body) {
+            // #1266: `/api/show` could not say, and the model has no thinking
+            // mode. Remember that and resend once with `think: false`. Local
+            // and unbilled, and the 400 came before any generation.
+            Err(e) if sent_think && is_think_unsupported(&e) => {
+                mark_no_think(&self.base_url, &self.model);
+                post(self.build_body(req))?
+            }
+            other => other?,
+        };
 
         crate::usage::tally(
             self.id(),
@@ -646,6 +802,251 @@ mod tests {
     fn own_caps_matches_capabilities_for_the_configured_model() {
         let provider = Ollama::new(DEFAULT_BASE_URL, "gemma3:4b", "low");
         assert_eq!(provider.own_caps(), provider.capabilities("gemma3:4b"));
+    }
+
+    // -- live capabilities (#1268, #1266) ---------------------------------
+
+    /// A one-shot fake Ollama on loopback that answers one request with
+    /// `body` as JSON. Returns the base URL (a fresh port, so the process
+    /// cache key is unique per test).
+    fn fake_show_server(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    type SeenRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A fake Ollama that answers each connection in turn with the next
+    /// `(status, body)`, then stops listening. Returns the base URL and
+    /// every request seen as `"<path> <json body>"`.
+    fn fake_server(responses: Vec<(&'static str, &'static str)>) -> (String, SeenRequests) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let seen: SeenRequests = Default::default();
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.ends_with(b"}") {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).to_string();
+                let path = text
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string();
+                let json = text.split("\r\n\r\n").nth(1).unwrap_or_default();
+                log.lock().unwrap().push(format!("{path} {json}"));
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    #[test]
+    fn a_failed_show_is_asked_once_across_resolve_and_complete() {
+        let (base, seen) = fake_server(vec![("500 Internal Server Error", r#"{"error":"x"}"#)]);
+        let provider = Ollama::new(&base, "gemma3:4b", "low");
+        let started = std::time::Instant::now();
+        assert!(provider.resolve_caps().vision, "name list still applies");
+        let _ = provider.complete(&req("sys", false));
+        let _ = provider.resolve_caps();
+        let seen = seen.lock().unwrap();
+        let shows = seen.iter().filter(|r| r.starts_with("/api/show")).count();
+        assert_eq!(shows, 1, "seen: {seen:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "no backoff sleeps: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_show_without_capabilities_is_asked_once_across_two_presses() {
+        let (base, seen) = fake_server(vec![("200 OK", "{}")]);
+        let provider = Ollama::new(&base, "gemma3:4b", "high");
+        assert!(provider.resolve_caps().vision, "old server: name list");
+        assert!(provider.resolve_caps().vision);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_400_does_not_support_thinking_is_resent_with_think_false_and_remembered() {
+        let (base, seen) = fake_server(vec![
+            ("200 OK", "{}"),
+            (
+                "400 Bad Request",
+                r#"{"error":"\"gemma3:4b\" does not support thinking"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"message":{"role":"assistant","content":"ok"},"done_reason":"stop"}"#,
+            ),
+        ]);
+        let provider = Ollama::new(&base, "gemma3:4b", "high");
+        let done = provider.complete(&req("sys", false)).expect("resent");
+        assert_eq!(done.text, "ok");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "show, chat, chat again: {seen:?}");
+        let think_of = |r: &str| -> Value {
+            let (path, json) = r.split_once(' ').unwrap();
+            assert_eq!(path, "/api/chat");
+            serde_json::from_str::<Value>(json).unwrap()["think"].clone()
+        };
+        assert_eq!(think_of(&seen[1]), true);
+        assert_eq!(think_of(&seen[2]), false);
+        // Remembered: the next body skips the 400 altogether.
+        assert_eq!(provider.build_body(&req("sys", false))["think"], false);
+    }
+
+    #[test]
+    fn a_stale_thinking_list_is_overruled_by_the_400() {
+        let (base, seen) = fake_server(vec![
+            (
+                "200 OK",
+                r#"{"capabilities":["completion","vision","thinking"]}"#,
+            ),
+            (
+                "400 Bad Request",
+                r#"{"error":"\"gemma3:4b\" does not support thinking"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"message":{"role":"assistant","content":"ok"},"done_reason":"stop"}"#,
+            ),
+        ]);
+        let provider = Ollama::new(&base, "gemma3:4b", "high");
+        provider.complete(&req("sys", false)).expect("resent");
+        let seen = seen.lock().unwrap();
+        let think_of = |r: &str| -> Value {
+            serde_json::from_str::<Value>(r.split_once(' ').unwrap().1).unwrap()["think"].clone()
+        };
+        assert_eq!(think_of(&seen[1]), true);
+        assert_eq!(think_of(&seen[2]), false);
+        assert_eq!(provider.build_body(&req("sys", false))["think"], false);
+    }
+
+    #[test]
+    fn a_different_400_is_not_resent() {
+        let (base, seen) = fake_server(vec![
+            ("200 OK", "{}"),
+            ("400 Bad Request", r#"{"error":"bad format"}"#),
+            ("200 OK", "{}"),
+        ]);
+        let provider = Ollama::new(&base, "gemma3:4b", "high");
+        assert!(provider.complete(&req("sys", false)).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// Shaped like a real 0.34 `/api/show` answer (extra fields kept).
+    const SHOW_VISION_ONLY: &str = r#"{"license":"x","modelfile":"FROM y","details":{"family":"gemma3","parameter_size":"4B"},"model_info":{"general.architecture":"gemma3"},"capabilities":["completion","vision"]}"#;
+
+    fn caps_of(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn high_effort_on_a_model_without_thinking_sends_think_false() {
+        let base = "http://127.0.0.1:1";
+        cache_put(base, "gemma3:4b", caps_of(&["completion", "vision"]));
+        let provider = Ollama::new(base, "gemma3:4b", "high");
+        let body = provider.build_body(&req("sys", false));
+        assert_eq!(body["think"], false);
+    }
+
+    #[test]
+    fn high_effort_on_a_thinking_model_sends_think_true() {
+        let base = "http://127.0.0.1:2";
+        cache_put(
+            base,
+            "qwen3.5:4b",
+            caps_of(&["completion", "vision", "thinking"]),
+        );
+        let provider = Ollama::new(base, "qwen3.5:4b", "high");
+        let body = provider.build_body(&req("sys", false));
+        assert_eq!(body["think"], true);
+        // Low effort on the same model is still an explicit false.
+        let provider = Ollama::new(base, "qwen3.5:4b", "low");
+        assert_eq!(provider.build_body(&req("sys", false))["think"], false);
+    }
+
+    #[test]
+    fn vision_from_live_capabilities_beats_the_name_list() {
+        let base = "http://127.0.0.1:3";
+        cache_put(base, "llama3.2-vision", caps_of(&["completion", "vision"]));
+        cache_put(base, "gemma3:1b", caps_of(&["completion"]));
+        let a = Ollama::new(base, "llama3.2-vision", "low");
+        let b = Ollama::new(base, "gemma3:1b", "low");
+        assert!(a.own_caps().vision, "llama3.2-vision reports vision");
+        assert!(!b.own_caps().vision, "gemma3:1b reports no vision");
+        assert!(b.own_caps().json_schema);
+    }
+
+    #[test]
+    fn an_unknown_model_falls_back_to_the_name_list_without_network() {
+        let provider = Ollama::new("http://127.0.0.1:4", "gemma3:4b", "low");
+        assert!(provider.own_caps().vision);
+        assert!(!provider.own_caps().thinking);
+    }
+
+    #[test]
+    fn resolve_caps_asks_show_once_and_caches_the_answer() {
+        let base = fake_show_server("200 OK", SHOW_VISION_ONLY);
+        let provider = Ollama::new(&base, "llama3.2-vision", "high");
+        // The name list says no vision; the server says yes.
+        assert!(provider.resolve_caps().vision);
+        // The one-shot server is gone now, so these come from the cache.
+        assert!(provider.resolve_caps().vision);
+        assert_eq!(provider.build_body(&req("sys", false))["think"], false);
+    }
+
+    #[test]
+    fn resolve_caps_on_a_failed_show_falls_back_to_the_name_list() {
+        let base = fake_show_server("500 Internal Server Error", r#"{"error":"boom"}"#);
+        let provider = Ollama::new(&base, "gemma3:4b", "low");
+        assert!(provider.resolve_caps().vision);
+        let provider = Ollama::new(&base, "llama3.2-vision", "low");
+        assert!(!provider.resolve_caps().vision);
+    }
+
+    #[test]
+    fn own_caps_never_calls_the_network() {
+        // Nothing listens here, and the call returns at once.
+        let provider = Ollama::new("http://127.0.0.1:9", "llama3.2-vision", "low");
+        let _ = provider.own_caps();
+        assert!(cache_get("http://127.0.0.1:9", "llama3.2-vision").is_none());
     }
 
     #[test]

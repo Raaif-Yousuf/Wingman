@@ -680,6 +680,14 @@ pub trait Provider: Send + Sync {
         Caps::default()
     }
 
+    /// Like [`own_caps`](Provider::own_caps), but may make a network call
+    /// to learn what the model really supports (#1268: Ollama's
+    /// `/api/show`). Only for a worker thread, never the UI thread, which
+    /// is why `own_caps` stays network-free. Defaults to `own_caps`.
+    fn resolve_caps(&self) -> Caps {
+        self.own_caps()
+    }
+
     /// `"<id>:<model>"` for the model this provider is configured with, the
     /// shape `ui::palette_model::friendly_model_name` reads. #228: lets
     /// [`Chain`] say which model answered. Defaults to the bare id for a
@@ -1024,7 +1032,7 @@ impl Chain {
                 first_choice = Some(provider.model_label());
             }
 
-            let needs_fallback = !req.images.is_empty() && !provider.own_caps().vision;
+            let needs_fallback = !req.images.is_empty() && !provider.resolve_caps().vision;
             let effective: std::borrow::Cow<'_, Request> = if needs_fallback {
                 let cached =
                     cached_fallback.get_or_insert_with(|| fallback().map_err(|e| format!("{e:#}")));
@@ -3865,6 +3873,9 @@ mod tests {
             }
             fn own_caps(&self) -> Caps {
                 self.0.own_caps()
+            }
+            fn resolve_caps(&self) -> Caps {
+                self.0.resolve_caps()
             }
             fn sends_off_machine(&self) -> bool {
                 self.0.sends_off_machine()
