@@ -388,8 +388,8 @@ struct ShowResponse {
 /// `POST /api/show` -- capabilities for one model. Falls back to the
 /// static [`is_vision_model`] allowlist when the response carries no
 /// `capabilities` array (an older Ollama). See [`ShowCapabilities`]'s doc
-/// comment for why nothing calls this outside tests yet.
-#[allow(dead_code)]
+/// comment. `Ollama` (#1268, #1266) calls it on a worker
+/// thread to learn a model's real vision and thinking support.
 pub fn show_capabilities(base_url: &str, model: &str) -> Result<ShowCapabilities> {
     let url = format!("{}/api/show", base_url.trim_end_matches('/'));
     let body = json!({"model": model});
