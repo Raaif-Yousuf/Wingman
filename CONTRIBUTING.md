@@ -80,6 +80,22 @@ observable that would differ if the change were wired to nothing, and check
 it by hand before calling the change done. The `wired-to-nothing` skill in
 this repo exists for exactly this.
 
+To try a debug build live while an installed Wingman is running (for example
+the first-run path), use a second instance. Put a `wingman.portable` file next
+to the debug exe (see "Portable mode" in the README) and set
+`WINGMAN_DEV_INSTANCE` to a short name (letters, digits, dashes, up to 16):
+
+```powershell
+New-Item target\debug\wingman.portable -ItemType File
+$env:WINGMAN_DEV_INSTANCE = "dev1"; .\target\debug\wingman.exe
+```
+
+The dev instance gets its own single-instance name and window class, so it
+does not poke the installed one, and it does not install the keyboard hook, so
+the Copilot key still goes to the installed one (use the tray menu to ask).
+Release builds ignore the variable, and without portable mode it is ignored
+with a warning. API keys live in Credential Manager, which both share.
+
 If your change touches the card or the palette, run the UI gallery (a debug
 build only, issue #363) and attach the screenshots to your pull request:
 

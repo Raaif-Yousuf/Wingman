@@ -18,7 +18,7 @@ use windows::Win32::System::Threading::CreateMutexW;
 /// `Local\` rather than `Global\`: the scope is the logged-in session, so two
 /// different users on the same machine each get their own instance, which is
 /// what they would expect — the config and the tray icon are per-user too.
-const MUTEX_NAME: windows::core::PCWSTR = w!("Local\\Wingman.SingleInstance.4d1b62f0");
+const MUTEX_NAME: &str = "Local\\Wingman.SingleInstance.4d1b62f0";
 
 /// Held for the lifetime of the process. Dropping it releases the name.
 pub struct InstanceLock(HANDLE);
@@ -45,7 +45,9 @@ pub enum Instance {
 /// as `First`: refusing to start because a lock could not be taken would be a
 /// worse failure than the duplicate it is guarding against.
 pub fn acquire() -> Instance {
-    acquire_named(MUTEX_NAME)
+    // #1271: a debug dev instance gets its own name (see `dev_instance`).
+    let name = crate::dev_instance::wide_name(MUTEX_NAME);
+    acquire_named(windows::core::PCWSTR(name.as_ptr()))
 }
 
 /// The mechanism, with the name injected.
@@ -150,7 +152,10 @@ enum Settled<L> {
 pub fn settle_duplicate(activation: Activation) -> Startup {
     match settle_with(
         POKE_RETRY_ATTEMPTS,
-        || find_ready_window(w!("Wingman.Owner.Window.4d1b62f0"), READY_PROP, None),
+        || {
+            let class = crate::dev_instance::wide_name(crate::app::OWNER_CLASS);
+            find_ready_window(windows::core::PCWSTR(class.as_ptr()), READY_PROP, None)
+        },
         || match acquire() {
             Instance::First(lock) => Some(lock),
             Instance::Already => None,
@@ -321,7 +326,9 @@ mod tests {
     fn the_production_name_is_not_what_the_test_locks() {
         // Guards against someone "simplifying" the test back onto MUTEX_NAME,
         // which would make the suite fail whenever the app is running.
-        assert!(!std::ptr::eq(TEST_NAME.0, MUTEX_NAME.0));
+        let prod: Vec<u16> = MUTEX_NAME.encode_utf16().collect();
+        let test = unsafe { TEST_NAME.as_wide() };
+        assert_ne!(test, prod.as_slice());
     }
 
     // -- #237: a duplicate that cannot find the running instance ------------

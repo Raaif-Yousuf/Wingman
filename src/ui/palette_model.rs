@@ -1372,6 +1372,7 @@ mod tests {
             crate::actions::rewrite_tone::SHORTER_ID,
             crate::actions::rewrite_tone::FRIENDLIER_ID,
             crate::actions::rewrite_tone::FORMAL_ID,
+            crate::actions::rewrite_tone::SIMPLIFY_ID,
             crate::actions::page_summary::ACTION_ID,
             crate::actions::describe_image::ACTION_ID,
             crate::actions::explain_screen::ACTION_ID,
