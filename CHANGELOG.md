@@ -7,6 +7,48 @@ tagged release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
+Changes since 0.2.0, grouped by what you notice. The release page has the
+download and its checksums.
+
+### Highlights
+
+- Check my work is no longer only for physics and statistics. It works on any
+  screen: it answers a question in any subject (and gives the answer when none
+  is entered yet), checks writing, code and forms, explains errors, and on a
+  screen with no question says what is there and a useful next step. A config
+  still holding the old default prompt moves to the new one by itself.
+- Ask my documents: put files in the knowledge folder (text, Markdown, HTML,
+  CSV, JSON, JSONL) and ask a typed question. The answer quotes your files and
+  the quotes are checked. The folder is watched, and the tray shows how many
+  files it holds.
+- Settings is rebuilt: a left rail with five pages, and it follows the
+  system's dark mode, light mode and high contrast. A typed API key is checked
+  with its vendor before it is saved.
+- The first key press with no model set up offers to set one up and finds a
+  local Ollama.
+- New action: Contact to address book.
+
+### Privacy and safety
+
+- Values after password, PIN and secret labels are hidden in the screenshot,
+  in documents and in text sent to a model.
+- The config file and the local store folder are limited to your account.
+- A request that timed out is not sent again, and a content-policy decline
+  stops the provider chain instead of trying the next one.
+- A remote Ollama is named before anything is sent to it.
+
+### Fixes and polish
+
+- Clearer cards when the network is down, naming the service that cannot be
+  reached, and a first failed request says what to fix and opens Settings.
+- The tray menu has rounded corners, dark mode and letter keys; the palette,
+  options card and preview were reworked for the Windows 11 look.
+- Much of the file, registry and clipboard work moved off the UI and keyboard
+  threads, so the key and the tray stay responsive.
+- The exe is about 100 KB smaller.
+
 ### Changed
 
 - Settings has no Save or Cancel button any more. A change applies when you
