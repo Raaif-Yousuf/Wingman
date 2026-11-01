@@ -462,6 +462,35 @@ pub fn format_tooltip_part(day: &DayTotal) -> Option<String> {
     Some(format!("{amount} today{tail}"))
 }
 
+/// Whether a request to `url` through provider `tag` can be billed, so a
+/// failure after it was sent still counts (#1284). Same loopback test as
+/// [`response_cost`].
+pub fn can_be_billed(tag: &str, url: &str) -> bool {
+    !is_loopback_url(url) && !tag.starts_with("ollama")
+}
+
+/// Counts one request that failed after it may have reached the vendor
+/// (a timeout, a reset, a body that never finished). The vendor may well have
+/// finished and billed it, so it is counted as one unpriced request, the same
+/// flat guess a response with no usage block gets. Local endpoints count
+/// nothing. Called once per failed send, never for an unsent retry (#1284).
+pub fn record_unconfirmed(tag: &str, url: &str, model: Option<&str>) {
+    if can_be_billed(tag, url) {
+        record(tag, model.unwrap_or(""), false, None);
+    }
+}
+
+/// Today's saved total, for another module's tests (they hold
+/// [`lock_usage_test`] so a before/after difference is exact).
+#[cfg(test)]
+pub(crate) fn day_total_today_for_test() -> DayTotal {
+    crate::store::global()
+        .unwrap()
+        .day_total(&local_date_today())
+        .unwrap()
+        .unwrap_or_default()
+}
+
 /// Today's date in local time, `YYYY-MM-DD`.
 fn local_date_today() -> String {
     use windows::Win32::System::SystemInformation::GetLocalTime;
