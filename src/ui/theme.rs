@@ -196,7 +196,7 @@ pub(crate) const LIGHT: Tokens = Tokens {
     text: rgb(23, 23, 23),
     text_dim: rgb(90, 90, 90),
     text_faint: rgb(112, 112, 112),
-    link: rgb(112, 112, 112),
+    link: DEFAULT_ACCENT.dark1,
     mark_note: rgb(0, 95, 184),
     danger: rgb(0xC4, 0x2B, 0x1C),
     control_fill: rgb(255, 255, 255),
@@ -209,7 +209,7 @@ pub(crate) const DARK: Tokens = Tokens {
     text: rgb(245, 245, 245),
     text_dim: rgb(190, 190, 190),
     text_faint: rgb(140, 140, 140),
-    link: rgb(140, 140, 140),
+    link: DEFAULT_ACCENT.light2,
     mark_note: rgb(96, 170, 255),
     danger: rgb(0xFF, 0x99, 0xA4),
     control_fill: rgb(45, 45, 45),
@@ -387,6 +387,18 @@ pub(crate) fn accent_fill(theme: Theme, shades: AccentShades, surface: u32) -> u
         Theme::Light | Theme::HighContrast => shades.dark1,
     };
     ensure_contrast(shade, surface, 3.0)
+}
+
+/// The colour of a link in `theme` on `surface`: the theme's shade of the
+/// user's accent (Accent Dark 1 on light, Accent Light 2 on dark, as Windows 11
+/// links), pushed apart from the surface until it holds 4.5:1 (WCAG AA for
+/// text). High contrast uses `hotlight` instead and never comes here.
+pub(crate) fn link_ink(theme: Theme, shades: AccentShades, surface: u32) -> u32 {
+    let shade = match theme {
+        Theme::Dark => shades.light2,
+        Theme::Light | Theme::HighContrast => shades.dark1,
+    };
+    ensure_contrast(shade, surface, 4.5)
 }
 
 /// The user's accent shades. Read from the registry rather than
@@ -712,8 +724,8 @@ mod tests {
         assert_eq!(LIGHT.danger, rgb(0xC4, 0x2B, 0x1C));
         assert_eq!(LIGHT.control_fill, rgb(255, 255, 255));
         assert_eq!(DARK.control_fill, rgb(45, 45, 45));
-        assert_eq!(LIGHT.link, LIGHT.text_faint);
-        assert_eq!(DARK.link, DARK.text_faint);
+        // #998: the link token is no longer pinned to text_faint; see
+        // `links_are_not_hint_text_and_stay_readable_for_any_accent`.
         assert_eq!(DARK.surface, rgb(32, 32, 32));
         assert_eq!(DARK.border, rgb(64, 64, 64));
         assert_eq!(DARK.text, rgb(245, 245, 245));
@@ -767,6 +779,53 @@ mod tests {
             }
         }
         assert_eq!(checked, 18, "the test must look at every pair");
+    }
+
+    #[test]
+    fn links_are_not_hint_text_and_stay_readable_for_any_accent() {
+        // The token defaults differ from the hint colour (#998).
+        assert_ne!(LIGHT.link, LIGHT.text_faint);
+        assert_ne!(DARK.link, DARK.text_faint);
+        assert!(contrast_between(LIGHT.link, LIGHT.surface) >= AA_TEXT);
+        assert!(contrast_between(DARK.link, DARK.surface) >= AA_TEXT);
+        let accents = [
+            rgb(0x00, 0x78, 0xD4),
+            rgb(0xFF, 0xB9, 0x00),
+            rgb(0xE7, 0x48, 0x56),
+            rgb(0x3A, 0x3A, 0x3A),
+            rgb(0x00, 0x00, 0x00),
+            rgb(0xFF, 0xFF, 0xFF),
+            rgb(0xFF, 0xF1, 0x00),
+        ];
+        let mut checked = 0;
+        for (theme, t) in [(Theme::Light, LIGHT), (Theme::Dark, DARK)] {
+            for a in accents {
+                let shades = AccentShades {
+                    light2: a,
+                    dark1: a,
+                };
+                let ink = link_ink(theme, shades, t.surface);
+                let ratio = contrast_between(ink, t.surface);
+                assert!(ratio >= AA_TEXT, "{theme:?} {a:#08x}: {ratio:.2}:1");
+                // A grey accent can only ever give a grey link, which may land
+                // on the hint grey; a coloured accent never should.
+                let grey = (a & 0xFF) == ((a >> 8) & 0xFF) && (a & 0xFF) == ((a >> 16) & 0xFF);
+                if !grey {
+                    assert_ne!(ink, t.text_faint, "{theme:?} {a:#08x}");
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 14);
+        // The default blue is used unchanged where it already reads.
+        assert_eq!(
+            link_ink(Theme::Light, DEFAULT_ACCENT, LIGHT.surface),
+            LIGHT.link
+        );
+        assert_eq!(
+            link_ink(Theme::Dark, DEFAULT_ACCENT, DARK.surface),
+            DARK.link
+        );
     }
 
     #[test]
