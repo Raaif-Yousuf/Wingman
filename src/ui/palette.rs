@@ -141,7 +141,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetCapture, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -150,11 +150,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE,
-    WM_APP, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
-    WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WS_CHILD, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_TABSTOP, WS_VISIBLE,
+    WM_APP, WM_CAPTURECHANGED, WM_COMMAND, WM_CTLCOLOREDIT, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFONT,
+    WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WM_USER, WNDCLASSEXW, WS_CHILD,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// `WM_MOUSELEAVE`'s stable, documented value (winuser.h) -- not re-exported
@@ -304,6 +304,8 @@ impl Palette {
             thumb_hot: false,
             wheel_remainder: 0,
             pressed: None,
+            #[cfg(test)]
+            wheel_cursor_for_test: None,
             ignore_mouse: false,
             dpi_forced: false,
             tracking_leave: false,
@@ -779,7 +781,8 @@ fn create_query_edit(parent: HWND, instance: HINSTANCE, font: HFONT, dpi: u32) -
         // #1260: the typed line is the question, so it is capped like the
         // selection and clipboard inputs (a longer paste is cut by the box).
         // A limit on the box, not a cut in the worker: the user sees it stop,
-        // and `run_generic_action_with` stays as it is.
+        // and `run_generic_action_with` stays as it is. The box counts UTF-16
+        // units, so a line of emoji holds half as many characters.
         const EM_SETLIMITTEXT: u32 = 0x00C5;
         SendMessageW(
             hwnd,
@@ -1503,6 +1506,9 @@ struct PaletteInner {
     /// a row only when it is on the same row. The outer `None` is no press
     /// seen at all, where the release row is used as before.
     pressed: Option<Option<usize>>,
+    /// Tests only: the pointer position the wheel arm uses instead of the real one.
+    #[cfg(test)]
+    wheel_cursor_for_test: Option<POINT>,
     /// #949: set by the gallery and by pixel tests so the real pointer, which
     /// the system reports to any window it is over, cannot change which row
     /// is hovered. Mouse moves and leaves are then ignored; a state that
@@ -1621,7 +1627,9 @@ impl PaletteInner {
         self.tracking_leave = false;
         self.pressed = None;
         unsafe {
-            let _ = ReleaseCapture();
+            if GetCapture() == self.hwnd {
+                let _ = ReleaseCapture();
+            }
         }
     }
 
@@ -1772,6 +1780,19 @@ impl PaletteInner {
         self.state = crate::ui::palette_model::PaletteState::new(rows);
         self.wheel_remainder = 0;
         self.pressed = None;
+    }
+
+    /// Where the pointer is, in this window's client pixels. Tests inject the
+    /// point so `cargo test` never moves the real mouse.
+    fn pointer_in_client(&self) -> Option<POINT> {
+        #[cfg(test)]
+        if let Some(pt) = self.wheel_cursor_for_test {
+            return Some(pt);
+        }
+        let mut pt = POINT::default();
+        (unsafe { GetCursorPos(&mut pt) }.is_ok()
+            && unsafe { ScreenToClient(self.hwnd, &mut pt) }.as_bool())
+        .then_some(pt)
     }
 
     /// The `Action` row under a client point, if any: headers, hints and
@@ -2093,10 +2114,7 @@ impl PaletteInner {
                     // #1289: the rows moved under a pointer that did not, so
                     // the highlight is worked out again from where it is.
                     if !self.ignore_mouse {
-                        let mut pt = POINT::default();
-                        if unsafe { GetCursorPos(&mut pt) }.is_ok()
-                            && unsafe { ScreenToClient(self.hwnd, &mut pt) }.as_bool()
-                        {
+                        if let Some(pt) = self.pointer_in_client() {
                             self.hover = self.action_row_at(pt.x, pt.y);
                         }
                     }
@@ -2175,14 +2193,23 @@ impl PaletteInner {
                 }
                 Some(LRESULT(0))
             }
+            // The capture was taken away (another window, Alt+Tab): the press is over.
+            WM_CAPTURECHANGED => {
+                self.pressed = None;
+                Some(LRESULT(0))
+            }
             WM_LBUTTONUP => {
+                // Taken before ReleaseCapture, which sends WM_CAPTURECHANGED
+                // (that clears `pressed`).
+                let pressed = self.pressed.take();
                 unsafe {
                     let _ = ReleaseCapture();
                 }
                 let released = self.action_row_at(mouse_x(lparam), mouse_y(lparam));
-                let pressed = self.pressed.take();
                 if let Some(idx) = released {
-                    if pressed.map_or(true, |p| p == Some(idx)) {
+                    // A release with no press seen here (the press began on
+                    // another window, or the rows were rebuilt) runs nothing.
+                    if pressed == Some(Some(idx)) {
                         self.state.selected = idx;
                         self.on_palette_key_command(crate::ui::palette_model::PaletteKey::Enter);
                     }
@@ -3365,7 +3392,10 @@ mod tests {
         // geometric row hovering highlighted).
         let hovered_action_id = p.selected_action_id_at(p.inner.hover.unwrap());
 
+        // #1289: a real click is a press then a release (the release alone
+        // no longer runs a row).
         unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONDOWN, Some(WPARAM(1)), Some(lparam));
             SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(lparam));
         }
         pump_pending(p.hwnd());
@@ -3658,12 +3688,56 @@ mod tests {
         }
     }
 
+    /// #1289: a release with no press in this window (the press began on
+    /// another window, or the rows were rebuilt mid-press) runs nothing.
+    #[test]
+    fn a_lone_release_runs_nothing() {
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        let owner = create_test_owner_window(inst);
+        p.set_owner(owner);
+        p.show(many_ungrouped_actions(5), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let at = client_lparam(50, row_mid_y(&p, 1));
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(at));
+        }
+        let mut msg = MSG::default();
+        assert!(!unsafe { PeekMessageW(&mut msg, Some(owner), 0, 0, PM_REMOVE) }.as_bool());
+        // A press, then a rebuilt list, then the release: also nothing.
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONDOWN, Some(WPARAM(1)), Some(at));
+        }
+        p.set_query_for_test("action");
+        unsafe {
+            SendMessageW(p.hwnd(), WM_LBUTTONUP, Some(WPARAM(0)), Some(at));
+        }
+        assert!(!unsafe { PeekMessageW(&mut msg, Some(owner), 0, 0, PM_REMOVE) }.as_bool());
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
+    }
+
+    /// Losing the mouse capture ends the press.
+    #[test]
+    fn losing_the_capture_forgets_the_press() {
+        const WM_CAPTURECHANGED: u32 = 0x0215;
+        let inst = instance();
+        let mut p = Palette::new_for_test(inst).unwrap();
+        p.show(many_ungrouped_actions(5), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let at = client_lparam(50, row_mid_y(&p, 1));
+        p.handle_message(WM_LBUTTONDOWN, WPARAM(1), at);
+        assert!(p.inner.pressed.is_some());
+        p.handle_message(WM_CAPTURECHANGED, WPARAM(0), LPARAM(0));
+        assert_eq!(p.inner.pressed, None);
+    }
+
     /// #1289 item 3: after the wheel moves the list, the highlight follows
-    /// the row now under the pointer, as a click would.
+    /// the row now under the pointer, as a click would. The point is passed
+    /// in, so the test never moves the real mouse.
     #[test]
     fn the_hover_follows_the_pointer_after_a_wheel_scroll() {
-        use windows::Win32::Graphics::Gdi::ClientToScreen;
-        use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
         let inst = instance();
         let mut p = Palette::new_for_test(inst).unwrap();
         p.show(many_ungrouped_actions(20), true, "mode: Auto".to_string());
@@ -3671,20 +3745,38 @@ mod tests {
         let y = row_mid_y(&p, 1);
         p.handle_message(WM_MOUSEMOVE, WPARAM(0), client_lparam(50, y));
         assert_eq!(p.inner.hover, Some(1));
-        let mut old = POINT::default();
-        let mut pt = POINT { x: 50, y };
-        unsafe {
-            let _ = GetCursorPos(&mut old);
-            let _ = ClientToScreen(p.hwnd(), &mut pt);
-            let _ = SetCursorPos(pt.x, pt.y);
-        }
         let wparam = WPARAM(((-120i16 as u16 as u32) as usize) << 16);
+        p.inner.wheel_cursor_for_test = Some(POINT { x: 50, y });
         p.handle_message(WM_MOUSEWHEEL, wparam, LPARAM(0));
-        unsafe {
-            let _ = SetCursorPos(old.x, old.y);
-        }
         assert_eq!(p.state_offset(), 1);
         assert_eq!(p.inner.hover, Some(2), "the row under the pointer now");
+        // A pointer outside the window hovers nothing.
+        p.inner.wheel_cursor_for_test = Some(POINT { x: -500, y: -500 });
+        p.handle_message(
+            WM_MOUSEWHEEL,
+            WPARAM(((120i16 as u16 as u32) as usize) << 16),
+            LPARAM(0),
+        );
+        assert_eq!(p.inner.hover, None);
+    }
+
+    /// #1260 item 3: a long paste is cut by the box at the limit.
+    #[test]
+    fn a_long_paste_is_cut_at_the_limit() {
+        const EM_REPLACESEL: u32 = 0x00C2;
+        let inst = instance();
+        let p = Palette::new_for_test(inst).unwrap();
+        let text = wide_z(&"a".repeat(25_000));
+        unsafe {
+            SendMessageW(
+                p.edit_hwnd(),
+                EM_REPLACESEL,
+                Some(WPARAM(0)),
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+        }
+        let len = unsafe { GetWindowTextLengthW(p.edit_hwnd()) } as usize;
+        assert_eq!(len, crate::inputs::selection::DEFAULT_MAX_CHARS);
     }
 
     fn create_test_owner_window(instance: HINSTANCE) -> HWND {
