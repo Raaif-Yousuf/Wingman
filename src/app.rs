@@ -984,8 +984,26 @@ fn option_rows(options: &[router::RouterOption]) -> Vec<OptionRow> {
         .map(|o| OptionRow {
             id: o.intent.clone(),
             label: o.label.clone(),
+            action: String::new(),
         })
         .collect()
+}
+
+/// #937: puts each row's catalogue name on it, looked up from the action id.
+/// The router's label is model text and can name a different action than the
+/// one the button runs; this name never comes from the model.
+fn name_option_rows(
+    mut rows: Vec<OptionRow>,
+    catalogue: &[palette_model::PaletteAction],
+) -> Vec<OptionRow> {
+    for row in &mut rows {
+        row.action = catalogue
+            .iter()
+            .find(|a| a.id == row.id)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+    }
+    rows
 }
 
 /// One overlay on screen (#809): the pure state machine, the real hooks and
@@ -2497,7 +2515,7 @@ impl App {
         self.options_generation = options_keys::next_generation(self.options_generation);
         let generation = self.options_generation;
         let content = router::options_content(None, catalogue, false);
-        let rows = option_rows(&content.options);
+        let rows = name_option_rows(option_rows(&content.options), catalogue);
         let key_pickable = option_key_pickable(&rows, catalogue);
         let behavior = self.options_behavior(keypress_runs_first(&key_pickable));
         self.options = Some(OptionsSession {
@@ -3182,7 +3200,7 @@ impl App {
             }
         };
         let content = router::options_content(routed.as_ref(), &session.catalogue, true);
-        let rows = option_rows(&content.options);
+        let rows = name_option_rows(option_rows(&content.options), &session.catalogue);
         let key_pickable = option_key_pickable(&rows, &session.catalogue);
         self.card
             .set_options_key_runs_first(generation, keypress_runs_first(&key_pickable));
@@ -13060,6 +13078,38 @@ mod tests {
         );
         assert_eq!(rows[3].id, "id3");
         assert!(super::option_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_shown_action_name_comes_from_the_id_not_the_model_label() {
+        let action = |id: &str, name: &str| palette_model::PaletteAction {
+            id: id.to_string(),
+            name: name.to_string(),
+            group: None,
+            requires_model: false,
+            effect: palette_model::Effect::None,
+            takes_text: false,
+        };
+        let catalogue = vec![
+            action("review-this-email", "Review this email"),
+            action("translate", "Translate"),
+        ];
+        let options = vec![
+            router::RouterOption {
+                intent: "review-this-email".into(),
+                label: "Translate".into(),
+                confidence: 0.9,
+            },
+            router::RouterOption {
+                intent: "gone".into(),
+                label: "Whatever".into(),
+                confidence: 0.5,
+            },
+        ];
+        let rows = super::name_option_rows(super::option_rows(&options), &catalogue);
+        assert_eq!(rows[0].label, "Translate", "the label stays the model's");
+        assert_eq!(rows[0].action, "Review this email", "the name is the id's");
+        assert_eq!(rows[1].action, "", "an unknown id shows no name");
     }
 
     /// The body of the `impl App` method `name`, from its signature to its
