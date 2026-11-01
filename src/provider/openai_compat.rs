@@ -181,6 +181,11 @@ impl OpenAiCompat {
         let value: Value =
             serde_json::from_str(body).context("openai-compat: response body is not valid JSON")?;
 
+        // #1285: a 200 that holds an error object, not a completion.
+        if let Some(e) = super::common::error_in_ok_body("openai-compat", &value) {
+            return Err(e);
+        }
+
         let choice = value
             .get("choices")
             .and_then(Value::as_array)
@@ -792,6 +797,112 @@ mod tests {
     fn parse_completion_rejects_invalid_json() {
         let err = OpenAiCompat::parse_completion("not json").unwrap_err();
         assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    // #1285: a gateway can answer 200 with an error object.
+    #[test]
+    fn parse_completion_surfaces_an_error_object_in_a_200_body() {
+        let err = OpenAiCompat::parse_completion(r#"{"error":{"message":"no credit","code":402}}"#)
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("no credit"), "{text}");
+        assert!(text.contains("HTTP 402"), "{text}");
+        assert!(!text.contains("no choices"), "{text}");
+    }
+
+    #[test]
+    fn parse_completion_error_body_is_kind_tagged_like_http_error() {
+        let rate = OpenAiCompat::parse_completion(
+            r#"{"error":{"message":"slow down","code":"429","type":"insufficient_quota"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{rate:#}").contains("HTTP 429 (no_credit)"),
+            "{rate:#}"
+        );
+        let credit = OpenAiCompat::parse_completion(
+            r#"{"error":{"message":"Your credit balance is too low","code":402}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{credit:#}").contains("HTTP 402 (no_credit)"),
+            "{credit:#}"
+        );
+        let plain = OpenAiCompat::parse_completion(r#"{"error":{"message":"busy","code":429}}"#)
+            .unwrap_err();
+        let plain = format!("{plain:#}");
+        assert!(
+            plain.contains("HTTP 429") && !plain.contains("(no_credit)"),
+            "{plain}"
+        );
+        let status =
+            OpenAiCompat::parse_completion(r#"{"error":{"message":"x","code":503}}"#).unwrap_err();
+        assert_eq!(
+            status
+                .downcast_ref::<crate::provider::common::HttpStatus>()
+                .map(|h| h.status),
+            Some(503)
+        );
+    }
+
+    #[test]
+    fn parse_completion_error_body_with_a_non_numeric_code_gets_a_neutral_marker() {
+        for body in [
+            r#"{"error":{"message":"upstream failed","code":"upstream_down"}}"#,
+            r#"{"error":{"message":"upstream failed"}}"#,
+            r#"{"error":{"message":"upstream failed","code":0}}"#,
+            r#"{"error":{"message":"upstream failed","code":200}}"#,
+            r#"{"error":{"message":"upstream failed","code":99999}}"#,
+        ] {
+            let text = format!("{:#}", OpenAiCompat::parse_completion(body).unwrap_err());
+            assert!(text.contains("upstream failed"), "{body}: {text}");
+            assert!(text.contains("HTTP 200"), "{body}: {text}");
+            assert!(!text.contains("no choices"), "{body}: {text}");
+        }
+    }
+
+    #[test]
+    fn parse_completion_error_body_is_redacted_and_cut_by_chars() {
+        let key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+        let long = "\u{e9}".repeat(400);
+        let body = format!(r#"{{"error":{{"message":"bad key {key} {long}","code":401}}}}"#);
+        let text = format!("{:#}", OpenAiCompat::parse_completion(&body).unwrap_err());
+        assert!(!text.contains(key), "{text}");
+        assert!(
+            text.chars().filter(|c| *c == '\u{e9}').count() < 300,
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn parse_completion_error_as_a_string_is_surfaced() {
+        let text = format!(
+            "{:#}",
+            OpenAiCompat::parse_completion(r#"{"error":"model not found"}"#).unwrap_err()
+        );
+        assert!(text.contains("model not found"), "{text}");
+    }
+
+    #[test]
+    fn parse_completion_odd_error_shapes_do_not_panic_or_hide_a_good_reply() {
+        let good =
+            r#"{"error":null,"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+        assert_eq!(OpenAiCompat::parse_completion(good).unwrap().text, "hi");
+        for body in [
+            r#"{"error":null}"#,
+            r#"{"error":[]}"#,
+            r#"{"error":["a"]}"#,
+            r#"{"error":""}"#,
+            r#"{"error":7}"#,
+            r#"{"error":{}}"#,
+            r#"{"error":{"message":{"a":1},"code":[1]}}"#,
+        ] {
+            assert!(OpenAiCompat::parse_completion(body).is_err(), "{body}");
+        }
+        assert!(OpenAiCompat::parse_completion(r#"{"error":null}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("no choices"));
     }
 
     #[test]

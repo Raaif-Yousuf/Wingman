@@ -147,6 +147,11 @@ impl Gemini {
         let value: Value =
             serde_json::from_str(body).context("gemini: response body is not valid JSON")?;
 
+        // #1285: a 2xx that holds an `error` object.
+        if let Some(e) = super::common::error_in_ok_body("gemini", &value) {
+            return Err(e);
+        }
+
         let candidates = value
             .get("candidates")
             .and_then(Value::as_array)
@@ -735,6 +740,20 @@ mod tests {
         let completion = Gemini::parse_completion(body).expect("should parse");
         let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.difficulty, None);
+    }
+
+    // #1285: a 200 body that is really {"error":{...}}.
+    #[test]
+    fn parse_completion_surfaces_an_error_object() {
+        let err = Gemini::parse_completion(
+            r#"{"error":{"code":429,"message":"quota exceeded","status":"RESOURCE_EXHAUSTED"}}"#,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("quota exceeded") && text.contains("HTTP 429"),
+            "{text}"
+        );
     }
 
     #[test]
