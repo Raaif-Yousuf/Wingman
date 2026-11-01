@@ -3813,6 +3813,16 @@ impl App {
             self.show_busy_card();
             return;
         }
+        // #1256: Pause means nothing runs, even the model-free actions.
+        if pause::is_paused_now() {
+            self.card.show_answer(
+                "Paused",
+                "Resume from the tray menu to copy a region.",
+                3,
+                None,
+            );
+            return;
+        }
 
         if self.refuse_if_password_manager() {
             return;
@@ -14194,6 +14204,27 @@ mod tests {
         let between = &body[select..spawn];
         assert!(between.contains("busy_now()"), "{between}");
         assert!(between.contains("show_busy_card()"), "{between}");
+    }
+
+    /// #1256: Pause means nothing runs, so `copy_region` shows the Paused
+    /// card after the busy check and before the selector opens, and the
+    /// palette reaches it through `dispatch_palette_target`.
+    #[test]
+    fn copy_region_honours_pause_before_the_selector() {
+        let src = lf(include_str!("app.rs"));
+        let body = body_between(&src, "    fn copy_region(", "\n    fn ");
+        let busy = body.find("busy_now()").expect("busy check");
+        let paused = body
+            .find("pause::is_paused_now()")
+            .unwrap_or_else(|| panic!("copy_region lost its Pause gate:\n{body}"));
+        let select = body.find("select_region(").expect("opens the selector");
+        assert!(busy < paused && paused < select, "{body}");
+        assert!(body[paused..select].contains("\"Paused\""), "{body}");
+        let dispatch = body_between(&src, "    fn dispatch_palette_target(", "\n    }\n");
+        assert!(
+            dispatch.contains("DispatchTarget::CopyRegion) => self.copy_region()"),
+            "{dispatch}"
+        );
     }
 
     #[test]
