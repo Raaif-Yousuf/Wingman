@@ -27,8 +27,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EnumFontFamiliesExW, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject, SetBkMode,
-    SetTextColor, DEFAULT_CHARSET, DT_CALCRECT, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_LEFT,
+    EnumFontFamiliesExW, ExcludeClipRect, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, DEFAULT_CHARSET, DT_CALCRECT, DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_LEFT,
     DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, LOGFONTW, TEXTMETRICW,
     TRANSPARENT,
 };
@@ -795,6 +795,11 @@ unsafe fn paint_row(ctx: &Ctx, dis: &DRAWITEMSTRUCT, rec: &ItemRecord) {
     }
     draw_text(hdc, &rec.label, text_rc, flags);
     SelectObject(hdc, old);
+    if rec.kind == Kind::Submenu {
+        // #968: the menu draws its own submenu arrow after WM_DRAWITEM, into this
+        // same DC. Excluding the row keeps that later draw off our row.
+        ExcludeClipRect(hdc, row.left, row.top, row.right, row.bottom);
+    }
 }
 
 unsafe fn draw_text(
