@@ -197,21 +197,34 @@ pub(crate) enum TransportError {
     /// fresh attempt -- it surfaces immediately, naming the status that was
     /// received, so the card is honest about what's known to have happened.
     BodyReadFailed { status: u16, error: String },
-    /// #727: the request timed out somewhere after the connection was made,
-    /// so the vendor may have received it and may already have billed it.
+    /// #727, #1267: the request failed somewhere after the connection was
+    /// made (a timeout, reset, early EOF or protocol error), so the vendor may have received it and may already have billed it.
     /// Never retried: a second send could be a second charge.
     TimedOut(String),
 }
 
-/// #727: true when this send failure proves nothing reached the vendor, so a
-/// retry cannot bill twice. Only a DNS or connect timeout qualifies; any
-/// other timeout (global, send, waiting for the response) may have come
-/// after the request was delivered. Non-timeout failures (refused, TLS,
-/// unknown host) happen before the body is sent and stay retryable.
+/// #727, #1267: true only when this send failure proves nothing reached the
+/// vendor, so a retry cannot bill twice. An allow-list: a DNS or connect
+/// timeout, an unknown host, a failed connect or TLS setup, a proxy connect
+/// failure, and an `Io` error whose kind can only come from connecting
+/// (refused, address unavailable; the `HostUnreachable` kinds need Rust 1.83
+/// and `rust-version` is 1.80, so they stay non-retried). Everything else is not retried: a reset, a broken
+/// pipe, an early EOF, a protocol error or any other timeout can happen after
+/// the body was written.
 fn is_provably_unsent(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind;
     match e {
         ureq::Error::Timeout(t) => matches!(t, ureq::Timeout::Resolve | ureq::Timeout::Connect),
-        _ => true,
+        ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::ConnectProxyFailed(_)
+        | ureq::Error::Tls(_)
+        | ureq::Error::TlsRequired => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
     }
 }
 
@@ -220,7 +233,7 @@ fn is_provably_unsent(e: &ureq::Error) -> bool {
 /// local Ollama call (prompt plus screenshot) would go to the proxy unless
 /// `NO_PROXY` happened to list it. A loopback address never uses a proxy; any
 /// other address keeps the environment's proxy settings.
-fn agent_for(url: &str) -> ureq::Agent {
+pub(crate) fn agent_for(url: &str) -> ureq::Agent {
     agent_with_base(url, ureq::Agent::config_builder())
 }
 
@@ -230,6 +243,10 @@ fn agent_with_base(
     url: &str,
     base: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
 ) -> ureq::Agent {
+    // #1265: never follow a redirect. ureq keeps custom headers (the API
+    // key) on a redirect, and the guards only saw the first URL. A 3xx comes
+    // back as a plain response and `http_error` turns it into a card.
+    let base = base.max_redirects(0).max_redirects_will_error(false);
     if crate::usage::is_loopback_url(url) {
         ureq::Agent::new_with_config(base.proxy(None).build())
     } else {
@@ -640,6 +657,11 @@ pub(crate) fn http_error(tag: &str, status: u16, body: &str) -> anyhow::Error {
             return super::blocked_error(tag, code);
         }
     }
+    if (300..400).contains(&status) {
+        return anyhow!(
+            "{tag}: HTTP {status}: the endpoint redirected. Wingman does not follow redirects, so check the base URL"
+        );
+    }
     let truncated = redact_and_truncate(body);
     match failure_kind(status, body) {
         Some(kind) => anyhow!("{tag}: HTTP {status} ({kind}): {truncated}"),
@@ -803,7 +825,7 @@ pub(crate) fn post_json_with(
             // send could charge again, so this surfaces as a card at once.
             Err(TransportError::TimedOut(e)) => {
                 return Err(anyhow!(
-                    "{tag}: the request timed out and was not sent again, in case it was already processed: {}",
+                    "{tag}: the connection failed after the request may have been sent, so it was not sent again: {}",
                     redact_detail(&e)
                 ));
             }
@@ -934,7 +956,7 @@ fn log_attempt(
             bytes_sent,
             0,
             egress::Outcome::Failure,
-            Some(&format!("timed out: {e}")),
+            Some(&format!("failed after send: {e}")),
         ),
         Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
             tag,
@@ -2402,7 +2424,8 @@ mod tests {
         assert_eq!(transport.call_count(), 1);
         assert!(sleeper.recorded().is_empty());
         let text = err.to_string();
-        assert!(text.contains("timed out"), "{text}");
+        assert!(text.contains("not sent again"), "{text}");
+        assert!(text.contains("timeout: global"), "{text}");
         assert!(!text.contains('\u{2014}'), "{text}");
     }
 
@@ -2430,8 +2453,69 @@ mod tests {
         assert!(!is_provably_unsent(&ureq::Error::Timeout(
             Timeout::SendBody
         )));
-        // Any non-timeout failure keeps the existing behaviour (retryable).
         assert!(is_provably_unsent(&ureq::Error::HostNotFound));
+        assert!(is_provably_unsent(&ureq::Error::ConnectionFailed));
+        assert!(is_provably_unsent(&ureq::Error::Tls("handshake")));
+    }
+
+    #[test]
+    fn an_io_or_protocol_failure_after_connect_is_not_provably_unsent() {
+        // #1267: a reset or a truncated reply can come after the body was
+        // written, so a retry could bill twice.
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !is_provably_unsent(&ureq::Error::Io(Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!is_provably_unsent(&ureq::Error::TooManyRedirects));
+        // Refused or unreachable happens at connect, before any byte is sent.
+        assert!(is_provably_unsent(&ureq::Error::Io(Error::from(
+            ErrorKind::ConnectionRefused
+        ))));
+    }
+
+    #[test]
+    fn the_real_transport_does_not_retry_a_dropped_connection() {
+        // Server accepts, reads, and closes with no reply: not provably unsent.
+        let _g = network_guard();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+        });
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_secs(5));
+        server.join().unwrap();
+        let Err(TransportError::TimedOut(detail)) = result else {
+            panic!("a dropped connection must not be retried");
+        };
+        // The card text is built around this detail; it must not call a drop
+        // a timeout, and the card wording itself no longer says "timed out".
+        assert!(!detail.to_lowercase().contains("timed out"), "{detail}");
+        assert!(!detail.to_lowercase().contains("timeout"), "{detail}");
+    }
+
+    #[test]
+    fn the_real_transport_still_retries_a_refused_connection() {
+        let _g = network_guard();
+        // Bind, take the port, drop: a tiny race if another process grabs it
+        // before the connect, which would only make this test fail loudly.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/");
+        let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_secs(5));
+        assert!(matches!(result, Err(TransportError::NoResponse(_))));
     }
 
     #[test]
@@ -3131,6 +3215,140 @@ mod tests {
         let err = agent_with_base(remote, dead_proxy()).get(remote).call();
         assert!(err.is_err(), "a remote call must go through the proxy");
     }
+    /// #1265: a 3xx from the endpoint is never followed, so the key header
+    /// never reaches the `Location` host. The second server must see no
+    /// connection and the caller must get the 302 as a plain response.
+    #[test]
+    fn a_redirect_is_not_followed_and_the_key_header_goes_nowhere() {
+        use std::io::{Read, Write};
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        other.set_nonblocking(true).unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = first.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{other_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = s.write_all(reply.as_bytes());
+        });
+        let url = format!("http://127.0.0.1:{first_port}/v1/messages");
+        let raw = UreqTransport
+            .post_json(
+                &url,
+                &[("x-api-key", "sk-test")],
+                &serde_json::json!({"a": 1}),
+                Duration::from_secs(5),
+            )
+            .unwrap_or_else(|_| panic!("a 302 is a response, not a transport error"));
+        server.join().unwrap();
+        assert_eq!(raw.status, 302);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            other.accept().is_err(),
+            "the redirect target must receive no connection"
+        );
+    }
+
+    /// #1265: a 3xx ends in a card that says the endpoint redirected.
+    #[test]
+    fn a_redirect_status_reads_as_a_redirect_in_the_error_text() {
+        for status in [301u16, 302, 303, 307, 308] {
+            let text = http_error("openai", status, "").to_string();
+            assert!(
+                text.contains("redirected") && text.contains(&status.to_string()),
+                "{text}"
+            );
+            assert!(!text.contains('\u{2014}'), "{text}");
+        }
+        assert!(!http_error("openai", 500, "")
+            .to_string()
+            .contains("redirected"));
+    }
+
+    /// #1265: the only place a `ureq` agent is built is `agent_with_base`,
+    /// and it turns redirects off. A second builder would skip that.
+    #[test]
+    fn agent_with_base_is_the_only_agent_builder_and_disables_redirects() {
+        let whole = include_str!("common.rs").replace('\r', "");
+        let code = whole.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(code.matches("ureq::Agent::new_with_config(").count(), 2);
+        assert_eq!(code.matches("new_with_defaults").count(), 0);
+        assert_eq!(code.matches("ureq::Agent::config_builder()").count(), 1);
+        assert_eq!(
+            agent_for("https://api.example.com/")
+                .config()
+                .max_redirects(),
+            0
+        );
+        assert_eq!(agent_for("http://127.0.0.1:1/").config().max_redirects(), 0);
+    }
+
+    /// #1265: outside `provider/common.rs` (the shared builder) and
+    /// `inputs/web_page.rs` (follows and re-checks each hop itself, on
+    /// purpose), no non-test code in `src/` may build a `ureq` agent or
+    /// call a bare `ureq::post`/`get`, which follow redirects by default.
+    #[test]
+    fn no_other_file_builds_a_ureq_agent_that_follows_redirects() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 20, "the scan found too few files");
+        let banned = [
+            "ureq::get(",
+            "ureq::post(",
+            "ureq::put(",
+            "ureq::delete(",
+            "ureq::head(",
+            "ureq::patch(",
+            "ureq::request(",
+            "ureq::agent(",
+            "Agent::new_with",
+            "Agent::with_parts",
+            "config_builder(",
+        ];
+        let mut scanned_oauth = false;
+        for path in files {
+            let name = path.to_string_lossy().replace('\\', "/");
+            if name.ends_with("provider/common.rs") || name.ends_with("inputs/web_page.rs") {
+                continue;
+            }
+            scanned_oauth |= name.ends_with("connectors/oauth.rs");
+            let whole = std::fs::read_to_string(&path).unwrap().replace('\r', "");
+            let code = whole
+                .split(
+                    "
+#[cfg(test)]",
+                )
+                .next()
+                .unwrap();
+            for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                for bad in banned {
+                    assert!(
+                        !line.contains(bad),
+                        "{name}: `{bad}` builds an agent that follows redirects; use provider::common::agent_for"
+                    );
+                }
+            }
+        }
+        assert!(scanned_oauth, "the scan never reached connectors/oauth.rs");
+    }
+
     /// #1157: every `ureq` send in this file must be built from
     /// [`agent_for`], or a new call site silently skips the loopback bypass.
     #[test]

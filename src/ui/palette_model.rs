@@ -133,7 +133,9 @@ pub const NO_ACTION_MATCH_HINT: &str =
 /// empty-query view, which never calls this for ranking but does for the
 /// `requires_model` filter's "does this row exist at all" check).
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
-    if query.trim().is_empty() {
+    // #1260: a stray leading or trailing space is not part of the match.
+    let query = query.trim();
+    if query.is_empty() {
         return Some(0);
     }
 
@@ -369,6 +371,22 @@ pub fn scroll_by(offset: usize, delta_rows: i32, total_rows: usize, visible_rows
     }
     let max_offset = (total_rows - visible_rows) as i32;
     (offset as i32 + delta_rows).clamp(0, max_offset) as usize
+}
+
+/// #1260: one wheel message's delta, folded into `remainder` (the part of a
+/// notch not yet scrolled), returning whole rows to move (positive = wheel up).
+pub fn wheel_notches(remainder: &mut i32, delta: i32) -> i32 {
+    /// `WHEEL_DELTA` (winuser.h): one notch.
+    const WHEEL_DELTA: i32 = 120;
+    // A change of direction starts afresh, so a few ticks up never eat the
+    // first ticks down.
+    if (*remainder > 0 && delta < 0) || (*remainder < 0 && delta > 0) {
+        *remainder = 0;
+    }
+    *remainder += delta;
+    let notches = *remainder / WHEEL_DELTA;
+    *remainder -= notches * WHEEL_DELTA;
+    notches
 }
 
 /// The scroll thumb for a list scrolled to `offset` (#883), in the pixels of a
@@ -1294,6 +1312,46 @@ mod tests {
     }
 
     #[test]
+    fn four_small_wheel_deltas_make_one_notch() {
+        let mut r = 0;
+        assert_eq!(wheel_notches(&mut r, 30), 0);
+        assert_eq!(wheel_notches(&mut r, 30), 0);
+        assert_eq!(wheel_notches(&mut r, 30), 0);
+        assert_eq!(wheel_notches(&mut r, 30), 1);
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn a_whole_notch_and_big_deltas_still_work() {
+        let mut r = 0;
+        assert_eq!(wheel_notches(&mut r, 120), 1);
+        assert_eq!(wheel_notches(&mut r, -120), -1);
+        assert_eq!(wheel_notches(&mut r, 240), 2);
+        assert_eq!(wheel_notches(&mut r, -150), -1);
+        assert_eq!(r, -30, "the leftover is kept");
+    }
+
+    #[test]
+    fn a_wheel_direction_change_drops_the_leftover() {
+        let mut r = 0;
+        assert_eq!(wheel_notches(&mut r, 90), 0);
+        // Down 60 must not first cancel the 90 up: it starts afresh.
+        assert_eq!(wheel_notches(&mut r, -60), 0);
+        assert_eq!(r, -60);
+        assert_eq!(wheel_notches(&mut r, -60), -1);
+    }
+
+    #[test]
+    fn a_trailing_or_leading_space_does_not_change_the_match() {
+        assert_eq!(
+            fuzzy_score("check my work ", "Check my work"),
+            fuzzy_score("check my work", "Check my work")
+        );
+        assert!(fuzzy_score(" check my work", "Check my work").is_some());
+        assert_eq!(fuzzy_score("  ", "Check my work"), Some(0));
+    }
+
+    #[test]
     fn scroll_by_is_zero_when_everything_fits() {
         assert_eq!(scroll_by(0, 5, 10, 12), 0);
     }
@@ -1375,6 +1433,7 @@ mod tests {
             crate::actions::rewrite_tone::SHORTER_ID,
             crate::actions::rewrite_tone::FRIENDLIER_ID,
             crate::actions::rewrite_tone::FORMAL_ID,
+            crate::actions::rewrite_tone::SIMPLIFY_ID,
             crate::actions::page_summary::ACTION_ID,
             crate::actions::describe_image::ACTION_ID,
             crate::actions::explain_screen::ACTION_ID,

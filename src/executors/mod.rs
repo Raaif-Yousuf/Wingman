@@ -131,10 +131,30 @@ impl Undo {
         self.restorable
     }
 
+    /// The summary, plus a line naming the tray's "Undo last action" when
+    /// this can be undone (#1281). A card never promises an Undo the app
+    /// does not hold.
+    pub fn summary_with_hint(&self) -> String {
+        if self.restorable {
+            format!("{} {UNDO_HINT}", self.summary)
+        } else {
+            self.summary.clone()
+        }
+    }
+
+    /// What the app keeps for the tray's "Undo last action": this, only if
+    /// it can put something back (#645, #1281).
+    pub fn remember(self) -> Option<Undo> {
+        self.is_restorable().then_some(self)
+    }
+
     pub fn undo(self) -> anyhow::Result<()> {
         (self.restore)()
     }
 }
+
+/// The line a card adds when the tray's "Undo last action" holds an undo.
+pub const UNDO_HINT: &str = "Undo last action in the tray menu undoes the most recent change.";
 
 /// Deterministic Rust that acts on a confirmed proposal. Never runs without
 /// a [`Confirmed`] value (the type system enforces it: there is no other way
@@ -145,4 +165,26 @@ pub trait Executor: Send + Sync {
     fn name(&self) -> &'static str;
     fn effect(&self) -> Effect;
     fn execute(&self, confirmed: Confirmed<serde_json::Value>) -> anyhow::Result<Undo>;
+}
+
+#[cfg(test)]
+mod undo_hint_tests {
+    use super::*;
+
+    /// #1281: a card names the tray Undo only when one is held.
+    #[test]
+    fn the_hint_is_offered_only_for_a_restorable_undo() {
+        let held = Undo::recording("Replaced text.", || Ok(()));
+        assert!(held.summary_with_hint().starts_with("Replaced text."));
+        assert!(held.summary_with_hint().contains(UNDO_HINT));
+        let none = Undo::none("copied");
+        assert_eq!(none.summary_with_hint(), "copied");
+    }
+
+    /// #1281: the app keeps exactly the restorable undos.
+    #[test]
+    fn remember_keeps_exactly_the_restorable_undos() {
+        assert!(Undo::recording("x", || Ok(())).remember().is_some());
+        assert!(Undo::none("x").remember().is_none());
+    }
 }

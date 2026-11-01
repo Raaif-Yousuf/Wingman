@@ -29,6 +29,9 @@ use unicode_segmentation::UnicodeSegmentation;
 pub struct OptionRow {
     pub id: String,
     pub label: String,
+    /// The catalogue's own name for the action `id` runs (#937), looked up from
+    /// the id, never from model text. Empty when the id is not in the catalogue.
+    pub action: String,
 }
 
 /// How the card behaves, from `[options]` in the config and from whether the
@@ -265,9 +268,26 @@ pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> Strin
 }
 
 /// The name a row button carries for assistive tech: the whole label, with
-/// where it sits in the list ("Review this email, 1 of 3").
-pub(super) fn accessible_name(label: &str, position: usize, count: usize) -> String {
-    format!("{label}, {position} of {count}")
+/// the catalogue action name when the row shows one (#937), and where it sits
+/// in the list ("Reply to Dana, Review this email, 1 of 3").
+pub(super) fn accessible_name(label: &str, action: &str, position: usize, count: usize) -> String {
+    match action_line(label, action) {
+        Some(name) => format!("{label}, {name}, {position} of {count}"),
+        None => format!("{label}, {position} of {count}"),
+    }
+}
+
+/// The second line of a row: the catalogue's action name (#937), so the
+/// button shows what it runs beside what the router said. `None` when there is
+/// no name, or when the label is already that name (the empty-label fallback),
+/// so it is never shown twice.
+pub(super) fn action_line<'a>(label: &str, action: &'a str) -> Option<&'a str> {
+    let action = action.trim();
+    if action.is_empty() || action.to_lowercase() == label.trim().to_lowercase() {
+        None
+    } else {
+        Some(action)
+    }
 }
 
 /// Which row is drawn as the default. `None` when the bare key will not run
@@ -631,13 +651,20 @@ impl CardInner {
         // #999: a label that does not fit one line wraps (up to two lines)
         // and its row grows, instead of being cut.
         let label_w = self.option_label_width(row_h);
+        let caption_line = self.line_height(self.fonts.caption).max(1);
         let mut row_extra = [0; options_keys::MAX_OPTIONS];
         if let Some(ui) = self.options.as_ref() {
             for (extra, row) in row_extra.iter_mut().zip(ui.rows.iter()) {
                 let text_h = self
                     .measure_wrapped(self.fonts.body, &row.label, label_w)
                     .clamp(body_line, body_line * OPTION_LABEL_MAX_LINES);
-                *extra = (text_h + gap * 2 - row_h).max(0);
+                // #937: the catalogue name takes one more (caption) line.
+                let name_h = if action_line(&row.label, &row.action).is_some() {
+                    caption_line
+                } else {
+                    0
+                };
+                *extra = (text_h + name_h + gap * 2 - row_h).max(0);
             }
         }
         LayoutInputs {
@@ -719,7 +746,7 @@ impl CardInner {
         };
         let count = ui.rows.len();
         for (n, (row, rect)) in ui.rows.iter().zip(metrics.rows.iter()).enumerate() {
-            let name = accessible_name(&row.label, n + 1, count);
+            let name = accessible_name(&row.label, &row.action, n + 1, count);
             let hwnd = create_preview_button(
                 parent,
                 instance,
@@ -1104,14 +1131,45 @@ impl CardInner {
                 let text_h = (measure.bottom - measure.top).max(0);
                 (shown, text_h)
             });
+            // #937: the catalogue name under the label, one caption line,
+            // cut with an ellipsis when it does not fit. Taken from the
+            // action id, never from the router's text.
+            let name = action_line(&row.label, &row.action);
+            let name_h = if name.is_some() {
+                self.line_height(self.fonts.caption).max(1)
+            } else {
+                0
+            };
+            let block_h = text_h + name_h;
             let mut text_rect = label_rect;
-            text_rect.top += ((label_rect.bottom - label_rect.top) - text_h).max(0) / 2;
+            text_rect.top += ((label_rect.bottom - label_rect.top) - block_h).max(0) / 2;
             draw_text_line(
                 hdc,
                 &shown,
                 text_rect,
                 DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX,
             );
+            if let Some(name) = name {
+                SelectObject(hdc, HGDIOBJ(self.fonts.caption.0));
+                let ink = if high_contrast.is_some() {
+                    look.text
+                } else {
+                    palette.detail
+                };
+                SetTextColor(hdc, windows::Win32::Foundation::COLORREF(ink));
+                let name_rect = RECT {
+                    left: label_rect.left,
+                    top: text_rect.top + text_h,
+                    right: label_rect.right,
+                    bottom: text_rect.top + text_h + name_h,
+                };
+                draw_text_line(
+                    hdc,
+                    name,
+                    name_rect,
+                    DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
             SelectObject(hdc, old_font);
 
             // The default row: an accent outline, because one press of the
@@ -1313,8 +1371,18 @@ mod tests {
     #[test]
     fn a_row_is_named_by_its_whole_label_and_position() {
         assert_eq!(
-            accessible_name("Review this email to Dana", 1, 3),
+            accessible_name("Review this email to Dana", "", 1, 3),
             "Review this email to Dana, 1 of 3"
+        );
+        assert_eq!(
+            accessible_name("Reply to Dana", "Review this email", 1, 3),
+            "Reply to Dana, Review this email, 1 of 3",
+            "the action name is read too"
+        );
+        assert_eq!(
+            accessible_name("Translate", "Translate", 2, 3),
+            "Translate, 2 of 3",
+            "not read twice"
         );
     }
 
@@ -1564,6 +1632,15 @@ mod tests {
             // The label and keycap digit sit on the card, hover included
             // (the hover fill moves 8 percent towards the text colour).
             let hover = crate::ui::card_buttons::blend(t.surface, t.text, 8);
+            let pressed = crate::ui::card_buttons::blend(
+                t.surface,
+                t.text,
+                crate::ui::card_buttons::SECONDARY_PRESSED_PCT,
+            );
+            // #937: the action name uses the dim ink, on every fill a row has.
+            for bg in [t.surface, hover, pressed] {
+                assert!(ratio(t.text_dim, bg) >= 4.5, "{theme:?} name on {bg:#08x}");
+            }
             for bg in [t.surface, hover] {
                 assert!(ratio(t.text, bg) >= 4.5, "{theme:?} label on {bg:#08x}");
                 assert!(ratio(t.text_dim, bg) >= 4.5, "{theme:?} digit on {bg:#08x}");
@@ -1617,6 +1694,7 @@ mod tests {
         .map(|(id, label)| OptionRow {
             id: id.to_string(),
             label: label.to_string(),
+            action: String::new(),
         })
         .collect()
     }
@@ -1694,16 +1772,61 @@ mod tests {
     }
 
     #[test]
+    fn the_action_name_shows_unless_the_label_already_is_it() {
+        assert_eq!(
+            action_line("Reply to Dana", "Review this email"),
+            Some("Review this email")
+        );
+        assert_eq!(action_line("Translate", "translate "), None, "same name");
+        assert_eq!(action_line("Translate", ""), None, "no name known");
+        assert_eq!(action_line("", "Translate"), Some("Translate"));
+    }
+
+    #[test]
+    fn an_action_name_adds_a_line_to_its_row() {
+        let _g = lock();
+        let mut card = new_card();
+        let bare = OptionRow {
+            id: "a".into(),
+            label: "Reply to Dana".into(),
+            action: String::new(),
+        };
+        let named = OptionRow {
+            action: "Review this email".into(),
+            ..bare.clone()
+        };
+        let same = OptionRow {
+            action: "Reply to Dana".into(),
+            ..bare.clone()
+        };
+        let h = |r: &RECT| r.bottom - r.top;
+        card.show_options(1, "Summary", std::slice::from_ref(&bare), BEHAVIOR);
+        let plain = card.inner.options_metrics();
+        card.show_options(2, "Summary", &[named], BEHAVIOR);
+        let with_name = card.inner.options_metrics();
+        assert!(
+            h(&with_name.rows[0]) > h(&plain.rows[0]),
+            "name takes a line"
+        );
+        card.show_options(3, "Summary", &[same], BEHAVIOR);
+        let deduped = card.inner.options_metrics();
+        assert_eq!(h(&deduped.rows[0]), h(&plain.rows[0]), "shown once");
+        card.hide();
+    }
+
+    #[test]
     fn a_long_label_grows_its_row_instead_of_being_cut() {
         let _g = lock();
         let mut card = new_card();
         let long = OptionRow {
             id: "long".into(),
             label: "Review this email to Dana about the quarterly budget".into(),
+            action: String::new(),
         };
         let short = OptionRow {
             id: "short".into(),
             label: "Translate".into(),
+            action: String::new(),
         };
         card.show_options(1, "Summary", &[short.clone(), short.clone()], BEHAVIOR);
         let plain = card.inner.options_metrics();
@@ -1808,6 +1931,7 @@ mod tests {
         many.push(OptionRow {
             id: "x".into(),
             label: "Fifth".into(),
+            action: String::new(),
         });
         card.show_options(1, "Summary", &many, BEHAVIOR);
         assert_eq!(child_count(&card), 4);

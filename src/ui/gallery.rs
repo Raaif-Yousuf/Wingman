@@ -9,8 +9,10 @@
 //! wired-to-nothing manual check described in the PR, not by `cargo test`).
 
 use std::path::PathBuf;
+#[cfg(any(test, debug_assertions))]
+use std::time::Duration;
 
-/// Parsed `--ui-gallery [--screenshot <dir>] [--theme <name>] [--dpi <percent>]
+/// Parsed `--ui-gallery [--screenshot <dir> | --out <dir>] [--theme <name>] [--dpi <percent>]
 /// [--matrix]` invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GalleryArgs {
@@ -28,6 +30,32 @@ pub struct GalleryArgs {
     /// (`tray-menu`, `card-options`), so one surface can be looked at without
     /// rendering the whole gallery.
     pub only: Option<String>,
+    /// Flags after `--ui-gallery` that the gallery does not know (#1270). The
+    /// driver refuses to run with any, so a mistyped flag cannot fall into the
+    /// interactive window and wait for a person.
+    pub unknown: Vec<String>,
+}
+
+/// The error for flags the gallery does not know (#1270).
+#[cfg(any(test, debug_assertions))]
+pub fn unknown_flags_message(unknown: &[String]) -> String {
+    format!(
+        "unknown argument {} after --ui-gallery; known flags: --screenshot <dir> (or --out <dir>), --theme <name>, --dpi <percent>, --matrix, --only <prefix>",
+        unknown.join(", ")
+    )
+}
+
+/// How long a screenshot run may go without finishing a picture before it is
+/// given up as hung (#1270). A real shot takes about 1.5 s (MEASURED
+/// 2026-11-01: 24 tray shots in 33 s), so this never fires on a healthy run.
+#[cfg(any(test, debug_assertions))]
+pub const STALL_LIMIT: Duration = Duration::from_secs(30);
+
+/// Whether no picture has finished for `limit`: `last_ms` and `now_ms` are
+/// milliseconds on one clock.
+#[cfg(any(test, debug_assertions))]
+pub fn is_stalled(last_ms: u64, now_ms: u64, limit: Duration) -> bool {
+    now_ms.saturating_sub(last_ms) >= limit.as_millis() as u64
 }
 
 /// The themes `--matrix` renders, by their `--theme` names.
@@ -116,8 +144,11 @@ pub fn theme_from_arg(name: &str) -> Option<crate::ui::theme::Theme> {
 }
 
 /// Recognizes `--ui-gallery` (optionally followed anywhere later by
-/// `--screenshot <dir>`, `--theme <name>`, `--dpi <percent>` and `--matrix`) among `args` (normally `std::env::args().skip(1)`
-/// collected by the caller). Returns `None` when `--ui-gallery` is absent.
+/// `--screenshot <dir>` (or `--out <dir>`), `--theme <name>`, `--dpi <percent>`,
+/// `--only <prefix>` and `--matrix`) among `args` (normally
+/// `std::env::args().skip(1)` collected by the caller). Returns `None` when
+/// `--ui-gallery` is absent. Any other `--flag` after it lands in `unknown`,
+/// which the driver turns into an error (#1270).
 /// `--screenshot` with no following value is treated as if `--screenshot`
 /// were absent (documented, not an error): the gallery still runs
 /// interactively rather than aborting on a typo.
@@ -130,9 +161,11 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
     let mut dpi = None;
     let mut matrix = false;
     let mut only = None;
+    let mut unknown = Vec::new();
+    let mut seen_gallery = false;
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
-        if a == "--screenshot" {
+        if a == "--screenshot" || a == "--out" {
             if let Some(dir) = iter.next() {
                 screenshot_dir = Some(PathBuf::from(dir));
             }
@@ -150,6 +183,10 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
             if let Some(prefix) = iter.next() {
                 only = Some(prefix.clone());
             }
+        } else if a == "--ui-gallery" {
+            seen_gallery = true;
+        } else if seen_gallery {
+            unknown.push(a.clone());
         }
     }
     Some(GalleryArgs {
@@ -158,6 +195,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
         dpi,
         matrix,
         only,
+        unknown,
     })
 }
 
@@ -468,11 +506,55 @@ mod driver {
         MSG, PM_REMOVE, WM_KEYDOWN, WM_PRINT,
     };
 
+    /// Milliseconds since the watchdog started at which the last picture
+    /// finished.
+    static LAST_PROGRESS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WATCHDOG_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    fn watchdog_now_ms() -> u64 {
+        WATCHDOG_START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    /// Call after each finished picture: restarts the stall clock.
+    fn mark_progress() {
+        LAST_PROGRESS_MS.store(watchdog_now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ends the process with exit code 1 if no picture finishes for
+    /// [`STALL_LIMIT`]. A modal loop that is never dismissed (a menu, a drop
+    /// list) cannot be interrupted from the thread that runs it, so a thread
+    /// that does not pump messages is the one that can end the run. This is
+    /// debug-only gallery code, so a check once a second is acceptable here
+    /// (the no-polling rule is about the shipped tray).
+    fn start_watchdog() {
+        mark_progress();
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let last = LAST_PROGRESS_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if is_stalled(last, watchdog_now_ms(), STALL_LIMIT) {
+                eprintln!(
+                    "Wingman: --ui-gallery finished no picture for {} s; giving up",
+                    STALL_LIMIT.as_secs()
+                );
+                std::process::exit(1);
+            }
+        });
+    }
+
     /// Runs the gallery. With `args.screenshot_dir` set, drives every state
     /// non-interactively, screenshots it, and exits; otherwise shows the
     /// first state and lets Left/Right step through the rest until the
     /// window closes.
     pub fn run_gallery(args: GalleryArgs) -> anyhow::Result<()> {
+        // Before any window: a mistyped flag must end the run, not open the
+        // interactive gallery and wait for a person (#1270).
+        anyhow::ensure!(
+            args.unknown.is_empty(),
+            unknown_flags_message(&args.unknown)
+        );
         unsafe {
             let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
                 windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -504,6 +586,7 @@ mod driver {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("--matrix needs --screenshot <dir>"))?;
             std::fs::create_dir_all(dir)?;
+            start_watchdog();
             for state in &states {
                 for theme_name in MATRIX_THEMES {
                     for percent in MATRIX_SCALES {
@@ -521,6 +604,7 @@ mod driver {
                             *state,
                             &dir.join(name),
                         )?;
+                        mark_progress();
                     }
                 }
             }
@@ -541,6 +625,7 @@ mod driver {
 
         if let Some(dir) = &args.screenshot_dir {
             std::fs::create_dir_all(dir)?;
+            start_watchdog();
             for state in &states {
                 let path = dir.join(screenshot_filename(state_name(*state)));
                 shoot(
@@ -552,6 +637,7 @@ mod driver {
                     *state,
                     &path,
                 )?;
+                mark_progress();
             }
             std::process::exit(0);
         }
@@ -784,12 +870,30 @@ mod driver {
         .collect()
     }
 
+    /// The catalogue name the gallery shows under a row (the app takes it from
+    /// the catalogue by id, #937). Ids the gallery makes up get a plain name.
+    fn gallery_action_name(id: &str) -> String {
+        match id {
+            "review-this-email" => "Review this email",
+            "rewrite-tone" => "Rewrite the tone",
+            "translate" => "Translate",
+            "explain-screen" => "Explain this screen",
+            "chart-table" => "Turn a table on screen into a chart with a long catalogue name",
+            "extract-text" => "Copy text from screen",
+            "read-qr" => "Read QR code",
+            "calculate-selection" => "Calculate selection",
+            _ => "",
+        }
+        .to_string()
+    }
+
     /// The options card's rows from `(id, label)` pairs.
     fn option_rows(rows: &[(&str, &str)]) -> Vec<crate::ui::card::OptionRow> {
         rows.iter()
             .map(|(id, label)| crate::ui::card::OptionRow {
                 id: (*id).to_string(),
                 label: (*label).to_string(),
+                action: gallery_action_name(id),
             })
             .collect()
     }
@@ -1760,6 +1864,100 @@ mod tests {
     }
 
     #[test]
+    fn out_is_another_name_for_screenshot() {
+        // #1270: `--out <dir>` was ignored, so the run fell into the
+        // interactive window and never exited.
+        let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only", "tray", "--out", "d"]))
+            .expect("--ui-gallery is present");
+        assert_eq!(parsed.screenshot_dir, Some(PathBuf::from("d")));
+        assert!(parsed.unknown.is_empty());
+    }
+
+    #[test]
+    fn unknown_flags_after_ui_gallery_are_collected() {
+        let parsed = parse_gallery_args(&args(&[
+            "--ui-gallery",
+            "--only",
+            "tray",
+            "--outt",
+            "--matrx",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.unknown,
+            vec!["--outt".to_string(), "--matrx".to_string()]
+        );
+    }
+
+    #[test]
+    fn flags_before_ui_gallery_and_known_flags_are_not_unknown() {
+        let parsed = parse_gallery_args(&args(&[
+            "--foo",
+            "--ui-gallery",
+            "--screenshot",
+            "d",
+            "--theme",
+            "dark",
+            "--dpi",
+            "150",
+            "--matrix",
+            "--only",
+            "tray",
+            "--out",
+            "e",
+        ]))
+        .unwrap();
+        assert!(parsed.unknown.is_empty(), "{:?}", parsed.unknown);
+    }
+
+    #[test]
+    fn the_unknown_flag_error_names_the_flag_and_the_known_ones() {
+        let msg = unknown_flags_message(&["--outt".to_string()]);
+        assert!(msg.contains("--outt"));
+        for known in [
+            "--screenshot",
+            "--out",
+            "--theme",
+            "--dpi",
+            "--matrix",
+            "--only",
+        ] {
+            assert!(msg.contains(known), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_run_is_stalled_only_after_the_limit_with_no_progress() {
+        let limit = Duration::from_secs(30);
+        assert!(!is_stalled(1_000, 1_000, limit));
+        assert!(!is_stalled(1_000, 30_999, limit));
+        assert!(is_stalled(1_000, 31_000, limit));
+        assert!(is_stalled(0, 600_000, limit));
+        // A clock that reads earlier than the last mark is not a stall.
+        assert!(!is_stalled(5_000, 1_000, limit));
+        assert_eq!(STALL_LIMIT, limit);
+    }
+
+    #[test]
+    fn stray_tokens_after_ui_gallery_are_unknown() {
+        let parsed = parse_gallery_args(&args(&[
+            "--ui-gallery",
+            "-out",
+            "d",
+            "/out",
+            "stray",
+            "--out",
+            "e",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.unknown,
+            ["-out", "d", "/out", "stray"].map(String::from).to_vec()
+        );
+        assert_eq!(parsed.screenshot_dir, Some(PathBuf::from("e")));
+    }
+
+    #[test]
     fn only_names_a_state_prefix() {
         let parsed = parse_gallery_args(&args(&["--ui-gallery", "--only", "tray-menu"]))
             .expect("--ui-gallery is present");
@@ -1930,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn garbage_args_interspersed_do_not_confuse_parsing() {
+    fn garbage_args_interspersed_do_not_confuse_parsing_and_unknown_flags_are_listed() {
         assert_eq!(
             parse_gallery_args(&args(&[
                 "--foo",
@@ -1943,6 +2141,7 @@ mod tests {
             ])),
             Some(GalleryArgs {
                 screenshot_dir: Some(PathBuf::from("C:\\out dir")),
+                unknown: vec!["--baz".to_string(), "--qux".to_string()],
                 ..Default::default()
             })
         );

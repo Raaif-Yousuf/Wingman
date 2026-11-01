@@ -485,6 +485,9 @@ pub const READ_QR_ACTION_ID: &str = "read-qr-code";
 ///   `rewrite_tone::builtin_actions`): proposal `text_answer`, executor
 ///   `replace_text`. Rewrite the selection in a fixed tone, confirmed on a
 ///   card, then written over the selection like "Translate selection".
+/// - `"simplify-text"` (#1278, `rewrite_tone::builtin_actions`): the same
+///   shape, right after the tones. Plain words, short sentences, every
+///   number, name and date kept, and a note when meaning cannot be kept.
 /// - `"resolve-relative-dates"` (#336, `relative_dates::builtin_action`):
 ///   model-free. Finds phrases like "next Tuesday" or "in 3 days" in the
 ///   selection (else on screen) and lists the date each works out to

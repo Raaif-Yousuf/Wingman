@@ -212,7 +212,8 @@ impl TokenTransport for UreqTransport {
 
 fn send_form(url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
     crate::ui_thread::blocking_call("oauth send_form");
-    let mut response = ureq::post(url)
+    let mut response = crate::provider::common::agent_for(url)
+        .post(url)
         .config()
         .http_status_as_error(false)
         .timeout_global(Some(Duration::from_secs(30)))
@@ -1447,6 +1448,42 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(started.elapsed() < WAKE_GRACE, "{:?}", started.elapsed());
+    }
+
+    /// #1265: a redirect from the token endpoint is not followed, so the
+    /// code, verifier and secret in the form never reach the `Location` host.
+    #[test]
+    fn a_token_endpoint_redirect_is_not_followed() {
+        use std::io::{Read, Write};
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        other.set_nonblocking(true).unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = first.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{other_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = s.write_all(reply.as_bytes());
+            // Drain the rest of the form so closing does not reset the socket.
+            let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+            while s.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        });
+        let (status, _) = send_form(
+            &format!("http://127.0.0.1:{first_port}/token"),
+            &[("code", "c"), ("client_secret", "s")],
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(status, 302);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            other.accept().is_err(),
+            "the redirect target must receive no connection"
+        );
     }
 
     #[test]

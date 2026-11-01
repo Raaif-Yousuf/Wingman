@@ -910,29 +910,87 @@ fn is_invisible_layered(flags: u32, alpha: u8) -> bool {
     flags & LWA_ALPHA != 0 && alpha == 0
 }
 
+/// The plain facts about one window that decide whether it is a real,
+/// visible thing a user could be pointing at. Shared by the overlay's
+/// `window_stack` and the region picker's snapshot (#1252) so the two window
+/// lists cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowFacts {
+    /// `DWMWA_CLOAKED` is non-zero (other virtual desktop, suspended UWP).
+    pub cloaked: bool,
+    pub class: String,
+    /// `GWL_EXSTYLE`.
+    pub ex_style: u32,
+    /// `(flags, alpha)` from `GetLayeredWindowAttributes`; `None` when the
+    /// window is not layered or the call failed.
+    pub layered: Option<(u32, u8)>,
+}
+
+impl WindowFacts {
+    /// Not cloaked, not a desktop/taskbar window, not drawn as nothing.
+    pub(crate) fn is_real(&self) -> bool {
+        !self.cloaked
+            && !is_shell_class(&self.class)
+            && !self
+                .layered
+                .is_some_and(|(flags, alpha)| is_invisible_layered(flags, alpha))
+    }
+
+    /// `WS_EX_TRANSPARENT`: mouse input falls through it.
+    pub(crate) fn click_through(&self) -> bool {
+        self.ex_style & WS_EX_TRANSPARENT.0 != 0
+    }
+}
+
+/// Reads [`WindowFacts`] for `hwnd`. Thin Win32 only; the decision is
+/// [`WindowFacts::is_real`].
+pub(crate) fn read_window_facts(hwnd: HWND) -> WindowFacts {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetLayeredWindowAttributes, GetWindowLongW, GWL_EXSTYLE, WS_EX_LAYERED,
+    };
+    let mut cloaked = 0u32;
+    let _ = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+    let mut buf = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+    let mut layered = None;
+    if ex_style & WS_EX_LAYERED.0 != 0 {
+        let (mut alpha, mut flags) = (0u8, Default::default());
+        if unsafe { GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)) }
+            .is_ok()
+        {
+            layered = Some((flags.0, alpha));
+        }
+    }
+    WindowFacts {
+        cloaked: cloaked != 0,
+        class,
+        ex_style,
+        layered,
+    }
+}
+
 /// The visible, un-cloaked, un-minimised top-level windows, topmost first.
 /// `None` when the enumeration fails: the caller treats that as unknown.
 fn window_stack() -> Option<Vec<Stacked>> {
-    use windows::Win32::Graphics::Dwm::{
-        DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-    };
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongW, GetWindowRect,
-        IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_LAYERED,
+        EnumWindows, GetWindowRect, IsIconic, IsWindowVisible,
     };
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
         // SAFETY: `lparam` is the `&mut Vec<Stacked>` passed below, which
         // outlives `EnumWindows`.
         let out = unsafe { &mut *(lparam.0 as *mut Vec<Stacked>) };
-        let mut cloaked = 0u32;
-        let _ = unsafe {
-            DwmGetWindowAttribute(
-                hwnd,
-                DWMWA_CLOAKED,
-                &mut cloaked as *mut u32 as *mut core::ffi::c_void,
-                std::mem::size_of::<u32>() as u32,
-            )
-        };
+        let facts = read_window_facts(hwnd);
         // The visible frame, without the invisible ~7 px DWM shadow border;
         // the plain window rect when DWM cannot say.
         let mut r = RECT::default();
@@ -946,23 +1004,8 @@ fn window_stack() -> Option<Vec<Stacked>> {
         }
         .is_ok();
         let got = dwm_ok || unsafe { GetWindowRect(hwnd, &mut r) }.is_ok();
-        let ex = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
-        let mut buf = [0u16; 64];
-        let n = unsafe { GetClassNameW(hwnd, &mut buf) }.max(0) as usize;
-        let shell = is_shell_class(&String::from_utf16_lossy(&buf[..n.min(buf.len())]));
-        let mut invisible = false;
-        if ex & WS_EX_LAYERED.0 != 0 {
-            let (mut alpha, mut flags) = (0u8, Default::default());
-            if unsafe { GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)) }
-                .is_ok()
-            {
-                invisible = is_invisible_layered(flags.0, alpha);
-            }
-        }
         if got
-            && cloaked == 0
-            && !shell
-            && !invisible
+            && facts.is_real()
             && unsafe { IsWindowVisible(hwnd) }.as_bool()
             && !unsafe { IsIconic(hwnd) }.as_bool()
         {
@@ -977,7 +1020,7 @@ fn window_stack() -> Option<Vec<Stacked>> {
                     bottom: r.bottom,
                 },
                 pid,
-                click_through: ex & WS_EX_TRANSPARENT.0 != 0,
+                click_through: facts.click_through(),
             });
         }
         true.into()
@@ -1404,6 +1447,40 @@ mod tests {
         for c in ["Notepad", "Chrome_WidgetWin_1", "STATIC", ""] {
             assert!(!is_shell_class(c), "{c}");
         }
+    }
+
+    #[test]
+    fn window_facts_real_excludes_cloaked_shell_and_invisible_but_keeps_click_through() {
+        let base = WindowFacts {
+            cloaked: false,
+            class: "Notepad".to_string(),
+            ex_style: 0,
+            layered: None,
+        };
+        assert!(base.is_real());
+        assert!(!WindowFacts {
+            cloaked: true,
+            ..base.clone()
+        }
+        .is_real());
+        assert!(!WindowFacts {
+            class: "Progman".into(),
+            ..base.clone()
+        }
+        .is_real());
+        assert!(!WindowFacts {
+            layered: Some((2, 0)),
+            ..base.clone()
+        }
+        .is_real());
+        // Click-through is not "unreal": the overlay keeps it, flagged.
+        let ct = WindowFacts {
+            ex_style: 0x20,
+            ..base.clone()
+        };
+        assert!(ct.is_real());
+        assert!(ct.click_through());
+        assert!(!base.click_through());
     }
 
     #[test]

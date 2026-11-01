@@ -120,9 +120,7 @@ impl Anthropic {
                 // never got to emit the answer -- a specific, reachable
                 // shape, not a generic malformed response (#155).
                 if stop_reason == Some("max_tokens") {
-                    return Err(anyhow!(
-                        "anthropic: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-                    ));
+                    return Err(super::truncated_error("anthropic"));
                 }
                 return Err(match stop_reason {
                     Some("pause_turn") => anyhow!(
@@ -614,6 +612,29 @@ mod tests {
         let completion = Anthropic::parse_completion(body).expect("should parse");
         let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.difficulty, None);
+    }
+
+    /// #1269: `max_tokens` with a text block is still a completion (the text
+    /// may be a whole valid answer); only the chain decides after parsing.
+    #[test]
+    fn parse_completion_keeps_text_when_stopped_at_max_tokens() {
+        let body = r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"{\"detail\":\"d\",\"headline\":\"h\"}"}]}"#;
+        let c = Anthropic::parse_completion(body).unwrap();
+        assert_eq!(c.stop, StopReason::MaxTokens);
+        assert!(crate::provider::parse_answer(&c.text).is_ok());
+    }
+
+    /// #1269: `max_tokens` with no text at all is the `Truncated` error.
+    #[test]
+    fn parse_completion_reports_truncated_for_max_tokens_with_no_text() {
+        let body =
+            r#"{"stop_reason":"max_tokens","content":[{"type":"thinking","thinking":"..."}]}"#;
+        let err = Anthropic::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
     }
 
     #[test]
