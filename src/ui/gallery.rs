@@ -40,18 +40,22 @@ pub struct GalleryArgs {
 #[cfg(any(test, debug_assertions))]
 pub fn unknown_flags_message(unknown: &[String]) -> String {
     format!(
-        "unknown flag {} after --ui-gallery; known flags: --screenshot <dir> (or --out <dir>), --theme <name>, --dpi <percent>, --matrix, --only <prefix>",
+        "unknown argument {} after --ui-gallery; known flags: --screenshot <dir> (or --out <dir>), --theme <name>, --dpi <percent>, --matrix, --only <prefix>",
         unknown.join(", ")
     )
 }
 
-/// How long a screenshot run may take before it is given up as hung (#1270):
-/// 30 s, or 5 s per picture when that is more. A real shot takes about
-/// 1.5 s (MEASURED 2026-11-01: 24 tray shots in 33 s), so this never fires on
-/// a healthy run.
+/// How long a screenshot run may go without finishing a picture before it is
+/// given up as hung (#1270). A real shot takes about 1.5 s (MEASURED
+/// 2026-11-01: 24 tray shots in 33 s), so this never fires on a healthy run.
 #[cfg(any(test, debug_assertions))]
-pub fn watchdog_limit(shots: usize) -> Duration {
-    Duration::from_secs(30u64.max(5 * shots as u64))
+pub const STALL_LIMIT: Duration = Duration::from_secs(30);
+
+/// Whether no picture has finished for `limit`: `last_ms` and `now_ms` are
+/// milliseconds on one clock.
+#[cfg(any(test, debug_assertions))]
+pub fn is_stalled(last_ms: u64, now_ms: u64, limit: Duration) -> bool {
+    now_ms.saturating_sub(last_ms) >= limit.as_millis() as u64
 }
 
 /// The themes `--matrix` renders, by their `--theme` names.
@@ -181,7 +185,7 @@ pub fn parse_gallery_args(args: &[String]) -> Option<GalleryArgs> {
             }
         } else if a == "--ui-gallery" {
             seen_gallery = true;
-        } else if seen_gallery && a.starts_with("--") {
+        } else if seen_gallery {
             unknown.push(a.clone());
         }
     }
@@ -502,19 +506,41 @@ mod driver {
         MSG, PM_REMOVE, WM_KEYDOWN, WM_PRINT,
     };
 
-    /// Ends the process with exit code 1 if a screenshot run is still going
-    /// after [`watchdog_limit`]. A modal loop that is never dismissed (a menu,
-    /// a drop list) cannot be interrupted from the thread that runs it, so a
-    /// thread that does not pump messages is the one that can end the run.
-    fn start_watchdog(shots: usize) {
-        let limit = watchdog_limit(shots);
-        std::thread::spawn(move || {
-            std::thread::sleep(limit);
-            eprintln!(
-                "Wingman: --ui-gallery did not finish within {} s; giving up",
-                limit.as_secs()
-            );
-            std::process::exit(1);
+    /// Milliseconds since the watchdog started at which the last picture
+    /// finished.
+    static LAST_PROGRESS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static WATCHDOG_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    fn watchdog_now_ms() -> u64 {
+        WATCHDOG_START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+
+    /// Call after each finished picture: restarts the stall clock.
+    fn mark_progress() {
+        LAST_PROGRESS_MS.store(watchdog_now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ends the process with exit code 1 if no picture finishes for
+    /// [`STALL_LIMIT`]. A modal loop that is never dismissed (a menu, a drop
+    /// list) cannot be interrupted from the thread that runs it, so a thread
+    /// that does not pump messages is the one that can end the run. This is
+    /// debug-only gallery code, so a check once a second is acceptable here
+    /// (the no-polling rule is about the shipped tray).
+    fn start_watchdog() {
+        mark_progress();
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let last = LAST_PROGRESS_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if is_stalled(last, watchdog_now_ms(), STALL_LIMIT) {
+                eprintln!(
+                    "Wingman: --ui-gallery finished no picture for {} s; giving up",
+                    STALL_LIMIT.as_secs()
+                );
+                std::process::exit(1);
+            }
         });
     }
 
@@ -560,7 +586,7 @@ mod driver {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("--matrix needs --screenshot <dir>"))?;
             std::fs::create_dir_all(dir)?;
-            start_watchdog(states.len() * MATRIX_THEMES.len() * MATRIX_SCALES.len());
+            start_watchdog();
             for state in &states {
                 for theme_name in MATRIX_THEMES {
                     for percent in MATRIX_SCALES {
@@ -578,6 +604,7 @@ mod driver {
                             *state,
                             &dir.join(name),
                         )?;
+                        mark_progress();
                     }
                 }
             }
@@ -598,7 +625,7 @@ mod driver {
 
         if let Some(dir) = &args.screenshot_dir {
             std::fs::create_dir_all(dir)?;
-            start_watchdog(states.len());
+            start_watchdog();
             for state in &states {
                 let path = dir.join(screenshot_filename(state_name(*state)));
                 shoot(
@@ -610,6 +637,7 @@ mod driver {
                     *state,
                     &path,
                 )?;
+                mark_progress();
             }
             std::process::exit(0);
         }
@@ -1834,11 +1862,9 @@ mod tests {
             "--only",
             "tray",
             "--outt",
-            "d",
             "--matrx",
         ]))
         .unwrap();
-        // "d" is a value, not a flag.
         assert_eq!(
             parsed.unknown,
             vec!["--outt".to_string(), "--matrx".to_string()]
@@ -1883,12 +1909,34 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_limit_grows_with_shots_and_has_a_floor() {
-        assert_eq!(watchdog_limit(0), Duration::from_secs(30));
-        assert_eq!(watchdog_limit(1), Duration::from_secs(30));
-        // A whole matrix of 24 shots takes about 33 s: the limit stays above it.
-        assert!(watchdog_limit(24) >= Duration::from_secs(120));
-        assert!(watchdog_limit(25) > watchdog_limit(24));
+    fn a_run_is_stalled_only_after_the_limit_with_no_progress() {
+        let limit = Duration::from_secs(30);
+        assert!(!is_stalled(1_000, 1_000, limit));
+        assert!(!is_stalled(1_000, 30_999, limit));
+        assert!(is_stalled(1_000, 31_000, limit));
+        assert!(is_stalled(0, 600_000, limit));
+        // A clock that reads earlier than the last mark is not a stall.
+        assert!(!is_stalled(5_000, 1_000, limit));
+        assert_eq!(STALL_LIMIT, limit);
+    }
+
+    #[test]
+    fn stray_tokens_after_ui_gallery_are_unknown() {
+        let parsed = parse_gallery_args(&args(&[
+            "--ui-gallery",
+            "-out",
+            "d",
+            "/out",
+            "stray",
+            "--out",
+            "e",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.unknown,
+            ["-out", "d", "/out", "stray"].map(String::from).to_vec()
+        );
+        assert_eq!(parsed.screenshot_dir, Some(PathBuf::from("e")));
     }
 
     #[test]
