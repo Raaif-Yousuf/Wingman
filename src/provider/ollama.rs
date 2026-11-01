@@ -169,9 +169,7 @@ impl Ollama {
         // `content`. Both cases are the same user-facing problem, so both
         // are reported the same way rather than only the empty-content one.
         if done_reason == Some("length") {
-            return Err(anyhow!(
-                "ollama: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-            ));
+            return Err(super::truncated_error("ollama"));
         }
 
         let text = value
@@ -504,6 +502,18 @@ mod tests {
         let err = Ollama::parse_completion(&body).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ran out of room"), "{msg}");
+    }
+
+    /// #1269: a `length` stop is the stop-the-chain `Truncated` error.
+    #[test]
+    fn parse_completion_reports_a_truncated_reply_as_truncated() {
+        let body = r#"{"message": {"role": "assistant", "content": "{\n  "}, "done": true, "done_reason": "length"}"#;
+        let err = Ollama::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
     }
 
     /// Neighbour: `done_reason: "length"` with non-empty (but truncated,

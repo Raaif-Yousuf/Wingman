@@ -101,6 +101,11 @@ impl Anthropic {
             return Err(super::refused_error("anthropic"));
         }
 
+        // Cut off at the token limit, with or without partial text (#1269).
+        if stop_reason == Some("max_tokens") {
+            return Err(super::truncated_error("anthropic"));
+        }
+
         let content = value
             .get("content")
             .and_then(Value::as_array)
@@ -119,11 +124,6 @@ impl Anthropic {
                 // model spent its whole output-token budget on thinking and
                 // never got to emit the answer -- a specific, reachable
                 // shape, not a generic malformed response (#155).
-                if stop_reason == Some("max_tokens") {
-                    return Err(anyhow!(
-                        "anthropic: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-                    ));
-                }
                 return Err(match stop_reason {
                     Some("pause_turn") => anyhow!(
                         "anthropic: the reply was paused before it finished (pause_turn)"
@@ -614,6 +614,19 @@ mod tests {
         let completion = Anthropic::parse_completion(body).expect("should parse");
         let answer = parse_answer(&completion.text).unwrap();
         assert_eq!(answer.difficulty, None);
+    }
+
+    /// #1269: `max_tokens` with a partial text block is a cut-off reply, not
+    /// a completion to be parsed and repaired.
+    #[test]
+    fn parse_completion_reports_a_truncated_reply_with_partial_text() {
+        let body = r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"{\"detail\":\"The ball"}]}"#;
+        let err = Anthropic::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
     }
 
     #[test]

@@ -150,26 +150,24 @@ impl OpenAi {
 
         let status = value.get("status").and_then(Value::as_str);
 
-        if text.is_empty() {
-            // `status: "incomplete"` with no `message` entry means the
-            // model spent its whole output-token budget on reasoning and
-            // never got to emit the answer -- a specific, reachable shape
-            // (see `tests/fixtures/openai_response_no_message.json`), not
-            // a generic malformed response (#155).
-            if status == Some("incomplete") {
-                // Incomplete because of the content filter is a decline, not
-                // a budget problem (#731).
-                let reason = value
-                    .get("incomplete_details")
-                    .and_then(|d| d.get("reason"))
-                    .and_then(Value::as_str);
-                if reason == Some("content_filter") {
-                    return Err(super::declined_error("openai", "content_filter"));
-                }
-                return Err(anyhow!(
-                    "openai: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-                ));
+        // `status: "incomplete"` is a cut-off reply, with or without text.
+        // With no `message` entry the model spent its whole output-token
+        // budget on reasoning (see
+        // `tests/fixtures/openai_response_no_message.json`, #155); with
+        // partial text it was cut mid-answer (#1269). Incomplete because of
+        // the content filter is a decline, not a budget problem (#731).
+        if status == Some("incomplete") {
+            let reason = value
+                .get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str);
+            if reason == Some("content_filter") {
+                return Err(super::declined_error("openai", "content_filter"));
             }
+            return Err(super::truncated_error("openai"));
+        }
+
+        if text.is_empty() {
             return Err(match status {
                 Some(s) => anyhow!(
                     "openai: no message text found in output[] (status: {})",
@@ -709,6 +707,29 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("refused"), "{msg}");
         assert!(!msg.contains("no message text"), "{msg}");
+    }
+
+    /// #1269: `status: "incomplete"` with `max_output_tokens` and partial text
+    /// is a cut-off reply. A content-filter incomplete with text is a decline.
+    #[test]
+    fn parse_completion_reports_a_truncated_reply_with_partial_text() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"detail\":\"The ball"}]}]}"#;
+        let err = OpenAi::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
+    }
+
+    #[test]
+    fn parse_completion_treats_incomplete_content_filter_with_text_as_a_decline() {
+        let body = r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"detail\":\"The"}]}]}"#;
+        let err = OpenAi::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Declined>().is_some(),
+            "{err:#}"
+        );
     }
 
     /// Neighbour: a `content[]` mixing a `text` part with a `refusal` part

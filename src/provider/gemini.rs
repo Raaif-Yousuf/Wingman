@@ -185,6 +185,11 @@ impl Gemini {
             return Err(super::declined_error("gemini", reason));
         }
 
+        // Cut off at the token limit, with or without partial text (#1269).
+        if finish_reason == Some("MAX_TOKENS") {
+            return Err(super::truncated_error("gemini"));
+        }
+
         let mut text = String::new();
         if let Some(parts) = candidate
             .get("content")
@@ -203,11 +208,6 @@ impl Gemini {
             // model spent its whole output-token budget before emitting an
             // answer -- a specific, reachable shape (#155's pattern in the
             // sibling providers), not a generic malformed response.
-            if finish_reason == Some("MAX_TOKENS") {
-                return Err(anyhow!(
-                    "gemini: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-                ));
-            }
             return Err(match finish_reason {
                 Some("LANGUAGE") => anyhow!(
                     "gemini: the model would not answer in the language of this request (LANGUAGE)"
@@ -775,6 +775,18 @@ mod tests {
         let body = r#"{"candidates": [{"finishReason": "OTHER", "content": {"parts": []}}]}"#;
         let err = Gemini::parse_completion(body).unwrap_err();
         assert!(err.to_string().contains("no text part found"));
+    }
+
+    /// #1269: `MAX_TOKENS` with partial text is a cut-off reply.
+    #[test]
+    fn parse_completion_reports_a_truncated_reply_with_partial_text() {
+        let body = r#"{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{\"detail\":\"The ball"}]}}]}"#;
+        let err = Gemini::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
     }
 
     // -- parse_completion: refusal finishReasons -----------------------------

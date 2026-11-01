@@ -210,9 +210,7 @@ impl OpenAiCompat {
         // truncated, invalid-JSON body is reported as budget exhaustion
         // rather than a generic parse failure.
         if finish_reason == Some("length") {
-            return Err(anyhow!(
-                "openai-compat: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-            ));
+            return Err(super::truncated_error("openai-compat"));
         }
 
         // The server's own filter blocked the reply (#731): a decline, not a
@@ -798,6 +796,17 @@ mod tests {
     fn parse_completion_rejects_missing_choices() {
         let err = OpenAiCompat::parse_completion(r#"{"id": "x"}"#).unwrap_err();
         assert!(err.to_string().contains("no choices"));
+    }
+
+    #[test]
+    fn parse_completion_reports_a_truncated_reply_as_truncated() {
+        let body = r#"{"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "{\n \"det"}}]}"#;
+        let err = OpenAiCompat::parse_completion(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
     }
 
     #[test]

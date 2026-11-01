@@ -351,6 +351,30 @@ impl std::fmt::Display for Declined {
 
 impl std::error::Error for Declined {}
 
+/// The error for a reply the vendor cut off at the token limit (#1269): the
+/// same words for every provider. The message keeps the older "ran out of
+/// room" sentence so the card still says what to change.
+pub(crate) fn truncated_error(tag: &str) -> anyhow::Error {
+    anyhow::Error::new(Truncated(format!(
+        "{tag}: The answer was too long and got cut off. The model ran out of room before finishing. Lower the effort setting or raise the token limit."
+    )))
+}
+
+/// A reply the vendor stopped at its token limit (#1269). Stops the whole
+/// chain: the next vendor would be sent the same screenshot and, with the same
+/// budget, cut off the same way, for a second bill. A repair request is not
+/// sent either. The card shows this text.
+#[derive(Debug)]
+pub struct Truncated(String);
+
+impl std::fmt::Display for Truncated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Truncated {}
+
 #[cfg(test)]
 mod safe_reason_tests {
     use super::safe_reason;
@@ -706,10 +730,13 @@ pub fn install_send_gate(gate: std::sync::Arc<dyn SendGate>) {
 pub struct SendCancelled;
 
 /// Whether this error ends the whole chain instead of moving to the next
-/// provider: the user cancelled the preview, or a vendor declined the content
-/// (#767). Anything else is a failure of that one provider.
+/// provider: the user cancelled the preview, a vendor declined the content
+/// (#767), or a reply was cut off at the token limit (#1269). Anything else is
+/// a failure of that one provider.
 fn stops_chain(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<SendCancelled>().is_some() || e.downcast_ref::<Declined>().is_some()
+    e.downcast_ref::<SendCancelled>().is_some()
+        || e.downcast_ref::<Declined>().is_some()
+        || e.downcast_ref::<Truncated>().is_some()
 }
 
 /// The chain had no provider to try (#832). `App` turns it into the setup
@@ -2187,6 +2214,43 @@ mod tests {
                 .unwrap_err();
             assert!(err.downcast_ref::<Declined>().is_some(), "{err:#}");
             assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// #1269: a reply cut off at the token limit stops the chain, in both
+    /// entry points. The second provider is never called, and the card text
+    /// is the plain "too long" sentence.
+    #[test]
+    fn a_truncated_reply_stops_the_chain_and_the_next_provider_is_never_called() {
+        for attributed in [false, true] {
+            let a = SequencedProvider::new("a", vec![|| Err(truncated_error("a"))]);
+            let (b, b_calls) = SequencedProvider::new_counted("b", vec![ok_completion]);
+            let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+            let err = if attributed {
+                chain
+                    .complete_parsed_with_fallback_attributed(
+                        &req(),
+                        || {
+                            Ok(NonVisionInputs {
+                                ocr_text: String::new(),
+                                uia_fields: String::new(),
+                            })
+                        },
+                        |c| parse_answer(&c.text),
+                    )
+                    .map(|_| ())
+                    .unwrap_err()
+            } else {
+                chain
+                    .complete_parsed(&req(), |c| parse_answer(&c.text))
+                    .unwrap_err()
+            };
+            assert!(err.downcast_ref::<Truncated>().is_some(), "{err:#}");
+            assert!(
+                err.to_string().contains("too long and got cut off"),
+                "{err:#}"
+            );
+            assert_eq!(b_calls.load(Ordering::SeqCst), 0, "attributed={attributed}");
         }
     }
 
