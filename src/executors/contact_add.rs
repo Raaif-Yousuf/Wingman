@@ -305,7 +305,7 @@ impl<O: Opener> Executor for ContactAddExecutor<O> {
         // Same honesty as the calendar: undo can only remove the file this
         // wrote, not a contact the address book made from it.
         let summary = format!(
-            "Saved \"{who}\" as a contact card at {}{opened_note}. Undo last action in the tray menu removes this file; removing the contact from your address book is a manual step.",
+            "Saved \"{who}\" as a contact card at {}{opened_note}. The undo only removes this file; removing the contact from your address book is a manual step.",
             path.display()
         );
         Ok(Undo::recording(summary, move || {
@@ -679,7 +679,8 @@ mod tests {
         assert!(!undo.summary.contains('\u{2014}'));
         assert!(undo.is_restorable());
         assert!(
-            undo.summary.contains("Undo last action in the tray menu"),
+            undo.summary_with_hint().contains(super::super::UNDO_HINT)
+                && !undo.summary.contains("tray menu"),
             "{}",
             undo.summary
         );

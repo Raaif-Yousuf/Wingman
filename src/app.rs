@@ -5173,7 +5173,7 @@ impl App {
     /// `executors::fill_form::format_outcomes`, already lists filled,
     /// skipped and refused fields by name; #268: the headline above it
     /// must agree, via [`Self::form_fill_headline`]). On success, stashes
-    /// the `Undo` for "Restore last form" (tray, `restore_last_form`).
+    /// the `Undo` for "Undo last action" (tray, `undo_last_action`).
     fn run_form_fill_executor(
         &mut self,
         executor: Box<dyn executors::Executor>,
@@ -5236,13 +5236,15 @@ impl App {
     /// #712: shows the card for a finished executor run, whichever action
     /// it was. Each arm is what that action's own handler showed when it ran
     /// the executor inline. On the form fill, stashes the `Undo` for
-    /// "Restore last form" (#645: only when something can be restored).
+    /// "Undo last action" (#645: only when something can be restored).
     fn on_exec_done(&mut self, result: std::result::Result<ExecDone, String>) {
         self.exec_in_flight = false;
         self.set_busy(false);
         let done = match result {
             Ok(done) => done,
             Err(packed) => {
+                // Nothing was written: an older undo must not stay live.
+                self.last_undo = None;
                 if self.show_empty_chain_failure(&packed) {
                     return;
                 }
@@ -5255,12 +5257,15 @@ impl App {
                 return;
             }
         };
-        match done {
+        match &done {
             ExecDone::Calendar(Ok(undo)) => {
                 let headline = Self::calendar_headline(&undo.outcome);
-                self.card
-                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-                self.last_undo = undo.remember();
+                self.card.show_answer(
+                    headline,
+                    &with_pending_notices(&undo.summary_with_hint()),
+                    0,
+                    None,
+                );
             }
             ExecDone::Calendar(Err(e)) => {
                 let detail = self.track_error("Couldn't add the event", &format!("{e:#}"));
@@ -5274,7 +5279,6 @@ impl App {
                     0,
                     None,
                 );
-                self.last_undo = undo.remember();
             }
             ExecDone::Review(Err(e)) => {
                 let detail = self.track_error("Couldn't update the email", &format!("{e:#}"));
@@ -5283,9 +5287,12 @@ impl App {
             }
             ExecDone::FormFill(Ok(undo)) => {
                 let headline = Self::form_fill_headline(&undo.outcome);
-                self.card
-                    .show_answer(headline, &with_pending_notices(&undo.summary), 0, None);
-                self.last_undo = undo.remember();
+                self.card.show_answer(
+                    headline,
+                    &with_pending_notices(&undo.summary_with_hint()),
+                    0,
+                    None,
+                );
             }
             ExecDone::FormFill(Err(e)) => {
                 let detail = self.track_error("Couldn't fill the form", &format!("{e:#}"));
@@ -5300,12 +5307,17 @@ impl App {
             } => {
                 // #441: a read-only `"none"` action's answer comes from the
                 // proposal the card confirmed.
+                let summary = if keeps_undo(executor_name) {
+                    undo.summary_with_hint()
+                } else {
+                    undo.summary.clone()
+                };
                 let text = actions::generic_answer::result_card_text(
                     &action.name,
-                    &executor_name,
+                    executor_name,
                     &action.proposal,
-                    &undo.summary,
-                    &proposal,
+                    &summary,
+                    proposal,
                 );
                 let detail = with_pending_notices(&text.detail);
                 let detail = with_fallback_footer(&detail, self.fallback_footer.as_deref());
@@ -5324,17 +5336,14 @@ impl App {
             ExecDone::Replace {
                 action_name,
                 report,
-                undo,
+                ..
             } => {
-                if let Some(undo) = undo {
-                    self.last_undo = Some(undo);
-                }
                 use actions::generic_replace::ReplaceReport;
                 match report {
                     ReplaceReport::Replaced(summary) => {
                         self.card.show_answer(
                             "Selection replaced",
-                            &with_pending_notices(&summary),
+                            &with_pending_notices(summary),
                             0,
                             None,
                         );
@@ -5342,7 +5351,7 @@ impl App {
                     ReplaceReport::Copied(detail) => {
                         self.card.show_answer(
                             "Copied to the clipboard",
-                            &with_pending_notices(&detail),
+                            &with_pending_notices(detail),
                             0,
                             None,
                         );
@@ -5357,7 +5366,7 @@ impl App {
                     }
                     ReplaceReport::Failed(reason) => {
                         let title = format!("Couldn't run \"{action_name}\"");
-                        let detail = self.track_error(&title, &reason);
+                        let detail = self.track_error(&title, reason);
                         self.card.show_error_with_details(&title, &detail);
                     }
                 }
@@ -5376,26 +5385,27 @@ impl App {
                     .show_error_with_details("Couldn't copy the region", &detail);
                 self.set_watch(true);
             }
-            ExecDone::RestoreForm(Ok(())) => {
+            ExecDone::UndoLast(Ok(())) => {
                 self.card
                     .show_answer("Undone", "The last action has been undone.", 5, None);
             }
-            ExecDone::RestoreForm(Err(e)) => {
+            ExecDone::UndoLast(Err(e)) => {
                 let detail = self.track_error("Couldn't fully undo that", &format!("{e:#}"));
                 self.card
                     .show_error_with_details("Couldn't fully undo that", &detail);
             }
         }
+        self.last_undo = undo_slot_after(done);
         self.set_watch(true);
     }
-    /// Tray "Restore last form" (#40's Undo requirement). Takes
+    /// Tray "Undo last action" (#40's Undo requirement). Takes
     /// `self.last_undo` (an `Undo::undo` is `FnOnce`, consumed on use)
     /// so a second click after a successful restore reports "nothing to
     /// restore" rather than attempting a stale undo twice. Always shown in
     /// the tray (no dynamic enable/disable state) -- clicking it with
     /// nothing to restore is a plain informational card, never a dialog
     /// box (rule 7).
-    fn restore_last_form(&mut self) {
+    fn undo_last_action(&mut self) {
         // #712: the restore runs off the UI thread, so it needs the same
         // "one thing at a time" as every other run. Keep the undo for later.
         if self.busy {
@@ -9075,7 +9085,7 @@ enum ExecDone {
         report: actions::generic_replace::ReplaceReport,
         undo: Option<executors::Undo>,
     },
-    RestoreForm(anyhow::Result<()>),
+    UndoLast(anyhow::Result<()>),
     /// #772: the region copy's clipboard write, with the size for the card.
     RegionCopy {
         width: u32,
@@ -9094,7 +9104,7 @@ impl std::fmt::Debug for ExecDone {
             ExecDone::FormFill(_) => "ExecDone::FormFill",
             ExecDone::Generic { .. } => "ExecDone::Generic",
             ExecDone::Replace { .. } => "ExecDone::Replace",
-            ExecDone::RestoreForm(_) => "ExecDone::RestoreForm",
+            ExecDone::UndoLast(_) => "ExecDone::UndoLast",
             ExecDone::RegionCopy { .. } => "ExecDone::RegionCopy",
         })
     }
@@ -9158,8 +9168,33 @@ fn exec_work_replace(
     }
 }
 
+/// #1281: what the tray's "Undo last action" holds after a result: the
+/// result's own undo when it wrote something that can be put back, and
+/// nothing otherwise, so an old undo never stays live behind a card about
+/// something else.
+fn undo_slot_after(done: ExecDone) -> Option<executors::Undo> {
+    match done {
+        ExecDone::Calendar(Ok(undo))
+        | ExecDone::Review(Ok(undo))
+        | ExecDone::FormFill(Ok(undo)) => undo.remember(),
+        ExecDone::Generic {
+            executor_name,
+            result: Ok(undo),
+            ..
+        } if keeps_undo(&executor_name) => undo.remember(),
+        ExecDone::Replace { undo, .. } => undo.and_then(executors::Undo::remember),
+        _ => None,
+    }
+}
+
+/// The clipboard executors' undo has no stale check (it could overwrite
+/// something copied later) and their cards never promise one, so it is
+/// not kept.
+fn keeps_undo(executor_name: &str) -> bool {
+    !matches!(executor_name, "clipboard" | "image_clipboard")
+}
 fn exec_work_restore(undo: executors::Undo) -> ExecDone {
-    ExecDone::RestoreForm(undo.undo())
+    ExecDone::UndoLast(undo.undo())
 }
 
 /// #772: puts the selected region on the clipboard as an image. Encoding the
@@ -10441,7 +10476,7 @@ fn handle_tray_message(hwnd: HWND, ptr: *mut App, lparam: LPARAM) -> LRESULT {
         MenuChoice::Command(cmd::WHAT_CAN_I_DO) => app.show_options_card(Trigger::Tray, true),
         MenuChoice::Command(cmd::REVIEW_EMAIL) => app.review_this_email(),
         MenuChoice::Command(cmd::FILL_FORM) => app.fill_form_from_screen(),
-        MenuChoice::Command(cmd::RESTORE_LAST_FORM) => app.restore_last_form(),
+        MenuChoice::Command(cmd::UNDO_LAST_ACTION) => app.undo_last_action(),
         MenuChoice::Command(cmd::EDIT_SETTINGS) => app.edit_settings(),
         MenuChoice::Command(cmd::OPEN_KNOWLEDGE) => app.open_knowledge_folder(),
         MenuChoice::Command(cmd::RELOAD) => app.reload(),
@@ -14034,7 +14069,7 @@ mod tests {
     fn an_executor_result_box_is_freed_when_dropped_unhandled() {
         use windows::Win32::Foundation::LPARAM;
         let done: std::result::Result<ExecDone, String> =
-            Ok(ExecDone::RestoreForm(Err(anyhow::anyhow!("x"))));
+            Ok(ExecDone::UndoLast(Err(anyhow::anyhow!("x"))));
         let boxed = Box::into_raw(Box::new(done));
         assert!(super::free_boxed_payload(
             WM_APP_EXECUTOR_DONE,
@@ -14219,7 +14254,7 @@ mod tests {
         let undo = executors::Undo::recording("x", || anyhow::bail!("could not put it back"));
         let done = exec_work_restore(undo);
         assert!(
-            matches!(done, ExecDone::RestoreForm(Err(ref e)) if e.root_cause().to_string().contains("put it back"))
+            matches!(done, ExecDone::UndoLast(Err(ref e)) if e.root_cause().to_string().contains("put it back"))
         );
     }
 
@@ -14275,33 +14310,86 @@ mod tests {
         assert!(hits >= 5, "the scan found only {hits} calls");
     }
 
-    /// #1281: every result arm whose card can promise an Undo keeps it for
-    /// the tray's "Undo last action". Reads the arms' own text, with the CRLF
-    /// stripped first.
-    #[test]
-    fn writing_result_arms_keep_their_undo_for_the_tray() {
-        let src = include_str!("app.rs").replace('\r', "");
-        let start = src.find("fn on_exec_done(").expect("fn exists");
-        let end = start + src[start..].find("fn restore_last_form(").expect("next fn");
-        let body = &src[start..end];
-        for arm in [
-            "ExecDone::Calendar(Ok(undo))",
-            "ExecDone::Review(Ok(undo))",
-            "ExecDone::FormFill(Ok(undo))",
-            "ExecDone::Replace {",
-        ] {
-            let at = body
-                .find(arm)
-                .unwrap_or_else(|| panic!("{arm} arm missing"));
-            let rest = &body[at + arm.len()..];
-            let next = rest.find("\n            ExecDone::").unwrap_or(rest.len());
-            assert!(
-                rest[..next].contains("self.last_undo = "),
-                "{arm} drops its Undo instead of keeping it in last_undo"
-            );
+    use super::undo_slot_after;
+
+    fn kept(summary: &str) -> executors::Undo {
+        executors::Undo::recording(summary, || Ok(()))
+    }
+
+    fn generic_done(executor: &str, undo: anyhow::Result<executors::Undo>) -> ExecDone {
+        ExecDone::Generic {
+            action: Box::new(actions::contact::builtin_action()),
+            executor_name: executor.to_string(),
+            proposal: Value::Null,
+            result: undo,
         }
     }
 
+    /// #1281: every writing result keeps its undo for the tray's "Undo last
+    /// action", and anything that produced none clears the slot, so an old
+    /// undo never stays live behind a card about something else.
+    #[test]
+    fn the_undo_slot_follows_the_latest_result() {
+        let some = |d: ExecDone| undo_slot_after(d).map(|u| u.summary);
+        assert_eq!(
+            some(ExecDone::Calendar(Ok(kept("cal")))).as_deref(),
+            Some("cal")
+        );
+        assert_eq!(
+            some(ExecDone::Review(Ok(kept("rev")))).as_deref(),
+            Some("rev")
+        );
+        assert_eq!(
+            some(ExecDone::FormFill(Ok(kept("form")))).as_deref(),
+            Some("form")
+        );
+        assert_eq!(
+            some(generic_done("contact_add", Ok(kept("contact")))).as_deref(),
+            Some("contact")
+        );
+        let replaced = ExecDone::Replace {
+            action_name: "r".into(),
+            report: actions::generic_replace::ReplaceReport::Replaced("x".into()),
+            undo: Some(kept("rep")),
+        };
+        assert_eq!(some(replaced).as_deref(), Some("rep"));
+    }
+
+    #[test]
+    fn a_result_with_no_undo_clears_the_slot() {
+        let none = |d: ExecDone| undo_slot_after(d).is_none();
+        assert!(none(ExecDone::Calendar(Err(anyhow::anyhow!("x")))));
+        assert!(none(ExecDone::Review(Ok(executors::Undo::none("x")))));
+        assert!(none(ExecDone::FormFill(Ok(executors::Undo::none("x")))));
+        assert!(none(generic_done("none", Ok(executors::Undo::none("x")))));
+        assert!(none(generic_done("contact_add", Err(anyhow::anyhow!("x")))));
+        // Copy-instead and failure: nothing was written, so nothing to undo.
+        for report in [
+            actions::generic_replace::ReplaceReport::Copied("c".into()),
+            actions::generic_replace::ReplaceReport::Failed("f".into()),
+            actions::generic_replace::ReplaceReport::NothingToReplace,
+        ] {
+            assert!(none(ExecDone::Replace {
+                action_name: "r".into(),
+                report,
+                undo: None,
+            }));
+        }
+        assert!(none(ExecDone::RegionCopy {
+            width: 1,
+            height: 1,
+            result: Ok(()),
+        }));
+    }
+
+    /// The clipboard undo has no stale check (it could overwrite something
+    /// copied later) and its card never promises one, so it is not kept.
+    #[test]
+    fn a_clipboard_undo_is_not_kept() {
+        for name in ["clipboard", "image_clipboard"] {
+            assert!(undo_slot_after(generic_done(name, Ok(kept("copied")))).is_none());
+        }
+    }
     #[test]
     fn begin_plan_without_a_model_skips_gate_capture_and_model_card() {
         let none = BeginPlan::for_fill_form(false);

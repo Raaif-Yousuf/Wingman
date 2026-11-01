@@ -154,7 +154,7 @@ impl Undo {
 }
 
 /// The line a card adds when the tray's "Undo last action" holds an undo.
-pub const UNDO_HINT: &str = "Undo last action in the tray menu puts this back.";
+pub const UNDO_HINT: &str = "Undo last action in the tray menu puts back the most recent change.";
 
 /// Deterministic Rust that acts on a confirmed proposal. Never runs without
 /// a [`Confirmed`] value (the type system enforces it: there is no other way

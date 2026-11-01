@@ -276,8 +276,8 @@ pub mod cmd {
     /// Confirm, Do). See `App::fill_form_from_screen` in `app.rs`.
     pub const FILL_FORM: u32 = 1026;
     /// Issue #40: Undo for the most recent successful `fill_form` run. See
-    /// `App::restore_last_form` in `app.rs`.
-    pub const RESTORE_LAST_FORM: u32 = 1027;
+    /// `App::undo_last_action` in `app.rs`.
+    pub const UNDO_LAST_ACTION: u32 = 1027;
 
     /// Issue #313: "Read QR code from screen" -- decode every QR code on the
     /// active monitor locally and copy the text. See `App::read_qr` in
@@ -891,7 +891,7 @@ impl Tray {
         append_item(actions, cmd::ADD_TO_CALENDAR, "Add event from screen")?;
         append_item(actions, cmd::REVIEW_EMAIL, "Review this email")?;
         append_item(actions, cmd::FILL_FORM, "Fill this form")?;
-        append_item(actions, cmd::RESTORE_LAST_FORM, "Undo last action")?;
+        append_item(actions, cmd::UNDO_LAST_ACTION, "Undo last action")?;
         if let Some(files) = self.knowledge_files {
             append_separator(actions)?;
             append_item(actions, cmd::OPEN_KNOWLEDGE, &knowledge_label(files))?;
@@ -2075,7 +2075,7 @@ mod tests {
             cmd::ADD_TO_CALENDAR,
             cmd::REVIEW_EMAIL,
             cmd::FILL_FORM,
-            cmd::RESTORE_LAST_FORM,
+            cmd::UNDO_LAST_ACTION,
         ];
         want.sort_unstable();
         assert_eq!(actions, want);
@@ -2635,10 +2635,10 @@ mod tests {
         let _ = unsafe { DestroyWindow(hwnd) };
     }
 
-    // -- #40: "Fill this form" and "Restore last form" are reachable --------
+    // -- #40: "Fill this form" and "Undo last action" are reachable --------
 
     #[test]
-    fn fill_form_and_restore_last_form_items_are_present_in_the_built_menu() {
+    fn fill_form_and_undo_last_action_items_are_present_in_the_built_menu() {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
         use windows::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, GetMenuItemInfoW, CW_USEDEFAULT, WINDOW_EX_STYLE,
@@ -2677,8 +2677,8 @@ mod tests {
         };
         unsafe { GetMenuItemInfoW(hmenu, cmd::FILL_FORM, false, &mut info) }
             .expect("cmd::FILL_FORM must be a real item id in the built menu, not orphaned data");
-        unsafe { GetMenuItemInfoW(hmenu, cmd::RESTORE_LAST_FORM, false, &mut info) }.expect(
-            "cmd::RESTORE_LAST_FORM must be a real item id in the built menu, not orphaned data",
+        unsafe { GetMenuItemInfoW(hmenu, cmd::UNDO_LAST_ACTION, false, &mut info) }.expect(
+            "cmd::UNDO_LAST_ACTION must be a real item id in the built menu, not orphaned data",
         );
 
         let _ = unsafe { DestroyMenu(hmenu) };
@@ -2762,7 +2762,7 @@ mod tests {
         ("WHAT_CAN_I_DO", cmd::WHAT_CAN_I_DO),
         ("REVIEW_EMAIL", cmd::REVIEW_EMAIL),
         ("FILL_FORM", cmd::FILL_FORM),
-        ("RESTORE_LAST_FORM", cmd::RESTORE_LAST_FORM),
+        ("UNDO_LAST_ACTION", cmd::UNDO_LAST_ACTION),
         ("READ_QR", cmd::READ_QR),
         ("IMPORT_ACTION", cmd::IMPORT_ACTION),
         ("OPEN_KNOWLEDGE", cmd::OPEN_KNOWLEDGE),

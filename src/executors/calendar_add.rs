@@ -96,7 +96,7 @@ impl Executor for CalendarAddExecutor {
         // gap implicit, since `Undo` has one `summary` string, used both
         // as the description of what happened and of what undoing it does.
         let summary = format!(
-            "Added \"{}\" to your calendar via {}{opened_note}. Undo last action in the tray menu removes this file; removing the event from your calendar app is a manual step.",
+            "Added \"{}\" to your calendar via {}{opened_note}. The undo only removes this file; removing the event from your calendar app is a manual step.",
             event.title,
             path.display()
         );
@@ -371,7 +371,11 @@ mod tests {
 
         assert!(undo.summary.contains("Standup"));
         // #1281: the Undo it names is the tray's, and it is held.
-        assert!(undo.summary.contains("Undo last action in the tray menu"));
+        assert!(
+            !undo.summary.contains("tray menu"),
+            "the promise comes from summary_with_hint"
+        );
+        assert!(undo.summary_with_hint().contains(super::super::UNDO_HINT));
         assert!(undo.is_restorable());
         assert!(
             undo.summary.contains("manual step") && undo.summary.contains("calendar app"),
