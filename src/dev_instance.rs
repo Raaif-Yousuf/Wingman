@@ -23,12 +23,15 @@
 //! Manager (API keys): a key saved in a dev instance is saved for both.
 
 /// The environment variable that turns the switch on.
+#[cfg(any(debug_assertions, test))]
 pub const ENV_VAR: &str = "WINGMAN_DEV_INSTANCE";
 
 /// Longest accepted name. Short on purpose: it ends up in kernel object names.
+#[cfg(any(debug_assertions, test))]
 const MAX_NAME_LEN: usize = 16;
 
 /// Whether `name` is usable: 1 to 16 characters, ASCII letters, digits or `-`.
+#[cfg(any(debug_assertions, test))]
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LEN
@@ -38,6 +41,7 @@ pub fn valid_name(name: &str) -> bool {
 /// The suffix to use for a raw environment value, or why it is ignored.
 /// `Ok(None)` is the normal case (unset or empty). `portable` is whether the
 /// process runs in portable mode. Pure.
+#[cfg(any(debug_assertions, test))]
 pub fn parse(raw: Option<&str>, portable: bool) -> Result<Option<String>, String> {
     let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
         return Ok(None);
@@ -69,6 +73,42 @@ pub fn install_hook(suffix: Option<&str>) -> bool {
     suffix.is_none()
 }
 
+/// What the process does with the raw variable: the name to use and the
+/// warning to record. Pure, so the ignore paths are tested directly.
+#[cfg(any(debug_assertions, test))]
+pub fn resolve(raw: Option<&str>, portable: bool) -> (Option<String>, Option<String>) {
+    match parse(raw, portable) {
+        Ok(name) => (name, None),
+        Err(why) => (None, Some(why)),
+    }
+}
+
+/// The tray tooltip for a dev instance: `text` plus ` (dev: <name>)`, so two
+/// Wingman icons can be told apart. The tag is kept whole when `text` is too
+/// long for the 127 units a tooltip holds; unchanged for a normal run. Pure.
+pub fn tooltip(text: &str, suffix: Option<&str>) -> String {
+    let Some(name) = suffix else {
+        return text.to_string();
+    };
+    let tag = format!(" (dev: {name})");
+    let room = 127usize.saturating_sub(tag.encode_utf16().count());
+    let mut base = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        used += c.len_utf16();
+        if used > room {
+            break;
+        }
+        base.push(c);
+    }
+    base + &tag
+}
+
+/// [`tooltip`] for this process.
+pub fn tray_tooltip(text: &str) -> String {
+    tooltip(text, active())
+}
+
 /// The dev name for this process, decided once. Always `None` in release.
 pub fn active() -> Option<&'static str> {
     #[cfg(debug_assertions)]
@@ -78,14 +118,11 @@ pub fn active() -> Option<&'static str> {
         ACTIVE
             .get_or_init(|| {
                 let raw = std::env::var(ENV_VAR).ok();
-                match parse(raw.as_deref(), crate::portable::is_portable()) {
-                    Ok(name) => name,
-                    Err(why) => {
-                        eprintln!("{why}");
-                        crate::diagnostics::note_warning(&why);
-                        None
-                    }
+                let (name, warning) = resolve(raw.as_deref(), crate::portable::is_portable());
+                if let Some(why) = warning {
+                    crate::diagnostics::note_warning(&why);
                 }
+                name
             })
             .as_deref()
     }
@@ -167,12 +204,43 @@ mod tests {
     }
 
     #[test]
-    fn the_test_binary_is_not_a_dev_instance() {
-        // The test binary is not portable, so even a stray variable is ignored.
-        assert_eq!(active(), None);
-        assert!(hook_enabled());
+    fn resolve_ignores_a_name_without_portable_mode_and_says_why() {
+        let (name, warning) = resolve(Some("dev1"), false);
+        assert_eq!(name, None);
+        assert!(warning.unwrap().contains("portable"));
     }
 
+    #[test]
+    fn resolve_ignores_a_bad_name_and_says_why() {
+        let (name, warning) = resolve(Some("bad name"), true);
+        assert_eq!(name, None);
+        assert!(warning.unwrap().contains("letters, digits or dashes"));
+    }
+
+    #[test]
+    fn resolve_uses_a_good_name_with_no_warning() {
+        assert_eq!(resolve(Some("dev1"), true), (Some("dev1".into()), None));
+        assert_eq!(resolve(None, false), (None, None));
+    }
+
+    #[test]
+    fn the_tooltip_names_the_dev_instance_only_when_there_is_one() {
+        assert_eq!(tooltip("Wingman: x", None), "Wingman: x");
+        assert_eq!(
+            tooltip("Wingman: x", Some("dev1")),
+            "Wingman: x (dev: dev1)"
+        );
+    }
+
+    #[test]
+    fn a_long_tooltip_keeps_the_dev_tag_within_the_limit() {
+        let long = "w".repeat(300);
+        let t = tooltip(&long, Some("dev1"));
+        assert!(t.ends_with(" (dev: dev1)"));
+        assert_eq!(t.encode_utf16().count(), 127);
+        let astral = "\u{1F600}".repeat(100);
+        assert!(tooltip(&astral, Some("d")).encode_utf16().count() <= 127);
+    }
     #[test]
     fn wide_names_are_nul_terminated() {
         let w = wide("ab");
