@@ -74,6 +74,9 @@ const OLD_DEFAULT_PROMPT_HASHES: &[(u64, &str)] = &[
     // lacked the non-vision-fallback parenthetical and the em-dash
     // instruction that c7c8e68 later added.
     (0x937c2b9f2fc523a9, "0797844"),
+    // c7c8e68 ("Fix model-facing prompt gaps"): the last physics/statistics
+    // wording, before the 2026-11-01 rewrite made the prompt subject-generic.
+    (0xd1a5d0b5d4c34772, "c7c8e68"),
 ];
 
 /// FNV-1a, 64-bit. Deterministic across builds and platforms (unlike
