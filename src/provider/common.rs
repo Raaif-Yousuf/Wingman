@@ -197,8 +197,8 @@ pub(crate) enum TransportError {
     /// fresh attempt -- it surfaces immediately, naming the status that was
     /// received, so the card is honest about what's known to have happened.
     BodyReadFailed { status: u16, error: String },
-    /// #727: the request timed out somewhere after the connection was made,
-    /// so the vendor may have received it and may already have billed it.
+    /// #727, #1267: the request failed somewhere after the connection was
+    /// made (a timeout, reset, early EOF or protocol error), so the vendor may have received it and may already have billed it.
     /// Never retried: a second send could be a second charge.
     TimedOut(String),
 }
@@ -207,7 +207,8 @@ pub(crate) enum TransportError {
 /// vendor, so a retry cannot bill twice. An allow-list: a DNS or connect
 /// timeout, an unknown host, a failed connect or TLS setup, a proxy connect
 /// failure, and an `Io` error whose kind can only come from connecting
-/// (refused, unreachable). Everything else is not retried: a reset, a broken
+/// (refused, address unavailable; the `HostUnreachable` kinds need Rust 1.83
+/// and `rust-version` is 1.80, so they stay non-retried). Everything else is not retried: a reset, a broken
 /// pipe, an early EOF, a protocol error or any other timeout can happen after
 /// the body was written.
 fn is_provably_unsent(e: &ureq::Error) -> bool {
@@ -221,10 +222,7 @@ fn is_provably_unsent(e: &ureq::Error) -> bool {
         | ureq::Error::TlsRequired => true,
         ureq::Error::Io(io) => matches!(
             io.kind(),
-            ErrorKind::ConnectionRefused
-                | ErrorKind::AddrNotAvailable
-                | ErrorKind::HostUnreachable
-                | ErrorKind::NetworkUnreachable
+            ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable
         ),
         _ => false,
     }
@@ -818,7 +816,7 @@ pub(crate) fn post_json_with(
             // send could charge again, so this surfaces as a card at once.
             Err(TransportError::TimedOut(e)) => {
                 return Err(anyhow!(
-                    "{tag}: the request timed out and was not sent again, in case it was already processed: {}",
+                    "{tag}: the connection failed after the request may have been sent, so it was not sent again: {}",
                     redact_detail(&e)
                 ));
             }
@@ -949,7 +947,7 @@ fn log_attempt(
             bytes_sent,
             0,
             egress::Outcome::Failure,
-            Some(&format!("timed out: {e}")),
+            Some(&format!("failed after send: {e}")),
         ),
         Err(TransportError::BodyReadFailed { status, error }) => egress::build_entry(
             tag,
@@ -2417,7 +2415,8 @@ mod tests {
         assert_eq!(transport.call_count(), 1);
         assert!(sleeper.recorded().is_empty());
         let text = err.to_string();
-        assert!(text.contains("timed out"), "{text}");
+        assert!(text.contains("not sent again"), "{text}");
+        assert!(text.contains("timeout: global"), "{text}");
         assert!(!text.contains('\u{2014}'), "{text}");
     }
 
@@ -2477,6 +2476,7 @@ mod tests {
     #[test]
     fn the_real_transport_does_not_retry_a_dropped_connection() {
         // Server accepts, reads, and closes with no reply: not provably unsent.
+        let _g = network_guard();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -2486,11 +2486,20 @@ mod tests {
         });
         let result = UreqTransport.post_json(&url, &[], &json!({}), Duration::from_secs(5));
         server.join().unwrap();
-        assert!(matches!(result, Err(TransportError::TimedOut(_))));
+        let Err(TransportError::TimedOut(detail)) = result else {
+            panic!("a dropped connection must not be retried");
+        };
+        // The card text is built around this detail; it must not call a drop
+        // a timeout, and the card wording itself no longer says "timed out".
+        assert!(!detail.to_lowercase().contains("timed out"), "{detail}");
+        assert!(!detail.to_lowercase().contains("timeout"), "{detail}");
     }
 
     #[test]
     fn the_real_transport_still_retries_a_refused_connection() {
+        let _g = network_guard();
+        // Bind, take the port, drop: a tiny race if another process grabs it
+        // before the connect, which would only make this test fail loudly.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
