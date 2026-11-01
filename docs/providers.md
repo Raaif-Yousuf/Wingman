@@ -72,7 +72,9 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   `output[]` is a `Truncated` error: "The answer was too long and got cut
   off." It stops the chain (#1269, see "Cut-off replies" below). Any other or
   missing reason with no message keeps the plain "ran out of room" error
-  (#155).
+  (#155). `incomplete` for `content_filter` is a decline with or without
+  text. With text, only `max_output_tokens` is a `MaxTokens` stop; any other
+  reason is `Other`.
 
 ## Anthropic
 

@@ -910,7 +910,9 @@ impl Chain {
     /// tokens). No repair is attempted when `completion.stop ==
     /// StopReason::MaxTokens`: a provider that already reported "ran out of
     /// budget" asked to "try again" with the same budget would just fail
-    /// the same way, and a genuine refusal never reaches this point at all
+    /// the same way. An unparseable cut-off reply is a [`Truncated`] error
+    /// that stops the whole chain (#1269, like [`Declined`]), as does a cut-off
+    /// repair reply. A genuine refusal never reaches this point at all
     /// -- every provider's own `complete` already turns a refusal into
     /// `Err` before a `Completion` exists (see e.g. `anthropic.rs`'s
     /// `stop_reason: "refusal"` handling), so it takes the plain
@@ -2191,6 +2193,52 @@ mod tests {
             .unwrap_err();
         assert!(err.downcast_ref::<Truncated>().is_some(), "{err:#}");
         assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// #1269: real provider bodies through the chain. A cut-off Anthropic
+    /// body with partial text ends in `Truncated`; the second vendor is not
+    /// called. A content-filter OpenAI body with partial text is a decline.
+    #[test]
+    fn real_cut_off_bodies_end_the_chain_with_the_right_error() {
+        struct Body(&'static str, fn(&str) -> anyhow::Result<Completion>);
+        impl Provider for Body {
+            fn id(&self) -> &'static str {
+                "a"
+            }
+            fn capabilities(&self, _model: &str) -> Caps {
+                Caps::default()
+            }
+            fn complete(&self, _req: &Request) -> anyhow::Result<Completion> {
+                (self.1)(self.0)
+            }
+        }
+        let anthropic = r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"{\"detail\":\"The ba"}]}"#;
+        let openai = r#"{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"detail\":\"The"}]}]}"#;
+        let cases: [(Body, bool); 2] = [
+            (
+                Body(anthropic, anthropic::Anthropic::parse_completion),
+                true,
+            ),
+            (Body(openai, openai::OpenAi::parse_completion), false),
+        ];
+        for (a, truncated) in cases {
+            let (b, b_calls) = SequencedProvider::new_counted("b", vec![ok_completion]);
+            let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+            let err = chain
+                .complete_parsed(&req(), |c| parse_answer(&c.text))
+                .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<Truncated>().is_some(),
+                truncated,
+                "{err:#}"
+            );
+            assert_eq!(
+                err.downcast_ref::<Declined>().is_some(),
+                !truncated,
+                "{err:#}"
+            );
+            assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     /// #1269: a cut-off reply whose text still parses is an answer.

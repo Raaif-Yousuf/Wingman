@@ -166,8 +166,7 @@ impl Ollama {
         // "length"` with `message.content` empty (all the budget spent on
         // `message.thinking`); a non-thinking model in the same situation
         // returns `done_reason: "length"` with truncated, invalid-JSON
-        // `content`. Both cases are the same user-facing problem, so both
-        // are reported the same way rather than only the empty-content one.
+        // `content`. Both cases are the same user-facing problem.
         //
         // #1269: with no text the reply is the stop-the-chain `Truncated`
         // error. With text it is returned as a completion with a
