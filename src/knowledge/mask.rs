@@ -14,6 +14,15 @@ use crate::payment_denylist::{card_number_spans, iban_spans, national_id_spans};
 use crate::secret_labels::secret_spans;
 use std::ops::Range;
 
+/// Version of the rules `mask_sensitive` applies. It is folded into
+/// `document.parser_ver` (`parse::INGEST_VERSION`), so raising it makes the
+/// next scan read every file again and mask it with the new rules. Raise it in
+/// the same change as any edit to the secret labels, the card, IBAN or
+/// national-id scans, or the markers here. The test
+/// `mask_rules_fingerprint_is_pinned` fails until you do.
+/// Cost: one full re-read of the knowledge folder on the first scan after.
+pub const MASK_VERSION: i64 = 2;
+
 /// Marker for a value that followed a secret label.
 const SECRET_MARKER: &str = "[secret]";
 
@@ -67,6 +76,79 @@ pub fn mask_sensitive(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FNV-1a over `mask_sensitive` run on every rule table entry (as
+    /// "label: value" and as bare text) and on fixed samples of each shape.
+    /// Hashing outputs and table contents, not source text, so line endings
+    /// cannot move it.
+    fn rules_fingerprint() -> u64 {
+        use crate::payment_denylist::{
+            BANK_TERMS, CARD_NUMBER_TERMS, CVV_TERMS, EXPIRY_TERMS, IBAN_TERMS, ID_LABELS,
+            SSN_LABELS,
+        };
+        let mut probes: Vec<String> = Vec::new();
+        for label in crate::secret_labels::SECRET_LABELS {
+            probes.push(format!("{label}: Zq9x7 end"));
+            probes.push(format!("{} = \"a b\"", label.to_uppercase()));
+            probes.push(format!("| {label} | Zq9x7 |"));
+        }
+        for terms in [
+            CARD_NUMBER_TERMS,
+            EXPIRY_TERMS,
+            IBAN_TERMS,
+            CVV_TERMS,
+            BANK_TERMS,
+        ] {
+            for term in terms {
+                probes.push(format!("{term}: 4111 1111 1111 1111 12/29"));
+            }
+        }
+        for label in SSN_LABELS.iter().chain(ID_LABELS.iter()) {
+            probes.push(format!("{label}: 123-45-6789 and 123456789"));
+        }
+        for sample in [
+            "4111 1111 1111 1111",
+            "4111\u{a0}1111\u{a0}1111\u{a0}1111",
+            "4111-1111-1111-1111",
+            "5500 0000 0000 0004",
+            "378282246310005",
+            "GB82 WEST 1234 5698 7654 32",
+            "DE89370400440532013000",
+            "123-45-6789",
+            "AB 12 34 56 C",
+            "plain text 20240101 +1 555-123-4567",
+        ] {
+            probes.push(sample.to_string());
+        }
+        let mut hash: u64 = 0xcbf29ce484222325;
+        let mut feed = |bytes: &[u8]| {
+            for b in bytes.iter().chain(&[0u8]) {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        };
+        for p in &probes {
+            feed(p.as_bytes());
+            feed(mask_sensitive(p).as_bytes());
+        }
+        for marker in [SECRET_MARKER, "[card number]", "[IBAN]", "[national id]"] {
+            feed(marker.as_bytes());
+        }
+        hash
+    }
+
+    /// #1261: the stored mask version must move whenever a rule does.
+    #[test]
+    fn mask_rules_fingerprint_is_pinned() {
+        const PINNED: (u64, i64) = (17511907619112586721, 2);
+        assert_eq!(
+            (rules_fingerprint(), MASK_VERSION),
+            PINNED,
+            "The masking rules changed. Raise MASK_VERSION in src/knowledge/mask.rs \
+             (so every indexed file is masked again on the next scan) and set PINNED \
+             to this new (fingerprint, version) pair."
+        );
+    }
 
     #[test]
     fn card_iban_and_national_id_become_markers() {
