@@ -2036,13 +2036,19 @@ impl PaletteInner {
                     }
                 }
                 let y = mouse_y(lparam);
-                let hit =
-                    row_at(y, self.dpi, self.state.offset, self.state.rows.len()).filter(|&i| {
-                        matches!(
-                            self.state.rows.get(i),
-                            Some(crate::ui::palette_model::Row::Action { .. })
-                        )
-                    });
+                let hit = row_at(
+                    mouse_x(lparam),
+                    y,
+                    self.dpi,
+                    self.state.offset,
+                    self.state.rows.len(),
+                )
+                .filter(|&i| {
+                    matches!(
+                        self.state.rows.get(i),
+                        Some(crate::ui::palette_model::Row::Action { .. })
+                    )
+                });
                 let hot = thumb_hot_at(mouse_x(lparam), y, self.dpi, self.state.rows.len());
                 if self.hover != hit || self.thumb_hot != hot {
                     self.hover = hit;
@@ -2072,7 +2078,13 @@ impl PaletteInner {
             WM_LBUTTONDOWN => Some(LRESULT(0)),
             WM_LBUTTONUP => {
                 let y = mouse_y(lparam);
-                if let Some(idx) = row_at(y, self.dpi, self.state.offset, self.state.rows.len()) {
+                if let Some(idx) = row_at(
+                    mouse_x(lparam),
+                    y,
+                    self.dpi,
+                    self.state.offset,
+                    self.state.rows.len(),
+                ) {
                     if matches!(
                         self.state.rows.get(idx),
                         Some(crate::ui::palette_model::Row::Action { .. })
