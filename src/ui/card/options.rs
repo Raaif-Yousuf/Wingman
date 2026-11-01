@@ -268,9 +268,13 @@ pub(super) fn ellipsize_to_fit(text: &str, fits: impl Fn(&str) -> bool) -> Strin
 }
 
 /// The name a row button carries for assistive tech: the whole label, with
-/// where it sits in the list ("Review this email, 1 of 3").
-pub(super) fn accessible_name(label: &str, position: usize, count: usize) -> String {
-    format!("{label}, {position} of {count}")
+/// the catalogue action name when the row shows one (#937), and where it sits
+/// in the list ("Reply to Dana, Review this email, 1 of 3").
+pub(super) fn accessible_name(label: &str, action: &str, position: usize, count: usize) -> String {
+    match action_line(label, action) {
+        Some(name) => format!("{label}, {name}, {position} of {count}"),
+        None => format!("{label}, {position} of {count}"),
+    }
 }
 
 /// The second line of a row: the catalogue's action name (#937), so the
@@ -742,7 +746,7 @@ impl CardInner {
         };
         let count = ui.rows.len();
         for (n, (row, rect)) in ui.rows.iter().zip(metrics.rows.iter()).enumerate() {
-            let name = accessible_name(&row.label, n + 1, count);
+            let name = accessible_name(&row.label, &row.action, n + 1, count);
             let hwnd = create_preview_button(
                 parent,
                 instance,
@@ -1367,8 +1371,18 @@ mod tests {
     #[test]
     fn a_row_is_named_by_its_whole_label_and_position() {
         assert_eq!(
-            accessible_name("Review this email to Dana", 1, 3),
+            accessible_name("Review this email to Dana", "", 1, 3),
             "Review this email to Dana, 1 of 3"
+        );
+        assert_eq!(
+            accessible_name("Reply to Dana", "Review this email", 1, 3),
+            "Reply to Dana, Review this email, 1 of 3",
+            "the action name is read too"
+        );
+        assert_eq!(
+            accessible_name("Translate", "Translate", 2, 3),
+            "Translate, 2 of 3",
+            "not read twice"
         );
     }
 
@@ -1618,6 +1632,15 @@ mod tests {
             // The label and keycap digit sit on the card, hover included
             // (the hover fill moves 8 percent towards the text colour).
             let hover = crate::ui::card_buttons::blend(t.surface, t.text, 8);
+            let pressed = crate::ui::card_buttons::blend(
+                t.surface,
+                t.text,
+                crate::ui::card_buttons::SECONDARY_PRESSED_PCT,
+            );
+            // #937: the action name uses the dim ink, on every fill a row has.
+            for bg in [t.surface, hover, pressed] {
+                assert!(ratio(t.text_dim, bg) >= 4.5, "{theme:?} name on {bg:#08x}");
+            }
             for bg in [t.surface, hover] {
                 assert!(ratio(t.text, bg) >= 4.5, "{theme:?} label on {bg:#08x}");
                 assert!(ratio(t.text_dim, bg) >= 4.5, "{theme:?} digit on {bg:#08x}");
