@@ -274,17 +274,21 @@ pub(super) fn row_fill(dpi: u32, pos: i32) -> RECT {
     rect(s.left, s.top + inset, s.right, s.bottom - inset)
 }
 
-/// #357: pure hit-test -- given a client-area `y` in physical pixels (as
+/// #357: pure hit-test -- given a client-area point (`x`, `y`) in physical pixels (as
 /// `WM_MOUSEMOVE`/`WM_LBUTTONUP` deliver it), the current viewport `offset`
 /// and the real row count, returns the real row index (into
 /// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
 /// under that `y`, or `None` when `y` is above the list, below the last real
 /// row, or below the whole painted viewport. Uses the same slots as
 /// [`build_ops`], so a click lands on the row it looks like it landed on.
-pub(super) fn row_at(y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
+pub(super) fn row_at(x: i32, y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
     let top = list_top(dpi);
     let row_h = row_height(dpi);
     if row_h <= 0 || y < top {
+        return None;
+    }
+    let slot = row_slot(dpi, 0);
+    if x < slot.left || x >= slot.right {
         return None;
     }
     let visible_pos = ((y - top) / row_h) as usize;
@@ -1041,25 +1045,64 @@ mod tests {
         }
     }
 
+    /// An x inside the row slots.
+    fn s_x(dpi: u32) -> i32 {
+        row_slot(dpi, 0).left
+    }
+
+    #[test]
+    fn the_thumb_strip_and_side_margins_are_not_rows() {
+        for dpi in DPIS {
+            let s = row_slot(dpi, 0);
+            let y = s.top + 1;
+            assert_eq!(
+                row_at(s.left, y, dpi, 0, 40),
+                Some(0),
+                "dpi {dpi}: left edge"
+            );
+            assert_eq!(
+                row_at(s.right - 1, y, dpi, 0, 40),
+                Some(0),
+                "dpi {dpi}: right edge"
+            );
+            assert_eq!(
+                row_at(s.left - 1, y, dpi, 0, 40),
+                None,
+                "dpi {dpi}: left margin"
+            );
+            assert_eq!(row_at(0, y, dpi, 0, 40), None, "dpi {dpi}: window edge");
+            assert_eq!(
+                row_at(s.right, y, dpi, 0, 40),
+                None,
+                "dpi {dpi}: strip start"
+            );
+            assert_eq!(
+                row_at(window_width(dpi) - 1, y, dpi, 3, 40),
+                None,
+                "dpi {dpi}: strip end"
+            );
+        }
+    }
+
     #[test]
     fn hit_testing_agrees_with_the_painted_slots() {
         for dpi in DPIS {
             for pos in 0..MAX_VISIBLE_ROWS as i32 {
                 let s = row_slot(dpi, pos);
                 assert_eq!(
-                    row_at(s.top, dpi, 3, 100),
+                    row_at(s.left, s.top, dpi, 3, 100),
                     Some(3 + pos as usize),
                     "dpi {dpi}"
                 );
                 assert_eq!(
-                    row_at(s.bottom - 1, dpi, 3, 100),
+                    row_at(s.left, s.bottom - 1, dpi, 3, 100),
                     Some(3 + pos as usize),
                     "dpi {dpi}"
                 );
             }
-            assert_eq!(row_at(list_top(dpi) - 1, dpi, 0, 10), None);
-            assert_eq!(row_at(list_bottom(dpi), dpi, 0, 100), None);
-            assert_eq!(row_at(list_top(dpi), dpi, 0, 0), None);
+            assert_eq!(row_at(s_x(dpi), list_top(dpi) - 1, dpi, 0, 10), None);
+            assert_eq!(row_at(s_x(dpi), list_bottom(dpi), dpi, 0, 100), None);
+            assert_eq!(row_at(s_x(dpi), list_top(dpi), dpi, 0, 0), None);
         }
     }
 
