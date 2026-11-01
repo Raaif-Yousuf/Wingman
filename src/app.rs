@@ -5420,7 +5420,7 @@ impl App {
         }
         let Some(undo) = self.last_undo.take() else {
             self.card.show_answer(
-                "Nothing to restore",
+                "Nothing to undo",
                 "No action that can be undone since Wingman started, or it was already undone.",
                 5,
                 None,
@@ -9191,7 +9191,10 @@ fn undo_slot_after(done: ExecDone) -> Option<executors::Undo> {
 /// something copied later) and their cards never promise one, so it is
 /// not kept.
 fn keeps_undo(executor_name: &str) -> bool {
-    !matches!(executor_name, "clipboard" | "image_clipboard")
+    matches!(
+        executor_name,
+        "calendar_add" | "contact_add" | "fill_form" | "replace_text"
+    )
 }
 fn exec_work_restore(undo: executors::Undo) -> ExecDone {
     ExecDone::UndoLast(undo.undo())
@@ -14386,7 +14389,7 @@ mod tests {
     /// copied later) and its card never promises one, so it is not kept.
     #[test]
     fn a_clipboard_undo_is_not_kept() {
-        for name in ["clipboard", "image_clipboard"] {
+        for name in ["clipboard", "image_clipboard", "some_future_executor"] {
             assert!(undo_slot_after(generic_done(name, Ok(kept("copied")))).is_none());
         }
     }
