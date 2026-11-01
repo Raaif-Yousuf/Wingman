@@ -1479,7 +1479,7 @@ struct PaletteInner {
     /// is hovered. Mouse moves and leaves are then ignored; a state that
     /// wants a hover sets it explicitly. Always false in the live app.
     ignore_mouse: bool,
-    /// The UI gallery pinned `dpi` (orce_dpi_for_gallery): do not re-read it
+    /// The UI gallery pinned `dpi` (`force_dpi_for_gallery`): do not re-read it
     /// from the window (#1258).
     dpi_forced: bool,
     /// #357: whether `TrackMouseEvent(TME_LEAVE)` is currently armed for
@@ -2126,17 +2126,24 @@ impl PaletteInner {
             WM_DPICHANGED if self.dpi_forced => Some(LRESULT(0)),
             WM_DPICHANGED => {
                 self.dpi = ((wparam.0 & 0xFFFF) as u32).max(1);
+                // #1258: the palette is never moved by the user, so centre it
+                // on the active monitor at the new DPI, as `reposition_centered`
+                // does, instead of taking Windows' suggested position. Whether
+                // this message arrives inside that call or at `ShowWindow`, it
+                // ends centred. The suggested rect is the fallback.
                 let suggested = unsafe { &*(lparam.0 as *const RECT) };
-                let w = (suggested.right - suggested.left).max(1);
-                let h = (suggested.bottom - suggested.top).max(1);
+                let target = match crate::capture::active_monitor_rect() {
+                    Ok(monitor) => centered_rect(monitor, self.dpi),
+                    Err(_) => *suggested,
+                };
                 unsafe {
                     let _ = SetWindowPos(
                         self.hwnd,
                         None,
-                        suggested.left,
-                        suggested.top,
-                        w,
-                        h,
+                        target.left,
+                        target.top,
+                        (target.right - target.left).max(1),
+                        (target.bottom - target.top).max(1),
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
@@ -2144,7 +2151,13 @@ impl PaletteInner {
                 self.layout_edit_control();
                 if let Some(renderer) = &mut self.d2d {
                     renderer.set_dpi(self.dpi);
-                    renderer.resize(w as u32, h as u32);
+                    let mut client = RECT::default();
+                    let (w, h) = if unsafe { GetClientRect(self.hwnd, &mut client) }.is_ok() {
+                        (client.right - client.left, client.bottom - client.top)
+                    } else {
+                        (target.right - target.left, target.bottom - target.top)
+                    };
+                    renderer.resize(w.max(1) as u32, h.max(1) as u32);
                 }
                 self.invalidate();
                 Some(LRESULT(0))
