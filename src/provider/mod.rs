@@ -1302,13 +1302,27 @@ fn attempt_provider<T>(
                 }
             }
 
+            // #1269: a reply cut off at the limit that does not parse is a
+            // `Truncated` error: no repair (the same budget would cut it off
+            // again) and no next vendor.
+            if completion.stop == StopReason::MaxTokens {
+                return Err(truncated_error(provider.id()));
+            }
+
             // #792: past the deadline nobody is waiting, so no billed repair.
-            if completion.stop != StopReason::MaxTokens && !past_deadline(deadline) {
+            if !past_deadline(deadline) {
                 let repair_req = repair_request(req, &completion.text, &parse_err.to_string());
-                if let Ok(repaired) = provider.complete(&repair_req) {
-                    if let Ok(value) = parse(&repaired) {
-                        return Ok(value);
-                    }
+                match provider.complete(&repair_req) {
+                    Ok(repaired) => match parse(&repaired) {
+                        Ok(value) => return Ok(value),
+                        Err(_) if repaired.stop == StopReason::MaxTokens => {
+                            return Err(truncated_error(provider.id()));
+                        }
+                        Err(_) => {}
+                    },
+                    // A repair reply cut off at the limit also stops the chain.
+                    Err(e) if e.downcast_ref::<Truncated>().is_some() => return Err(e),
+                    Err(_) => {}
                 }
             }
             Err(parse_err)
@@ -2166,20 +2180,54 @@ mod tests {
     #[test]
     fn no_repair_when_the_provider_stop_reason_is_max_tokens() {
         // Only one result scripted: if a repair were attempted, the second
-        // `complete()` call would panic on the empty queue instead of
-        // falling through cleanly to provider b.
+        // `complete()` call would panic on the empty queue. #1269: the
+        // cut-off reply that cannot be parsed is a `Truncated` error that
+        // stops the chain, so provider b is never called.
         let a = SequencedProvider::new("a", vec![max_tokens_completion]);
-        let b = MockProvider {
-            id: "b",
-            ready: true,
-            calls: AtomicU32::new(0),
-            result: ok_completion,
-        };
+        let (b, b_calls) = SequencedProvider::new_counted("b", vec![ok_completion]);
         let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+        let err = chain
+            .complete_parsed(&req(), |c| parse_answer(&c.text))
+            .unwrap_err();
+        assert!(err.downcast_ref::<Truncated>().is_some(), "{err:#}");
+        assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// #1269: a cut-off reply whose text still parses is an answer.
+    #[test]
+    fn a_max_tokens_reply_that_still_parses_is_an_answer() {
+        let a = SequencedProvider::new(
+            "a",
+            vec![|| {
+                Ok(Completion {
+                    text: r#"{"detail":"d","headline":"42"}"#.to_string(),
+                    usage: None,
+                    stop: StopReason::MaxTokens,
+                })
+            }],
+        );
+        let chain = Chain::new(vec![Box::new(a)]);
         let answer = chain
             .complete_parsed(&req(), |c| parse_answer(&c.text))
             .unwrap();
         assert_eq!(answer.headline, "42");
+    }
+
+    /// #1269: bad JSON, then the repair reply is cut off. The chain stops;
+    /// the second vendor is not billed.
+    #[test]
+    fn a_truncated_repair_reply_stops_the_chain() {
+        let repairs: [ScriptedResult; 2] = [|| Err(truncated_error("a")), max_tokens_completion];
+        for repair in repairs {
+            let a = SequencedProvider::new("a", vec![unparseable_completion, repair]);
+            let (b, b_calls) = SequencedProvider::new_counted("b", vec![ok_completion]);
+            let chain = Chain::new(vec![Box::new(a), Box::new(b)]);
+            let err = chain
+                .complete_parsed(&req(), |c| parse_answer(&c.text))
+                .unwrap_err();
+            assert!(err.downcast_ref::<Truncated>().is_some(), "{err:#}");
+            assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

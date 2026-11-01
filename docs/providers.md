@@ -67,10 +67,12 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Retry/429:** shared with Anthropic and Gemini via
   `provider/common.rs::post_json` (see "Retry and 429 handling" below).
   Timeout is 90 seconds total (`REQUEST_TIMEOUT`).
-- **Budget exhaustion:** `status: "incomplete"` with no `message` entry in
-  `output[]` is reported as "The model ran out of room before answering.
-  Lower the effort setting or raise the token limit." rather than a generic
-  parse failure (#155).
+- **Budget exhaustion:** `status: "incomplete"` with
+  `incomplete_details.reason: "max_output_tokens"` and no `message` entry in
+  `output[]` is a `Truncated` error: "The answer was too long and got cut
+  off." It stops the chain (#1269, see "Cut-off replies" below). Any other or
+  missing reason with no message keeps the plain "ran out of room" error
+  (#155).
 
 ## Anthropic
 
@@ -95,8 +97,8 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
 - **Retry/429:** shared, see below. Timeout is 90 seconds total.
 - **Refusal:** `stop_reason: "refusal"` is surfaced as
   `"anthropic: model refused to answer"` rather than being treated as a
-  malformed response. `stop_reason: "max_tokens"` with no text block is
-  reported as the same "ran out of room" message OpenAI uses (#155).
+  malformed response. `stop_reason: "max_tokens"` with no text block is a
+  `Truncated` error that stops the chain (#1269).
 
 ## Gemini
 
@@ -142,8 +144,7 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   (<reason>)". No candidates at all with `promptFeedback.blockReason` set is
   reported as "the prompt was blocked (<reason>)" -- a prompt-level block,
   distinct from a per-candidate refusal. `finishReason: "MAX_TOKENS"` with
-  no text part gets the same "ran out of room" message as the other
-  providers.
+  no text part is a `Truncated` error that stops the chain (#1269).
 
 ## Ollama
 
@@ -204,10 +205,11 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   loopback connect should be near-instant) and a long total timeout (180s,
   to allow a cold model load; MEASURED 2026-09-17: ~18s for a first-load
   `gemma3:4b` call, CPU-only, on the dev machine).
-- **Budget exhaustion:** `done_reason: "length"` is reported as the same
-  "ran out of room" message, whether `message.content` came back empty (all
-  budget spent on `message.thinking`) or truncated-but-present (a
-  non-thinking model cut short) -- both MEASURED 2026-09-17.
+- **Budget exhaustion:** `done_reason: "length"` with empty
+  `message.content` (all budget spent on `message.thinking`) is a `Truncated`
+  error that stops the chain (#1269). With truncated-but-present content (a
+  non-thinking model cut short) the text is returned with a `MaxTokens` stop
+  and the chain decides after parsing -- both shapes MEASURED 2026-09-17.
 - **`OLLAMA_IGPU_ENABLE` for Intel iGPUs:** an environment variable for the
   Ollama *server process itself*, not read or set anywhere in this crate.
   On this machine's Intel Arc 140T, Vulkan drops the iGPU unless the Ollama
@@ -282,8 +284,21 @@ last four characters of a saved cloud key (`src/ui/settings.rs`).
   this provider calls it with the tag `"openai-compat"`. Timeout is 90
   seconds total (`REQUEST_TIMEOUT`).
 - **Refusal/budget exhaustion:** a non-empty `message.refusal` is reported
-  as "openai-compat: model refused to answer"; `finish_reason: "length"` is
-  reported as the same "ran out of room" message the other providers use.
+  as "openai-compat: model refused to answer"; `finish_reason: "length"` with
+  no text is a `Truncated` error that stops the chain (#1269); with text it
+  is returned with a `MaxTokens` stop.
+
+## Cut-off replies (#1269)
+
+A reply stopped at the token limit is recognised from each vendor's stop
+reason (Anthropic `max_tokens`, OpenAI `max_output_tokens`, Gemini
+`MAX_TOKENS`, Ollama `length`, compat `length`). With no text, the provider
+returns the `Truncated` error. With text, it returns the completion with a
+`MaxTokens` stop, because the text may be a whole valid answer. If that text
+does not parse, `attempt_provider` returns `Truncated` without a repair
+request. `Truncated` sits next to `Declined` in `stops_chain`: the card says
+"The answer was too long and got cut off.", and no second vendor is called.
+A repair reply that is cut off also stops the chain.
 
 ## Retry and 429 handling
 
