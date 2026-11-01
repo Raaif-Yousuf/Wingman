@@ -633,7 +633,8 @@ impl Tray {
             uFlags: NIF_TIP | NIF_SHOWTIP,
             ..Default::default()
         };
-        set_sz_tip(&mut nid.szTip, text);
+        // #1271: a dev instance says so, to tell two icons apart.
+        set_sz_tip(&mut nid.szTip, &crate::dev_instance::tray_tooltip(text));
         let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
     }
 
@@ -877,7 +878,13 @@ impl Tray {
         append_separator(actions)?;
         append_item(actions, cmd::EXTRACT_TEXT, "Copy text from screen")?;
         append_item(actions, cmd::READ_QR, "Read QR code from screen")?;
-        append_item(actions, cmd::COPY_REGION, "Copy region to clipboard")?;
+        // #1256: honors Pause like "Calculate selection" below.
+        append_item_state(
+            actions,
+            cmd::COPY_REGION,
+            "Copy region to clipboard",
+            !self.paused,
+        )?;
         // #115: works with no provider at all, but still honors Pause
         // (issue #20's rule: nothing Wingman does runs while paused, even
         // the model-free actions), same greyed-while-paused treatment as
@@ -1436,7 +1443,10 @@ fn add_icon(hwnd: HWND, instance: HINSTANCE) -> Result<HICON> {
         hIcon: icon,
         ..Default::default()
     };
-    set_sz_tip(&mut nid.szTip, "Wingman");
+    set_sz_tip(
+        &mut nid.szTip,
+        &crate::dev_instance::tray_tooltip("Wingman"),
+    );
 
     let added = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
     if !added.as_bool() {
@@ -2385,7 +2395,13 @@ mod tests {
         assert!(!grey(&running, cmd::WHAT_CAN_I_DO));
 
         let paused = built_menu_tree(|t| t.set_paused(true));
-        for id in [cmd::QUICK_ASK, cmd::WHAT_CAN_I_DO, cmd::CALCULATE_SELECTION] {
+        assert!(!grey(&running, cmd::COPY_REGION));
+        for id in [
+            cmd::QUICK_ASK,
+            cmd::WHAT_CAN_I_DO,
+            cmd::CALCULATE_SELECTION,
+            cmd::COPY_REGION,
+        ] {
             assert!(grey(&paused, id), "{id} must be greyed while paused");
         }
         let top: Vec<&str> = paused.iter().filter_map(Node::label).collect();

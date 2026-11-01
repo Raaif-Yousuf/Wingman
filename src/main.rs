@@ -14,6 +14,7 @@ mod config_example;
 mod config_writer;
 mod connectors;
 mod crash_note;
+mod dev_instance;
 mod diagnostics;
 mod dismiss;
 mod dpapi;
