@@ -1479,7 +1479,7 @@ struct PaletteInner {
     /// is hovered. Mouse moves and leaves are then ignored; a state that
     /// wants a hover sets it explicitly. Always false in the live app.
     ignore_mouse: bool,
-    /// The UI gallery pinned dpi (orce_dpi_for_gallery): do not re-read it
+    /// The UI gallery pinned `dpi` (orce_dpi_for_gallery): do not re-read it
     /// from the window (#1258).
     dpi_forced: bool,
     /// #357: whether `TrackMouseEvent(TME_LEAVE)` is currently armed for
@@ -1609,18 +1609,29 @@ impl PaletteInner {
         };
         place(self.hwnd, centered_rect(monitor, self.dpi));
         // #1258: moving to a monitor with another scale makes Windows send
-        // WM_DPICHANGED from inside that call. Whatever happened, re-read the
-        // window's real DPI and, if it is not the one the rect was computed
-        // with, place it again with the final size so the width, the centring
-        // and the render target all agree.
-        let real_dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(1);
-        if !self.dpi_forced && real_dpi != self.dpi {
-            self.dpi = real_dpi;
-            self.rebuild_font();
-            if let Some(renderer) = &self.d2d {
-                renderer.set_dpi(real_dpi);
+        // WM_DPICHANGED from inside that call, and the arm has already
+        // updated `self.dpi` by the time it returns, so `self.dpi` cannot say
+        // whether the rect was stale. Compare where the window really is with
+        // where its real DPI puts it, and place it again if they differ.
+        if !self.dpi_forced {
+            let real_dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(1);
+            if real_dpi != self.dpi {
+                self.dpi = real_dpi;
+                self.rebuild_font();
+                if let Some(renderer) = &self.d2d {
+                    renderer.set_dpi(real_dpi);
+                }
             }
-            place(self.hwnd, centered_rect(monitor, real_dpi));
+            let mut actual = RECT::default();
+            if unsafe {
+                windows::Win32::UI::WindowsAndMessaging::GetWindowRect(self.hwnd, &mut actual)
+            }
+            .is_ok()
+            {
+                if let Some(r) = replacement_rect(monitor, real_dpi, actual) {
+                    place(self.hwnd, r);
+                }
+            }
         }
         self.layout_edit_control();
         // #216: the render target's pixel buffer must match the window's
@@ -1637,6 +1648,7 @@ impl PaletteInner {
             renderer.resize(w.max(1) as u32, h.max(1) as u32);
         }
     }
+
     /// Positions the query `EDIT` control in the window -- factored
     /// out of [`PaletteInner::reposition_centered`] so `WM_DPICHANGED`'s
     /// handler can re-run the same layout after a DPI change without
@@ -2111,6 +2123,7 @@ impl PaletteInner {
             // physical size and the render target's DPI change together
             // (leaving one stale relative to the other would stretch or
             // shrink the DIP-laid-out content -- see the doc comment).
+            WM_DPICHANGED if self.dpi_forced => Some(LRESULT(0)),
             WM_DPICHANGED => {
                 self.dpi = ((wparam.0 & 0xFFFF) as u32).max(1);
                 let suggested = unsafe { &*(lparam.0 as *const RECT) };
@@ -2158,6 +2171,17 @@ fn centered_rect(monitor: RECT, dpi: u32) -> RECT {
         right: x + w,
         bottom: y + h,
     }
+}
+/// #1258: after the window has been placed, the rect to place it at again, or
+/// `None` when it is already where `dpi` (the DPI it really ended up at) puts
+/// it. Moving to a monitor with another scale makes Windows resize the window
+/// from inside `SetWindowPos`, so the size and centring worked out from the
+/// old DPI can be left stale.
+fn replacement_rect(monitor: RECT, real_dpi: u32, actual: RECT) -> Option<RECT> {
+    let want = centered_rect(monitor, real_dpi);
+    let same = (want.left, want.top, want.right, want.bottom)
+        == (actual.left, actual.top, actual.right, actual.bottom);
+    (!same).then_some(want)
 }
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -2995,6 +3019,22 @@ mod tests {
         );
     }
 
+    /// #1258: the cross-DPI case, which the client-size test below cannot
+    /// reach on one monitor: placed at 96, the window really is at 192.
+    #[test]
+    fn a_window_placed_at_the_old_dpi_is_placed_again_at_the_real_one() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160,
+        };
+        let stale = centered_rect(monitor, 96);
+        let want = centered_rect(monitor, 192);
+        assert_eq!(replacement_rect(monitor, 192, stale), Some(want));
+        assert_eq!(replacement_rect(monitor, 192, want), None, "already right");
+        assert_eq!(replacement_rect(monitor, 96, stale), None, "same dpi");
+    }
     /// #1258: after `show` the Direct2D target is exactly the window's client
     /// size (a stale target size paints stretched or clipped).
     #[test]
