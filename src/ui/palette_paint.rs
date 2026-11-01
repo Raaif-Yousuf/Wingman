@@ -278,8 +278,9 @@ pub(super) fn row_fill(dpi: u32, pos: i32) -> RECT {
 /// `WM_MOUSEMOVE`/`WM_LBUTTONUP` deliver it), the current viewport `offset`
 /// and the real row count, returns the real row index (into
 /// `PaletteState::rows`, the same space `PaletteState::selected` lives in)
-/// under that `y`, or `None` when `y` is above the list, below the last real
-/// row, or below the whole painted viewport. Uses the same slots as
+/// under that point, or `None` when `x` is outside the row slots (the thumb
+/// strip or a side margin, #1257), or `y` is above the list, below the last
+/// real row, or below the whole painted viewport. Uses the same slots as
 /// [`build_ops`], so a click lands on the row it looks like it landed on.
 pub(super) fn row_at(x: i32, y: i32, dpi: u32, offset: usize, row_count: usize) -> Option<usize> {
     let top = list_top(dpi);
