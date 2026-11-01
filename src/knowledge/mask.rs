@@ -106,6 +106,25 @@ mod tests {
         for label in SSN_LABELS.iter().chain(ID_LABELS.iter()) {
             probes.push(format!("{label}: 123-45-6789 and 123456789"));
         }
+        // Shapes that exercise the scan rules in `secret_spans`: a value on the
+        // next line, the next-line length limit on both sides, emphasis and
+        // quotes around the label, `;` cells, and filler words.
+        for shape in [
+            "password:\nZq9x7".to_string(),
+            format!("password:\n{}", "a".repeat(119)),
+            format!("password:\n{}", "a".repeat(121)),
+            "**password**: x".to_string(),
+            "\"password\": \"x\"".to_string(),
+            "'pin': 'x'".to_string(),
+            "a; password: x; b: y".to_string(),
+            "a; password: x; token: y".to_string(),
+            "password is x".to_string(),
+            "the password was x".to_string(),
+            "| password | x |".to_string(),
+            "password:".to_string(),
+        ] {
+            probes.push(shape);
+        }
         for sample in [
             "4111 1111 1111 1111",
             "4111\u{a0}1111\u{a0}1111\u{a0}1111",
@@ -140,7 +159,7 @@ mod tests {
     /// #1261: the stored mask version must move whenever a rule does.
     #[test]
     fn mask_rules_fingerprint_is_pinned() {
-        const PINNED: (u64, i64) = (17511907619112586721, 2);
+        const PINNED: (u64, i64) = (12571788103002314704, 2);
         assert_eq!(
             (rules_fingerprint(), MASK_VERSION),
             PINNED,

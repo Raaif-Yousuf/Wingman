@@ -9,6 +9,9 @@ pub const PARSER_VERSION: i64 = 1;
 /// together, so a change to either makes the next scan read the file again
 /// (#1261). Parser in the thousands, mask in the ones.
 pub const INGEST_VERSION: i64 = PARSER_VERSION * 1000 + super::mask::MASK_VERSION;
+// The mask version lives in the ones and tens and hundreds; 1000 would collide
+// with the next parser version.
+const _: () = assert!(super::mask::MASK_VERSION < 1000);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
