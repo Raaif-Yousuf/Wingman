@@ -5,6 +5,13 @@ use super::flatten;
 pub const MAX_FILE_BYTES: usize = 25 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 pub const PARSER_VERSION: i64 = 1;
+/// What `document.parser_ver` stores: the parser version and the mask version
+/// together, so a change to either makes the next scan read the file again
+/// (#1261). Parser in the thousands, mask in the ones.
+pub const INGEST_VERSION: i64 = PARSER_VERSION * 1000 + super::mask::MASK_VERSION;
+// The mask version lives in the ones and tens and hundreds; 1000 would collide
+// with the next parser version.
+const _: () = assert!(super::mask::MASK_VERSION < 1000);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -802,6 +809,9 @@ mod tests {
         assert_eq!(Parser::Text.name(), "txt");
         assert_eq!(Parser::Markdown.name(), "md");
         assert_eq!(PARSER_VERSION, 1);
+        // Parser 1, mask 2: the stored value changed from 1 on purpose (#1261),
+        // so every index made before the mask version existed is read again once.
+        assert_eq!(INGEST_VERSION, 1002);
     }
 
     #[test]

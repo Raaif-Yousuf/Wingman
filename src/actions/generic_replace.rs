@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use super::generic_inputs::Gathered;
 use super::review_email::{do_review_confirmed, ReplaceTarget, ReviewContext};
-use crate::executors::Executor;
+use crate::executors::{Executor, Undo};
 use crate::inputs::selection::SelectionTarget;
 use crate::ui::confirm::Confirmed;
 
@@ -213,19 +213,23 @@ pub enum ReplaceReport {
 /// the clipboard so the user's confirmed (possibly edited) text is never
 /// lost. A blank text does neither. The executors are passed in so this is
 /// tested with fakes; `App` passes the real `replace_text` and `clipboard`.
+///
+/// #1281: also returns the write's `Undo` when it can be undone, for the
+/// tray's "Undo last action". The `replace_text` undo re-checks the text is
+/// still what it wrote and refuses to overwrite newer edits.
 pub fn replace_or_copy(
     replace: &dyn Executor,
     copy: &dyn Executor,
     plan: Option<&ReplaceSelection>,
     confirmed: Confirmed<Value>,
-) -> ReplaceReport {
+) -> (ReplaceReport, Option<Undo>) {
     let blank = confirmed
         .value()
         .get("text")
         .and_then(Value::as_str)
         .map_or(true, |t| t.trim().is_empty());
     if blank {
-        return ReplaceReport::NothingToReplace;
+        return (ReplaceReport::NothingToReplace, None);
     }
     // #694: text the user edited in the preview is matched to the selection's
     // line endings too, so a copy-instead (no target, or a failed write)
@@ -239,17 +243,21 @@ pub fn replace_or_copy(
         None => confirmed,
     };
     let Some(context) = plan.and_then(|p| review_context(p, confirmed.value())) else {
-        return copy_report(copy, confirmed, COPIED_INSTEAD_DETAIL.to_string(), None);
+        let report = copy_report(copy, confirmed, COPIED_INSTEAD_DETAIL.to_string(), None);
+        return (report, None);
     };
     match do_review_confirmed(replace, &context) {
-        Ok(undo) => ReplaceReport::Replaced(undo.summary),
+        Ok(undo) => (
+            ReplaceReport::Replaced(undo.summary_with_hint()),
+            undo.remember(),
+        ),
         Err(e) => {
             let reason = format!("{e:#}");
             let detail = format!(
                 "Could not replace in place: {}. The text is on the clipboard.",
                 reason.trim_end_matches('.')
             );
-            copy_report(copy, confirmed, detail, Some(reason))
+            (copy_report(copy, confirmed, detail, Some(reason)), None)
         }
     }
 }
@@ -506,7 +514,7 @@ mod tests {
         let replace = Fake::new("replace_text", Ok(Undo::none("wrote it")));
         let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
         let plan = replace_plan(&gathered());
-        let report = replace_or_copy(
+        let (report, _undo) = replace_or_copy(
             &replace,
             &copy,
             plan.as_deref(),
@@ -517,12 +525,34 @@ mod tests {
         assert!(!copy.ran());
     }
 
+    /// #1281: the write's `Undo` comes back with the report, and the card
+    /// text names it; it was dropped before.
+    #[test]
+    fn a_successful_replace_hands_back_its_undo_and_names_it() {
+        let replace = Fake::new("replace_text", Ok(Undo::recording("wrote it", || Ok(()))));
+        let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
+        let plan = replace_plan(&gathered());
+        let (report, undo) = replace_or_copy(
+            &replace,
+            &copy,
+            plan.as_deref(),
+            confirmed(json!({"text": "hello"})),
+        );
+        let ReplaceReport::Replaced(text) = report else {
+            panic!("expected a replace, got {report:?}");
+        };
+        assert!(text.contains(crate::executors::UNDO_HINT), "{text}");
+        undo.expect("a restorable write keeps its undo")
+            .undo()
+            .unwrap();
+    }
+
     #[test]
     fn a_failed_replace_keeps_the_edited_text_on_the_clipboard() {
         let replace = Fake::new("replace_text", Err(anyhow::anyhow!("the text changed")));
         let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
         let plan = replace_plan(&gathered());
-        let report = replace_or_copy(
+        let (report, _undo) = replace_or_copy(
             &replace,
             &copy,
             plan.as_deref(),
@@ -553,7 +583,7 @@ mod tests {
             target: Some(target()),
             selected_text: "a\r\nb".into(),
         };
-        let report = replace_or_copy(
+        let (report, _undo) = replace_or_copy(
             &replace,
             &copy,
             Some(&plan),
@@ -574,7 +604,7 @@ mod tests {
             target: None,
             selected_text: "a\r\nb".into(),
         };
-        let report = replace_or_copy(
+        let (report, _undo) = replace_or_copy(
             &replace,
             &copy,
             Some(&plan),
@@ -592,7 +622,8 @@ mod tests {
     fn no_plan_copies_without_trying_to_replace() {
         let replace = Fake::new("replace_text", Ok(Undo::none("wrote it")));
         let copy = Fake::new("clipboard", Ok(Undo::none("copied")));
-        let report = replace_or_copy(&replace, &copy, None, confirmed(json!({"text": "hello"})));
+        let (report, _undo) =
+            replace_or_copy(&replace, &copy, None, confirmed(json!({"text": "hello"})));
         assert_eq!(report, ReplaceReport::Copied(COPIED_INSTEAD_DETAIL.into()));
         assert!(!replace.ran());
     }
@@ -603,7 +634,8 @@ mod tests {
             let replace = Fake::new("replace_text", Ok(Undo::none("x")));
             let copy = Fake::new("clipboard", Ok(Undo::none("x")));
             let plan = replace_plan(&gathered());
-            let report = replace_or_copy(&replace, &copy, plan.as_deref(), confirmed(v.clone()));
+            let (report, _undo) =
+                replace_or_copy(&replace, &copy, plan.as_deref(), confirmed(v.clone()));
             assert_eq!(report, ReplaceReport::NothingToReplace, "{v}");
             assert!(!replace.ran() && !copy.ran(), "{v}");
         }
@@ -614,7 +646,7 @@ mod tests {
         let replace = Fake::new("replace_text", Err(anyhow::anyhow!("no value pattern")));
         let copy = Fake::new("clipboard", Err(anyhow::anyhow!("clipboard busy")));
         let plan = replace_plan(&gathered());
-        let report = replace_or_copy(
+        let (report, _undo) = replace_or_copy(
             &replace,
             &copy,
             plan.as_deref(),
