@@ -209,11 +209,8 @@ impl OpenAiCompat {
         // handling (#155-style), checked before the content is read so a
         // truncated, invalid-JSON body is reported as budget exhaustion
         // rather than a generic parse failure.
-        if finish_reason == Some("length") {
-            return Err(anyhow!(
-                "openai-compat: The model ran out of room before answering. Lower the effort setting or raise the token limit."
-            ));
-        }
+        // #1269: with no text that is the stop-the-chain `Truncated` error
+        // (below); with text it is a completion with a `MaxTokens` stop.
 
         // The server's own filter blocked the reply (#731): a decline, not a
         // missing field.
@@ -227,19 +224,22 @@ impl OpenAiCompat {
         let text = match text {
             Some(t) if !t.is_empty() => t,
             _ => {
+                if finish_reason == Some("length") {
+                    return Err(super::truncated_error("openai-compat"));
+                }
                 return Err(match finish_reason {
                     Some(r) => anyhow!(
                         "openai-compat: response has no message.content (finish_reason: {})",
                         super::safe_reason(r)
                     ),
                     None => anyhow!("openai-compat: response has no message.content"),
-                })
+                });
             }
         };
 
         let stop = match finish_reason {
             Some("stop") => StopReason::Complete,
-            Some("length") => StopReason::MaxTokens, // unreachable: handled above
+            Some("length") => StopReason::MaxTokens,
             _ => StopReason::Other,
         };
 
@@ -801,10 +801,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_completion_reports_budget_exhaustion_for_length_finish_reason() {
-        let body = r#"{"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "{\n \"det"}}]}"#;
+    fn parse_completion_keeps_text_when_finish_reason_is_length() {
+        // #1269: the text is returned and the chain decides after parsing.
+        let body = r#"{"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "{\"detail\":\"d\",\"headline\":\"h\"}"}}]}"#;
+        let c = OpenAiCompat::parse_completion(body).unwrap();
+        assert_eq!(c.stop, StopReason::MaxTokens);
+        assert!(crate::provider::parse_answer(&c.text).is_ok());
+        let cut = r#"{"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": "{\n \"det"}}]}"#;
+        assert!(OpenAiCompat::parse_completion(cut).is_ok());
+    }
+
+    #[test]
+    fn parse_completion_reports_truncated_for_length_with_no_text() {
+        let body = r#"{"choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": ""}}]}"#;
         let err = OpenAiCompat::parse_completion(body).unwrap_err();
-        assert!(err.to_string().contains("ran out of room"));
+        assert!(
+            err.downcast_ref::<super::super::Truncated>().is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("too long and got cut off"));
     }
 
     #[test]
