@@ -784,12 +784,30 @@ mod driver {
         .collect()
     }
 
+    /// The catalogue name the gallery shows under a row (the app takes it from
+    /// the catalogue by id, #937). Ids the gallery makes up get a plain name.
+    fn gallery_action_name(id: &str) -> String {
+        match id {
+            "review-this-email" => "Review this email",
+            "rewrite-tone" => "Rewrite the tone",
+            "translate" => "Translate",
+            "explain-screen" => "Explain this screen",
+            "chart-table" => "Turn a table on screen into a chart with a long catalogue name",
+            "extract-text" => "Copy text from screen",
+            "read-qr" => "Read QR code",
+            "calculate-selection" => "Calculate selection",
+            _ => "",
+        }
+        .to_string()
+    }
+
     /// The options card's rows from `(id, label)` pairs.
     fn option_rows(rows: &[(&str, &str)]) -> Vec<crate::ui::card::OptionRow> {
         rows.iter()
             .map(|(id, label)| crate::ui::card::OptionRow {
                 id: (*id).to_string(),
                 label: (*label).to_string(),
+                action: gallery_action_name(id),
             })
             .collect()
     }
