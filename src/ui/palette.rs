@@ -303,6 +303,7 @@ impl Palette {
             hover: None,
             thumb_hot: false,
             ignore_mouse: false,
+            dpi_forced: false,
             tracking_leave: false,
             suppress_en_change: false,
             theme,
@@ -500,6 +501,7 @@ impl Palette {
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn force_dpi_for_gallery(&mut self, dpi: u32) {
         self.inner.dpi = dpi.max(1);
+        self.inner.dpi_forced = true;
         self.inner.rebuild_font();
         if let Some(renderer) = &self.inner.d2d {
             renderer.set_dpi(self.inner.dpi);
@@ -1477,6 +1479,9 @@ struct PaletteInner {
     /// is hovered. Mouse moves and leaves are then ignored; a state that
     /// wants a hover sets it explicitly. Always false in the live app.
     ignore_mouse: bool,
+    /// The UI gallery pinned dpi (orce_dpi_for_gallery): do not re-read it
+    /// from the window (#1258).
+    dpi_forced: bool,
     /// #357: whether `TrackMouseEvent(TME_LEAVE)` is currently armed for
     /// this window. `TrackMouseEvent` disarms itself the moment it fires
     /// (`WM_MOUSELEAVE`) or the mouse leaves, so it must be re-armed on
@@ -1591,33 +1596,47 @@ impl PaletteInner {
         let Ok(monitor) = crate::capture::active_monitor_rect() else {
             return;
         };
-        let w = scale(WINDOW_WIDTH, self.dpi);
-        let h = window_height(self.dpi);
-        let mon_w = monitor.right - monitor.left;
-        let mon_h = monitor.bottom - monitor.top;
-        let x = monitor.left + (mon_w - w).max(0) / 2;
-        let y = monitor.top + (mon_h - h).max(0) / 3; // upper third, like a launcher
-        unsafe {
+        let place = |hwnd: HWND, r: RECT| unsafe {
             let _ = SetWindowPos(
-                self.hwnd,
+                hwnd,
                 None,
-                x,
-                y,
-                w,
-                h,
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
             );
+        };
+        place(self.hwnd, centered_rect(monitor, self.dpi));
+        // #1258: moving to a monitor with another scale makes Windows send
+        // WM_DPICHANGED from inside that call. Whatever happened, re-read the
+        // window's real DPI and, if it is not the one the rect was computed
+        // with, place it again with the final size so the width, the centring
+        // and the render target all agree.
+        let real_dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(1);
+        if !self.dpi_forced && real_dpi != self.dpi {
+            self.dpi = real_dpi;
+            self.rebuild_font();
+            if let Some(renderer) = &self.d2d {
+                renderer.set_dpi(real_dpi);
+            }
+            place(self.hwnd, centered_rect(monitor, real_dpi));
         }
         self.layout_edit_control();
         // #216: the render target's pixel buffer must match the window's
-        // real physical size -- resized here (never recreated) alongside
-        // every window resize, mirroring the window/edit-control resize
-        // right above rather than waiting for a separate WM_SIZE.
+        // real physical size -- read back from the window, never assumed.
+        let mut client = RECT::default();
+        let have_client = unsafe { GetClientRect(self.hwnd, &mut client) }.is_ok();
+        let (w, h) = if have_client {
+            (client.right - client.left, client.bottom - client.top)
+        } else {
+            let r = centered_rect(monitor, self.dpi);
+            (r.right - r.left, r.bottom - r.top)
+        };
         if let Some(renderer) = &mut self.d2d {
             renderer.resize(w.max(1) as u32, h.max(1) as u32);
         }
     }
-
     /// Positions the query `EDIT` control in the window -- factored
     /// out of [`PaletteInner::reposition_centered`] so `WM_DPICHANGED`'s
     /// handler can re-run the same layout after a DPI change without
@@ -2123,6 +2142,23 @@ impl PaletteInner {
     }
 }
 
+/// #1258: where the palette goes on `monitor` at `dpi`: its scaled size,
+/// centred across the monitor and in the upper third, like a launcher. Pure,
+/// so it can be recomputed with the DPI the window really ends up at.
+fn centered_rect(monitor: RECT, dpi: u32) -> RECT {
+    let w = scale(WINDOW_WIDTH, dpi);
+    let h = window_height(dpi);
+    let mon_w = monitor.right - monitor.left;
+    let mon_h = monitor.bottom - monitor.top;
+    let x = monitor.left + (mon_w - w).max(0) / 2;
+    let y = monitor.top + (mon_h - h).max(0) / 3;
+    RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    }
+}
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -2922,6 +2958,66 @@ mod tests {
         );
     }
 
+    /// #1258: the placement is a pure function of the monitor and the DPI the
+    /// window ends up at, so it can be recomputed with the final DPI.
+    #[test]
+    fn centered_rect_uses_the_given_dpi_for_size_and_centring() {
+        let monitor = RECT {
+            left: -1920,
+            top: 100,
+            right: 0,
+            bottom: 1180,
+        };
+        for dpi in [96u32, 144, 192] {
+            let r = centered_rect(monitor, dpi);
+            assert_eq!(
+                r.right - r.left,
+                scale(WINDOW_WIDTH, dpi),
+                "dpi {dpi}: width"
+            );
+            assert_eq!(r.bottom - r.top, window_height(dpi), "dpi {dpi}: height");
+            let w = r.right - r.left;
+            assert_eq!(
+                r.left,
+                monitor.left + (1920 - w) / 2,
+                "dpi {dpi}: centred on the final width"
+            );
+            assert_eq!(
+                r.top,
+                monitor.top + (1080 - (r.bottom - r.top)) / 3,
+                "dpi {dpi}: upper third"
+            );
+        }
+        assert_ne!(
+            centered_rect(monitor, 96).left,
+            centered_rect(monitor, 192).left,
+            "a different DPI must move the centre"
+        );
+    }
+
+    /// #1258: after `show` the Direct2D target is exactly the window's client
+    /// size (a stale target size paints stretched or clipped).
+    #[test]
+    fn show_leaves_the_render_target_the_size_of_the_client_area() {
+        let mut p = Palette::new_for_test(instance()).unwrap();
+        p.show(free_actions(), true, "mode: Auto".to_string());
+        pump_pending(p.hwnd());
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(p.hwnd(), &mut client).expect("GetClientRect");
+        }
+        let target = p
+            .inner
+            .d2d
+            .as_ref()
+            .and_then(|r| r.target.as_ref())
+            .expect("a live render target after show");
+        let size = unsafe { target.GetPixelSize() };
+        assert_eq!(
+            (size.width as i32, size.height as i32),
+            (client.right - client.left, client.bottom - client.top)
+        );
+    }
     #[test]
     fn empty_query_selects_the_first_action_in_grouped_order() {
         let mut p = Palette::new_for_test(instance()).unwrap();
