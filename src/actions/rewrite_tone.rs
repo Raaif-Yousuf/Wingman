@@ -79,13 +79,20 @@ pub fn builtin_actions() -> Vec<Action> {
 
 /// "Simplify this text": plain words and short sentences at a lower reading
 /// level. Same proposal and executor as the tones. Its own prompt, because
-/// the shared end tells the model to change only the wording and tone, and
-/// this one must also say when meaning would be lost.
+/// the shared end tells the model to change only the wording and tone.
+///
+/// All of `text` is written over the selection by `replace_text`, and
+/// `text_answer` has no card-only field, so the prompt cannot ask for a
+/// remark about what could not be simplified: that part is left in the
+/// original words instead. A card-only remark is owed (#1278).
 fn simplify_action() -> Action {
-    let mut a = tone_action(SIMPLIFY_ID, "Simplify this text", "");
-    a.prompt = "You are given a piece of text the user selected, such as a policy, a contract clause or a paper abstract. Rewrite it in plain words and short sentences, at a lower reading level, so a general reader understands it the first time. Replace jargon and long phrases with everyday words, and split long sentences. Keep the meaning, facts and the language of the original, and keep every number, name and date exactly as written. Do not add information that is not in the text. If part of it cannot be simplified without losing meaning, keep that part as written and add a last line starting with \"Note:\" that says which part and why. Keep the line breaks and formatting characters where they still make sense. Return only the rewritten text in `text`, with no quotation marks or explanation. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them.".to_string();
-    a
+    Action {
+        prompt: SIMPLIFY_PROMPT.to_string(),
+        ..tone_action(SIMPLIFY_ID, "Simplify this text", "")
+    }
 }
+
+const SIMPLIFY_PROMPT: &str = "You are given a piece of text the user selected, such as a policy, a contract clause or a paper abstract. Rewrite it in plain words and short sentences, at a lower reading level, so a general reader understands it the first time. Replace jargon and long phrases with everyday words, and split long sentences. Keep the meaning, facts and the language of the original, and keep every number, name and date exactly as written. Do not add information that is not in the text. If a part cannot be simplified without losing meaning, leave that part in its original words. Keep the line breaks and formatting characters where they still make sense. Return only the rewritten text in `text`, and nothing else: no notes, no quotation marks, no explanation. Use plain text only: no markdown (no asterisks, backticks, headers or bullet characters), no LaTeX, and no em dashes unless the original text has them.";
 
 #[cfg(test)]
 mod tests {
@@ -149,22 +156,22 @@ mod tests {
     }
 
     #[test]
-    fn simplify_asks_for_plain_words_and_keeps_every_fact() {
-        let p = builtin_actions()
+    fn simplify_never_asks_for_a_note_inside_the_text_that_replaces_the_selection() {
+        // Only the proposal's `text` is written over the selection, and
+        // `text_answer` has no other field to hold a remark.
+        let schema = crate::actions::schema::schema_for("text_answer", false).unwrap();
+        let props: Vec<&String> = schema["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(props, ["text"], "no card-only field exists to hold a note");
+        let prompt = builtin_actions()
             .into_iter()
             .find(|a| a.id == SIMPLIFY_ID)
             .unwrap()
             .prompt;
-        for needle in [
-            "plain words",
-            "short sentences",
-            "reading level",
-            "cannot be simplified without losing meaning",
-            "every number, name and date exactly",
-        ] {
-            assert!(p.contains(needle), "simplify prompt lacks {needle}");
-        }
-        assert!(!p.contains('\u{2014}'));
+        assert_eq!(prompt, SIMPLIFY_PROMPT);
+        assert!(!prompt.contains("Note:"));
+        assert!(prompt.contains("leave that part in its original words"));
+        assert!(prompt.contains("every number, name and date exactly"));
+        assert!(!prompt.contains('\u{2014}'));
     }
 
     #[test]
