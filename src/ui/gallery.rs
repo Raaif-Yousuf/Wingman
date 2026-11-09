@@ -312,6 +312,9 @@ pub enum GalleryState {
     /// to its end, to see the scrolled thumb, the dark scrollbar and the lower
     /// rows.
     SettingsModelsScrolled,
+    /// #1292: the General page scrolled to its end: the last section card and
+    /// the gap under it.
+    SettingsGeneralScrolled,
     /// Issue #580: the region-select overlay over a synthetic backdrop, with a
     /// selection staged.
     RegionOverlay,
@@ -385,6 +388,7 @@ pub fn gallery_states() -> Vec<GalleryState> {
         SettingsCheckFocus,
         SettingsTrackFocus,
         SettingsModelsScrolled,
+        SettingsGeneralScrolled,
         RegionOverlay,
         OverlayNotes,
         TrayMenu,
@@ -453,6 +457,7 @@ pub fn state_name(state: GalleryState) -> &'static str {
         SettingsCheckFocus => "settings-check-focus",
         SettingsTrackFocus => "settings-track-focus",
         SettingsModelsScrolled => "settings-models-scrolled",
+        SettingsGeneralScrolled => "settings-general-scrolled",
         RegionOverlay => "region-overlay",
         OverlayNotes => "overlay-notes",
         TrayMenu => "tray-menu",
@@ -1333,6 +1338,7 @@ mod driver {
             | SettingsCheckFocus
             | SettingsTrackFocus
             | SettingsModelsScrolled
+            | SettingsGeneralScrolled
             | SettingsKeyChecking
             | SettingsKeyRejected => {
                 card.hide();
@@ -1370,6 +1376,7 @@ mod driver {
                         w.reveal_providers();
                         w.scroll_to_end();
                     }
+                    SettingsGeneralScrolled => w.scroll_to_end(),
                     _ => {}
                 }
                 *settings = Some(w);
@@ -1398,6 +1405,7 @@ mod driver {
             | SettingsCheckFocus
             | SettingsTrackFocus
             | SettingsModelsScrolled
+            | SettingsGeneralScrolled
             | SettingsKeyChecking
             | SettingsKeyRejected => settings
                 .as_ref()
@@ -2036,7 +2044,7 @@ mod tests {
             settings_states += usize::from(n.starts_with("settings-"));
         }
         assert_eq!(
-            settings_states, 18,
+            settings_states, 19,
             "the test must see every Settings state"
         );
     }
@@ -2175,8 +2183,8 @@ mod tests {
         // (#1109) = 53, + the same combo with its list open (#1125) = 54, + the long
         // button label (#828) = 55, + the focused checked checkbox
         // (#582) = 56, + the focused trackbar (#582) = 57, + the scrolled Models page
-        // (#1246) = 58.
-        assert_eq!(states.len(), 58);
+        // (#1246) = 58, + the scrolled General page (#1292) = 59.
+        assert_eq!(states.len(), 59);
         let names: std::collections::HashSet<&str> =
             states.iter().map(|s| state_name(*s)).collect();
         assert_eq!(
@@ -2229,14 +2237,15 @@ mod tests {
             "settings-check-focus",
             "settings-track-focus",
             "settings-models-scrolled",
+            "settings-general-scrolled",
         ] {
             assert!(names.contains(&want), "missing {want}");
         }
         // One state per page of the rail: a page added there needs a picture.
         assert_eq!(
             crate::ui::settings::page_labels().len(),
-            names.iter().filter(|n| n.starts_with("settings-")).count() - 13,
-            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) the open combo list (#1125) the focused checkbox and the focused trackbar (#582) and the scrolled Models page (#1246)"
+            names.iter().filter(|n| n.starts_with("settings-")).count() - 14,
+            "the Advanced page has two states (prompt closed and open), the Models page three (#874), the status line five (#875, #876), the combo hover (#1109) the open combo list (#1125) the focused checkbox and the focused trackbar (#582) the scrolled Models page (#1246) and the scrolled General page (#1292)"
         );
     }
 
