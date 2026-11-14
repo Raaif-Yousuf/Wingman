@@ -67,7 +67,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub const WM_APP_DISMISS: u32 = WM_APP + 5;
 
 /// Pack a screen point into the 32-bit encoding described on
-/// [`WM_APP_DISMISS`].
+/// [`WM_APP_DISMISS`]. Each axis is truncated to a signed 16-bit word, so a
+/// virtual desktop past 32767 px (or below -32768) gives a wrong point
+/// (#1255); real layouts stay inside that.
 pub fn pack_point(x: i32, y: i32) -> u32 {
     let lo = (x as i16 as u16) as u32;
     let hi = (y as i16 as u16) as u32;

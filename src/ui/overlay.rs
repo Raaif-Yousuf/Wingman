@@ -1032,8 +1032,8 @@ fn window_stack() -> Option<Vec<Stacked>> {
 }
 
 /// The top-level windows under the marks, one per distinct window: what
-/// the overlay watches for change. Found at each annotation rect's centre
-/// from the z-ordered window list. Empty when the list cannot be read, which
+/// the overlay watches for change. Found at each annotation rect's centre and
+/// four quarter points (#1255) from the z-ordered window list. Empty when the list cannot be read, which
 /// the caller treats as "do not show" (no way to go stale is the outcome to
 /// avoid).
 pub(crate) fn targets_under(annotations: &[Annotation]) -> Vec<isize> {
@@ -1048,11 +1048,18 @@ pub(crate) fn targets_under(annotations: &[Annotation]) -> Vec<isize> {
 fn targets_in(stack: &[Stacked], annotations: &[Annotation], own_pid: u32) -> Vec<isize> {
     let mut out: Vec<isize> = Vec::new();
     for rect in annotations.iter().flat_map(|a| a.rects.iter()) {
-        let x = rect.left + (rect.right.saturating_sub(rect.left)) / 2;
-        let y = rect.top + (rect.bottom.saturating_sub(rect.top)) / 2;
-        if let Some(w) = target_at(stack, x, y, own_pid) {
-            if !out.contains(&w) {
-                out.push(w);
+        // #1255: the centre plus the four quarter points, so a mark spanning
+        // two windows watches both, and one whose centre is over a
+        // click-through or Wingman's own window still finds the window behind.
+        let w = rect.right.saturating_sub(rect.left);
+        let h = rect.bottom.saturating_sub(rect.top);
+        for (fx, fy) in [(2, 2), (1, 1), (3, 1), (1, 3), (3, 3)] {
+            let x = rect.left + w.saturating_mul(fx) / 4;
+            let y = rect.top + h.saturating_mul(fy) / 4;
+            if let Some(t) = target_at(stack, x, y, own_pid) {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
             }
         }
     }
@@ -1338,6 +1345,31 @@ mod tests {
         assert_eq!(targets_in(&stack, &marks, 7), vec![3, 4]);
         // A mark over nothing adds nothing; no windows means no targets.
         assert!(targets_in(&[], &marks, 7).is_empty());
+    }
+
+    /// #1255: a mark spanning two windows watches both, and a mark whose
+    /// centre sits over Wingman's own window still finds the window behind
+    /// its other sample points.
+    #[test]
+    fn targets_in_samples_more_than_the_centre() {
+        const OWN: u32 = 7;
+        let stack = [
+            stacked(3, r(0, 0, 400, 400), 9, false),
+            stacked(4, r(400, 0, 800, 400), 9, false),
+        ];
+        // Centre (400, 100) is on window 4; the left quarter is on window 3.
+        let span = Annotation::note(vec![r(200, 90, 600, 110)], "x").unwrap();
+        let mut got = targets_in(&stack, &[span], OWN);
+        got.sort();
+        assert_eq!(got, vec![3, 4]);
+
+        // Wingman's own window covers the centre only.
+        let stack = [
+            stacked(1, r(180, 80, 220, 120), OWN, false),
+            stacked(3, r(0, 0, 400, 400), 9, false),
+        ];
+        let mark = Annotation::note(vec![r(100, 60, 300, 140)], "x").unwrap();
+        assert_eq!(targets_in(&stack, &[mark], OWN), vec![3]);
     }
 
     /// Real windows of a system class (no Wingman name is registered): a

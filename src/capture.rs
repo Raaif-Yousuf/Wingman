@@ -860,11 +860,23 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
         return Err(anyhow!("no monitors found"));
     }
 
-    for m in &monitors {
+    // #1255: a monitor that cannot be captured must not come out silently
+    // black (a selection over it would copy black pixels with no card), so
+    // the grab fails and the error card names the monitor.
+    let mut failed: Vec<String> = Vec::new();
+    for (i, m) in monitors.iter().enumerate() {
+        let label = || {
+            m.name()
+                .ok()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("#{}", i + 1))
+        };
         let (Ok(mx), Ok(my)) = (m.x(), m.y()) else {
+            failed.push(label());
             continue;
         };
         let Ok(image) = m.capture_image() else {
+            failed.push(label());
             continue;
         };
         let (mw, mh) = (image.width(), image.height());
@@ -878,6 +890,9 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
             mx - desktop.left,
             my - desktop.top,
         );
+    }
+    if let Some(msg) = failed_monitors_message(&failed, monitors.len()) {
+        return Err(anyhow!(msg));
     }
 
     Ok(RawShot {
@@ -896,6 +911,23 @@ pub fn grab_virtual_desktop_raw() -> Result<RawShot> {
             // refuses a map with no lookup, so it would fail closed.
             None,
         )),
+    })
+}
+
+/// The error text for a virtual-desktop grab where `failed` monitors (out of
+/// `total`) could not be captured, or `None` when all were. Names the
+/// monitors so the card says which screen is the problem. Pure.
+fn failed_monitors_message(failed: &[String], total: usize) -> Option<String> {
+    if failed.is_empty() {
+        return None;
+    }
+    let names = failed.join(", ");
+    Some(if failed.len() >= total {
+        format!("Wingman could not capture any screen ({names}). Try again.")
+    } else if failed.len() == 1 {
+        format!("Wingman could not capture the screen {names}, so the picker would show it black. Try again.")
+    } else {
+        format!("Wingman could not capture these screens: {names}, so the picker would show them black. Try again.")
     })
 }
 
@@ -1005,6 +1037,24 @@ pub fn crop_rgba(rgba: &[u8], width: u32, height: u32, rect: RectPx) -> RawShot 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_monitors_message_names_the_monitors() {
+        use super::failed_monitors_message;
+        assert_eq!(failed_monitors_message(&[], 2), None);
+        let one = failed_monitors_message(&["DELL U2720Q".into()], 2).unwrap();
+        assert!(
+            one.contains("DELL U2720Q") && one.contains("black"),
+            "{one}"
+        );
+        let two = failed_monitors_message(&["A".into(), "B".into()], 3).unwrap();
+        assert!(two.contains("A, B"), "{two}");
+        let all = failed_monitors_message(&["A".into()], 1).unwrap();
+        assert!(all.contains("any screen") && all.contains('A'), "{all}");
+        for m in [&one, &two, &all] {
+            assert!(!m.contains('\u{2014}'));
+        }
+    }
+
     use super::{
         blit_into, crop_rgba, encode, encode_png, fit_for_model, fit_long_edge,
         pick_compression_level, resolve_limits, Cursor, RawShot, RectPx,
